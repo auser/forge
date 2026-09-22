@@ -11,6 +11,7 @@ built-in mock providers.
 - Project spec: [`specs/project.md`](specs/project.md)
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
 - Implementation plan: [`specs/implementation-plan.md`](specs/implementation-plan.md)
+- Roadmap and future directions: [`specs/roadmap.md`](specs/roadmap.md)
 - BDD features: [`tests/features/`](tests/features/)
 
 ## Quickstart
