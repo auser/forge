@@ -262,7 +262,7 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 10 features / 16 scenarios / 61 steps.
+  mock providers — fully offline. Currently 16 features / 24 scenarios / 93 steps.
 
 ## Known limitations (v0.3)
 
