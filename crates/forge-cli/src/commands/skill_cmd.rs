@@ -70,7 +70,7 @@ fn show(ctx: &Context, name: &str) -> Result<(), ForgeError> {
     let skill = registry.activate(name)?;
 
     let store = JsonlSessionStore::new(ctx.project_root()?.join(".forge").join("sessions"));
-    store.append(&Event::new(
+    store.append(Event::new(
         new_run_id(),
         CLI_SESSION,
         EventKind::SkillActivated {
@@ -119,13 +119,13 @@ async fn test(ctx: &Context, name: &str) -> Result<(), ForgeError> {
 
     // Keep a handle to the mock so we can report what would have run.
     let mock = if resolved.config.execution == "mock" {
-        Some(MockExecution::new())
+        Some(MockExecution::new(&root))
     } else {
         None
     };
     let exec: std::sync::Arc<dyn forge_core::ExecutionProvider> = match &mock {
         Some(m) => Arc::new(m.clone()),
-        None => build_execution(&resolved.config)?,
+        None => build_execution(&resolved.config, &root)?,
     };
     let registry = FsSkillRegistry::new(&root, Some(exec));
 

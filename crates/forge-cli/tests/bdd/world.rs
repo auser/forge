@@ -11,12 +11,14 @@ pub const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_MODEL",
     "FORGE_MODEL_BASE_URL",
     "FORGE_MODEL_KEY_ENV",
+    "FORGE_MOCK_SCRIPT",
     "FORGE_ROUTER",
     "FORGE_ROUTER_URL",
     "FORGE_ROUTER_KEY_ENV",
     "FORGE_EXECUTION",
     "FORGE_APPROVAL",
     "FORGE_LOCAL_ONLY",
+    "FORGE_MAX_TURNS",
     "FORGE_SERVER_HOST",
     "FORGE_SERVER_PORT",
 ];
@@ -44,6 +46,9 @@ pub struct BddWorld {
     pub secret: String,
     pub sse_content_type: String,
     pub sse_body: String,
+    /// Pending `.forge/config.toml` lines, flushed before the next
+    /// command or server start (lets several Given steps each set keys).
+    pub config_lines: Vec<String>,
 }
 
 impl BddWorld {
@@ -136,6 +141,22 @@ impl BddWorld {
                 }
             }
         }
+    }
+
+    /// Set/replace a config key line (TOML `key = value`); flushed to
+    /// `.forge/config.toml` by `flush_config`.
+    pub fn set_config(&mut self, key: &str, value: &str) {
+        let prefix = format!("{key} =");
+        self.config_lines.retain(|l| !l.starts_with(&prefix));
+        self.config_lines.push(format!("{prefix} {value}"));
+    }
+
+    pub fn flush_config(&mut self) {
+        if self.config_lines.is_empty() {
+            return;
+        }
+        let content = self.config_lines.join("\n") + "\n";
+        self.write_file(".forge/config.toml", &content);
     }
 
     /// All session JSONL content under .forge/sessions, concatenated.

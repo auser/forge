@@ -76,8 +76,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
         Command::Doctor => doctor::run(&ctx),
         Command::Config { command } => config_cmd::run(&ctx, command),
 
-        Command::Run { prompt } => run_cmd::run(&ctx, prompt).await,
-        Command::Resume { id } => session_cmd::resume(&ctx, &id),
+        Command::Run { prompt, max_turns } => run_cmd::run(&ctx, prompt, max_turns).await,
+        Command::Resume { id } => session_cmd::resume(&ctx, &id).await,
         Command::Cancel { id } => session_cmd::cancel(&ctx, &id),
         Command::Session { command } => match command.unwrap_or(SessionCommand::List) {
             SessionCommand::List => session_cmd::list(&ctx),

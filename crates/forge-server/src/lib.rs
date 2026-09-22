@@ -29,7 +29,7 @@ use forge_core::{ForgeError, SkillRegistry};
 use forge_graph::LocalGraph;
 use forge_runtime::AgentService;
 
-pub use state::{AppState, RunStatus};
+pub use state::{AppState, MAX_TRACKED_RUNS, RunRegistry, RunStatus};
 
 /// Build the axum router. Takes the shared service plus the skill registry
 /// and project graph handles explicitly so tests can compose them freely.

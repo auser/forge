@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
-use forge_core::{Event, ForgeError};
+use forge_core::{Event, ForgeError, ProjectGraph};
 use serde::Deserialize;
 
 use crate::state::{AppState, RunStatus};
@@ -119,16 +119,13 @@ pub async fn create_run(
     }
     let (run_id, session_id, handle) = state.service.start_run(body.prompt, body.session_id);
 
-    {
-        let mut runs = state.runs.lock().unwrap_or_else(|e| e.into_inner());
-        runs.insert(
-            run_id.clone(),
-            crate::state::RunEntry {
-                status: RunStatus::Running,
-                abort: handle.abort_handle(),
-            },
-        );
-    }
+    state.insert_run(
+        run_id.clone(),
+        crate::state::RunEntry {
+            status: RunStatus::Running,
+            abort: handle.abort_handle(),
+        },
+    );
 
     // Monitor: update the status map when the task finishes.
     let monitor = state.clone();
@@ -159,6 +156,8 @@ fn status_from_events(events: &[Event]) -> RunStatus {
         Some(forge_core::EventKind::Completed { .. }) => RunStatus::Completed,
         Some(forge_core::EventKind::Cancelled { .. }) => RunStatus::Cancelled,
         Some(forge_core::EventKind::Error { message }) => RunStatus::Failed(message.clone()),
+        // Parked in an approval wait.
+        Some(forge_core::EventKind::ApprovalRequested { .. }) => RunStatus::WaitingForApproval,
         _ => RunStatus::Running,
     }
 }
@@ -178,6 +177,17 @@ pub async fn get_run(
         (None, false) => status_from_events(&events),
         (None, true) => return Err(ApiError::not_found(format!("unknown run: {id}"))),
     };
+    // A "running" run whose latest event is an unanswered approval request
+    // is actually parked.
+    let status = if status == RunStatus::Running
+        && matches!(
+            events.last().map(|e| &e.kind),
+            Some(forge_core::EventKind::ApprovalRequested { .. })
+        ) {
+        RunStatus::WaitingForApproval
+    } else {
+        status
+    };
     let session_id = events
         .first()
         .map(|e| e.session_id.clone())
@@ -195,20 +205,39 @@ pub struct RunInput {
     input: String,
 }
 
-/// Record run-scoped input as a `note` event (persisted + broadcast). The
-/// note is not fed back into the model — agent steering lands later.
+/// Deliver user input to a run: `AgentService::send_input` feeds the
+/// run's input channel (approval pauses consume it) and records an
+/// `InputReceived` event. 404 for unknown runs; 409 for terminal runs or
+/// closed input channels. Input for a run owned by another process is
+/// recorded as an event but not consumed by that loop (the input channel
+/// is in-process).
 pub async fn run_input(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<RunInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let in_flight = state.status_of(&id);
+    let events = state.service.events(&id).unwrap_or_default();
+    if in_flight.is_none() && events.is_empty() {
+        return Err(ApiError::not_found(format!("unknown run: {id}")));
+    }
+    let status = in_flight.unwrap_or_else(|| status_from_events(&events));
+    if status.is_terminal() {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!("run {id} is {status:?}; not accepting input"),
+        });
+    }
     state
         .service
-        .record_input(&id, &body.input)
-        .map_err(|_| ApiError::not_found(format!("unknown run: {id}")))?;
+        .send_input(&id, body.input)
+        .map_err(|e| ApiError {
+            status: StatusCode::CONFLICT,
+            message: e.to_string(),
+        })?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "recorded": true, "run_id": id })),
+        Json(serde_json::json!({ "delivered": true, "run_id": id })),
     ))
 }
 
@@ -216,11 +245,13 @@ pub async fn cancel_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Abort the in-flight task when this server started it.
+    // Abort the in-flight task when this server started it (the runtime's
+    // cancellation token also unwinds the loop; the abort is the prompt
+    // fallback for a task blocked elsewhere).
     let abort = {
         let mut runs = state.runs.lock().unwrap_or_else(|e| e.into_inner());
         runs.get_mut(&id).and_then(|entry| {
-            (entry.status == RunStatus::Running).then(|| {
+            (!entry.status.is_terminal()).then(|| {
                 entry.status = RunStatus::Cancelled;
                 entry.abort.clone()
             })

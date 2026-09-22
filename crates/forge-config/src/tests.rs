@@ -186,3 +186,29 @@ fn unparseable_project_file_is_a_config_error() {
     let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
     assert!(matches!(err, ForgeError::Config(_)));
 }
+
+#[test]
+#[serial]
+fn max_turns_default_env_and_invalid() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.max_turns, 25);
+    assert_eq!(
+        resolved.explain("max_turns"),
+        Some(("25".to_string(), Origin::Default))
+    );
+
+    unsafe { std::env::set_var("FORGE_MAX_TURNS", "7") };
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.max_turns, 7);
+    assert_eq!(
+        resolved.explain("max_turns"),
+        Some(("7".to_string(), Origin::Environment))
+    );
+
+    unsafe { std::env::set_var("FORGE_MAX_TURNS", "lots") };
+    let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
+    assert!(matches!(err, ForgeError::Config(_)));
+}

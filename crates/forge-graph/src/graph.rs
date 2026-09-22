@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use forge_core::{ForgeError, GraphStats, GrepMatch, ProjectGraph, SymbolInfo};
+use forge_core::{ContextHit, ForgeError, GraphStats, GrepMatch, ProjectGraph, SymbolInfo};
 use sha2::{Digest, Sha256};
 
 use crate::parse::{FileParse, parse_source};
@@ -50,14 +50,6 @@ pub struct DirSummary {
     /// File counts by kind (kind name → count).
     pub files: BTreeMap<String, usize>,
     pub symbols: usize,
-}
-
-/// One ranked context result for `graph context`.
-#[derive(Debug, Clone)]
-pub struct ContextHit {
-    pub path: String,
-    pub score: u32,
-    pub reasons: Vec<String>,
 }
 
 /// Local, deterministic, incremental project graph.
@@ -403,7 +395,7 @@ impl LocalGraph {
     }
 
     /// Top-N files relevant to a free-text query (naive token match).
-    pub fn context(&self, query: &str, limit: usize) -> Vec<ContextHit> {
+    fn context_impl(&self, query: &str, limit: usize) -> Vec<ContextHit> {
         let tokens: Vec<String> = query
             .split(|c: char| !c.is_alphanumeric())
             .map(str::to_lowercase)
@@ -628,6 +620,10 @@ impl ProjectGraph for LocalGraph {
                 line: s.line,
             })
             .collect()
+    }
+
+    fn context(&self, query: &str, limit: usize) -> Vec<ContextHit> {
+        self.context_impl(query, limit)
     }
 
     fn grep(&self, pattern: &str) -> Result<Vec<GrepMatch>, ForgeError> {

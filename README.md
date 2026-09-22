@@ -32,10 +32,10 @@ so every command above works with no accounts, keys, or network.
 
 ```text
 forge init                          Initialize a project (idempotent)
-forge run <prompt...>               Run a prompt through the agent
+forge run [--max-turns N] <prompt>  Run the multi-turn agent loop
 forge serve [--host --port]         Start the REST/SSE server
-forge resume <run-or-session-id>    Show a run/session event history
-forge cancel <run-or-session-id>    Record cancellation of a run
+forge resume <run-or-session-id>    Continue a completed run in its session
+forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
 forge graph build|check|map|grep|callers|blast|context
 forge skill list|show|test
@@ -79,7 +79,8 @@ Key settings (all optional):
 
 | Key | Default | Env var | Meaning |
 |---|---|---|---|
-| `model` | `mock-local` | `FORGE_MODEL` | Active model |
+| `model` | `mock-local` | `FORGE_MODEL` | Active model (`scripted-mock` = scripted offline model) |
+| `mock_script` | — | `FORGE_MOCK_SCRIPT` | JSON script path for `scripted-mock` (project-relative) |
 | `model_base_url` | — | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
 | `router` | `static` | `FORGE_ROUTER` | `static` \| `mock` \| `http` |
@@ -91,6 +92,7 @@ Key settings (all optional):
 | `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers |
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
+| `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
 
 Unknown keys are tolerated. Inspect the resolved configuration:
 
@@ -115,14 +117,17 @@ These are the three pluggable seams (traits in `forge-core`):
   out, static routing takes over and the decision is marked `fallback_used`.
   TypeSafe Jev / Kev services work through the `http` backend — nothing is
   hard-coded.
-- **ExecutionProvider** — all command/script execution goes through this trait
-  (the runtime never spawns processes directly). `native` runs locally with
-  approval gating: `Risky` commands pause for approval under
-  `approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
-  commands and lets `Risky` ones run (non-interactive stdin → typed
-  "approval required" error). `auto` runs, `deny` blocks. `mock` records
-  requests for tests.
-  MVM/container/remote executors plug into the same trait later.
+- **ExecutionProvider** — all command/script execution AND file
+  reads/writes/edits/deletes go through this trait (the runtime never spawns
+  processes or touches files directly). Risk classification: reads are `Safe`,
+  in-project writes/edits are `Risky`, deletes and out-of-project paths are
+  `Destructive`. `native` runs locally with approval gating: `Risky` operations
+  pause for approval under `approval = "prompt"`, while `prompt-dangerous` asks
+  only for `Destructive` ones (non-interactive stdin → typed "approval required"
+  error, which the agent loop treats as a pause: answer via piped stdin lines,
+  e.g. `echo y | forge run ...`). `auto` runs, `deny` blocks. `mock` records
+  requests for tests. MVM/container/remote executors plug into the same trait
+  later.
 
 ## Skills
 
@@ -170,9 +175,16 @@ GET  /health                   liveness + version
 GET  /v1/capabilities          server/model/router/execution capabilities
 GET  /v1/models                known models with capabilities
 POST /v1/runs                  {"prompt": "..."} → 202 {"run_id","session_id"}
-GET  /v1/runs/:id              status + events so far
-POST /v1/runs/:id/input        record input as a run-scoped note event
-POST /v1/runs/:id/cancel       abort an in-flight run (404 if unknown)
+GET  /v1/runs/:id              status + events so far; status is one of
+                               running | waiting_for_approval | completed |
+                               failed | cancelled
+POST /v1/runs/:id/input        deliver input to a run (202): a run parked in an
+                               approval wait consumes it ("y" approves, anything
+                               else denies). Records an `input_received` event.
+                               404 unknown run, 409 terminal/closed run
+POST /v1/runs/:id/cancel       cancel mid-loop: runtime cancellation token +
+                               `.forge/runs/<id>.cancel` marker + task abort +
+                               `cancelled` event (404 if unknown)
 GET  /v1/runs/:id/events       SSE: replays stored events, streams live, ends
                                after a terminal (completed/cancelled/error) event
 GET  /v1/skills                discovered skill metadata
@@ -180,21 +192,29 @@ GET  /v1/project/graph         graph stats + freshness
 POST /v1/project/context       {"query": "..."} → ranked context selection
 ```
 
+The server tracks at most 1024 in-flight/recent runs in memory
+(`MAX_TRACKED_RUNS`); oldest terminal entries are evicted first and remain fully
+retrievable from the session store (the source of truth).
+
 ## Sessions and events
 
-Every run appends versioned events (`"v": 1`) to
+Every run appends versioned events (`"v": 2`, with a monotonic per-run `seq`
+assigned by the session store on append) to
 `.forge/sessions/<session_id>.jsonl` — one JSON object per line, append-only.
-Event kinds: `run_started`, `routing_decision_made`, `skill_activated`,
-`tool_started`, `tool_completed`, `file_changed`, `note`, `error`, `cancelled`,
-`completed`. Events carry run/session IDs, provider, model, routing confidence,
-and fallback flags. Secret-looking values (API-key patterns, `Bearer` tokens,
-values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env vars) are redacted to
-`[REDACTED]` before anything is written.
+v1 logs (no `seq`, f32 confidence) remain readable. Event kinds: `run_started`,
+`routing_decision_made`, `skill_activated`, `tool_call_requested`,
+`tool_started`, `tool_completed`, `file_changed`, `approval_requested`,
+`approval_decided`, `turn_completed`, `input_received`, `note` (v1 compat),
+`error`, `cancelled`, `completed`. Events carry run/session IDs, provider,
+model, routing confidence, and fallback flags. Secret-looking values (API-key
+patterns, `Bearer` tokens, values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*`
+env vars) are redacted to `[REDACTED]` before anything is written.
 
 ```bash
 forge session list        # sessions with event counts
 forge session show <id>   # full event history
-forge resume <id>         # alias-style view of a run/session history
+forge resume <id>         # continue a completed run (new run, same session,
+                          # seeded with the original prompt + prior outcome)
 ```
 
 ## Development
@@ -241,14 +261,14 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 7 features / 11 scenarios / 44 steps.
+  mock providers — fully offline. Currently 10 features / 16 scenarios / 61 steps.
 
-## Known limitations (v0.2)
+## Known limitations (v0.3)
 
-- `forge resume` replays history; real re-execution needs the interactive agent
-  loop (planned v0.3). `POST /v1/runs/:id/input` records input as a note event
-  rather than resuming a paused run.
+- `forge resume` seeds the new run with the original prompt and the prior
+  (truncated) completion summary; full conversation replay is future work.
 - Symbol/call extraction is regex-based; `graph blast` covers two hops.
-- Server run-status state is in-memory and unbounded; no restart persistence.
-- `RoutingDecision.confidence` is `f32`, so serialized values show float
-  widening (e.g. `0.8999…`) — slated to become `f64` in event schema v2.
+- Server run-status state is in-memory (bounded at `MAX_TRACKED_RUNS` = 1024,
+  terminal-first eviction); the session store persists across restarts.
+- Input delivery is in-process: `POST /v1/runs/:id/input` for a run owned by
+  another process records the event but that loop does not consume it.

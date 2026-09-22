@@ -32,6 +32,14 @@ pub struct GrepMatch {
     pub text: String,
 }
 
+/// One ranked context-selection result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextHit {
+    pub path: String,
+    pub score: u32,
+    pub reasons: Vec<String>,
+}
+
 /// Deterministic, local, incremental, regenerable structural project graph.
 /// Stored below `.forge/graph/`; never requires model calls to build.
 pub trait ProjectGraph: Send + Sync {
@@ -47,4 +55,11 @@ pub trait ProjectGraph: Send + Sync {
 
     /// Search indexed symbol names and import paths.
     fn grep(&self, pattern: &str) -> Result<Vec<GrepMatch>, ForgeError>;
+
+    /// Top-N files relevant to a free-text query. Default: no results
+    /// (used when no graph is available).
+    fn context(&self, query: &str, limit: usize) -> Vec<ContextHit> {
+        let _ = (query, limit);
+        Vec::new()
+    }
 }

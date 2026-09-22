@@ -1,38 +1,50 @@
 use std::io::{BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use forge_core::{
-    ApprovalPolicy, ExecRequest, ExecResult, ExecutionProvider, ForgeError, RiskLevel,
+    ApprovalPolicy, ExecRequest, ExecResult, ExecutionProvider, FileOp, FileOpResult, ForgeError,
+    RiskLevel,
 };
 
-/// Runs commands as local child processes via `tokio::process::Command`.
+/// Runs commands as local child processes via `tokio::process::Command`
+/// and performs file operations directly, both gated by the same approval
+/// policy. The project root is used for file-op risk classification.
 pub struct NativeExecution {
     approval: ApprovalPolicy,
+    project_root: PathBuf,
 }
 
 impl NativeExecution {
-    pub fn new(approval: ApprovalPolicy) -> Self {
-        Self { approval }
+    pub fn new(approval: ApprovalPolicy, project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            approval,
+            project_root: project_root.into(),
+        }
     }
 
     pub fn approval(&self) -> ApprovalPolicy {
         self.approval
     }
 
-    /// Gate a request by risk level and approval policy.
-    fn check_approval(&self, request: &ExecRequest) -> Result<(), ForgeError> {
-        if request.risk == RiskLevel::Safe {
+    pub fn project_root(&self) -> &std::path::Path {
+        &self.project_root
+    }
+
+    /// Gate an operation by risk level and approval policy. Shared by
+    /// command execution and file operations.
+    fn check_approval(&self, description: &str, risk: RiskLevel) -> Result<(), ForgeError> {
+        if risk == RiskLevel::Safe {
             return Ok(());
         }
         match self.approval {
             ApprovalPolicy::Auto => Ok(()),
             ApprovalPolicy::Deny => Err(ForgeError::execution(format!(
-                "approval denied: `{}` is {:?} and policy is 'deny'",
-                request.command, request.risk
+                "approval denied: {description} is {risk:?} and policy is 'deny'"
             ))),
-            ApprovalPolicy::Prompt => prompt_for_approval(request),
-            ApprovalPolicy::PromptDestructive => match request.risk {
-                RiskLevel::Destructive => prompt_for_approval(request),
+            ApprovalPolicy::Prompt => prompt_for_approval(description, risk),
+            ApprovalPolicy::PromptDestructive => match risk {
+                RiskLevel::Destructive => prompt_for_approval(description, risk),
                 _ => Ok(()),
             },
         }
@@ -40,25 +52,19 @@ impl NativeExecution {
 }
 
 /// Interactive y/N prompt, only when stdin is a terminal. On a
-/// non-interactive stdin the command pauses with a typed
+/// non-interactive stdin the operation pauses with a typed
 /// "approval required" error instead of hanging.
-fn prompt_for_approval(request: &ExecRequest) -> Result<(), ForgeError> {
+fn prompt_for_approval(description: &str, risk: RiskLevel) -> Result<(), ForgeError> {
     if !std::io::stdin().is_terminal() {
-        return Err(ForgeError::execution(format!(
-            "approval required: `{}` is {:?}; re-run interactively or with --approval auto",
-            request.command, request.risk
-        )));
+        return Err(ForgeError::ApprovalRequired {
+            description: description.to_string(),
+            risk,
+        });
     }
     let mut stderr = std::io::stderr();
-    write!(
-        stderr,
-        "approve {:?} command `{} {}`? [y/N] ",
-        request.risk,
-        request.command,
-        request.args.join(" ")
-    )
-    .and_then(|()| stderr.flush())
-    .map_err(ForgeError::Io)?;
+    write!(stderr, "approve {risk:?} operation {description}? [y/N] ")
+        .and_then(|()| stderr.flush())
+        .map_err(ForgeError::Io)?;
 
     let mut line = String::new();
     std::io::stdin()
@@ -69,9 +75,18 @@ fn prompt_for_approval(request: &ExecRequest) -> Result<(), ForgeError> {
         Ok(())
     } else {
         Err(ForgeError::execution(format!(
-            "approval denied by user: `{}`",
-            request.command
+            "approval denied by user: {description}"
         )))
+    }
+}
+
+/// Resolve an op path against the project root (relative paths are
+/// root-relative).
+fn resolve(root: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
     }
 }
 
@@ -82,8 +97,33 @@ impl ExecutionProvider for NativeExecution {
     }
 
     async fn execute(&self, request: ExecRequest) -> Result<ExecResult, ForgeError> {
-        self.check_approval(&request)?;
+        let description = format!("`{} {}`", request.command, request.args.join(" "));
+        self.check_approval(&description, request.risk)?;
+        self.execute_ungated(request).await
+    }
 
+    /// Bypass path: invoked only after an explicit recorded approval.
+    async fn execute_approved(&self, request: ExecRequest) -> Result<ExecResult, ForgeError> {
+        self.execute_ungated(request).await
+    }
+
+    async fn file_op(&self, op: FileOp) -> Result<FileOpResult, ForgeError> {
+        let risk = op.risk(&self.project_root);
+        let description = format!("file op {op:?}");
+        self.check_approval(&description, risk)?;
+        self.file_op_ungated(op).await
+    }
+
+    /// Bypass path: invoked only after an explicit recorded approval.
+    async fn file_op_approved(&self, op: FileOp) -> Result<FileOpResult, ForgeError> {
+        self.file_op_ungated(op).await
+    }
+}
+
+impl NativeExecution {
+    /// Ungated process spawn (the body shared by execute and
+    /// execute_approved).
+    async fn execute_ungated(&self, request: ExecRequest) -> Result<ExecResult, ForgeError> {
         let mut command = tokio::process::Command::new(&request.command);
         command.args(&request.args);
         if let Some(cwd) = &request.cwd {
@@ -101,6 +141,62 @@ impl ExecutionProvider for NativeExecution {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
+
+    /// Ungated file operation (the body shared by file_op and
+    /// file_op_approved).
+    async fn file_op_ungated(&self, op: FileOp) -> Result<FileOpResult, ForgeError> {
+        let risk = op.risk(&self.project_root);
+        let path = resolve(&self.project_root, op.path());
+        tracing::debug!(path = %path.display(), risk = ?risk, "file op");
+
+        match op {
+            FileOp::Read { .. } => {
+                let content = std::fs::read_to_string(&path).map_err(ForgeError::Io)?;
+                Ok(FileOpResult {
+                    content: Some(content),
+                    changed: false,
+                })
+            }
+            FileOp::Write { content, .. } => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(ForgeError::Io)?;
+                }
+                std::fs::write(&path, content).map_err(ForgeError::Io)?;
+                Ok(FileOpResult {
+                    content: None,
+                    changed: true,
+                })
+            }
+            FileOp::Edit { old, new, .. } => {
+                let text = std::fs::read_to_string(&path).map_err(ForgeError::Io)?;
+                let matches = text.matches(&old).count();
+                if matches == 0 {
+                    return Err(ForgeError::execution(format!(
+                        "edit failed: `old` text not found in {}",
+                        path.display()
+                    )));
+                }
+                if matches > 1 {
+                    return Err(ForgeError::execution(format!(
+                        "edit failed: `old` text is ambiguous ({matches} occurrences) in {}",
+                        path.display()
+                    )));
+                }
+                std::fs::write(&path, text.replacen(&old, &new, 1)).map_err(ForgeError::Io)?;
+                Ok(FileOpResult {
+                    content: None,
+                    changed: true,
+                })
+            }
+            FileOp::Delete { .. } => {
+                std::fs::remove_file(&path).map_err(ForgeError::Io)?;
+                Ok(FileOpResult {
+                    content: None,
+                    changed: true,
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -116,9 +212,13 @@ mod tests {
         }
     }
 
+    fn exec(policy: ApprovalPolicy) -> NativeExecution {
+        NativeExecution::new(policy, std::env::temp_dir())
+    }
+
     #[tokio::test]
     async fn native_runs_safe_command_and_captures_output() {
-        let exec = NativeExecution::new(ApprovalPolicy::Prompt);
+        let exec = exec(ApprovalPolicy::Prompt);
         let result = exec.execute(safe_echo()).await.expect("echo succeeds");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout.trim(), "hello");
@@ -126,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_reports_exit_code_and_stderr() {
-        let exec = NativeExecution::new(ApprovalPolicy::Auto);
+        let exec = exec(ApprovalPolicy::Auto);
         let result = exec
             .execute(ExecRequest {
                 command: "sh".to_string(),
@@ -142,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_failure_is_typed_execution_error() {
-        let exec = NativeExecution::new(ApprovalPolicy::Auto);
+        let exec = exec(ApprovalPolicy::Auto);
         let err = exec
             .execute(ExecRequest::new(
                 "definitely-not-a-real-forge-binary",
@@ -155,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_blocks_risky_and_destructive() {
-        let exec = NativeExecution::new(ApprovalPolicy::Deny);
+        let exec = exec(ApprovalPolicy::Deny);
         for risk in [RiskLevel::Risky, RiskLevel::Destructive] {
             let err = exec
                 .execute(ExecRequest::new("echo", risk))
@@ -168,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_allows_risky() {
-        let exec = NativeExecution::new(ApprovalPolicy::Auto);
+        let exec = exec(ApprovalPolicy::Auto);
         let result = exec
             .execute(ExecRequest {
                 risk: RiskLevel::Risky,
@@ -183,7 +283,7 @@ mod tests {
     async fn prompt_without_terminal_requires_approval() {
         // Tests never run with a terminal stdin, so Prompt must pause.
         assert!(!std::io::stdin().is_terminal());
-        let exec = NativeExecution::new(ApprovalPolicy::Prompt);
+        let exec = exec(ApprovalPolicy::Prompt);
         let err = exec
             .execute(ExecRequest {
                 risk: RiskLevel::Risky,
@@ -191,36 +291,27 @@ mod tests {
             })
             .await
             .expect_err("must pause for approval");
-        assert!(matches!(err, ForgeError::Execution(_)));
-        assert!(err.to_string().contains("approval required"));
+        assert!(matches!(err, ForgeError::ApprovalRequired { .. }));
     }
 
     #[tokio::test]
-    async fn prompt_destructive_allows_risky_without_asking() {
+    async fn prompt_dangerous_allows_risky_but_pauses_destructive() {
         assert!(!std::io::stdin().is_terminal());
-        let exec = NativeExecution::new(ApprovalPolicy::PromptDestructive);
+        let exec = exec(ApprovalPolicy::PromptDestructive);
+        // Risky runs without asking.
         let result = exec
             .execute(ExecRequest {
                 risk: RiskLevel::Risky,
                 ..safe_echo()
             })
             .await
-            .expect("risky runs without approval under prompt-dangerous");
+            .expect("risky allowed");
         assert!(result.success());
-    }
-
-    #[tokio::test]
-    async fn prompt_destructive_pauses_for_destructive_without_terminal() {
-        assert!(!std::io::stdin().is_terminal());
-        let exec = NativeExecution::new(ApprovalPolicy::PromptDestructive);
+        // Destructive pauses without a TTY.
         let err = exec
-            .execute(ExecRequest {
-                risk: RiskLevel::Destructive,
-                ..safe_echo()
-            })
+            .execute(ExecRequest::new("rm", RiskLevel::Destructive))
             .await
-            .expect_err("destructive must pause for approval");
-        assert!(matches!(err, ForgeError::Execution(_)));
+            .expect_err("must pause");
         assert!(err.to_string().contains("approval required"));
     }
 
@@ -246,5 +337,171 @@ mod tests {
             ApprovalPolicy::parse("yolo"),
             Err(ForgeError::Config(_))
         ));
+    }
+
+    // --- file operations ---
+
+    #[tokio::test]
+    async fn file_ops_read_write_edit_delete_happy_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exec = NativeExecution::new(ApprovalPolicy::Auto, tmp.path());
+
+        // Write (Risky, in-project).
+        let result = exec
+            .file_op(FileOp::Write {
+                path: PathBuf::from("src/main.rs"),
+                content: "fn main() {}\n".to_string(),
+            })
+            .await
+            .expect("write");
+        assert!(result.changed);
+        assert!(tmp.path().join("src/main.rs").is_file());
+
+        // Read (Safe).
+        let result = exec
+            .file_op(FileOp::Read {
+                path: PathBuf::from("src/main.rs"),
+            })
+            .await
+            .expect("read");
+        assert_eq!(result.content.as_deref(), Some("fn main() {}\n"));
+        assert!(!result.changed);
+
+        // Edit (exact replacement).
+        let result = exec
+            .file_op(FileOp::Edit {
+                path: PathBuf::from("src/main.rs"),
+                old: "fn main() {}".to_string(),
+                new: "fn main() { println!(\"hi\"); }".to_string(),
+            })
+            .await
+            .expect("edit");
+        assert!(result.changed);
+        let text = std::fs::read_to_string(tmp.path().join("src/main.rs")).expect("read");
+        assert!(text.contains("println!"));
+
+        // Delete (Destructive, in-project).
+        let result = exec
+            .file_op(FileOp::Delete {
+                path: PathBuf::from("src/main.rs"),
+            })
+            .await
+            .expect("delete");
+        assert!(result.changed);
+        assert!(!tmp.path().join("src/main.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn edit_errors_when_old_missing_or_ambiguous() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("f.txt"), "foo foo\n").expect("write");
+        let exec = NativeExecution::new(ApprovalPolicy::Auto, tmp.path());
+
+        let missing = exec
+            .file_op(FileOp::Edit {
+                path: PathBuf::from("f.txt"),
+                old: "bar".to_string(),
+                new: "baz".to_string(),
+            })
+            .await
+            .expect_err("not found");
+        assert!(missing.to_string().contains("not found"));
+
+        let ambiguous = exec
+            .file_op(FileOp::Edit {
+                path: PathBuf::from("f.txt"),
+                old: "foo".to_string(),
+                new: "baz".to_string(),
+            })
+            .await
+            .expect_err("ambiguous");
+        assert!(ambiguous.to_string().contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn path_escape_is_classified_destructive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let read = FileOp::Read {
+            path: PathBuf::from("../outside.txt"),
+        };
+        assert_eq!(read.risk(root), RiskLevel::Safe); // reads are safe
+        let write = FileOp::Write {
+            path: PathBuf::from("../outside.txt"),
+            content: "x".to_string(),
+        };
+        assert_eq!(write.risk(root), RiskLevel::Destructive);
+        let inside = FileOp::Write {
+            path: PathBuf::from("src/ok.rs"),
+            content: "x".to_string(),
+        };
+        assert_eq!(inside.risk(root), RiskLevel::Risky);
+        let delete_inside = FileOp::Delete {
+            path: PathBuf::from("src/ok.rs"),
+        };
+        assert_eq!(delete_inside.risk(root), RiskLevel::Destructive);
+        let absolute_escape = FileOp::Write {
+            path: PathBuf::from("/tmp/forge-escape-test.txt"),
+            content: "x".to_string(),
+        };
+        assert_eq!(absolute_escape.risk(root), RiskLevel::Destructive);
+    }
+
+    #[tokio::test]
+    async fn prompt_dangerous_allows_risky_write_but_pauses_destructive_delete() {
+        assert!(!std::io::stdin().is_terminal());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("doomed.txt"), "x\n").expect("write");
+        let exec = NativeExecution::new(ApprovalPolicy::PromptDestructive, tmp.path());
+
+        // Risky write proceeds.
+        exec.file_op(FileOp::Write {
+            path: PathBuf::from("new.txt"),
+            content: "y\n".to_string(),
+        })
+        .await
+        .expect("risky write allowed");
+
+        // Destructive delete pauses without a TTY.
+        let err = exec
+            .file_op(FileOp::Delete {
+                path: PathBuf::from("doomed.txt"),
+            })
+            .await
+            .expect_err("must pause");
+        assert!(err.to_string().contains("approval required"));
+
+        // Out-of-project write is Destructive and also pauses.
+        let err = exec
+            .file_op(FileOp::Write {
+                path: PathBuf::from("../escape.txt"),
+                content: "x".to_string(),
+            })
+            .await
+            .expect_err("must pause");
+        assert!(err.to_string().contains("approval required"));
+    }
+
+    #[tokio::test]
+    async fn deny_blocks_file_writes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exec = NativeExecution::new(ApprovalPolicy::Deny, tmp.path());
+        let err = exec
+            .file_op(FileOp::Write {
+                path: PathBuf::from("nope.txt"),
+                content: "x".to_string(),
+            })
+            .await
+            .expect_err("denied");
+        assert!(err.to_string().contains("approval denied"));
+        // Reads remain Safe under deny.
+        std::fs::write(tmp.path().join("r.txt"), "data").expect("write");
+        let result = exec
+            .file_op(FileOp::Read {
+                path: PathBuf::from("r.txt"),
+            })
+            .await
+            .expect("read allowed under deny");
+        assert_eq!(result.content.as_deref(), Some("data"));
     }
 }

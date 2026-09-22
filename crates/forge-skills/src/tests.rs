@@ -121,7 +121,7 @@ async fn test_skill_runs_through_execution_provider() {
     );
     std::fs::write(tmp.path().join(".forge/skills/demo/test.sh"), "exit 0\n").expect("write");
 
-    let exec = Arc::new(MockExecution::new());
+    let exec = Arc::new(MockExecution::new(tmp.path()));
     let reg = FsSkillRegistry::with_roots(
         vec![(SkillSource::ProjectForge, tmp.path().join(".forge/skills"))],
         Some(exec.clone()),
@@ -146,7 +146,7 @@ async fn test_skill_returns_none_without_test_script() {
     );
     let reg = FsSkillRegistry::with_roots(
         vec![(SkillSource::ProjectForge, tmp.path().join(".forge/skills"))],
-        Some(Arc::new(MockExecution::new())),
+        Some(Arc::new(MockExecution::new(tmp.path()))),
     );
     assert!(reg.test_skill("demo").await.expect("ok").is_none());
 }

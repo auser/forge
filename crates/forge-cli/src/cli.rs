@@ -68,6 +68,9 @@ pub enum Command {
     Run {
         #[arg(required = true, num_args = 1.., value_name = "PROMPT")]
         prompt: Vec<String>,
+        /// Agent-loop turn budget (overrides config `max_turns`).
+        #[arg(long, value_name = "N")]
+        max_turns: Option<u32>,
     },
 
     /// Start the REST/SSE server.

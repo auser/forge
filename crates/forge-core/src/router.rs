@@ -48,7 +48,7 @@ impl RoutingRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingDecision {
     pub selected_model: String,
-    pub confidence: f32,
+    pub confidence: f64,
     pub router_name: String,
     pub fallback_used: bool,
     pub reason: String,

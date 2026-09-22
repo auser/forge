@@ -14,7 +14,9 @@ fn store(ctx: &Context) -> Result<JsonlSessionStore, ForgeError> {
 fn format_event(event: &Event) -> String {
     let ts = event.ts.format("%Y-%m-%dT%H:%M:%SZ");
     let detail = match &event.kind {
-        EventKind::RunStarted { provider, model } => {
+        EventKind::RunStarted {
+            provider, model, ..
+        } => {
             format!("run_started provider={provider} model={model}")
         }
         EventKind::RoutingDecisionMade {
@@ -33,6 +35,17 @@ fn format_event(event: &Event) -> String {
             format!("tool_completed name={name} success={success}")
         }
         EventKind::FileChanged { path } => format!("file_changed path={}", path.display()),
+        EventKind::ToolCallRequested { tool, args_summary } => {
+            format!("tool_call_requested tool={tool} args={args_summary}")
+        }
+        EventKind::ApprovalRequested { command, risk } => {
+            format!("approval_requested command={command} risk={risk:?}")
+        }
+        EventKind::ApprovalDecided { command, approved } => {
+            format!("approval_decided command={command} approved={approved}")
+        }
+        EventKind::TurnCompleted { turn } => format!("turn_completed turn={turn}"),
+        EventKind::InputReceived { message } => format!("input_received message={message}"),
         EventKind::Note { message } => format!("note message={message}"),
         EventKind::Error { message } => format!("error message={message}"),
         EventKind::Cancelled { reason } => format!("cancelled reason={reason}"),
@@ -56,15 +69,22 @@ fn print_events(ctx: &Context, events: &[Event]) -> Result<(), ForgeError> {
     Ok(())
 }
 
-/// `forge resume <id>` — load and report the event history of a session or
-/// run. Real re-execution arrives in a later phase.
-pub fn resume(ctx: &Context, id: &str) -> Result<(), ForgeError> {
+/// `forge resume <id>` — continue a completed run: start a new run in the
+/// same session seeded with the original prompt and prior outcome, and
+/// print the new run's output. (`forge session show` for pure history.)
+pub async fn resume(ctx: &Context, id: &str) -> Result<(), ForgeError> {
     let service = build_service(ctx)?;
-    let events = service.resume(id)?;
-    if !ctx.global.json {
-        println!("session history for {id} ({} events)", events.len());
+    let outcome = service.resume(id).await?;
+    if ctx.global.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome)
+                .map_err(|e| ForgeError::session(format!("serializing run outcome: {e}")))?
+        );
+    } else {
+        println!("{}", outcome.text);
     }
-    print_events(ctx, &events)
+    Ok(())
 }
 
 /// `forge cancel <id>` — record a cancellation event for a run or session.

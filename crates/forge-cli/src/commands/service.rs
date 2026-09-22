@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use forge_core::{ApprovalPolicy, ExecutionProvider, ForgeError};
@@ -8,15 +9,18 @@ use forge_skills::FsSkillRegistry;
 
 use crate::commands::Context;
 
-/// Build the execution provider from configuration.
+/// Build the execution provider from configuration. The project root is
+/// used for file-op risk classification.
 pub fn build_execution(
     config: &forge_config::Config,
+    project_root: &Path,
 ) -> Result<Arc<dyn ExecutionProvider>, ForgeError> {
     match config.execution.as_str() {
-        "native" => Ok(Arc::new(NativeExecution::new(ApprovalPolicy::parse(
-            &config.approval,
-        )?))),
-        "mock" => Ok(Arc::new(MockExecution::new())),
+        "native" => Ok(Arc::new(NativeExecution::new(
+            ApprovalPolicy::parse(&config.approval)?,
+            project_root,
+        ))),
+        "mock" => Ok(Arc::new(MockExecution::new(project_root))),
         other => Err(ForgeError::execution(format!(
             "unknown execution provider {other:?} (expected native or mock)"
         ))),
@@ -31,21 +35,24 @@ pub fn build_service(ctx: &Context) -> Result<AgentService, ForgeError> {
     let resolved = ctx.resolve_config()?;
     let root = ctx.project_root()?;
 
-    let model = forge_providers::model_from_config(&resolved.config)?;
+    let model = forge_providers::model_from_config(&resolved.config, &root)?;
     let registry = vec![(model.name().to_string(), model.capabilities())];
     let router = forge_providers::router_from_config(&resolved.config, &registry)?;
 
-    let execution = build_execution(&resolved.config)?;
+    let execution = build_execution(&resolved.config, &root)?;
     let skills = Arc::new(FsSkillRegistry::new(&root, Some(execution.clone())));
 
     let sessions = Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions")));
 
-    Ok(AgentService::new(
-        model,
-        router,
-        execution,
-        skills,
-        sessions,
-        resolved.config,
-    ))
+    // Wire the project graph when one has been built; absence never
+    // blocks a run.
+    let graph = forge_graph::LocalGraph::open(&root)
+        .ok()
+        .filter(|g| g.graph_file().is_file())
+        .map(|g| Arc::new(g) as Arc<dyn forge_core::ProjectGraph>);
+
+    Ok(
+        AgentService::new(model, router, execution, skills, sessions, resolved.config)
+            .with_graph(graph),
+    )
 }

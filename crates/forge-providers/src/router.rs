@@ -215,7 +215,7 @@ struct RouteRequest<'a> {
 #[derive(Deserialize)]
 struct RouteResponse {
     selected_model: String,
-    confidence: f32,
+    confidence: f64,
     #[serde(default)]
     reason: String,
 }
@@ -476,7 +476,7 @@ mod tests {
             .await
             .expect("routes");
         assert_eq!(decision.selected_model, "chosen");
-        assert!((decision.confidence - 0.9).abs() < f32::EPSILON);
+        assert!((decision.confidence - 0.9).abs() < f64::EPSILON);
         assert_eq!(decision.router_name, "http");
         assert_eq!(decision.reason, "best fit");
     }

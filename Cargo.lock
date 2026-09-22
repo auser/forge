@@ -633,12 +633,14 @@ dependencies = [
  "forge-config",
  "forge-core",
  "forge-execution",
+ "forge-graph",
  "forge-providers",
  "forge-session",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

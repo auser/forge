@@ -665,3 +665,384 @@ fn cancellation_event_recorded(world: &mut BddWorld) {
         world.run_id
     );
 }
+
+// ---------------------------------------------------------------------------
+// agent-loop.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a scripted mock model that edits {string}")]
+async fn scripted_mock_edits(world: &mut BddWorld, path: String) {
+    world.write_file(&path, "fn main() {}\n");
+    world.write_file(
+        "script.json",
+        r#"[
+            {"tool_calls": [{"id": "call_1", "name": "edit_file", "arguments": {"path": "main.rs", "old": "fn main() {}", "new": "fn main() { hello(); }\n\nfn hello() { println!(\"hello\"); } // scripted content"}}]},
+            {"text": "added hello() to main.rs"}
+        ]"#,
+    );
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+    world.set_config("approval", "\"auto\"");
+    world.flush_config();
+}
+
+#[when("I run an agent task")]
+async fn i_run_an_agent_task(world: &mut BddWorld) {
+    world.flush_config();
+    world.run_forge(&["run", "do the agent task"]).await;
+}
+
+#[then(expr = "the file {string} contains the scripted content")]
+fn file_contains_scripted_content(world: &mut BddWorld, path: String) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let content = std::fs::read_to_string(world.project().join(&path)).expect("file exists");
+    assert!(
+        content.contains("scripted content"),
+        "expected scripted content in {path}: {content}"
+    );
+}
+
+#[then("the session events include tool calls and a file change")]
+fn session_events_include_tool_calls_and_file_change(world: &mut BddWorld) {
+    let log = world.session_log();
+    for needle in [
+        "tool_call_requested",
+        "tool_started",
+        "file_changed",
+        "tool_completed",
+        "turn_completed",
+        "completed",
+    ] {
+        assert!(log.contains(needle), "missing {needle} in: {log}");
+    }
+}
+
+#[given("a scripted mock model that always requests a tool call")]
+fn scripted_mock_always_tool_calls(world: &mut BddWorld) {
+    let replies: Vec<String> = (0..6)
+        .map(|i| {
+            format!(
+                r#"{{"tool_calls": [{{"id": "c{i}", "name": "read_file", "arguments": {{"path": "f{i}.txt"}}}}]}}"#
+            )
+        })
+        .collect();
+    world.write_file("script.json", &format!("[{}]", replies.join(",")));
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+    world.set_config("approval", "\"auto\"");
+}
+
+#[when(expr = "I run an agent task with max turns {int}")]
+async fn i_run_agent_task_with_max_turns(world: &mut BddWorld, max_turns: u32) {
+    world.flush_config();
+    world
+        .run_forge(&["run", "--max-turns", &max_turns.to_string(), "spin"])
+        .await;
+}
+
+#[then("the run fails with a turn budget error")]
+fn run_fails_with_turn_budget_error(world: &mut BddWorld) {
+    assert_ne!(world.last_code, Some(0), "run must fail");
+    assert!(
+        world.last_stderr.contains("max turns (3) exhausted"),
+        "stderr: {}",
+        world.last_stderr
+    );
+    let log = world.session_log();
+    let error_event = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "error")
+        .unwrap_or_else(|| panic!("no error event in: {log}"));
+    assert!(
+        error_event["message"]
+            .as_str()
+            .expect("message")
+            .contains("max turns (3)"),
+        "error event: {error_event}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// approval.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "approval mode {string}")]
+fn approval_mode(world: &mut BddWorld, mode: String) {
+    world.set_config("approval", &format!("\"{mode}\""));
+}
+
+#[given(expr = "a scripted mock model that writes {string}")]
+fn scripted_mock_writes(world: &mut BddWorld, path: String) {
+    let script = format!(
+        r#"[
+            {{"tool_calls": [{{"id": "call_1", "name": "write_file", "arguments": {{"path": "{path}", "content": "scripted content"}}}}]}},
+            {{"text": "all done"}}
+        ]"#
+    );
+    world.write_file("script.json", &script);
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+}
+
+#[then(expr = "the file {string} does not exist")]
+fn file_does_not_exist(world: &mut BddWorld, path: String) {
+    assert!(
+        !world.project().join(&path).exists(),
+        "{path} should not exist"
+    );
+}
+
+#[then("the session events include a tool error")]
+fn session_events_include_tool_error(world: &mut BddWorld) {
+    let log = world.session_log();
+    let tool_error = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "tool_completed" && e["success"] == false);
+    assert!(
+        tool_error.is_some(),
+        "no failed tool_completed event in: {log}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// resume.feature
+// ---------------------------------------------------------------------------
+
+#[given("a completed scripted-mock run")]
+async fn completed_scripted_mock_run(world: &mut BddWorld) {
+    world.write_file("script.json", r#"[{"text": "first"}, {"text": "second"}]"#);
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+    world.flush_config();
+    world.run_forge(&["--json", "run", "original task"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let outcome: serde_json::Value =
+        serde_json::from_str(world.last_stdout.trim()).expect("run json");
+    world.run_id = outcome["run_id"].as_str().expect("run id").to_string();
+    world.session_id = outcome["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+}
+
+#[when("I resume the run")]
+async fn i_resume_the_run(world: &mut BddWorld) {
+    let run_id = world.run_id.clone();
+    world.run_forge(&["resume", &run_id]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[then("a new run continues in the same session")]
+fn new_run_continues_in_same_session(world: &mut BddWorld) {
+    let log = world.session_log();
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let run_ids: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "run_started")
+        .filter_map(|e| e["run_id"].as_str())
+        .collect();
+    assert_eq!(run_ids.len(), 2, "expected two runs in log: {log}");
+    assert_ne!(run_ids[0], run_ids[1], "resume must start a NEW run");
+    assert_eq!(run_ids[0], world.run_id);
+    // Same session file, resume marker linking the runs.
+    assert!(
+        events.iter().all(|e| e["session_id"] == world.session_id),
+        "all events in the same session"
+    );
+    let marker = events
+        .iter()
+        .find(|e| e["type"] == "input_received")
+        .expect("resume marker");
+    assert!(
+        marker["message"]
+            .as_str()
+            .expect("message")
+            .contains(&world.run_id),
+        "marker: {marker}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// server-input.feature / cancellation.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a served project with approval mode {string}")]
+async fn served_project_with_approval(world: &mut BddWorld, mode: String) {
+    world.set_config("approval", &format!("\"{mode}\""));
+    // Config is flushed in the When step, right before the server starts
+    // (the model/script Givens may add more keys first).
+}
+
+#[when("a run pauses for approval via REST")]
+async fn run_pauses_for_approval_via_rest(world: &mut BddWorld) {
+    world.flush_config();
+    if world.server.is_none() {
+        world.start_server().await;
+    }
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/v1/runs", world.base_url))
+        .json(&serde_json::json!({"prompt": "write the notes"}))
+        .send()
+        .await
+        .expect("run response");
+    assert_eq!(response.status(), 202);
+    let body: serde_json::Value = response.json().await.expect("run body");
+    world.run_id = body["run_id"].as_str().expect("run id").to_string();
+
+    // Poll until the run parks at the approval wait.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let run: serde_json::Value = client
+            .get(format!("{}/v1/runs/{}", world.base_url, world.run_id))
+            .send()
+            .await
+            .expect("get run")
+            .json()
+            .await
+            .expect("run json");
+        if run["status"] == "waiting_for_approval" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run never parked; last status: {}",
+            run["status"]
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll the run until terminal; return its final JSON.
+async fn wait_terminal(world: &BddWorld) -> serde_json::Value {
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let run: serde_json::Value = client
+            .get(format!("{}/v1/runs/{}", world.base_url, world.run_id))
+            .send()
+            .await
+            .expect("get run")
+            .json()
+            .await
+            .expect("run json");
+        let status = run["status"].as_str().unwrap_or("");
+        if status != "running" && status != "waiting_for_approval" {
+            return run;
+        }
+        assert!(std::time::Instant::now() < deadline, "run never terminated");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[when("I send approval input via REST")]
+async fn i_send_approval_input_via_rest(world: &mut BddWorld) {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/v1/runs/{}/input", world.base_url, world.run_id))
+        .json(&serde_json::json!({"input": "y"}))
+        .send()
+        .await
+        .expect("input response");
+    assert_eq!(response.status(), 202);
+}
+
+#[then("the run completes and the file exists")]
+async fn run_completes_and_file_exists(world: &mut BddWorld) {
+    let run = wait_terminal(world).await;
+    assert_eq!(run["status"], "completed", "run: {run}");
+    let content = std::fs::read_to_string(world.project().join("notes.txt")).expect("file exists");
+    assert_eq!(content, "scripted content");
+    let types: Vec<&str> = run["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|e| e["type"].as_str())
+        .collect();
+    for needle in [
+        "approval_requested",
+        "input_received",
+        "approval_decided",
+        "file_changed",
+        "completed",
+    ] {
+        assert!(types.contains(&needle), "missing {needle} in {types:?}");
+    }
+}
+
+#[when("I cancel the run via REST")]
+async fn i_cancel_the_run_via_rest(world: &mut BddWorld) {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "{}/v1/runs/{}/cancel",
+            world.base_url, world.run_id
+        ))
+        .send()
+        .await
+        .expect("cancel response");
+    assert_eq!(response.status(), 200);
+}
+
+#[then("the run ends with a cancelled event")]
+async fn run_ends_with_cancelled_event(world: &mut BddWorld) {
+    let run = wait_terminal(world).await;
+    assert_eq!(run["status"], "cancelled", "run: {run}");
+    let events = run["events"].as_array().expect("events");
+    assert!(
+        events.iter().any(|e| e["type"] == "cancelled"),
+        "no cancelled event: {events:?}"
+    );
+    assert!(
+        !world.project().join("notes.txt").exists(),
+        "cancelled run must not have written the file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// event-schema.feature
+// ---------------------------------------------------------------------------
+
+#[given("a session log written in the v1 event format")]
+fn v1_session_log(world: &mut BddWorld) {
+    // Literal v1 lines: v:1, no `seq`, no `prompt` on run_started,
+    // f32-widened confidence value.
+    world.write_file(
+        ".forge/sessions/v1sess.jsonl",
+        concat!(
+            "{\"v\":1,\"ts\":\"2026-09-01T10:00:00Z\",\"run_id\":\"old-run\",\"session_id\":\"v1sess\",\"type\":\"run_started\",\"provider\":\"mock-local\",\"model\":\"mock-local\"}\n",
+            "{\"v\":1,\"ts\":\"2026-09-01T10:00:01Z\",\"run_id\":\"old-run\",\"session_id\":\"v1sess\",\"type\":\"routing_decision_made\",\"router\":\"static\",\"selected_model\":\"mock-local\",\"confidence\":0.8999999761581421,\"fallback_used\":false}\n",
+            "{\"v\":1,\"ts\":\"2026-09-01T10:00:02Z\",\"run_id\":\"old-run\",\"session_id\":\"v1sess\",\"type\":\"completed\",\"summary\":\"done\"}\n",
+        ),
+    );
+}
+
+#[when("I inspect the session")]
+async fn i_inspect_the_session(world: &mut BddWorld) {
+    world.run_forge(&["session", "show", "v1sess"]).await;
+}
+
+#[then("the v1 events are shown")]
+fn v1_events_are_shown(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    assert!(
+        world.last_stdout.contains("run_started"),
+        "stdout: {}",
+        world.last_stdout
+    );
+    assert!(
+        world.last_stdout.contains("routing_decision"),
+        "stdout: {}",
+        world.last_stdout
+    );
+    assert!(
+        world.last_stdout.contains("completed"),
+        "stdout: {}",
+        world.last_stdout
+    );
+}

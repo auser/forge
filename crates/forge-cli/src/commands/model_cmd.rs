@@ -18,11 +18,15 @@ pub async fn run(ctx: &Context, command: ModelCommand) -> Result<(), ForgeError>
 /// of the resolved configuration (base URL, key env) intact.
 fn provider_for(ctx: &Context, name: Option<&str>) -> Result<Arc<dyn ModelProvider>, ForgeError> {
     let resolved = ctx.resolve_config()?;
+    let root = ctx.project_root()?;
     let model = name.unwrap_or(&resolved.config.model).to_string();
-    forge_providers::model_from_config(&Config {
-        model,
-        ..resolved.config.clone()
-    })
+    forge_providers::model_from_config(
+        &Config {
+            model,
+            ..resolved.config.clone()
+        },
+        &root,
+    )
 }
 
 fn list(ctx: &Context) -> Result<(), ForgeError> {

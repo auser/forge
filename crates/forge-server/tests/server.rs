@@ -5,6 +5,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use forge_config::Config;
+use forge_core::{ExecutionProvider, ModelProvider};
 use forge_execution::MockExecution;
 use forge_graph::LocalGraph;
 use forge_providers::{MockModel, MockRouter};
@@ -14,22 +15,38 @@ use forge_skills::FsSkillRegistry;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-/// Compose a fully offline test app: mock model/router/execution, tempdir
-/// session store, empty skill registry, graph over the temp project.
-fn test_app(project: &std::path::Path) -> Router {
+/// Compose a test app over arbitrary providers (scripted mock, native
+/// execution on a tempdir, etc.).
+fn test_app_with(
+    project: &std::path::Path,
+    model: Arc<dyn ModelProvider>,
+    execution: Arc<dyn ExecutionProvider>,
+    config: Config,
+) -> Router {
     let service = Arc::new(AgentService::new(
-        Arc::new(MockModel::new()),
+        model,
         Arc::new(MockRouter::selecting("mock-local")),
-        Arc::new(MockExecution::new()),
+        execution,
         Arc::new(FsSkillRegistry::with_roots(vec![], None)),
         Arc::new(JsonlSessionStore::new(
             project.join(".forge").join("sessions"),
         )),
-        Config::default(),
+        config.clone(),
     ));
     let skills = service.skills().clone();
     let graph = Arc::new(LocalGraph::open(project).expect("open graph"));
-    forge_server::build_router(service, skills, Some(graph), Config::default())
+    forge_server::build_router(service, skills, Some(graph), config)
+}
+
+/// Compose a fully offline test app: mock model/router/execution, tempdir
+/// session store, empty skill registry, graph over the temp project.
+fn test_app(project: &std::path::Path) -> Router {
+    test_app_with(
+        project,
+        Arc::new(MockModel::new()),
+        Arc::new(MockExecution::new(project)),
+        Config::default(),
+    )
 }
 
 async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -138,7 +155,7 @@ async fn run_lifecycle_end_to_end() {
 }
 
 #[tokio::test]
-async fn run_input_records_note_event() {
+async fn run_input_delivers_and_rejects_terminal_runs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let app = test_app(tmp.path());
 
@@ -146,24 +163,16 @@ async fn run_input_records_note_event() {
     let run_id = body["run_id"].as_str().expect("run_id").to_string();
     wait_for_terminal(&app, &run_id).await;
 
-    let (status, _) = post_json(
+    // Terminal run: 409, not accepted.
+    let (status, body) = post_json(
         &app,
         &format!("/v1/runs/{run_id}/input"),
-        serde_json::json!({"input": "please also check tests"}),
+        serde_json::json!({"input": "too late"}),
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
 
-    let (_, run) = get_json(&app, &format!("/v1/runs/{run_id}")).await;
-    let events = run["events"].as_array().expect("events");
-    assert!(
-        events
-            .iter()
-            .any(|e| e["type"] == "note" && e["message"] == "please also check tests"),
-        "events: {events:?}"
-    );
-
-    // Unknown run → 404.
+    // Unknown run: 404.
     let (status, _) = post_json(
         &app,
         "/v1/runs/nope/input",
@@ -350,4 +359,240 @@ async fn serves_on_a_real_ephemeral_port() {
     assert_eq!(body["status"], "ok");
 
     task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// v0.3: scripted-mock loop over HTTP, SSE v2 events, approval + cancel
+// ---------------------------------------------------------------------------
+
+use forge_execution::NativeExecution;
+use forge_providers::ScriptedMockModel;
+
+fn scripted_app(project: &std::path::Path, script_json: &str, approval: &str) -> Router {
+    std::fs::write(project.join("script.json"), script_json).expect("write script");
+    let model = ScriptedMockModel::from_path(&project.join("script.json")).expect("script parses");
+    test_app_with(
+        project,
+        Arc::new(model),
+        Arc::new(NativeExecution::new(
+            forge_core::ApprovalPolicy::parse(approval).expect("policy"),
+            project,
+        )),
+        Config {
+            approval: approval.to_string(),
+            ..Config::default()
+        },
+    )
+}
+
+/// Read an SSE response body to completion (with a timeout guard) and
+/// return the parsed event JSON values in order.
+async fn read_sse_events(app: &Router, run_id: &str) -> Vec<serde_json::Value> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.clone().oneshot(
+            Request::builder()
+                .uri(format!("/v1/runs/{run_id}/events"))
+                .body(Body::empty())
+                .expect("request"),
+        ),
+    )
+    .await
+    .expect("sse timed out")
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("sse body")
+        .to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).expect("event json"))
+        .collect()
+}
+
+#[tokio::test]
+async fn sse_streams_v2_tool_and_turn_events_in_order() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = scripted_app(
+        tmp.path(),
+        r#"[
+            {"tool_calls": [{"id": "call_1", "name": "write_file", "arguments": {"path": "sse.txt", "content": "from the loop"}}]},
+            {"text": "wrote sse.txt"}
+        ]"#,
+        "auto",
+    );
+
+    let (status, body) = post_json(&app, "/v1/runs", serde_json::json!({"prompt": "write"})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = body["run_id"].as_str().expect("run_id").to_string();
+    wait_for_terminal(&app, &run_id).await;
+
+    // The file really got written through the loop.
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("sse.txt")).expect("file"),
+        "from the loop"
+    );
+
+    let events = read_sse_events(&app, &run_id).await;
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().expect("type"))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "run_started",
+            "routing_decision_made",
+            "tool_call_requested",
+            "tool_started",
+            "file_changed",
+            "tool_completed",
+            "turn_completed",
+            "completed"
+        ],
+        "event order: {types:?}"
+    );
+    // v2 schema: sequence numbers are monotonic, confidence is clean f64.
+    let seqs: Vec<u64> = events
+        .iter()
+        .map(|e| e["seq"].as_u64().expect("seq"))
+        .collect();
+    assert_eq!(seqs, (1..=8).collect::<Vec<_>>());
+    assert!(events.iter().all(|e| e["v"] == 2));
+}
+
+#[tokio::test]
+async fn approval_over_http_pause_then_approve() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = scripted_app(
+        tmp.path(),
+        r#"[
+            {"tool_calls": [{"id": "call_1", "name": "write_file", "arguments": {"path": "approved.txt", "content": "approved via http"}}]},
+            {"text": "written"}
+        ]"#,
+        "prompt",
+    );
+
+    let (_, body) = post_json(&app, "/v1/runs", serde_json::json!({"prompt": "write"})).await;
+    let run_id = body["run_id"].as_str().expect("run_id").to_string();
+
+    // Poll until the run parks at the approval wait.
+    let mut parked = None;
+    for _ in 0..200 {
+        let (_, run) = get_json(&app, &format!("/v1/runs/{run_id}")).await;
+        if run["status"] == "waiting_for_approval" {
+            parked = Some(run);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let parked = parked.expect("run never parked at approval");
+    let events = parked["events"].as_array().expect("events");
+    assert!(
+        events.iter().any(|e| e["type"] == "approval_requested"),
+        "events: {events:?}"
+    );
+    assert!(!tmp.path().join("approved.txt").exists());
+
+    // Approve over HTTP.
+    let (status, _) = post_json(
+        &app,
+        &format!("/v1/runs/{run_id}/input"),
+        serde_json::json!({"input": "y"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let run = wait_for_terminal(&app, &run_id).await;
+    assert_eq!(run["status"], "completed");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("approved.txt")).expect("file"),
+        "approved via http"
+    );
+    let events = run["events"].as_array().expect("events");
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().expect("type"))
+        .collect();
+    for needle in [
+        "approval_requested",
+        "input_received",
+        "approval_decided",
+        "file_changed",
+        "completed",
+    ] {
+        assert!(types.contains(&needle), "missing {needle} in {types:?}");
+    }
+    let decided = events
+        .iter()
+        .find(|e| e["type"] == "approval_decided")
+        .expect("approval_decided");
+    assert_eq!(decided["approved"], true);
+}
+
+#[tokio::test]
+async fn cancel_parked_run_terminates_with_cancelled_event() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = scripted_app(
+        tmp.path(),
+        r#"[
+            {"tool_calls": [{"id": "call_1", "name": "delete_file", "arguments": {"path": "x.txt"}}]},
+            {"text": "never"}
+        ]"#,
+        "prompt",
+    );
+
+    let (_, body) = post_json(&app, "/v1/runs", serde_json::json!({"prompt": "delete"})).await;
+    let run_id = body["run_id"].as_str().expect("run_id").to_string();
+
+    // Wait for the approval park.
+    let mut parked = false;
+    for _ in 0..200 {
+        let (_, run) = get_json(&app, &format!("/v1/runs/{run_id}")).await;
+        if run["status"] == "waiting_for_approval" {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(parked, "run never parked");
+
+    let (status, _) = post_json(
+        &app,
+        &format!("/v1/runs/{run_id}/cancel"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let run = wait_for_terminal(&app, &run_id).await;
+    assert_eq!(run["status"], "cancelled");
+    let events = run["events"].as_array().expect("events");
+    assert!(
+        events.iter().any(|e| e["type"] == "cancelled"),
+        "events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn evicted_run_remains_retrievable_from_the_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = test_app(tmp.path());
+
+    let (_, body) = post_json(&app, "/v1/runs", serde_json::json!({"prompt": "hi"})).await;
+    let run_id = body["run_id"].as_str().expect("run_id").to_string();
+    wait_for_terminal(&app, &run_id).await;
+
+    // Registry eviction loses only in-memory status; a fresh app over the
+    // same project (empty registry, same store) still serves the run —
+    // the same code path an evicted-but-persisted run takes.
+    let app2 = test_app(tmp.path());
+    let (status, run) = get_json(&app2, &format!("/v1/runs/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(run["status"], "completed");
+    assert!(!run["events"].as_array().expect("events").is_empty());
 }

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use forge_core::{Event, ForgeError, SessionStore};
 
@@ -26,10 +28,17 @@ pub struct SessionInfo {
 
 /// Append-only store: one `{session_id}.jsonl` file per session under
 /// `root`, created lazily on first append.
+///
+/// The store assigns `Event.seq` on append: the next monotonic number per
+/// run, starting at 1. The counter is seeded from the existing file (so
+/// appending to a v1 log or from a fresh process continues correctly) and
+/// cached in memory.
 pub struct JsonlSessionStore {
     root: PathBuf,
     session_id: Option<String>,
     redactor: Redactor,
+    /// run_id → last assigned seq.
+    seq_counters: Mutex<HashMap<String, u64>>,
 }
 
 impl JsonlSessionStore {
@@ -39,6 +48,7 @@ impl JsonlSessionStore {
             root: root.into(),
             session_id: None,
             redactor: Redactor::new(),
+            seq_counters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -48,6 +58,7 @@ impl JsonlSessionStore {
             root: root.into(),
             session_id: Some(session_id.into()),
             redactor: Redactor::new(),
+            seq_counters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,12 +154,36 @@ impl JsonlSessionStore {
         }
         Ok(None)
     }
+    /// Highest seq already stored for `run_id` in the session file (0 when
+    /// none / v1 events only). Used to seed the in-memory counter.
+    fn stored_max_seq(&self, session_id: &str, run_id: &str) -> Result<u64, ForgeError> {
+        let events = self.events_for(session_id)?;
+        Ok(events
+            .iter()
+            .filter(|e| e.run_id == run_id)
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0))
+    }
+
+    fn next_seq(&self, session_id: &str, run_id: &str) -> Result<u64, ForgeError> {
+        let mut counters = self.seq_counters.lock().unwrap_or_else(|e| e.into_inner());
+        let counter = match counters.get(run_id) {
+            Some(current) => *current,
+            None => self.stored_max_seq(session_id, run_id)?,
+        };
+        let next = counter + 1;
+        counters.insert(run_id.to_string(), next);
+        Ok(next)
+    }
 }
 
 impl SessionStore for JsonlSessionStore {
-    fn append(&self, event: &Event) -> Result<(), ForgeError> {
+    fn append(&self, mut event: Event) -> Result<Event, ForgeError> {
         std::fs::create_dir_all(&self.root).map_err(ForgeError::Io)?;
-        let mut value = serde_json::to_value(event)
+        event.seq = self.next_seq(&event.session_id, &event.run_id)?;
+        event.v = forge_core::EVENT_SCHEMA_VERSION;
+        let mut value = serde_json::to_value(&event)
             .map_err(|e| ForgeError::session(format!("serializing event: {e}")))?;
         self.redactor.redact_value(&mut value);
         let line = serde_json::to_string(&value)
@@ -159,7 +194,8 @@ impl SessionStore for JsonlSessionStore {
             .append(true)
             .open(self.file_for(&event.session_id))
             .map_err(ForgeError::Io)?;
-        writeln!(file, "{line}").map_err(ForgeError::Io)
+        writeln!(file, "{line}").map_err(ForgeError::Io)?;
+        Ok(event)
     }
 
     fn events(&self) -> Result<Vec<Event>, ForgeError> {
@@ -194,11 +230,12 @@ mod tests {
             EventKind::RunStarted {
                 provider: "mock".into(),
                 model: "mock-local".into(),
+                prompt: "do the thing".into(),
             },
         );
-        store.append(&event).expect("append");
+        store.append(event).expect("append");
         store
-            .append(&Event::new(
+            .append(Event::new(
                 "run-1",
                 "sess-1",
                 EventKind::Completed {
@@ -211,7 +248,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0].kind, EventKind::RunStarted { .. }));
         assert!(matches!(events[1].kind, EventKind::Completed { .. }));
-        assert_eq!(events[0].v, 1);
+        assert_eq!(events[0].v, forge_core::EVENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -221,7 +258,7 @@ mod tests {
         for (session, n) in [("sess-a", 1usize), ("sess-b", 2)] {
             for _ in 0..n {
                 store
-                    .append(&Event::new(
+                    .append(Event::new(
                         "r",
                         session,
                         EventKind::ToolStarted { name: "t".into() },
@@ -244,7 +281,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = JsonlSessionStore::new(tmp.path());
         store
-            .append(&Event::new(
+            .append(Event::new(
                 "run-x",
                 "sess-1",
                 EventKind::ToolStarted { name: "t".into() },
@@ -266,7 +303,7 @@ mod tests {
         let store = JsonlSessionStore::new(tmp.path()); // env snapshot happens here
 
         store
-            .append(&Event::new(
+            .append(Event::new(
                 "run-1",
                 "sess-1",
                 EventKind::Error {
@@ -289,5 +326,102 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 26);
         assert_ne!(new_session_id(), new_session_id());
+    }
+
+    #[test]
+    fn seq_is_monotonic_per_run_and_seeded_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path());
+
+        let e1 = store
+            .append(Event::new(
+                "run-a",
+                "sess",
+                EventKind::ToolStarted { name: "t".into() },
+            ))
+            .expect("append");
+        let e2 = store
+            .append(Event::new(
+                "run-a",
+                "sess",
+                EventKind::ToolStarted { name: "t".into() },
+            ))
+            .expect("append");
+        // A different run in the same session gets its own counter.
+        let other = store
+            .append(Event::new(
+                "run-b",
+                "sess",
+                EventKind::ToolStarted { name: "t".into() },
+            ))
+            .expect("append");
+        assert_eq!(e1.seq, 1);
+        assert_eq!(e2.seq, 2);
+        assert_eq!(other.seq, 1);
+
+        // A fresh store instance (e.g. a new CLI process) continues from
+        // the on-disk maximum instead of restarting.
+        let fresh = JsonlSessionStore::new(tmp.path());
+        let e3 = fresh
+            .append(Event::new(
+                "run-a",
+                "sess",
+                EventKind::ToolCompleted {
+                    name: "t".into(),
+                    success: true,
+                },
+            ))
+            .expect("append");
+        assert_eq!(e3.seq, 3);
+
+        let events = store.events_for("sess").expect("read");
+        let seqs: Vec<u64> = events
+            .iter()
+            .filter(|e| e.run_id == "run-a")
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn appending_to_a_v1_log_continues_with_v2_events() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Hand-write a v1 line: no seq field.
+        std::fs::write(
+            tmp.path().join("sess.jsonl"),
+            "{\"v\":1,\"ts\":\"2026-09-22T20:01:39.172579Z\",\"run_id\":\"run-a\",\"session_id\":\"sess\",\"type\":\"run_started\",\"provider\":\"mock-local\",\"model\":\"mock-local\"}\n",
+        )
+        .expect("write v1 line");
+
+        let store = JsonlSessionStore::new(tmp.path());
+        // v1 events read back with seq 0 and remain readable.
+        let events = store.events_for("sess").expect("read v1");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].v, 1);
+        assert_eq!(events[0].seq, 0);
+
+        // New appends are v2 and get seq starting at 1 (v1 had none).
+        let appended = store
+            .append(Event::new(
+                "run-a",
+                "sess",
+                EventKind::Completed {
+                    summary: "done".into(),
+                },
+            ))
+            .expect("append");
+        assert_eq!(appended.v, 2);
+        assert_eq!(appended.seq, 1);
+
+        let events = store.events_for("sess").expect("read mixed");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .enumerate()
+                .map(|(i, e)| e.seq_or_index(i))
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 }

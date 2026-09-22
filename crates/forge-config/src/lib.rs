@@ -19,6 +19,9 @@ pub struct Config {
     pub model: String,
     pub model_base_url: Option<String>,
     pub model_key_env: Option<String>,
+    /// Path to a JSON script for `model = "scripted-mock"` (relative to
+    /// the project root).
+    pub mock_script: Option<String>,
     pub router: String,
     pub router_url: Option<String>,
     pub router_key_env: Option<String>,
@@ -28,6 +31,8 @@ pub struct Config {
     pub local_only: bool,
     pub server_host: String,
     pub server_port: u16,
+    /// Agent-loop turn budget.
+    pub max_turns: u32,
     /// Unknown keys are tolerated and preserved.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -39,6 +44,7 @@ impl Default for Config {
             model: "mock-local".to_string(),
             model_base_url: None,
             model_key_env: None,
+            mock_script: None,
             router: "static".to_string(),
             router_url: None,
             router_key_env: None,
@@ -48,6 +54,7 @@ impl Default for Config {
             local_only: false,
             server_host: "127.0.0.1".to_string(),
             server_port: 7_341,
+            max_turns: 25,
             extra: toml::Table::new(),
         }
     }
@@ -97,6 +104,7 @@ pub struct CliOverrides {
     pub local_only: Option<bool>,
     pub server_host: Option<String>,
     pub server_port: Option<u16>,
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +125,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_MODEL", "model"),
     ("FORGE_MODEL_BASE_URL", "model_base_url"),
     ("FORGE_MODEL_KEY_ENV", "model_key_env"),
+    ("FORGE_MOCK_SCRIPT", "mock_script"),
     ("FORGE_ROUTER", "router"),
     ("FORGE_ROUTER_URL", "router_url"),
     ("FORGE_ROUTER_KEY_ENV", "router_key_env"),
@@ -125,6 +134,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_LOCAL_ONLY", "local_only"),
     ("FORGE_SERVER_HOST", "server_host"),
     ("FORGE_SERVER_PORT", "server_port"),
+    ("FORGE_MAX_TURNS", "max_turns"),
 ];
 
 impl Config {
@@ -243,6 +253,11 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
             "local_only" => toml::Value::Boolean(parse_env_bool(env_name, &raw)?),
             "server_port" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
                 ForgeError::config(format!("{env_name} must be a valid port, got {raw:?}"))
+            })?),
+            "max_turns" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
+                ForgeError::config(format!(
+                    "{env_name} must be a positive integer, got {raw:?}"
+                ))
             })?),
             _ => toml::Value::String(raw),
         };

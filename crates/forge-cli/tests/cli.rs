@@ -148,17 +148,21 @@ fn serve_serves_health_on_ephemeral_port() {
         .expect("addr")
         .port();
 
+    let server_log = tmp.path().join("serve.log");
+    let log_file = std::fs::File::create(&server_log).expect("log file");
     let mut child = forge(tmp.path())
         .args(["--project"])
         .arg(&project)
         .args(["serve", "--host", "127.0.0.1", "--port"])
         .arg(port.to_string())
+        .stdout(log_file.try_clone().expect("clone"))
+        .stderr(log_file)
         .spawn()
         .expect("spawn forge serve");
 
     let mut body = String::new();
     let mut ok = false;
-    for _ in 0..50 {
+    for _ in 0..100 {
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
@@ -176,7 +180,8 @@ fn serve_serves_health_on_ephemeral_port() {
     }
     child.kill().ok();
     child.wait().ok();
-    assert!(ok, "server never came up");
+    let log = std::fs::read_to_string(&server_log).unwrap_or_default();
+    assert!(ok, "server never came up; server log:\n{log}");
     assert!(body.contains("\"status\":\"ok\""), "body: {body}");
 }
 
@@ -239,18 +244,36 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     assert!(stdout.contains(session_id), "list output: {stdout}");
     assert!(stdout.contains("3 events"), "list output: {stdout}");
 
+    // resume continues the completed run: a NEW run in the same session,
+    // seeded with the original prompt, printing the new run's output.
     let resume = forge(tmp.path())
         .args(["--project"])
         .arg(&project)
         .args(["resume", run_id])
         .output()
         .expect("run");
-    assert!(resume.status.success());
-    let stdout = String::from_utf8(resume.stdout).expect("utf8");
-    assert!(stdout.contains("run_started"), "resume output: {stdout}");
     assert!(
-        stdout.contains("routing_decision"),
+        resume.status.success(),
+        "resume stderr: {}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let stdout = String::from_utf8(resume.stdout).expect("utf8");
+    assert!(
+        stdout.contains("mock response to: hi"),
         "resume output: {stdout}"
+    );
+    // The resumed run landed in the same session (session show reveals
+    // both runs' events plus the resume marker).
+    let show = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["session", "show", session_id])
+        .output()
+        .expect("run");
+    let show_out = String::from_utf8(show.stdout).expect("utf8");
+    assert!(
+        show_out.contains("input_received"),
+        "resume marker missing: {show_out}"
     );
 
     let cancel = forge(tmp.path())
@@ -452,5 +475,106 @@ fn skill_list_show_test_and_activation_logging() {
     assert!(
         stdout.contains("mock execution recorded: sh"),
         "mock: {stdout}"
+    );
+}
+
+#[test]
+fn scripted_mock_loop_edits_file_and_emits_tool_events() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    std::fs::write(project.join("main.rs"), "fn main() {}\n").expect("write");
+    std::fs::write(
+        project.join("script.json"),
+        r#"[
+            {"tool_calls": [{"id": "call_1", "name": "edit_file", "arguments": {"path": "main.rs", "old": "fn main() {}", "new": "fn main() { println!(\"hello\"); }"}}]},
+            {"text": "added hello to main.rs"}
+        ]"#,
+    )
+    .expect("write script");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"scripted-mock\"\nmock_script = \"script.json\"\napproval = \"auto\"\n",
+    )
+    .expect("write config");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "add a hello function to main.rs"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert_eq!(stdout.trim(), "added hello to main.rs");
+
+    // The loop actually edited the file.
+    let content = std::fs::read_to_string(project.join("main.rs")).expect("read");
+    assert!(
+        content.contains("println!(\"hello\")"),
+        "content: {content}"
+    );
+
+    // And the full tool trail is in the session log.
+    let log = std::fs::read_to_string(
+        std::fs::read_dir(project.join(".forge/sessions"))
+            .expect("sessions")
+            .next()
+            .expect("one session")
+            .expect("entry")
+            .path(),
+    )
+    .expect("log");
+    for needle in [
+        "tool_call_requested",
+        "tool_started",
+        "tool_completed",
+        "file_changed",
+        "turn_completed",
+        "completed",
+    ] {
+        assert!(log.contains(needle), "missing {needle} in {log}");
+    }
+}
+
+#[test]
+fn max_turns_flag_bounds_the_loop() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    // Script always requests another tool call.
+    std::fs::write(
+        project.join("script.json"),
+        r#"[
+            {"tool_calls": [{"id": "c1", "name": "read_file", "arguments": {"path": "a"}}]},
+            {"tool_calls": [{"id": "c2", "name": "read_file", "arguments": {"path": "b"}}]},
+            {"tool_calls": [{"id": "c3", "name": "read_file", "arguments": {"path": "c"}}]},
+            {"tool_calls": [{"id": "c4", "name": "read_file", "arguments": {"path": "d"}}]}
+        ]"#,
+    )
+    .expect("write script");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"scripted-mock\"\nmock_script = \"script.json\"\n",
+    )
+    .expect("write config");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "--max-turns", "2", "spin"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+    assert!(
+        stderr.contains("max turns (2) exhausted"),
+        "stderr: {stderr}"
     );
 }

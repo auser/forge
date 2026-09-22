@@ -1,16 +1,22 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use forge_config::Config;
 use forge_core::{
     CompletionRequest, DecisionRouter, Event, EventKind, ExecutionProvider, ForgeError, Message,
-    ModelProvider, RoutingRequest, SessionStore, Skill, SkillMeta, SkillRegistry,
+    ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, SessionStore, Skill, SkillMeta,
+    SkillRegistry, ToolResult,
 };
 use forge_session::{JsonlSessionStore, new_run_id, new_session_id};
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 
-/// Skill registry placeholder until forge-skills lands in Phase C.
+use crate::tools::{ToolDispatcher, ToolOutcome, tool_definitions};
+
+/// Skill registry for runtimes without skills (tests).
 pub struct NullSkillRegistry;
 
 impl SkillRegistry for NullSkillRegistry {
@@ -19,9 +25,7 @@ impl SkillRegistry for NullSkillRegistry {
     }
 
     fn activate(&self, name: &str) -> Result<Skill, ForgeError> {
-        Err(ForgeError::skill(format!(
-            "skill {name:?} unavailable: skill support arrives in Phase C"
-        )))
+        Err(ForgeError::skill(format!("unknown skill: {name}")))
     }
 }
 
@@ -31,11 +35,59 @@ pub struct RunOutcome {
     pub run_id: String,
     pub session_id: String,
     pub text: String,
+    pub turns: u32,
+    pub tool_calls: usize,
     pub events: Vec<Event>,
 }
 
-/// Transport-neutral agent runtime: routing → model → events. CLI and the
-/// future server share this type.
+/// Optional parameters for a run.
+#[derive(Debug, Default)]
+pub struct RunOptions {
+    /// Pre-generated run id (defaults to a fresh ULID).
+    pub run_id: Option<String>,
+    /// Session to run in (defaults to a fresh session).
+    pub session_id: Option<String>,
+    /// Turn budget override (defaults to `config.max_turns`).
+    pub max_turns: Option<u32>,
+    /// When resuming: the previous run's id and its final text.
+    pub resume_from: Option<ResumeSeed>,
+}
+
+/// Context carried into a resumed run.
+#[derive(Debug, Clone)]
+pub struct ResumeSeed {
+    pub old_run_id: String,
+    pub prior_text: String,
+}
+
+/// Input channel state for a run. `Closed` is a tombstone: closing before
+/// the run starts (e.g. stdin already at EOF) must still close the
+/// receiver the loop will take, so approval waits fail instead of hanging.
+enum InputState {
+    Open {
+        sender: mpsc::Sender<String>,
+        receiver: Option<mpsc::Receiver<String>>,
+    },
+    Closed,
+}
+
+impl InputState {
+    fn open() -> Self {
+        let (sender, receiver) = mpsc::channel(32);
+        Self::Open {
+            sender,
+            receiver: Some(receiver),
+        }
+    }
+}
+
+/// Transport-neutral agent runtime: routing → model → tool loop → events.
+/// CLI and server share this type.
+///
+/// Cancellation works in-process (a per-run `CancellationToken`) and
+/// cross-process: `cancel()` also writes `.forge/runs/<run_id>.cancel`,
+/// which a running loop polls at every turn/tool checkpoint — so CLI
+/// `forge cancel` can stop a `forge run` in another process.
 pub struct AgentService {
     model: Arc<dyn ModelProvider>,
     router: Arc<dyn DecisionRouter>,
@@ -43,7 +95,10 @@ pub struct AgentService {
     skills: Arc<dyn SkillRegistry>,
     sessions: Arc<JsonlSessionStore>,
     config: Config,
+    graph: Option<Arc<dyn ProjectGraph>>,
     broadcasters: Mutex<HashMap<String, broadcast::Sender<Event>>>,
+    inputs: Mutex<HashMap<String, InputState>>,
+    cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
 }
 
 impl AgentService {
@@ -62,8 +117,17 @@ impl AgentService {
             skills,
             sessions,
             config,
+            graph: None,
             broadcasters: Mutex::new(HashMap::new()),
+            inputs: Mutex::new(HashMap::new()),
+            cancel_tokens: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Attach a project graph for context seeding and graph tools.
+    pub fn with_graph(mut self, graph: Option<Arc<dyn ProjectGraph>>) -> Self {
+        self.graph = graph;
+        self
     }
 
     pub fn model(&self) -> &Arc<dyn ModelProvider> {
@@ -96,32 +160,151 @@ impl AgentService {
     }
 
     /// Subscribe to the live event stream of a run. This is the
-    /// transport-neutral seam the Phase D SSE endpoint will consume.
+    /// transport-neutral seam the server's SSE endpoint consumes.
     pub fn subscribe(&self, run_id: &str) -> broadcast::Receiver<Event> {
         self.broadcaster(run_id).subscribe()
     }
 
-    /// Append an event to the store, broadcast it to subscribers, and
-    /// collect it for the outcome.
+    /// Per-run input channel sender (created on demand). Used by
+    /// `send_input` (server input endpoint / CLI stdin feeder) and by the
+    /// approval pause inside the loop.
+    fn input_sender(&self, run_id: &str) -> Result<mpsc::Sender<String>, ForgeError> {
+        let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        match inputs
+            .entry(run_id.to_string())
+            .or_insert_with(InputState::open)
+        {
+            InputState::Open { sender, .. } => Ok(sender.clone()),
+            InputState::Closed => Err(ForgeError::session(format!(
+                "input channel for run {run_id} is closed"
+            ))),
+        }
+    }
+
+    /// The loop takes the receiver once, at run start. A tombstoned
+    /// (already closed) channel yields an immediately-closed receiver.
+    fn take_input_receiver(&self, run_id: &str) -> mpsc::Receiver<String> {
+        let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        match inputs
+            .entry(run_id.to_string())
+            .or_insert_with(InputState::open)
+        {
+            InputState::Open { sender, receiver } => match receiver.take() {
+                Some(receiver) => receiver,
+                None => {
+                    // Receiver already taken (one loop per run id, so this
+                    // shouldn't happen); replace with a fresh live channel.
+                    let (new_sender, new_receiver) = mpsc::channel(32);
+                    *sender = new_sender;
+                    new_receiver
+                }
+            },
+            InputState::Closed => {
+                let (sender, receiver) = mpsc::channel(32);
+                drop(sender);
+                receiver
+            }
+        }
+    }
+
+    /// Deliver user input to a run and record an `InputReceived` event
+    /// (when the run is already persisted).
+    pub fn send_input(&self, run_id: &str, message: impl Into<String>) -> Result<(), ForgeError> {
+        let message = message.into();
+        let sender = self.input_sender(run_id)?;
+        if let Ok(Some(session)) = self.sessions.find_run(run_id) {
+            let stored = self.sessions.append(Event::new(
+                run_id,
+                &session,
+                EventKind::InputReceived {
+                    message: message.clone(),
+                },
+            ))?;
+            let _ = self.broadcaster(run_id).send(stored);
+        }
+        sender
+            .try_send(message)
+            .map_err(|e| ForgeError::session(format!("input queue for run {run_id} is full: {e}")))
+    }
+
+    /// Close a run's input channel. The loop treats a closed channel
+    /// during an approval wait as "no approval possible" and fails the
+    /// run cleanly instead of hanging.
+    pub fn close_input(&self, run_id: &str) {
+        self.inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id.to_string(), InputState::Closed);
+    }
+
+    fn cancel_token(&self, run_id: &str) -> CancellationToken {
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(run_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    fn runs_dir(&self) -> PathBuf {
+        // sessions live in <root>/.forge/sessions → markers in .forge/runs
+        match self.sessions.root().parent() {
+            Some(forge_dir) => forge_dir.join("runs"),
+            None => PathBuf::from(".forge/runs"),
+        }
+    }
+
+    fn cancel_marker(&self, run_id: &str) -> PathBuf {
+        self.runs_dir().join(format!("{run_id}.cancel"))
+    }
+
+    /// In-process token or cross-process marker file.
+    fn cancel_requested(&self, run_id: &str) -> bool {
+        let token_fired = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+            .is_some_and(CancellationToken::is_cancelled);
+        token_fired || self.cancel_marker(run_id).exists()
+    }
+
+    /// Append an event to the store (which assigns its sequence number),
+    /// broadcast the stored event to subscribers, and collect it.
     fn emit(
         &self,
         sender: &broadcast::Sender<Event>,
         collected: &mut Vec<Event>,
         event: Event,
     ) -> Result<(), ForgeError> {
-        self.sessions.append(&event)?;
+        let stored = self.sessions.append(event)?;
         // No subscribers yet is normal for the CLI; not an error.
-        let _ = sender.send(event.clone());
-        collected.push(event);
+        let _ = sender.send(stored.clone());
+        collected.push(stored);
         Ok(())
     }
 
-    /// Route the prompt, call the model, and emit the full event trail.
-    /// Generates fresh run/session ids.
+    /// Run a prompt through the agent loop with fresh run/session ids.
     pub async fn run(&self, prompt: &str) -> Result<RunOutcome, ForgeError> {
-        let session_id = new_session_id();
-        let run_id = new_run_id();
-        self.run_with_ids(prompt, &run_id, &session_id).await
+        self.run_with_options(prompt, RunOptions::default()).await
+    }
+
+    /// Run a prompt with explicit options.
+    pub async fn run_with_options(
+        &self,
+        prompt: &str,
+        options: RunOptions,
+    ) -> Result<RunOutcome, ForgeError> {
+        let run_id = options.run_id.unwrap_or_else(new_run_id);
+        let session_id = options.session_id.unwrap_or_else(new_session_id);
+        self.run_inner(
+            prompt,
+            &run_id,
+            &session_id,
+            options.max_turns,
+            options.resume_from,
+        )
+        .await
     }
 
     /// Start a run on a tokio task without blocking the caller. Returns
@@ -145,40 +328,27 @@ impl AgentService {
         let service = Arc::clone(self);
         let prompt = prompt.into();
         let (rid, sid) = (run_id.clone(), session_id.clone());
-        let handle = tokio::spawn(async move { service.run_with_ids(&prompt, &rid, &sid).await });
+        let handle =
+            tokio::spawn(async move { service.run_inner(&prompt, &rid, &sid, None, None).await });
         (run_id, session_id, handle)
     }
 
-    /// Record run-scoped client input as a `Note` event (the semantics of
-    /// `POST /v1/runs/:id/input` for now — the note is persisted and
-    /// broadcast, not fed back into the model).
-    pub fn record_input(&self, run_id: &str, input: &str) -> Result<(), ForgeError> {
-        let session_id = self
-            .sessions
-            .find_run(run_id)?
-            .ok_or_else(|| ForgeError::session(format!("unknown run: {run_id}")))?;
-        let event = Event::new(
-            run_id,
-            &session_id,
-            EventKind::Note {
-                message: input.to_string(),
-            },
-        );
-        self.sessions.append(&event)?;
-        let _ = self.broadcaster(run_id).send(event);
-        Ok(())
-    }
-
-    async fn run_with_ids(
+    async fn run_inner(
         &self,
         prompt: &str,
         run_id: &str,
         session_id: &str,
+        max_turns: Option<u32>,
+        resume_from: Option<ResumeSeed>,
     ) -> Result<RunOutcome, ForgeError> {
         let run_id = run_id.to_string();
         let session_id = session_id.to_string();
+        let max_turns = max_turns.unwrap_or(self.config.max_turns);
         let sender = self.broadcaster(&run_id);
+        let token = self.cancel_token(&run_id);
+        let mut input_rx = self.take_input_receiver(&run_id);
         let mut collected = Vec::new();
+        let mut tool_call_count = 0usize;
 
         let fail = |collected: &mut Vec<Event>, error: ForgeError| -> ForgeError {
             let event = Event::new(
@@ -201,9 +371,24 @@ impl AgentService {
                 EventKind::RunStarted {
                     provider: self.model.name().to_string(),
                     model: self.config.model.clone(),
+                    prompt: prompt.to_string(),
                 },
             ),
         )?;
+
+        if let Some(seed) = &resume_from {
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::InputReceived {
+                        message: format!("resume of run {}", seed.old_run_id),
+                    },
+                ),
+            )?;
+        }
 
         let routing_request = RoutingRequest {
             task: prompt.to_string(),
@@ -236,7 +421,15 @@ impl AgentService {
             ),
         )?;
 
+        // Build the conversation: resume seed, activated skills, graph
+        // context, then the user prompt.
         let mut messages = Vec::new();
+        if let Some(seed) = &resume_from {
+            messages.push(Message::system(format!(
+                "This run resumes run {}. Its final answer was:\n{}",
+                seed.old_run_id, seed.prior_text
+            )));
+        }
         for meta in self.skills.match_task(prompt) {
             match self.skills.activate(&meta.name) {
                 Ok(skill) => {
@@ -262,32 +455,292 @@ impl AgentService {
                 }
             }
         }
+        if let Some(graph) = &self.graph {
+            let hits = graph.context(prompt, 5);
+            if !hits.is_empty() {
+                let listing = hits
+                    .iter()
+                    .map(|h| format!("- {} (score {})", h.path, h.score))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                messages.push(Message::system(format!(
+                    "Relevant project files (from the project graph):\n{listing}"
+                )));
+            }
+        }
         messages.push(Message::user(prompt));
 
-        let request = CompletionRequest::new(decision.selected_model.clone(), messages);
-        let response = match self.model.complete(request).await {
-            Ok(response) => response,
-            Err(e) => return Err(fail(&mut collected, e)),
+        let tools = if self.model.capabilities().tools {
+            tool_definitions()
+        } else {
+            Vec::new()
         };
 
-        let summary: String = response.content.chars().take(80).collect();
-        self.emit(
-            &sender,
-            &mut collected,
-            Event::new(&run_id, &session_id, EventKind::Completed { summary }),
-        )?;
+        if tools.is_empty() {
+            // Single-turn path: providers without tool support behave
+            // exactly as a plain completion.
+            let request = CompletionRequest::new(decision.selected_model.clone(), messages);
+            let response = match self.model.complete(request).await {
+                Ok(response) => response,
+                Err(e) => return Err(fail(&mut collected, e)),
+            };
+            let summary: String = response.content.chars().take(80).collect();
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(&run_id, &session_id, EventKind::Completed { summary }),
+            )?;
+            return Ok(RunOutcome {
+                run_id,
+                session_id,
+                text: response.content,
+                turns: 1,
+                tool_calls: tool_call_count,
+                events: collected,
+            });
+        }
+
+        let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
+        let selected = decision.selected_model.clone();
+        let mut turn = 0u32;
+        let final_text = loop {
+            turn += 1;
+            if turn > max_turns {
+                return Err(fail(
+                    &mut collected,
+                    ForgeError::agent(format!("max turns ({max_turns}) exhausted")),
+                ));
+            }
+            if self.cancel_requested(&run_id) {
+                // cancel() already recorded the Cancelled event.
+                return Err(ForgeError::agent("run cancelled"));
+            }
+
+            let request = CompletionRequest::new(selected.clone(), messages.clone())
+                .with_tools(tools.clone());
+            let response = match self.model.complete(request).await {
+                Ok(response) => response,
+                Err(e) => return Err(fail(&mut collected, e)),
+            };
+
+            if response.tool_calls.is_empty() {
+                let summary: String = response.content.chars().take(80).collect();
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(&run_id, &session_id, EventKind::Completed { summary }),
+                )?;
+                break response.content;
+            }
+
+            let mut assistant = Message::assistant_tool_calls(response.tool_calls.clone());
+            assistant.content.clone_from(&response.content);
+            messages.push(assistant);
+
+            for call in &response.tool_calls {
+                if self.cancel_requested(&run_id) {
+                    return Err(ForgeError::agent("run cancelled"));
+                }
+                tool_call_count += 1;
+                let args_summary: String = call.arguments.to_string().chars().take(120).collect();
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(
+                        &run_id,
+                        &session_id,
+                        EventKind::ToolCallRequested {
+                            tool: call.name.clone(),
+                            args_summary,
+                        },
+                    ),
+                )?;
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(
+                        &run_id,
+                        &session_id,
+                        EventKind::ToolStarted {
+                            name: call.name.clone(),
+                        },
+                    ),
+                )?;
+
+                let outcome = match dispatcher.dispatch(call).await {
+                    Ok(outcome) => outcome,
+                    Err(ForgeError::ApprovalRequired { description, risk }) => {
+                        self.emit(
+                            &sender,
+                            &mut collected,
+                            Event::new(
+                                &run_id,
+                                &session_id,
+                                EventKind::ApprovalRequested {
+                                    command: description.clone(),
+                                    risk,
+                                },
+                            ),
+                        )?;
+                        match self
+                            .await_approval(&run_id, &mut input_rx, &token, &description, risk)
+                            .await
+                        {
+                            Ok(true) => {
+                                self.emit(
+                                    &sender,
+                                    &mut collected,
+                                    Event::new(
+                                        &run_id,
+                                        &session_id,
+                                        EventKind::ApprovalDecided {
+                                            command: description,
+                                            approved: true,
+                                        },
+                                    ),
+                                )?;
+                                match dispatcher.dispatch_approved(call).await {
+                                    Ok(outcome) => outcome,
+                                    Err(e) => return Err(fail(&mut collected, e)),
+                                }
+                            }
+                            Ok(false) => {
+                                self.emit(
+                                    &sender,
+                                    &mut collected,
+                                    Event::new(
+                                        &run_id,
+                                        &session_id,
+                                        EventKind::ApprovalDecided {
+                                            command: description,
+                                            approved: false,
+                                        },
+                                    ),
+                                )?;
+                                ToolOutcome {
+                                    result: ToolResult::error(
+                                        call.id.clone(),
+                                        call.name.clone(),
+                                        "approval denied".to_string(),
+                                    ),
+                                    file_changed: None,
+                                }
+                            }
+                            Err(e @ ForgeError::ApprovalRequired { .. }) => {
+                                // Input channel closed with no answer:
+                                // record the denial, then fail cleanly.
+                                self.emit(
+                                    &sender,
+                                    &mut collected,
+                                    Event::new(
+                                        &run_id,
+                                        &session_id,
+                                        EventKind::ApprovalDecided {
+                                            command: description,
+                                            approved: false,
+                                        },
+                                    ),
+                                )?;
+                                return Err(fail(&mut collected, e));
+                            }
+                            // Cancellation: the Cancelled event was already
+                            // recorded by cancel(); no Error event.
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(e) => return Err(fail(&mut collected, e)),
+                };
+
+                if let Some(path) = &outcome.file_changed {
+                    self.emit(
+                        &sender,
+                        &mut collected,
+                        Event::new(
+                            &run_id,
+                            &session_id,
+                            EventKind::FileChanged { path: path.clone() },
+                        ),
+                    )?;
+                }
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(
+                        &run_id,
+                        &session_id,
+                        EventKind::ToolCompleted {
+                            name: call.name.clone(),
+                            success: !outcome.result.is_error,
+                        },
+                    ),
+                )?;
+                messages.push(Message::tool(
+                    call.id.clone(),
+                    outcome.result.content.clone(),
+                ));
+            }
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(&run_id, &session_id, EventKind::TurnCompleted { turn }),
+            )?;
+        };
 
         Ok(RunOutcome {
             run_id,
             session_id,
-            text: response.content,
+            text: final_text,
+            turns: turn,
+            tool_calls: tool_call_count,
             events: collected,
         })
     }
 
-    /// Record cancellation for a run (or session); unknown ids are a
-    /// typed error. Aborting an in-flight task is the caller's job (the
-    /// server holds the task handle).
+    /// Wait for an approval decision on the run's input channel.
+    /// Returns Ok(true/false) on an explicit answer. A closed channel
+    /// (stdin EOF, nobody listening) fails the run cleanly with the
+    /// original approval-required error instead of hanging; cancellation
+    /// aborts the wait.
+    async fn await_approval(
+        &self,
+        run_id: &str,
+        rx: &mut mpsc::Receiver<String>,
+        token: &CancellationToken,
+        description: &str,
+        risk: RiskLevel,
+    ) -> Result<bool, ForgeError> {
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some(text) => {
+                            let answer = text.trim().to_lowercase();
+                            return Ok(matches!(answer.as_str(), "y" | "yes" | "approve"));
+                        }
+                        None => {
+                            return Err(ForgeError::ApprovalRequired {
+                                description: description.to_string(),
+                                risk,
+                            });
+                        }
+                    }
+                }
+                () = token.cancelled() => {
+                    return Err(ForgeError::agent("run cancelled"));
+                }
+                _ = ticker.tick() => {
+                    if self.cancel_marker(run_id).exists() {
+                        return Err(ForgeError::agent("run cancelled"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record cancellation for a run (or session): cancel the in-process
+    /// token, write the cross-process marker file, and append the
+    /// `Cancelled` event. Unknown ids are a typed error.
     pub fn cancel(&self, run_or_session_id: &str) -> Result<(), ForgeError> {
         let session_id = match self.sessions.find_run(run_or_session_id)? {
             Some(session) => Some(session),
@@ -303,21 +756,30 @@ impl AgentService {
                 "unknown run or session: {run_or_session_id}"
             )));
         };
-        let event = Event::new(
+
+        // In-process + cross-process cancellation signals.
+        self.cancel_token(run_or_session_id).cancel();
+        let marker = self.cancel_marker(run_or_session_id);
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent).map_err(ForgeError::Io)?;
+        }
+        std::fs::write(&marker, b"cancelled\n").map_err(ForgeError::Io)?;
+
+        let stored = self.sessions.append(Event::new(
             run_or_session_id,
             &session_id,
             EventKind::Cancelled {
                 reason: "cancelled by user".to_string(),
             },
-        );
-        self.sessions.append(&event)?;
-        let _ = self.broadcaster(run_or_session_id).send(event);
+        ))?;
+        let _ = self.broadcaster(run_or_session_id).send(stored);
         Ok(())
     }
 
-    /// Load the event history of a session (or the session owning a run).
-    /// Real re-execution of the run arrives in a later phase.
-    pub fn resume(&self, session_or_run_id: &str) -> Result<Vec<Event>, ForgeError> {
+    /// Resume a completed run: start a NEW run in the same session, seeded
+    /// with the original prompt and the prior run's final text. An
+    /// `InputReceived` marker event links the new run to the old one.
+    pub async fn resume(&self, session_or_run_id: &str) -> Result<RunOutcome, ForgeError> {
         let session_id = match self.sessions.find_run(session_or_run_id)? {
             Some(session) => session,
             None if self.session_exists(session_or_run_id)? => session_or_run_id.to_string(),
@@ -327,10 +789,62 @@ impl AgentService {
                 )));
             }
         };
-        self.sessions.events_for(&session_id)
+        let events = self.sessions.events_for(&session_id)?;
+
+        // The target run: the id itself when it names a run, else the
+        // session's latest run.
+        let target_run = if events.iter().any(|e| e.run_id == session_or_run_id) {
+            session_or_run_id.to_string()
+        } else {
+            events
+                .last()
+                .map(|e| e.run_id.clone())
+                .ok_or_else(|| ForgeError::session("session has no runs"))?
+        };
+        let run_events: Vec<&Event> = events.iter().filter(|e| e.run_id == target_run).collect();
+
+        let prompt = run_events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::RunStarted { prompt, .. } if !prompt.is_empty() => Some(prompt.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ForgeError::agent(format!(
+                    "run {target_run} predates event schema v2 (no prompt recorded); cannot resume"
+                ))
+            })?;
+
+        // Only completed runs resume; the prior final text is the
+        // (truncated) completion summary recorded in the events.
+        let prior_text = match run_events.last().map(|e| &e.kind) {
+            Some(EventKind::Completed { summary }) => summary.clone(),
+            Some(EventKind::Error { .. } | EventKind::Cancelled { .. }) => {
+                return Err(ForgeError::agent(format!(
+                    "run {target_run} ended without completion; cannot resume"
+                )));
+            }
+            _ => {
+                return Err(ForgeError::agent(format!(
+                    "run {target_run} is still in progress or empty; cannot resume"
+                )));
+            }
+        };
+
+        self.run_inner(
+            &prompt,
+            &new_run_id(),
+            &session_id,
+            None,
+            Some(ResumeSeed {
+                old_run_id: target_run,
+                prior_text,
+            }),
+        )
+        .await
     }
 
-    /// All events belonging to one run (for the Phase D events endpoint).
+    /// All events belonging to one run (for the server events endpoint).
     pub fn events(&self, run_id: &str) -> Result<Vec<Event>, ForgeError> {
         match self.sessions.find_run(run_id)? {
             Some(session) => Ok(self
@@ -353,133 +867,4 @@ impl AgentService {
 }
 
 #[cfg(test)]
-mod tests {
-    use forge_core::EventKind;
-    use forge_execution::MockExecution;
-    use forge_providers::{MockModel, MockRouter};
-
-    use super::*;
-
-    fn test_service(root: &std::path::Path) -> AgentService {
-        AgentService::new(
-            Arc::new(MockModel::new()),
-            Arc::new(MockRouter::selecting("mock-local")),
-            Arc::new(MockExecution::new()),
-            Arc::new(NullSkillRegistry),
-            Arc::new(JsonlSessionStore::new(root.join("sessions"))),
-            Config::default(),
-        )
-    }
-
-    #[tokio::test]
-    async fn full_run_emits_ordered_events() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let service = test_service(tmp.path());
-
-        let outcome = service.run("hello there").await.expect("run succeeds");
-
-        assert_eq!(outcome.text, "mock response to: hello there");
-        let kinds: Vec<&str> = outcome
-            .events
-            .iter()
-            .map(|e| match &e.kind {
-                EventKind::RunStarted { .. } => "run_started",
-                EventKind::RoutingDecisionMade { .. } => "routing_decision_made",
-                EventKind::Completed { .. } => "completed",
-                _ => "other",
-            })
-            .collect();
-        assert_eq!(kinds, ["run_started", "routing_decision_made", "completed"]);
-
-        // Everything was persisted too.
-        let persisted = service
-            .sessions()
-            .events_for(&outcome.session_id)
-            .expect("read");
-        assert_eq!(persisted.len(), 3);
-        assert!(persisted.iter().all(|e| e.run_id == outcome.run_id));
-    }
-
-    struct FailingRouter;
-
-    #[async_trait::async_trait]
-    impl DecisionRouter for FailingRouter {
-        async fn route(
-            &self,
-            _: &RoutingRequest,
-        ) -> Result<forge_core::RoutingDecision, ForgeError> {
-            Err(ForgeError::router("router exploded"))
-        }
-    }
-
-    #[tokio::test]
-    async fn run_failure_appends_error_event() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let service = AgentService::new(
-            Arc::new(MockModel::new()),
-            Arc::new(FailingRouter),
-            Arc::new(MockExecution::new()),
-            Arc::new(NullSkillRegistry),
-            Arc::new(JsonlSessionStore::new(tmp.path().join("sessions"))),
-            Config::default(),
-        );
-
-        let err = service.run("doomed").await.expect_err("routing fails");
-        assert!(matches!(err, ForgeError::Router(_)));
-
-        let all = service.sessions().events().expect("read all");
-        assert_eq!(all.len(), 2);
-        assert!(matches!(all[0].kind, EventKind::RunStarted { .. }));
-        match &all[1].kind {
-            EventKind::Error { message } => assert!(message.contains("router exploded")),
-            other => panic!("expected error event, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn cancel_unknown_run_is_typed_error() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let service = test_service(tmp.path());
-        let err = service
-            .cancel("definitely-unknown-run")
-            .expect_err("unknown");
-        assert!(matches!(err, ForgeError::Session(_)));
-    }
-
-    #[tokio::test]
-    async fn cancel_records_event_and_resume_returns_history() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let service = test_service(tmp.path());
-        let outcome = service.run("do a thing").await.expect("run");
-
-        service.cancel(&outcome.run_id).expect("cancel");
-
-        let history = service.resume(&outcome.session_id).expect("resume");
-        assert_eq!(history.len(), 4);
-        assert!(matches!(history[3].kind, EventKind::Cancelled { .. }));
-
-        // Resume also works by run id.
-        let by_run = service.resume(&outcome.run_id).expect("resume by run");
-        assert_eq!(by_run.len(), 4);
-
-        // events(run_id) filters to the run.
-        let run_events = service.events(&outcome.run_id).expect("events");
-        assert_eq!(run_events.len(), 4);
-        assert!(run_events.iter().all(|e| e.run_id == outcome.run_id));
-    }
-
-    #[tokio::test]
-    async fn subscribers_receive_live_events() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let service = test_service(tmp.path());
-
-        // Subscribing requires a run id; the CLI won't know it ahead of
-        // time, but the server can subscribe right after RunStarted. Here
-        // we verify the broadcast seam carries events.
-        let outcome = service.run("stream me").await.expect("run");
-        let mut rx = service.subscribe(&outcome.run_id);
-        service.cancel(&outcome.run_id).expect("cancel");
-        let event = rx.try_recv().expect("broadcast delivered");
-        assert!(matches!(event.kind, EventKind::Cancelled { .. }));
-    }
-}
+mod tests;

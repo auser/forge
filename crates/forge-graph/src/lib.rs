@@ -6,7 +6,8 @@ mod graph;
 mod parse;
 mod state;
 
-pub use graph::{BuildReport, ContextHit, DirSummary, FreshnessReport, LocalGraph};
+pub use forge_core::ContextHit;
+pub use graph::{BuildReport, DirSummary, FreshnessReport, LocalGraph};
 pub use state::{FileKind, FileNode, ImportEdge, SymbolNode};
 
 #[cfg(test)]
