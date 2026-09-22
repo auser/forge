@@ -55,7 +55,7 @@ Global flags:
 --router <r>          override the router (static|mock|http)
 --execution <p>       override the execution provider (native|mock)
 --local-only          restrict to local providers
---approval <mode>     auto | prompt | deny (for risky/destructive commands)
+--approval <mode>     auto | prompt | prompt-dangerous | deny
 --json                machine-readable JSON on stdout, nothing else on stdout
 --no-color            disable ANSI colors
 ```
@@ -87,7 +87,7 @@ Key settings (all optional):
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key |
 | `router_timeout_ms` | `5000` | — | HTTP router timeout |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` \| `mock` |
-| `approval` | `prompt` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `deny` |
+| `approval` | `prompt` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny` |
 | `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers |
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
@@ -117,9 +117,11 @@ These are the three pluggable seams (traits in `forge-core`):
   hard-coded.
 - **ExecutionProvider** — all command/script execution goes through this trait
   (the runtime never spawns processes directly). `native` runs locally with
-  approval gating: `Risky`/`Destructive` commands pause for approval under
-  `approval = "prompt"` (non-interactive stdin → typed "approval required"
-  error), `auto` runs, `deny` blocks. `mock` records requests for tests.
+  approval gating: `Risky` commands pause for approval under
+  `approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
+  commands and lets `Risky` ones run (non-interactive stdin → typed
+  "approval required" error). `auto` runs, `deny` blocks. `mock` records
+  requests for tests.
   MVM/container/remote executors plug into the same trait later.
 
 ## Skills

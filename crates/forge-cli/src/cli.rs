@@ -46,7 +46,7 @@ pub struct GlobalOpts {
     #[arg(long, global = true)]
     pub local_only: bool,
 
-    /// Override the approval mode (auto|prompt|deny).
+    /// Override the approval mode (auto|prompt|prompt-dangerous|deny).
     #[arg(long, global = true, value_name = "MODE")]
     pub approval: Option<String>,
 

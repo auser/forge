@@ -31,6 +31,10 @@ impl NativeExecution {
                 request.command, request.risk
             ))),
             ApprovalPolicy::Prompt => prompt_for_approval(request),
+            ApprovalPolicy::PromptDestructive => match request.risk {
+                RiskLevel::Destructive => prompt_for_approval(request),
+                _ => Ok(()),
+            },
         }
     }
 }
@@ -192,6 +196,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_destructive_allows_risky_without_asking() {
+        assert!(!std::io::stdin().is_terminal());
+        let exec = NativeExecution::new(ApprovalPolicy::PromptDestructive);
+        let result = exec
+            .execute(ExecRequest {
+                risk: RiskLevel::Risky,
+                ..safe_echo()
+            })
+            .await
+            .expect("risky runs without approval under prompt-dangerous");
+        assert!(result.success());
+    }
+
+    #[tokio::test]
+    async fn prompt_destructive_pauses_for_destructive_without_terminal() {
+        assert!(!std::io::stdin().is_terminal());
+        let exec = NativeExecution::new(ApprovalPolicy::PromptDestructive);
+        let err = exec
+            .execute(ExecRequest {
+                risk: RiskLevel::Destructive,
+                ..safe_echo()
+            })
+            .await
+            .expect_err("destructive must pause for approval");
+        assert!(matches!(err, ForgeError::Execution(_)));
+        assert!(err.to_string().contains("approval required"));
+    }
+
+    #[tokio::test]
     async fn approval_policy_parses_config_strings() {
         assert!(matches!(
             ApprovalPolicy::parse("auto"),
@@ -200,6 +233,10 @@ mod tests {
         assert!(matches!(
             ApprovalPolicy::parse("prompt"),
             Ok(ApprovalPolicy::Prompt)
+        ));
+        assert!(matches!(
+            ApprovalPolicy::parse("prompt-dangerous"),
+            Ok(ApprovalPolicy::PromptDestructive)
         ));
         assert!(matches!(
             ApprovalPolicy::parse("deny"),

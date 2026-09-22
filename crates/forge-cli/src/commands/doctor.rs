@@ -138,7 +138,7 @@ pub fn run(ctx: &Context) -> Result<(), ForgeError> {
                 "mock-local (built-in mock, available offline)".into()
             } else {
                 format!(
-                    "{} (configured; connectivity checked in Phase B)",
+                    "{} (configured; run `forge model test` to verify connectivity)",
                     config.model
                 )
             },
@@ -157,6 +157,18 @@ pub fn run(ctx: &Context) -> Result<(), ForgeError> {
                 execution_note(&config.execution)
             ),
         });
+        match forge_core::ApprovalPolicy::parse(&config.approval) {
+            Ok(policy) => checks.push(Check {
+                level: Level::Ok,
+                label: "approval mode".into(),
+                detail: format!("{} ({policy:?})", config.approval),
+            }),
+            Err(e) => checks.push(Check {
+                level: Level::Fail,
+                label: "approval mode".into(),
+                detail: e.to_string(),
+            }),
+        }
     }
 
     let mut failures = 0usize;
@@ -234,8 +246,8 @@ fn router_note(router: &str) -> &'static str {
     match router {
         "static" => "deterministic rules, available offline",
         "mock" => "deterministic mock, available offline",
-        "http" => "System One-compatible HTTP router; connectivity checked in Phase B",
-        _ => "custom router; verified in Phase B",
+        "http" => "System One-compatible HTTP router (uses router_url)",
+        _ => "unrecognized router name",
     }
 }
 
@@ -243,6 +255,6 @@ fn execution_note(execution: &str) -> &'static str {
     match execution {
         "native" => "local process execution, available",
         "mock" => "recorded mock execution, available offline",
-        _ => "custom execution provider; verified in Phase B",
+        _ => "unrecognized execution provider",
     }
 }

@@ -21,22 +21,28 @@ pub enum RiskLevel {
 pub enum ApprovalPolicy {
     /// Run without asking.
     Auto,
-    /// Ask on an interactive terminal; without one, pause with an
-    /// "approval required" error.
+    /// Ask for `Risky` and `Destructive` commands on an interactive terminal;
+    /// without one, pause with an "approval required" error.
     Prompt,
+    /// Ask only for `Destructive` commands; `Risky` commands run without
+    /// asking. On a non-interactive stdin, destructive commands pause with an
+    /// "approval required" error.
+    PromptDestructive,
     /// Always refuse.
     Deny,
 }
 
 impl ApprovalPolicy {
-    /// Parse the `approval` configuration string (`auto`|`prompt`|`deny`).
+    /// Parse the `approval` configuration string
+    /// (`auto`|`prompt`|`prompt-dangerous`|`deny`).
     pub fn parse(value: &str) -> Result<Self, ForgeError> {
         match value {
             "auto" => Ok(Self::Auto),
             "prompt" => Ok(Self::Prompt),
+            "prompt-dangerous" => Ok(Self::PromptDestructive),
             "deny" => Ok(Self::Deny),
             other => Err(ForgeError::config(format!(
-                "invalid approval mode {other:?} (expected auto, prompt, or deny)"
+                "invalid approval mode {other:?} (expected auto, prompt, prompt-dangerous, or deny)"
             ))),
         }
     }
