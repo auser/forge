@@ -40,6 +40,8 @@ pub struct BddWorld {
     pub health_body: String,
     pub run_id: String,
     pub run_status: u16,
+    pub session_id: String,
+    pub secret: String,
     pub sse_content_type: String,
     pub sse_body: String,
 }

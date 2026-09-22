@@ -481,3 +481,187 @@ fn diagnostics_written_to_stderr(world: &mut BddWorld) {
         world.last_stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// graph.feature
+// ---------------------------------------------------------------------------
+
+#[given("a project with Rust source files")]
+fn project_with_rust_sources(world: &mut BddWorld) {
+    world.write_file(
+        "src/main.rs",
+        "use crate::util::help;\nfn main() {\n    help();\n}\n",
+    );
+    world.write_file("src/util.rs", "pub fn help() {}\n");
+}
+
+#[when("I build the project graph")]
+async fn i_build_the_project_graph(world: &mut BddWorld) {
+    world.run_forge(&["--json", "graph", "build"]).await;
+}
+
+#[then("the graph records symbols and files")]
+fn graph_records_symbols_and_files(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let stats: serde_json::Value =
+        serde_json::from_str(world.last_stdout.trim()).expect("graph build json");
+    assert!(stats["files"].as_u64().expect("files") >= 2, "{stats}");
+    assert!(stats["symbols"].as_u64().expect("symbols") >= 2, "{stats}");
+    assert!(world.project().join(".forge/graph/graph.json").is_file());
+}
+
+#[given("a project with a built graph")]
+async fn project_with_a_built_graph(world: &mut BddWorld) {
+    project_with_rust_sources(world);
+    world.run_forge(&["graph", "build"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[when("I modify a source file")]
+fn i_modify_a_source_file(world: &mut BddWorld) {
+    world.write_file(
+        "src/util.rs",
+        "pub fn help() {\n    println!(\"changed\");\n}\n",
+    );
+}
+
+#[then("the graph reports that it is stale")]
+async fn graph_reports_stale(world: &mut BddWorld) {
+    world.run_forge(&["graph", "check"]).await;
+    assert_ne!(
+        world.last_code,
+        Some(0),
+        "graph check must fail on stale graph"
+    );
+    assert!(
+        world.last_stdout.contains("stale"),
+        "stdout: {}",
+        world.last_stdout
+    );
+    assert!(
+        world.last_stdout.contains("src/util.rs"),
+        "stdout: {}",
+        world.last_stdout
+    );
+}
+
+#[when("I rebuild the project graph")]
+async fn i_rebuild_the_project_graph(world: &mut BddWorld) {
+    world.run_forge(&["graph", "build"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[then("the graph reports that it is fresh")]
+async fn graph_reports_fresh(world: &mut BddWorld) {
+    world.run_forge(&["graph", "check"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    assert!(
+        world.last_stdout.contains("fresh"),
+        "stdout: {}",
+        world.last_stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
+// privacy.feature
+// ---------------------------------------------------------------------------
+
+#[when(expr = "I run a prompt containing the secret {string}")]
+async fn i_run_prompt_with_secret(world: &mut BddWorld, secret: String) {
+    let prompt = format!("please use key {secret} here");
+    world.secret = secret;
+    world.run_forge(&["run", &prompt]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[then(expr = "the session log does not contain {string}")]
+fn session_log_omits_secret(world: &mut BddWorld, secret: String) {
+    let log = world.session_log();
+    assert!(!log.is_empty(), "expected a session log");
+    assert!(
+        !log.contains(&secret),
+        "secret leaked into session log: {log}"
+    );
+}
+
+#[then("the session log marks the value as redacted")]
+fn session_log_marks_redacted(world: &mut BddWorld) {
+    let log = world.session_log();
+    assert!(
+        log.contains("[REDACTED]"),
+        "session log missing redaction marker: {log}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// sessions.feature
+// ---------------------------------------------------------------------------
+
+#[when("I run a prompt with the mock model")]
+async fn i_run_a_prompt_with_mock_model(world: &mut BddWorld) {
+    world.run_forge(&["--json", "run", "session test"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let outcome: serde_json::Value =
+        serde_json::from_str(world.last_stdout.trim()).expect("run json");
+    world.run_id = outcome["run_id"].as_str().expect("run id").to_string();
+    world.session_id = outcome["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+}
+
+#[then("the session is listed")]
+async fn the_session_is_listed(world: &mut BddWorld) {
+    let session_id = world.session_id.clone();
+    world.run_forge(&["session", "list"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    assert!(
+        world.last_stdout.contains(&session_id),
+        "stdout: {}",
+        world.last_stdout
+    );
+}
+
+#[then("the session events include run started and completed")]
+async fn session_events_include_run_started_and_completed(world: &mut BddWorld) {
+    let session_id = world.session_id.clone();
+    world.run_forge(&["session", "show", &session_id]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    assert!(
+        world.last_stdout.contains("run_started"),
+        "stdout: {}",
+        world.last_stdout
+    );
+    assert!(
+        world.last_stdout.contains("completed"),
+        "stdout: {}",
+        world.last_stdout
+    );
+}
+
+#[given("a completed run with the mock model")]
+async fn a_completed_run_with_mock_model(world: &mut BddWorld) {
+    i_run_a_prompt_with_mock_model(world).await;
+    // The mock completes synchronously; the run is finished by now.
+}
+
+#[when("I cancel the run")]
+async fn i_cancel_the_run(world: &mut BddWorld) {
+    let run_id = world.run_id.clone();
+    world.run_forge(&["cancel", &run_id]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[then("a cancellation event is recorded for the run")]
+fn cancellation_event_recorded(world: &mut BddWorld) {
+    let log = world.session_log();
+    let cancelled = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "cancelled" && e["run_id"] == world.run_id);
+    assert!(
+        cancelled.is_some(),
+        "no cancelled event for {} in: {log}",
+        world.run_id
+    );
+}
