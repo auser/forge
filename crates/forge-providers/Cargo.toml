@@ -1,0 +1,21 @@
+[package]
+name = "forge-providers"
+description = "Model providers and decision routers for Forge"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-config.workspace = true
+forge-core.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true }
+wiremock.workspace = true

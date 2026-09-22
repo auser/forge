@@ -1,0 +1,17 @@
+[package]
+name = "forge-session"
+description = "Append-only JSONL session/run store with secret redaction for Forge"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tempfile.workspace = true

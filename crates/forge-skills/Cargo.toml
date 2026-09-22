@@ -1,0 +1,16 @@
+[package]
+name = "forge-skills"
+description = "SKILL.md discovery and progressive-disclosure activation for Forge"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+forge-execution.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true }

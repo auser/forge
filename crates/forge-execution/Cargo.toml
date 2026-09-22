@@ -1,0 +1,15 @@
+[package]
+name = "forge-execution"
+description = "Native and mock ExecutionProvider implementations for Forge"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

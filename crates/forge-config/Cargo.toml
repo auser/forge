@@ -1,0 +1,15 @@
+[package]
+name = "forge-config"
+description = "Layered configuration loading with provenance for Forge"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tempfile.workspace = true
