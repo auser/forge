@@ -86,7 +86,7 @@ fn json_config_show_is_pure_json_on_stdout() {
     assert!(output.status.success());
     let parsed: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
-    assert_eq!(parsed["config"]["model"], "mock-local");
+    assert_eq!(parsed["config"]["model"], "qwen3-coder");
     assert_eq!(parsed["sources"]["model"]["origin"], "default");
 }
 
@@ -189,7 +189,13 @@ fn serve_serves_health_on_ephemeral_port() {
 fn run_works_offline_with_mock_model() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = tmp.path().join("proj");
-    std::fs::create_dir_all(&project).expect("mkdir");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    // Mock is opt-in: request it explicitly.
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"mock-local\"\n",
+    )
+    .expect("write config");
 
     let output = forge(tmp.path())
         .args(["--project"])
@@ -218,7 +224,12 @@ fn run_works_offline_with_mock_model() {
 fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = tmp.path().join("proj");
-    std::fs::create_dir_all(&project).expect("mkdir");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"mock-local\"\n",
+    )
+    .expect("write config");
 
     let output = forge(tmp.path())
         .args(["--project"])
@@ -315,7 +326,7 @@ fn model_list_and_test_work_offline() {
     let test = forge(tmp.path())
         .args(["--project"])
         .arg(&project)
-        .args(["model", "test"])
+        .args(["model", "test", "mock-local"])
         .output()
         .expect("run");
     assert!(test.status.success());

@@ -289,6 +289,11 @@ impl ModelProvider for OpenAiCompatibleModel {
         let response = http.send().await.map_err(|e| {
             if e.is_timeout() {
                 ForgeError::provider(format!("model request to {url} timed out"))
+            } else if e.is_connect() {
+                ForgeError::provider(format!(
+                    "cannot reach OpenAI-compatible server at {url} (connection refused); \
+                     start your model server (e.g. oMLX) or set model = \"mock-local\" for offline use"
+                ))
             } else {
                 ForgeError::provider(format!("model request to {url} failed: {e}"))
             }
@@ -390,19 +395,24 @@ pub fn model_from_config(
         }
         name => {
             // A `[models.<name>]` entry resolves the endpoint and can
-            // override capabilities; unset fields inherit the global
-            // model_base_url/model_key_env.
+            // override capabilities; an explicitly changed global
+            // model_base_url (different from the built-in default) wins
+            // over the entry's URL so env/CLI/file overrides always work.
+            const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:8080/v1";
             let entry = config.models.get(name);
-            let base_url = entry
-                .and_then(|e| e.base_url.clone())
-                .or_else(|| config.model_base_url.clone())
-                .unwrap_or_else(|| {
+            let entry_url = entry.and_then(|e| e.base_url.clone());
+            let base_url = match (entry_url, &config.model_base_url) {
+                (Some(_), Some(global)) if global != DEFAULT_MODEL_BASE_URL => global.clone(),
+                (Some(entry_url), _) => entry_url,
+                (None, Some(global)) => global.clone(),
+                (None, None) => {
                     tracing::warn!(
                         model = name,
                         "no model_base_url configured; requests will fail"
                     );
                     "http://127.0.0.1:9".to_string()
-                });
+                }
+            };
             let key_env = entry
                 .and_then(|e| e.key_env.clone())
                 .or_else(|| config.model_key_env.clone());
@@ -579,8 +589,11 @@ mod tests {
     }
 
     #[test]
-    fn model_from_config_defaults_to_offline_mock() {
-        let config = Config::default();
+    fn model_from_config_mock_is_explicit() {
+        let config = Config {
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
         let model = model_from_config(&config, std::path::Path::new(".")).expect("mock builds");
         assert_eq!(model.name(), "mock-local");
     }
@@ -718,6 +731,36 @@ mod tests {
             Err(ForgeError::Config(_)) => {}
             other => panic!("expected config error, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_global_base_url_wins_over_entry_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "from override endpoint" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // qwen3-coder's entry URL is 127.0.0.1:8080 — unreachable here. An
+        // explicitly changed global base_url must win and reach the mock.
+        let config = Config {
+            model: "qwen3-coder".to_string(),
+            model_base_url: Some(server.uri()),
+            ..Config::default()
+        };
+        let model = model_from_config(&config, std::path::Path::new(".")).expect("builds");
+        let response = model
+            .complete(CompletionRequest::new(
+                "qwen3-coder",
+                vec![Message::user("hi")],
+            ))
+            .await
+            .expect("override endpoint answers");
+        assert_eq!(response.content, "from override endpoint");
     }
 
     #[tokio::test]

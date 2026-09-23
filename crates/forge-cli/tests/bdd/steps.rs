@@ -298,7 +298,9 @@ fn selected_model_is(world: &mut BddWorld, model: String) {
 
 #[given("Forge runs with a mock model")]
 async fn forge_runs_with_mock_model(world: &mut BddWorld) {
-    // Default config is model = "mock-local"; just start the server.
+    // Mock is opt-in (the default model is a real local endpoint).
+    world.set_config("model", "\"mock-local\"");
+    world.flush_config();
     world.start_server().await;
 }
 
@@ -414,6 +416,7 @@ fn skill_description_shown(world: &mut BddWorld) {
 
 #[when("a task matches the skill")]
 async fn task_matches_skill(world: &mut BddWorld) {
+    world.set_config("model", "\"mock-local\"");
     world.run_forge(&["run", "please run the demo"]).await;
 }
 
@@ -483,7 +486,7 @@ fn stdout_contains_only_json(world: &mut BddWorld) {
     assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
     let value: serde_json::Value =
         serde_json::from_str(world.last_stdout.trim()).expect("stdout is one JSON value");
-    assert_eq!(value["config"]["model"], "mock-local");
+    assert_eq!(value["config"]["model"], "qwen3-coder");
 }
 
 #[then("diagnostics are written to stderr")]
@@ -582,6 +585,7 @@ async fn graph_reports_fresh(world: &mut BddWorld) {
 
 #[when(expr = "I run a prompt containing the secret {string}")]
 async fn i_run_prompt_with_secret(world: &mut BddWorld, secret: String) {
+    world.set_config("model", "\"mock-local\"");
     let prompt = format!("please use key {secret} here");
     world.secret = secret;
     world.run_forge(&["run", &prompt]).await;
@@ -613,6 +617,7 @@ fn session_log_marks_redacted(world: &mut BddWorld) {
 
 #[when("I run a prompt with the mock model")]
 async fn i_run_a_prompt_with_mock_model(world: &mut BddWorld) {
+    world.set_config("model", "\"mock-local\"");
     world.run_forge(&["--json", "run", "session test"]).await;
     assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
     let outcome: serde_json::Value =
@@ -1100,6 +1105,11 @@ async fn models_with_costs(
     world.add_config_block(format!(
         "[models.{pricey}]\ncost_input_per_mtok = {pricey_cost}\ndescription = \"pricey test model\"\nbase_url = \"http://127.0.0.1:9\""
     ));
+    // The built-in local model is free ($0) and would win "cheapest";
+    // reprice it so the fixture's own entries decide the ranking.
+    world.add_config_block(
+        "[models.qwen3-coder]\ncost_input_per_mtok = 99.9\ncost_output_per_mtok = 99.9".to_string(),
+    );
 }
 
 #[given(expr = "router mode {string}")]
@@ -1142,6 +1152,10 @@ async fn laya_router_answering(world: &mut BddWorld, choice: String, confidence:
         .await;
     world.set_config("router", "\"laya\"");
     world.set_config("router_url", &format!("\"{}\"", server.uri()));
+    // The answered model must be a candidate and resolvable offline.
+    if choice == "mock-local" {
+        world.set_config("model", "\"mock-local\"");
+    }
     world.router_mock = Some(server);
 }
 

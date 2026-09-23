@@ -47,8 +47,13 @@ fn defaults_when_nothing_set() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
 
-    assert_eq!(resolved.config.model, "mock-local");
-    assert_eq!(resolved.config.router, "static");
+    // Default stack: local oMLX model + Laya router (mocks are opt-in).
+    assert_eq!(resolved.config.model, "qwen3-coder");
+    assert_eq!(
+        resolved.config.model_base_url.as_deref(),
+        Some("http://127.0.0.1:8080/v1")
+    );
+    assert_eq!(resolved.config.router, "laya");
     assert_eq!(resolved.config.router_timeout_ms, 5_000);
     assert_eq!(resolved.config.execution, "native");
     assert_eq!(resolved.config.approval, "prompt");
@@ -57,7 +62,20 @@ fn defaults_when_nothing_set() {
     assert_eq!(resolved.config.server_port, 7_341);
     assert_eq!(
         resolved.explain("model"),
-        Some(("\"mock-local\"".to_string(), Origin::Default))
+        Some(("\"qwen3-coder\"".to_string(), Origin::Default))
+    );
+    // Built-in model registry with cost metadata.
+    let models = resolved.config.model_entries();
+    assert_eq!(models.len(), 3);
+    assert_eq!(models["qwen3-coder"].cost_input_per_mtok, 0.0);
+    assert_eq!(models["deepseek-chat"].cost_input_per_mtok, 0.14);
+    assert_eq!(
+        models["kimi-k2.7-code"].key_env.as_deref(),
+        Some("MOONSHOT_API_KEY")
+    );
+    assert_eq!(
+        resolved.explain("models").map(|(_, o)| o),
+        Some(Origin::Default)
     );
 }
 
@@ -89,7 +107,7 @@ fn project_file_overrides_user_file_and_defaults() {
     // Untouched key stays default.
     assert_eq!(
         resolved.explain("router"),
-        Some(("\"static\"".to_string(), Origin::Default))
+        Some(("\"laya\"".to_string(), Origin::Default))
     );
 }
 
@@ -233,7 +251,8 @@ fn models_table_deep_merges_by_name() {
 
     let resolved = Config::load(Some(&project), &CliOverrides::default()).expect("load");
     let models = &resolved.config.models;
-    assert_eq!(models.len(), 3);
+    // 3 built-in defaults + 3 from the layered files.
+    assert_eq!(models.len(), 6);
     // Project entry replaces the same-named user entry entirely.
     assert_eq!(models["shared"].cost_input_per_mtok, 9.0);
     assert_eq!(

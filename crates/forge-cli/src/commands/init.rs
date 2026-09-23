@@ -7,10 +7,11 @@ use crate::commands::Context;
 
 const STARTER_CONFIG: &str = "\
 # Forge project configuration.
-# Values here override user config and defaults; environment variables and
-# CLI flags override this file. See `forge config explain <key>`.
-model = \"mock-local\"
-router = \"static\"
+# Defaults: local oMLX model + Laya (open-source System One) router.
+# Precedence: user config -> this file -> FORGE_* env -> CLI flags.
+# See `forge config explain <key>`.
+model = \"qwen3-coder\"        # served by oMLX at model_base_url
+router = \"laya\"              # open-source Jev; falls back to static when down
 execution = \"native\"
 approval = \"prompt\"
 ";

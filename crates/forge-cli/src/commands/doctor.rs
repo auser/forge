@@ -131,18 +131,66 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
 
     if let Ok(resolved) = &resolved {
         let config = &resolved.config;
-        checks.push(Check {
-            level: Level::Ok,
-            label: "model provider".into(),
-            detail: if config.model == "mock-local" {
-                "mock-local (built-in mock, available offline)".into()
-            } else {
-                format!(
-                    "{} (configured; run `forge model test` to verify connectivity)",
-                    config.model
-                )
-            },
-        });
+        // Model provider: mock/scripted are offline; anything else gets a
+        // reachability probe of its endpoint (warn, never fail).
+        let model_detail = match config.model.as_str() {
+            "mock-local" | "mock" => Some("mock-local (built-in mock, available offline)".into()),
+            "scripted-mock" => Some("scripted-mock (offline script)".into()),
+            _ => None,
+        };
+        match model_detail {
+            Some(detail) => checks.push(Check {
+                level: Level::Ok,
+                label: "model provider".into(),
+                detail,
+            }),
+            None => {
+                let url = config
+                    .models
+                    .get(&config.model)
+                    .and_then(|e| e.base_url.clone())
+                    .or_else(|| config.model_base_url.clone());
+                let check = match url {
+                    None => (
+                        Level::Warn,
+                        format!("{} (no base URL configured)", config.model),
+                    ),
+                    Some(url) => {
+                        let probe = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_millis(1_500))
+                            .build()
+                            .ok();
+                        match probe {
+                            Some(client) => {
+                                let probe_url = format!("{}/models", url.trim_end_matches('/'));
+                                match client.get(&probe_url).send().await {
+                                    Ok(_) => (
+                                        Level::Ok,
+                                        format!("{} (reachable at {url})", config.model),
+                                    ),
+                                    Err(_) => (
+                                        Level::Warn,
+                                        format!(
+                                            "{} (no OpenAI-compatible server at {url}; start oMLX or set model_base_url)",
+                                            config.model
+                                        ),
+                                    ),
+                                }
+                            }
+                            None => (
+                                Level::Warn,
+                                format!("{} (could not build probe client)", config.model),
+                            ),
+                        }
+                    }
+                };
+                checks.push(Check {
+                    level: check.0,
+                    label: "model provider".into(),
+                    detail: check.1,
+                });
+            }
+        }
         checks.push(Check {
             level: Level::Ok,
             label: "decision router".into(),

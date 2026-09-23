@@ -124,7 +124,7 @@ async fn health_capabilities_models() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["model"]["name"], "mock-local");
     assert_eq!(body["model"]["capabilities"]["tools"], true);
-    assert_eq!(body["router"], "static");
+    assert_eq!(body["router"], "laya");
     assert_eq!(body["execution"], "native");
 
     let (status, body) = get_json(&app, "/v1/models").await;

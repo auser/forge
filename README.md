@@ -5,8 +5,10 @@ interactive coding agent core, provider-neutral model access, configurable decis
 routing, progressive-disclosure skills, a deterministic incremental project graph,
 pluggable execution, and both CLI and REST/SSE interfaces over one shared runtime.
 
-No Node.js, Python, database, or daemon is required. Everything works offline with
-built-in mock providers.
+No Node.js, database, or daemon is required. The default stack is Laya
+(open-source System One decision routing) in front of a local oMLX coding model
+— no mock in the default path, no hosted account needed. Mock providers exist
+for tests and demos but are strictly opt-in (`model = "mock-local"`).
 
 - Project spec: [`specs/project.md`](specs/project.md)
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
@@ -49,44 +51,39 @@ Release assets are built by CI for every `v*` tag (see
 
 ## Quickstart
 
-Zero setup, fully offline (mock model, static router, native execution).
-After [installing](#installation) (or with `cargo build --release` and
-`./target/release/forge` in place of `forge`):
+The default stack routes Jev-style: Laya (open-source System One) → a real
+local model via oMLX — no mock anywhere in the default path.
+
+Prereqs: an OpenAI-compatible server running `qwen3-coder` at
+`http://127.0.0.1:8080/v1` (oMLX or compatible), and the Laya router
+(`pip install laya`). After [installing](#installation) (or with
+`cargo build --release` and `./target/release/forge` in place of `forge`):
 
 ```bash
 cd /path/to/your/project
+forge router serve &           # Laya decision router on 127.0.0.1:8788
 forge init                     # creates .forge/, starter config, gitignore entry, builds graph
-forge doctor                   # health report
+forge doctor                   # probes model + router endpoints, warns if down
 forge run "Explain this project"
 forge serve                    # REST/SSE on http://127.0.0.1:7341
 curl http://127.0.0.1:7341/health
 ```
 
-With a real model (any OpenAI-compatible server, e.g. oMLX):
+No GPU, no accounts, just evaluating? The mock is one explicit flag away:
 
-```toml
-# .forge/config.toml
-model = "my-coder"
-model_base_url = "http://127.0.0.1:8080/v1"   # include the /v1 prefix
-model_key_env = "MY_API_KEY"   # name of the env var, never the key itself
+```bash
+forge --model mock-local --router static run "Explain this project"
 ```
 
-With cost-aware routing (see [Model registry with costs](#model-registry-with-costs)):
+Without Laya installed, routing still works: the decision falls back to
+deterministic static routing (`fallback_used: true` in the events) and the run
+proceeds with the configured model. To point at a different endpoint or use an
+API key, override per project:
 
 ```toml
 # .forge/config.toml
-router = "cheapest"            # or "laya" with the reference adapter running
-
-[models.local-small]
-description = "fast local model for simple edits"
-cost_input_per_mtok = 0.0
-
-[models.frontier]
-description = "strong frontier model for hard tasks"
-base_url = "https://api.example.com"
-key_env = "FRONTIER_API_KEY"
-cost_input_per_mtok = 3.0
-cost_output_per_mtok = 15.0
+model_base_url = "http://127.0.0.1:8080/v1"   # include the /v1 prefix
+model_key_env = "MY_API_KEY"   # name of the env var, never the key itself
 ```
 
 ## Usage
@@ -179,11 +176,11 @@ Key settings (all optional):
 
 | Key | Default | Env var | Meaning |
 |---|---|---|---|
-| `model` | `mock-local` | `FORGE_MODEL` | Active model (`scripted-mock` = scripted offline model) |
+| `model` | `qwen3-coder` | `FORGE_MODEL` | Active model (`mock-local`/`scripted-mock` = opt-in offline mocks) |
 | `mock_script` | — | `FORGE_MOCK_SCRIPT` | JSON script path for `scripted-mock` (project-relative) |
-| `model_base_url` | — | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
+| `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `static` | `FORGE_ROUTER` | `static` \| `mock` \| `cheapest` \| `http` \| `laya` |
+| `router` | `laya` | `FORGE_ROUTER` | `laya` \| `static` \| `cheapest` \| `mock` \| `http` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key |
 | `router_timeout_ms` | `5000` | — | HTTP router timeout |
@@ -210,18 +207,21 @@ These are the three pluggable seams (traits in `forge-core`).
 
 ### ModelProvider
 
-`mock` (offline, deterministic), `scripted-mock` (JSON-scripted replies incl.
-tool calls, for tests/demos), or any OpenAI-compatible server (oMLX and friends)
-via `model_base_url`. Capabilities (streaming, tools, structured output, vision,
-context size) are explicit per provider, never assumed; a provider without
-`tools` receives single-turn requests only.
+The default is `qwen3-coder` via the OpenAI-compatible endpoint at
+`model_base_url` (oMLX convention). `mock` (offline, deterministic) and
+`scripted-mock` (JSON-scripted replies incl. tool calls) exist for tests,
+demos, and CI — always explicitly requested. Capabilities (streaming, tools,
+structured output, vision, context size) are explicit per provider, never
+assumed; a provider without `tools` receives single-turn requests only.
 
 ### DecisionRouter
 
 Chooses the model per task and records the decision with a confidence score.
 Five modes:
 
-- `static` (deterministic rules; default),
+- `laya` (open-source System One decision model via the reference adapter;
+  **default**; falls back to static when the adapter is down),
+- `static` (deterministic rules),
 - `mock` (preset decision, for tests),
 - `cheapest` (lowest-cost candidate from the `[models]` cost table;
   tie-breaks by output cost then name),
@@ -239,29 +239,42 @@ the `http` backend — nothing is hard-coded.
 
 ### Model registry with costs
 
+Three entries ship as built-in defaults (prices as of September 2026 — prices
+change; check provider pages):
+
 ```toml
-# .forge/config.toml
-router = "cheapest"           # or "laya"
-router_fallback = "cheapest"  # used when the primary fails / is unconfident
-
-[models.mock-fast]
-description = "fast local mock for trivial tasks"
+[models.qwen3-coder]      # local default, free
+description = "local coding model via oMLX (Qwen3-Coder)"
+base_url = "http://127.0.0.1:8080/v1"
 cost_input_per_mtok = 0.0
+tools = true
 
-[models.deepseek-coder]
-description = "strong coding model"
-base_url = "http://127.0.0.1:8080/v1"   # oMLX / OpenAI-compatible endpoint, incl. /v1
-key_env = "DEEPSEEK_API_KEY"          # env var holding the API key
+[models.deepseek-chat]    # DeepSeek V4-class, very low cost
+description = "DeepSeek V4-class chat/coding model, very low cost"
+base_url = "https://api.deepseek.com/v1"
+key_env = "DEEPSEEK_API_KEY"
 cost_input_per_mtok = 0.14
 cost_output_per_mtok = 0.28
-tools = true                          # capability overrides are explicit
+tools = true
+
+[models.kimi-k2.7-code]   # Moonshot, frontier-quality coding
+description = "Moonshot Kimi K2.7 Code, frontier-quality coding"
+base_url = "https://api.moonshot.ai/v1"
+key_env = "MOONSHOT_API_KEY"
+cost_input_per_mtok = 0.95
+cost_output_per_mtok = 4.00
+tools = true
 ```
 
-The `[models]` table deep-merges by name across user/project config files
-(env/CLI flags don't set entries). The runtime builds routing candidates from
-it, and when the router selects a model with a `base_url`, Forge constructs the
-OpenAI-compatible provider for it automatically. `forge model list` shows the
-cost table.
+The `[models]` table deep-merges by name across user/project config files — a
+same-named project entry replaces the built-in entirely (env/CLI flags don't
+set entries). The runtime builds routing candidates from it, and when the
+router selects a model with a `base_url`, Forge constructs the
+OpenAI-compatible provider for it automatically. **Hosted entries are never
+called implicitly**: the default active model is local `qwen3-coder`, and
+hosted models only run when a router selects them or you set `model`
+explicitly. `forge model list` shows the cost table. Cheapest routing with the
+built-ins prefers the free local model unless it's capability-ineligible.
 
 ### Laya via the reference adapter
 

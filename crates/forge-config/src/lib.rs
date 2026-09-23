@@ -95,12 +95,54 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        // Default stack: Laya (open-source System One router) → local oMLX
+        // model. Mock providers stay available but are opt-in
+        // (`model = "mock-local"`). Hosted models are only called when a
+        // router selects them or the user sets `model` explicitly.
+        let models = [
+            ModelEntry {
+                description: Some("local coding model via oMLX (Qwen3-Coder)".to_string()),
+                cost_input_per_mtok: 0.0,
+                cost_output_per_mtok: 0.0,
+                base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+                key_env: None,
+                tools: Some(true),
+                streaming: Some(true),
+                structured_output: None,
+                vision: None,
+                max_context: Some(32_768),
+            },
+            ModelEntry {
+                description: Some("DeepSeek V4-class chat/coding model, very low cost".to_string()),
+                cost_input_per_mtok: 0.14,
+                cost_output_per_mtok: 0.28,
+                base_url: Some("https://api.deepseek.com/v1".to_string()),
+                key_env: Some("DEEPSEEK_API_KEY".to_string()),
+                tools: Some(true),
+                streaming: Some(true),
+                structured_output: None,
+                vision: None,
+                max_context: Some(128_000),
+            },
+            ModelEntry {
+                description: Some("Moonshot Kimi K2.7 Code, frontier-quality coding".to_string()),
+                cost_input_per_mtok: 0.95,
+                cost_output_per_mtok: 4.00,
+                base_url: Some("https://api.moonshot.ai/v1".to_string()),
+                key_env: Some("MOONSHOT_API_KEY".to_string()),
+                tools: Some(true),
+                streaming: Some(true),
+                structured_output: None,
+                vision: None,
+                max_context: Some(256_000),
+            },
+        ];
         Self {
-            model: "mock-local".to_string(),
-            model_base_url: None,
+            model: "qwen3-coder".to_string(),
+            model_base_url: Some("http://127.0.0.1:8080/v1".to_string()),
             model_key_env: None,
             mock_script: None,
-            router: "static".to_string(),
+            router: "laya".to_string(),
             router_url: None,
             router_key_env: None,
             router_timeout_ms: 5_000,
@@ -112,7 +154,13 @@ impl Default for Config {
             max_turns: 25,
             router_confidence_threshold: 0.7,
             router_fallback: "static".to_string(),
-            models: BTreeMap::new(),
+            models: [
+                ("qwen3-coder".to_string(), models[0].clone()),
+                ("deepseek-chat".to_string(), models[1].clone()),
+                ("kimi-k2.7-code".to_string(), models[2].clone()),
+            ]
+            .into_iter()
+            .collect(),
             extra: toml::Table::new(),
         }
     }

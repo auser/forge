@@ -829,8 +829,21 @@ mod tests {
     }
 
     #[test]
-    fn router_from_config_builds_static_by_default() {
+    fn router_from_config_builds_laya_chain_by_default() {
+        // Default router is laya (threshold-gated, static fallback).
         let config = Config::default();
+        assert_eq!(config.router, "laya");
+        assert_eq!(config.router_fallback, "static");
+        let router = router_from_config(&config, &[]).expect("default chain builds");
+        drop(router);
+    }
+
+    #[test]
+    fn router_from_config_builds_static() {
+        let config = Config {
+            router: "static".to_string(),
+            ..Config::default()
+        };
         let router = router_from_config(&config, &[]).expect("static builds");
         drop(router);
     }
