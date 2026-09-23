@@ -91,8 +91,12 @@ Each sub-project gets its own spec → plan → implementation cycle:
    existing roots surface as `/name` commands (the `.claude/skills/`
    root means Claude Code skills just work). Needle's direct-dispatch
    fast path (§5) makes slash/plain-text intent routing instant and
-   on-device. Needs its own design (TUI framework, streaming render,
-   keybindings, approval UX).
+   on-device. Modern-harness table stakes are in scope: forking a
+   conversation into a new session, backgrounding a running task and
+   reattaching to it, and listing/switching live runs — the append-only
+   session store and `forge resume`/`cancel` are the substrate. Needs
+   its own design (TUI framework, streaming render, keybindings,
+   approval UX, fork/background semantics).
 
 Parallel track (in progress on main): **cloud subscription support** —
 credential detection for Claude Code OAuth, Codex, Kimi/Moonshot and
