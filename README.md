@@ -549,3 +549,11 @@ go in `specs/adrs/`.
   terminal-first eviction); the session store persists across restarts.
 - Input delivery is in-process: `POST /v1/runs/:id/input` for a run owned by
   another process records the event but that loop does not consume it.
+
+## Contributing
+
+`main` is protected: changes land via pull request only (direct pushes,
+force pushes, and branch deletion are rejected). Every PR must pass the
+`verify` CI job (`cargo fmt --check`, clippy with `-D warnings`, all tests,
+and the BDD suite — the same as `just verify` locally). No approvals are
+required for now; keep PRs small and green.
