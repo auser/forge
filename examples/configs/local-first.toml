@@ -1,0 +1,17 @@
+# Fully local, free: oMLX + Laya. This is Forge's built-in default stack,
+# made explicit so you can tune it. Nothing leaves your machine.
+
+model = "qwen3-coder"
+model_base_url = "http://127.0.0.1:8080/v1"
+router = "laya"               # open-source System One router (forge router serve)
+router_fallback = "static"    # static rules if Laya is not running
+execution = "native"
+approval = "prompt"
+local_only = true
+
+# Add more local models here as you install them; Laya picks per task.
+# [models.qwen3-coder-30b]
+# description = "larger local coder for hard tasks"
+# base_url = "http://127.0.0.1:8080/v1"
+# cost_input_per_mtok = 0.0
+# cost_output_per_mtok = 0.0

@@ -1,0 +1,33 @@
+# Recommended: Laya routes each task to the cheapest model that can handle
+# it. Easy tasks stay local and free; hard ones escalate to hosted models.
+# Prices below are current list prices (Sept 2026) — check provider pages.
+
+model = "qwen3-coder"         # used when Laya is down (static fallback)
+router = "laya"
+router_fallback = "cheapest"  # if Laya is down/unconfident: cheapest capable
+router_confidence_threshold = 0.7
+execution = "native"
+approval = "prompt"
+
+[models.qwen3-coder]          # local via oMLX, free
+description = "local coding model, free, good for routine edits and questions"
+base_url = "http://127.0.0.1:8080/v1"
+cost_input_per_mtok = 0.0
+cost_output_per_mtok = 0.0
+tools = true
+
+[models.deepseek-chat]        # DeepSeek V4-class, very low cost
+description = "low-cost hosted model for general coding tasks"
+base_url = "https://api.deepseek.com/v1"
+key_env = "DEEPSEEK_API_KEY"
+cost_input_per_mtok = 0.14
+cost_output_per_mtok = 0.28
+tools = true
+
+[models.kimi-k2.7-code]       # Moonshot, frontier-quality coding
+description = "frontier-quality coding model for hard debugging and refactors"
+base_url = "https://api.moonshot.ai/v1"
+key_env = "MOONSHOT_API_KEY"
+cost_input_per_mtok = 0.95
+cost_output_per_mtok = 4.00
+tools = true

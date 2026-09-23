@@ -101,6 +101,23 @@ Full environment precedence: **shell env** (incl. `FORGE_*` vars) →
 CLI flags beat everything. Values loaded from `.env` files are covered by
 session-log secret redaction just like shell-set keys.
 
+### Drop-in setup for existing projects
+
+```bash
+forge init     # loads .env/.env.local, detects known provider keys, builds the graph
+```
+
+Forge ships ready-made config presets — copy one into `.forge/config.toml`
+(or `~/.config/forge/config.toml` for all projects) and you're done:
+
+```bash
+cp configs/hybrid-laya.toml .forge/config.toml   # from the repo's examples/
+```
+
+See [`examples/`](examples/) for `local-first`, `hybrid-laya`,
+`budget-hosted`, and `offline-eval` presets plus an `env.example` template
+for provider keys.
+
 ## Usage
 
 Run the agent loop (multi-turn, tool-using when the model supports it):

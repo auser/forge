@@ -1,0 +1,26 @@
+# No local GPU: always send the task to the cheapest capable hosted model.
+# Put your key in .env (see env.example) — never in this file.
+
+model = "deepseek-chat"
+router = "cheapest"           # picks the lowest-cost candidate that qualifies
+execution = "native"
+approval = "prompt"
+
+[models.deepseek-chat]        # DeepSeek V4-class (Sept 2026 list prices)
+description = "low-cost hosted model for general coding tasks"
+base_url = "https://api.deepseek.com/v1"
+key_env = "DEEPSEEK_API_KEY"
+cost_input_per_mtok = 0.14
+cost_output_per_mtok = 0.28
+tools = true
+
+[models.kimi-k2.7-code]       # escalates when you need frontier quality
+description = "frontier-quality coding model for hard debugging and refactors"
+base_url = "https://api.moonshot.ai/v1"
+key_env = "MOONSHOT_API_KEY"
+cost_input_per_mtok = 0.95
+cost_output_per_mtok = 4.00
+tools = true
+
+# Tip: switch to `router = "laya"` any time — this registry is already
+# shaped for it (descriptions are Laya's routing criteria).
