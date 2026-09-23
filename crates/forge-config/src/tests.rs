@@ -267,6 +267,44 @@ fn models_table_deep_merges_by_name() {
     );
 }
 
+/// Regression test: the generic nested-section merge added for `[needle]`
+/// must never leak stale per-model dotted sources for `[models]`, which has
+/// its own dedicated name-keyed merge path. Before the fix, a project-file
+/// override of a built-in model landed correctly in `resolved.config` but
+/// `explain("models.qwen3-coder")` still reported the stale default value
+/// with `Origin::Default`, because the generic branch (mis-)handled the
+/// very first (defaults) layer for "models" before the dedicated branch
+/// ever got a chance to run.
+#[test]
+#[serial]
+fn models_override_does_not_leak_stale_dotted_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let xdg = tmp.path().join("xdg");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    let _guard = EnvGuard::isolated(&xdg);
+
+    write_project_config(
+        &project,
+        "[models.qwen3-coder]\ncost_input_per_mtok = 999.0\n",
+    );
+
+    let resolved = Config::load(Some(&project), &CliOverrides::default()).expect("load");
+    // The override is correctly applied to the resolved config...
+    assert_eq!(
+        resolved.config.models["qwen3-coder"].cost_input_per_mtok,
+        999.0
+    );
+    // ...and per-model dotted keys are never exposed via explain (models
+    // only ever gets the aggregate "models" source), so there is no stale
+    // default value to leak.
+    assert_eq!(resolved.explain("models.qwen3-coder"), None);
+    assert_eq!(
+        resolved.explain("models").map(|(_, o)| o),
+        Some(Origin::ProjectFile)
+    );
+}
+
 #[test]
 fn needle_defaults() {
     let c = Config::default();

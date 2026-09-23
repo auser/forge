@@ -440,12 +440,19 @@ fn apply_layer(
 ) {
     for (key, value) in layer {
         // The models table merges by entry name: a later layer's entry
-        // replaces the same-named entry, other entries survive.
+        // replaces the same-named entry, other entries survive. This
+        // always takes the dedicated path for "models" (even on the very
+        // first layer, when `merged` doesn't have a "models" entry yet) so
+        // it never falls into the generic nested-section branch below,
+        // which would otherwise leak stale per-model dotted sources that
+        // are never refreshed once this branch takes over on later layers.
         if key == "models"
-            && let Some(toml::Value::Table(existing)) = merged.get("models")
             && let toml::Value::Table(new_entries) = &value
         {
-            let mut combined = existing.clone();
+            let mut combined = match merged.get("models") {
+                Some(toml::Value::Table(existing)) => existing.clone(),
+                _ => toml::Table::new(),
+            };
             for (name, entry) in new_entries {
                 combined.insert(name.clone(), entry.clone());
             }
@@ -483,13 +490,6 @@ fn apply_layer(
                     },
                 );
             }
-            sources.insert(
-                key.clone(),
-                ConfigSource {
-                    value: value.to_string(),
-                    origin,
-                },
-            );
             merged.insert(key, toml::Value::Table(merged_table));
             continue;
         }
