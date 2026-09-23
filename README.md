@@ -235,6 +235,9 @@ Key settings (all optional):
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
 | `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
+| `needle.variant` | `medium` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small ≈ 8 MB / medium / full ≈ 29 MB) |
+| `needle.weights_path` | — | — | Weights override; empty → ~/.cache/forge/models/ |
+| `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights |
 
 Unknown keys are tolerated. Inspect the resolved configuration:
 

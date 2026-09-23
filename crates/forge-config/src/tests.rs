@@ -268,6 +268,74 @@ fn models_table_deep_merges_by_name() {
 }
 
 #[test]
+fn needle_defaults() {
+    let c = Config::default();
+    assert_eq!(c.needle.variant, "medium");
+    assert_eq!(c.needle.weights_path, "");
+    assert!(c.needle.autofetch);
+}
+
+#[test]
+fn needle_section_parses_and_validates() {
+    let c: Config =
+        toml::from_str("[needle]\nvariant = \"small\"\nautofetch = false").expect("parses");
+    assert_eq!(c.needle.variant, "small");
+    assert!(!c.needle.autofetch);
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn needle_invalid_variant_names_valid_values() {
+    let c: Config = toml::from_str("[needle]\nvariant = \"tiny\"").expect("parses");
+    let err = c
+        .validate()
+        .expect_err("invalid variant rejected")
+        .to_string();
+    assert!(err.contains("tiny") && err.contains("small") && err.contains("full"));
+}
+
+#[test]
+#[serial]
+fn needle_env_overrides_and_explain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.needle.variant, "medium");
+    assert_eq!(
+        resolved.explain("needle.variant"),
+        Some(("\"medium\"".to_string(), Origin::Default))
+    );
+    assert_eq!(
+        resolved.explain("needle.autofetch"),
+        Some(("true".to_string(), Origin::Default))
+    );
+
+    unsafe {
+        std::env::set_var("FORGE_NEEDLE_VARIANT", "small");
+        std::env::set_var("FORGE_NEEDLE_AUTOFETCH", "false");
+    }
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.needle.variant, "small");
+    assert!(!resolved.config.needle.autofetch);
+    // weights_path untouched by env should still resolve to its default,
+    // even though only two of three needle fields were overridden.
+    assert_eq!(resolved.config.needle.weights_path, "");
+    assert_eq!(
+        resolved.explain("needle.variant"),
+        Some(("\"small\"".to_string(), Origin::Environment))
+    );
+    assert_eq!(
+        resolved.explain("needle.autofetch"),
+        Some(("false".to_string(), Origin::Environment))
+    );
+
+    unsafe { std::env::set_var("FORGE_NEEDLE_VARIANT", "bogus") };
+    let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
+    assert!(matches!(err, ForgeError::Config(_)));
+}
+
+#[test]
 #[serial]
 fn router_confidence_threshold_and_fallback_defaults_and_env() {
     let tmp = tempfile::tempdir().expect("tempdir");
