@@ -48,9 +48,11 @@ pub trait NeedleBackend: Send + 'static {
 
 /// Generic fallback cache location, used only by `UnavailableBackend`'s
 /// `Default` impl (tests, and any caller without a resolved
-/// `NeedleConfig` to hand): `~/.cache/forge/models/needle3-medium.bin`.
-/// Mirrors the `std::env::home_dir()` fallback pattern `forge_config::Config`
-/// uses for `~/.config/forge/config.toml`. Real, variant-aware resolution
+/// `NeedleConfig` to hand): `~/.cache/forge/models/needle3-full.bin`,
+/// matching `NeedleConfig::default().variant` ("full" — the only variant
+/// with a hosted, pinned artifact today). Mirrors the
+/// `std::env::home_dir()` fallback pattern `forge_config::Config` uses for
+/// `~/.config/forge/config.toml`. Real, variant-aware resolution
 /// (including the pinned filename and any `weights_path` override) lives in
 /// `crate::weights::weights_path` (Task 6); `engine_from_config` always
 /// resolves through that and passes the result to `UnavailableBackend::new`.
@@ -60,7 +62,7 @@ pub(crate) fn default_weights_path() -> PathBuf {
         .join(".cache")
         .join("forge")
         .join("models")
-        .join("needle3-medium.bin")
+        .join("needle3-full.bin")
 }
 
 /// Placeholder backend used by `engine_from_config` until the real FFI

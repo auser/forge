@@ -136,7 +136,11 @@ crates/forge-needle    # safe async wrapper + trait impls
 **Weights**: fetched once by `forge init` to
 `~/.cache/forge/models/needle3-<variant>.bin`, SHA-256 verified.
 Variants follow Needle's intelligence ladder: `small` (~8 MB) /
-`medium` (default) / `full` (~29 MB). Optional cargo feature
+`medium` / `full` (default; ~35 MB) — `full` is the default because it's
+currently the only variant Cactus-Compute hosts as a downloadable
+artifact (see §8); revert to a smaller rung once one is hosted. An
+operator can override the expected checksum via `needle.weights_sha256`
+to run their own weights without recompiling. Optional cargo feature
 `embed-weights` bakes weights into the binary via `include_bytes!` for
 single-file distribution.
 
@@ -185,9 +189,10 @@ model-load cost.
 router = "needle"                 # new default (was "laya")
 
 [needle]
-variant = "medium"                # small | medium | full
+variant = "full"                  # small | medium | full — full is the only hosted artifact today
 weights_path = ""                 # override; empty → ~/.cache/forge/models/
 autofetch = true                  # forge init downloads + verifies weights
+weights_sha256 = ""               # operator override for the expected checksum; empty → compiled-in pin
 ```
 
 Reused as-is: `router_confidence_threshold` (0.7), `router_fallback`
@@ -304,12 +309,22 @@ adds `router_name: "needle"` and confidence — no schema change.
   `hashlib.sha256`); asking for `"small"` or `"medium"` returns a typed
   error naming `"full"` as the available variant, and `ensure_weights`
   degrades that to `WeightsStatus::Missing` (static routing continues) —
-  it never blocks `forge init` or the router. Since `medium` is
-  `NeedleConfig::default().variant`, **a fresh `forge init` with no
-  config overrides does not fetch anything today**; a project must set
-  `needle.variant = "full"` to get real weights. Either vendor a
-  small/medium cut later (once Cactus hosts one, or forge builds its own
-  via the CLI) or reconsider the default variant in a follow-up task.
+  it never blocks `forge init` or the router.
+
+  **Amendment (controller ruling, Task 6 amendment round)**:
+  `NeedleConfig::default().variant` was originally left at `"medium"`
+  (following the design's stated default), which meant a fresh `forge
+  init` fetched nothing out of the box — silently inert. The default is
+  now `"full"`, the one variant that is actually hosted, so `forge init`
+  with no config overrides fetches real, working weights immediately.
+  Revert the default to a smaller rung once Cactus hosts one (or forge
+  builds its own via the CLI) — `full` is a stopgap driven by artifact
+  availability, not a statement that `full` is the right default ladder
+  rung long-term. Also added `[needle].weights_sha256`: an operator
+  override for the expected checksum (empty → compiled-in pin), so
+  someone running their own weights build (paired with `weights_path`
+  and/or a custom base URL) doesn't need to recompile forge to change
+  the trust anchor.
 - **C API stability**: Needle 3 shipped 2026-09-18; pin an exact
   library + weights version, verify by checksum.
 - **Quality bar**: Needle's routing/guardrail accuracy on forge's

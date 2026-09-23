@@ -18,6 +18,12 @@
 //! report for the full pinning transcript (download + `shasum -a 256`) and
 //! the license finding (Apache-2.0, both the HF `cardData.license` and the
 //! repo's `LICENSE` file).
+//!
+//! An operator who wants to run different weights entirely (paired with a
+//! `weights_path` override and possibly a custom base URL) can set
+//! `[needle].weights_sha256` to their own known-good checksum — it takes
+//! precedence over both the test-only env override and the compiled-in
+//! pin. See [`ensure_weights`] for the exact precedence order.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,7 +39,8 @@ const BASE_URL_ENV: &str = "FORGE_NEEDLE_WEIGHTS_BASE_URL";
 
 /// Test-only escape hatch: overrides the expected SHA-256 so tests can
 /// verify against small fake payloads instead of a real multi-MB artifact.
-/// Never set outside tests.
+/// Never set outside tests. Lower precedence than `[needle].weights_sha256`
+/// — see [`ensure_weights`].
 const TEST_SHA256_ENV: &str = "FORGE_NEEDLE_TEST_SHA256";
 
 /// Real resolve-URL prefix for the pinned Hugging Face repo.
@@ -246,8 +253,15 @@ pub async fn ensure_weights(needle: &NeedleConfig) -> Result<WeightsStatus, Forg
     // `spec_for` just succeeded for this variant, so `weights_path` cannot
     // fail here.
     let path = weights_path(needle)?;
-    let expected_sha256 =
-        std::env::var(TEST_SHA256_ENV).unwrap_or_else(|_| spec.sha256.to_string());
+    // Precedence: an operator-supplied `[needle].weights_sha256` wins over
+    // everything (it's a conscious override, paired with a custom
+    // `weights_path`/base URL); then the test-only env escape hatch; else
+    // the compiled-in pin, the default trust anchor.
+    let expected_sha256 = if !needle.weights_sha256.trim().is_empty() {
+        needle.weights_sha256.clone()
+    } else {
+        std::env::var(TEST_SHA256_ENV).unwrap_or_else(|_| spec.sha256.to_string())
+    };
 
     if path.is_file() {
         if verify(&path, &expected_sha256)? {
@@ -347,6 +361,7 @@ mod tests {
             variant: "full".to_string(),
             weights_path: "/custom/location/w.cact".to_string(),
             autofetch: true,
+            weights_sha256: String::new(),
         };
         let path = weights_path(&cfg).expect("override + pinned variant resolves");
         assert_eq!(path, PathBuf::from("/custom/location/w.cact"));
@@ -360,6 +375,7 @@ mod tests {
             variant: "medium".to_string(),
             weights_path: "/custom/location/w.bin".to_string(),
             autofetch: true,
+            weights_sha256: String::new(),
         };
         assert!(weights_path(&cfg).is_err());
     }
@@ -383,6 +399,7 @@ mod tests {
             variant: "full".to_string(),
             weights_path: dir.path().join("w.bin").display().to_string(),
             autofetch: true,
+            weights_sha256: String::new(),
         };
 
         let first = ensure_weights(&cfg).await.expect("fetches");
@@ -393,6 +410,42 @@ mod tests {
         unsafe {
             std::env::remove_var(BASE_URL_ENV);
             std::env::remove_var(TEST_SHA256_ENV);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn config_supplied_checksum_override_is_respected() {
+        // `needle.weights_sha256` (an operator-supplied override) must win
+        // even though it doesn't match the compiled-in pin for "full", and
+        // even with no FORGE_NEEDLE_TEST_SHA256 env var set at all — the
+        // config field alone is enough.
+        let server = wiremock::MockServer::start().await;
+        let body = b"operator-supplied-weights".to_vec();
+        let sha = hex_sha256(&body);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().expect("tmp");
+        unsafe {
+            std::env::set_var(BASE_URL_ENV, server.uri());
+            std::env::remove_var(TEST_SHA256_ENV);
+        }
+        let cfg = NeedleConfig {
+            variant: "full".to_string(),
+            weights_path: dir.path().join("w.bin").display().to_string(),
+            autofetch: true,
+            weights_sha256: sha,
+        };
+
+        let status = ensure_weights(&cfg)
+            .await
+            .expect("fetches against the config-supplied checksum");
+        assert!(matches!(status, WeightsStatus::Fetched(_)));
+
+        unsafe {
+            std::env::remove_var(BASE_URL_ENV);
         }
     }
 
@@ -414,6 +467,7 @@ mod tests {
             variant: "full".to_string(),
             weights_path: dir.path().join("w.bin").display().to_string(),
             autofetch: true,
+            weights_sha256: String::new(),
         };
 
         let status = ensure_weights(&cfg)
@@ -451,6 +505,7 @@ mod tests {
             variant: "full".to_string(),
             weights_path: path.display().to_string(),
             autofetch: true,
+            weights_sha256: String::new(),
         };
 
         let status = ensure_weights(&cfg)
@@ -475,6 +530,7 @@ mod tests {
             variant: "medium".to_string(),
             weights_path: dir.path().join("w.bin").display().to_string(),
             autofetch: true,
+            weights_sha256: String::new(),
         };
         let status = ensure_weights(&cfg)
             .await

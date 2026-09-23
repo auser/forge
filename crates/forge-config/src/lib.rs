@@ -70,14 +70,22 @@ impl ModelEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NeedleConfig {
-    /// Weights ladder: "small" (~8 MB), "medium" (default), or "full"
-    /// (~29 MB).
+    /// Weights ladder: "small" (~8 MB), "medium", or "full" (default;
+    /// ~29 MB; currently the only variant with a hosted, pinned artifact —
+    /// see `forge-needle`'s `weights::VARIANTS`).
     pub variant: String,
     /// Override path to weights; empty means the default cache location
     /// (`~/.cache/forge/models/`).
     pub weights_path: String,
     /// Whether `forge init` downloads and verifies weights automatically.
     pub autofetch: bool,
+    /// Operator-supplied SHA-256 override for the expected weights
+    /// checksum; empty means use the compiled-in pin (`forge-needle`'s
+    /// `weights::VARIANTS` table). Compiled-in pins are the default trust
+    /// anchor — this lets an operator consciously supply their own weights
+    /// (paired with `weights_path`/a custom base URL) without recompiling
+    /// forge. Must be empty or exactly 64 hex characters.
+    pub weights_sha256: String,
 }
 
 /// Weights ladder values accepted by `[needle].variant`.
@@ -86,9 +94,14 @@ const NEEDLE_VARIANTS: &[&str] = &["small", "medium", "full"];
 impl Default for NeedleConfig {
     fn default() -> Self {
         Self {
-            variant: "medium".to_string(),
+            // "full" is the only variant with a hosted, pinned artifact
+            // today, so a fresh `forge init` actually fetches working
+            // weights out of the box. Revert to a smaller rung once Cactus
+            // hosts one (see the design spec's risks section).
+            variant: "full".to_string(),
             weights_path: String::new(),
             autofetch: true,
+            weights_sha256: String::new(),
         }
     }
 }
@@ -337,6 +350,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_ROUTER_AUTOSTART", "router_autostart"),
     ("FORGE_NEEDLE_VARIANT", "needle.variant"),
     ("FORGE_NEEDLE_AUTOFETCH", "needle.autofetch"),
+    ("FORGE_NEEDLE_WEIGHTS_SHA256", "needle.weights_sha256"),
 ];
 
 impl Config {
@@ -374,6 +388,13 @@ impl Config {
                 "needle.variant must be one of {} (got {:?})",
                 NEEDLE_VARIANTS.join(", "),
                 self.needle.variant
+            )));
+        }
+        let sha = &self.needle.weights_sha256;
+        if !sha.is_empty() && !(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err(ForgeError::config(format!(
+                "needle.weights_sha256 must be empty or 64 hex characters (got {:?})",
+                sha
             )));
         }
         Ok(())

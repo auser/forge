@@ -86,7 +86,15 @@ impl BddWorld {
             .stdin(Stdio::null())
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
-            .env("NO_COLOR", "1");
+            .env("NO_COLOR", "1")
+            // Hermetic default: BDD never depends on the network.
+            // `needle.variant` now defaults to "full" (the only variant
+            // with a hosted, pinned artifact), so an un-overridden `forge
+            // init` would otherwise download ~35 MB from Hugging Face on
+            // every scenario run. A scenario that wants to exercise real
+            // autofetch can still opt in via `world.env`, which is applied
+            // after this and wins.
+            .env("FORGE_NEEDLE_AUTOFETCH", "false");
         for var in FORGE_ENV_VARS {
             cmd.env_remove(var);
         }

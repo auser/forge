@@ -309,9 +309,14 @@ fn models_override_does_not_leak_stale_dotted_source() {
 #[test]
 fn needle_defaults() {
     let c = Config::default();
-    assert_eq!(c.needle.variant, "medium");
+    // "full" is the only variant with a hosted, pinned artifact today, so
+    // a fresh `forge init` actually fetches working weights out of the
+    // box. See the design spec's risks section for reverting this once
+    // Cactus hosts a smaller rung.
+    assert_eq!(c.needle.variant, "full");
     assert_eq!(c.needle.weights_path, "");
     assert!(c.needle.autofetch);
+    assert_eq!(c.needle.weights_sha256, "");
 }
 
 #[test]
@@ -334,16 +339,51 @@ fn needle_invalid_variant_names_valid_values() {
 }
 
 #[test]
+fn needle_weights_sha256_parses_and_validates() {
+    // Empty (the default) and a well-formed 64-char hex string both pass.
+    let empty: Config = toml::from_str("[needle]\nvariant = \"full\"").expect("parses");
+    assert!(empty.validate().is_ok());
+
+    let good: Config = toml::from_str(&format!(
+        "[needle]\nvariant = \"full\"\nweights_sha256 = \"{}\"",
+        "a".repeat(64)
+    ))
+    .expect("parses");
+    assert_eq!(good.needle.weights_sha256, "a".repeat(64));
+    assert!(good.validate().is_ok());
+
+    // Wrong length and non-hex characters are both rejected, and the
+    // error names the offending field.
+    let too_short: Config = toml::from_str("[needle]\nweights_sha256 = \"abcd\"").expect("parses");
+    let err = too_short
+        .validate()
+        .expect_err("short hash rejected")
+        .to_string();
+    assert!(err.contains("weights_sha256"), "err: {err}");
+
+    let not_hex: Config = toml::from_str(&format!(
+        "[needle]\nweights_sha256 = \"{}\"",
+        "z".repeat(64)
+    ))
+    .expect("parses");
+    let err = not_hex
+        .validate()
+        .expect_err("non-hex rejected")
+        .to_string();
+    assert!(err.contains("weights_sha256"), "err: {err}");
+}
+
+#[test]
 #[serial]
 fn needle_env_overrides_and_explain() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _guard = EnvGuard::isolated(tmp.path());
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
-    assert_eq!(resolved.config.needle.variant, "medium");
+    assert_eq!(resolved.config.needle.variant, "full");
     assert_eq!(
         resolved.explain("needle.variant"),
-        Some(("\"medium\"".to_string(), Origin::Default))
+        Some(("\"full\"".to_string(), Origin::Default))
     );
     assert_eq!(
         resolved.explain("needle.autofetch"),
