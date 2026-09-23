@@ -118,6 +118,43 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
         });
     }
 
+    // Credential detection summary (sources only, never values).
+    {
+        let probes = forge_providers::probe_auth();
+        let detected: Vec<String> = probes
+            .iter()
+            .filter(|p| p.detected)
+            .filter_map(|p| p.source.as_ref().map(|s| format!("{} ({s})", p.provider)))
+            .collect();
+        let codex_note = probes.iter().any(|p| p.note.is_some());
+        let (level, detail) = if !detected.is_empty() {
+            let suffix = if codex_note {
+                "; codex subscription OAuth unsupported (set OPENAI_API_KEY)"
+            } else {
+                ""
+            };
+            (
+                Level::Ok,
+                format!("{} detected{}", detected.join(", "), suffix),
+            )
+        } else if codex_note {
+            (
+                Level::Warn,
+                "codex subscription OAuth detected but unsupported; set OPENAI_API_KEY".to_string(),
+            )
+        } else {
+            (
+                Level::Warn,
+                "no provider credentials detected (env keys or CLI stores)".to_string(),
+            )
+        };
+        checks.push(Check {
+            level,
+            label: "credentials".into(),
+            detail,
+        });
+    }
+
     // Skill discovery.
     {
         use forge_core::SkillRegistry;

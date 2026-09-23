@@ -26,6 +26,11 @@ pub struct ModelEntry {
     pub cost_output_per_mtok: f64,
     pub base_url: Option<String>,
     pub key_env: Option<String>,
+    /// Provider family for the endpoint: "openai" (default) or
+    /// "anthropic". Explicit wins; otherwise inferred from base_url host.
+    pub provider: Option<String>,
+    /// Max tokens to generate per completion (default 8192).
+    pub max_output_tokens: Option<u32>,
     pub tools: Option<bool>,
     pub streaming: Option<bool>,
     pub structured_output: Option<bool>,
@@ -109,6 +114,8 @@ impl Default for Config {
                 cost_output_per_mtok: 0.0,
                 base_url: Some("http://127.0.0.1:8080/v1".to_string()),
                 key_env: None,
+                provider: None,
+                max_output_tokens: None,
                 tools: Some(true),
                 streaming: Some(true),
                 structured_output: None,
@@ -121,6 +128,8 @@ impl Default for Config {
                 cost_output_per_mtok: 0.28,
                 base_url: Some("https://api.deepseek.com/v1".to_string()),
                 key_env: Some("DEEPSEEK_API_KEY".to_string()),
+                provider: None,
+                max_output_tokens: None,
                 tools: Some(true),
                 streaming: Some(true),
                 structured_output: None,
@@ -128,11 +137,48 @@ impl Default for Config {
                 max_context: Some(128_000),
             },
             ModelEntry {
+                description: Some(
+                    "Anthropic Claude (subscription via Claude Code, or ANTHROPIC_API_KEY)"
+                        .to_string(),
+                ),
+                // Subscription-served: no per-token cost here.
+                cost_input_per_mtok: 0.0,
+                cost_output_per_mtok: 0.0,
+                base_url: Some("https://api.anthropic.com".to_string()),
+                key_env: Some("ANTHROPIC_API_KEY".to_string()),
+                provider: Some("anthropic".to_string()),
+                max_output_tokens: None,
+                tools: Some(true),
+                streaming: Some(false),
+                structured_output: None,
+                vision: None,
+                max_context: Some(200_000),
+            },
+            ModelEntry {
+                description: Some(
+                    "OpenAI GPT-5 via API key (Codex CLI auth.json is detected)".to_string(),
+                ),
+                // Prices as of Sept 2026; check provider pages.
+                cost_input_per_mtok: 1.25,
+                cost_output_per_mtok: 10.0,
+                base_url: Some("https://api.openai.com/v1".to_string()),
+                key_env: Some("OPENAI_API_KEY".to_string()),
+                provider: Some("openai".to_string()),
+                max_output_tokens: None,
+                tools: Some(true),
+                streaming: Some(true),
+                structured_output: None,
+                vision: None,
+                max_context: Some(256_000),
+            },
+            ModelEntry {
                 description: Some("Moonshot Kimi K2.7 Code, frontier-quality coding".to_string()),
                 cost_input_per_mtok: 0.95,
                 cost_output_per_mtok: 4.00,
                 base_url: Some("https://api.moonshot.ai/v1".to_string()),
                 key_env: Some("MOONSHOT_API_KEY".to_string()),
+                provider: None,
+                max_output_tokens: None,
                 tools: Some(true),
                 streaming: Some(true),
                 structured_output: None,
@@ -161,7 +207,9 @@ impl Default for Config {
             models: [
                 ("qwen3-coder".to_string(), models[0].clone()),
                 ("deepseek-chat".to_string(), models[1].clone()),
-                ("kimi-k2.7-code".to_string(), models[2].clone()),
+                ("claude-sonnet".to_string(), models[2].clone()),
+                ("gpt-5".to_string(), models[3].clone()),
+                ("kimi-k2.7-code".to_string(), models[4].clone()),
             ]
             .into_iter()
             .collect(),

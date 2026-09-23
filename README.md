@@ -241,6 +241,45 @@ forge config path            # config file locations and which exist
 forge config explain model   # winning value + source, e.g. model = "cli-model" (source: cli-flag)
 ```
 
+## Authentication
+
+Forge uses your existing credentials, in this order:
+
+1. **`key_env` env var** from the model's `[models]` entry (e.g. `DEEPSEEK_API_KEY`).
+2. **Conventional env vars** per provider (`ANTHROPIC_API_KEY`,
+   `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `MOONSHOT_API_KEY` /
+   `KIMI_API_KEY`) — including ones loaded from `.env`/`.env.local` at startup.
+3. **CLI credential stores**: `~/.claude/.credentials.json` (Claude Code OAuth)
+   and `~/.codex/auth.json` (its `OPENAI_API_KEY` field).
+
+`forge auth status` shows what was detected — provider, usable models, source,
+and kind (api-key/oauth) — never any values. `forge doctor` summarizes the
+same in one line.
+
+**Claude subscription**: run `claude login` (or `claude setup-token`) once;
+Forge picks up the stored OAuth token automatically and uses it for the
+built-in `claude-sonnet` entry (`provider = "anthropic"`). Codex CLI:
+`~/.codex/auth.json` with an API key works out of the box; **OAuth-only Codex
+subscriptions are not usable yet** (they target the ChatGPT Responses backend,
+which is unimplemented — set `OPENAI_API_KEY` for API access). macOS Keychain
+credential lookup is not implemented yet.
+
+> **Terms note:** subscription OAuth tokens are intended by providers for
+> their own CLIs; using them elsewhere may violate provider terms. API keys
+> are the supported path.
+
+A provider entry looks like:
+
+```toml
+[models.claude-sonnet]
+provider = "anthropic"
+description = "Anthropic Claude (subscription via Claude Code)"
+base_url = "https://api.anthropic.com"
+key_env = "ANTHROPIC_API_KEY"   # used when set; CLI OAuth store is the fallback
+tools = true
+max_context = 200000
+```
+
 ## Models, routing, execution
 
 These are the three pluggable seams (traits in `forge-core`).

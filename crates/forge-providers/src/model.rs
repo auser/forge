@@ -127,13 +127,13 @@ pub(crate) fn reject_tools_without_capability(
 }
 
 /// OpenAI-compatible chat-completions client (works with oMLX and other
-/// compatible servers). The API key is read from `api_key_env` at request
-/// time and is never logged.
+/// compatible servers). Holds a resolved credential (never logged); when
+/// none was found, requests go out unauthenticated with a one-time warn.
 pub struct OpenAiCompatibleModel {
     client: reqwest::Client,
     base_url: String,
     model: String,
-    api_key_env: Option<String>,
+    credential: Option<crate::credentials::ResolvedCredential>,
     capabilities: ModelCapabilities,
 }
 
@@ -141,7 +141,7 @@ impl OpenAiCompatibleModel {
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
-        api_key_env: Option<String>,
+        credential: Option<crate::credentials::ResolvedCredential>,
         capabilities: ModelCapabilities,
         timeout: Duration,
     ) -> Result<Self, ForgeError> {
@@ -153,7 +153,7 @@ impl OpenAiCompatibleModel {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
-            api_key_env,
+            credential,
             capabilities,
         })
     }
@@ -274,16 +274,16 @@ impl ModelProvider for OpenAiCompatibleModel {
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut http = self.client.post(&url).json(&body);
-        if let Some(env_name) = &self.api_key_env {
-            match std::env::var(env_name) {
-                Ok(key) if !key.is_empty() => http = http.bearer_auth(key),
-                // Configured key env var missing/empty: send unauthenticated
-                // but warn loudly — this is the classic silent-401 cause.
-                _ => tracing::warn!(
-                    "model_key_env {env_name} is configured but the environment variable \
-                     is not set; requests will be sent without authentication"
-                ),
-            }
+        match &self.credential {
+            Some(credential) => http = http.bearer_auth(&credential.secret),
+            // No credential resolved: send unauthenticated but warn loudly
+            // — this is the classic silent-401 cause. Sources only, never
+            // values.
+            None => tracing::warn!(
+                "no credential resolved for model {}; requests will be sent \
+                 without authentication (see `forge auth status`)",
+                self.model
+            ),
         }
 
         let response = http.send().await.map_err(|e| {
@@ -413,9 +413,6 @@ pub fn model_from_config(
                     "http://127.0.0.1:9".to_string()
                 }
             };
-            let key_env = entry
-                .and_then(|e| e.key_env.clone())
-                .or_else(|| config.model_key_env.clone());
             let mut capabilities = ModelCapabilities {
                 streaming: true,
                 tools: true,
@@ -441,14 +438,67 @@ pub fn model_from_config(
                     capabilities.max_context = v;
                 }
             }
+            // Provider family: explicit entry.provider wins, else infer
+            // from the endpoint host.
+            let hint = entry
+                .and_then(|e| e.provider.clone())
+                .or_else(|| infer_provider_hint(&base_url));
+            let key_env = entry
+                .and_then(|e| e.key_env.clone())
+                .or_else(|| config.model_key_env.clone());
+
+            if hint.as_deref() == Some("anthropic") {
+                let credential = crate::credentials::resolve_credential(
+                    key_env.as_deref(),
+                    Some("anthropic"),
+                )
+                .ok_or_else(|| {
+                    ForgeError::provider(format!(
+                        "no credential for anthropic model {name:?}; tried {key_env_display},                          CLAUDE_CODE_OAUTH_TOKEN, ~/.claude/.credentials.json                          (see `forge auth status`)",
+                        key_env_display = key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY")
+                    ))
+                })?;
+                let base = entry
+                    .and_then(|e| e.base_url.clone())
+                    .unwrap_or_else(|| base_url.clone());
+                return Ok(Arc::new(crate::anthropic::AnthropicModel::new(
+                    Some(base),
+                    name,
+                    credential,
+                    capabilities,
+                    entry.and_then(|e| e.max_output_tokens),
+                    Duration::from_secs(120),
+                )?));
+            }
+
+            let credential =
+                crate::credentials::resolve_credential(key_env.as_deref(), hint.as_deref());
+            if credential.is_none() && key_env.is_some() {
+                tracing::warn!(
+                    "no credential found for model {name}; tried env vars and CLI                      credential stores (see `forge auth status`)"
+                );
+            }
             Ok(Arc::new(OpenAiCompatibleModel::new(
                 base_url,
                 name,
-                key_env,
+                credential,
                 capabilities,
                 Duration::from_secs(120),
             )?))
         }
+    }
+}
+
+/// Infer the provider family from an endpoint URL.
+fn infer_provider_hint(base_url: &str) -> Option<String> {
+    if base_url.contains("anthropic") {
+        Some("anthropic".to_string())
+    } else if base_url.contains("openai.com") {
+        Some("openai".to_string())
+    } else if base_url.contains("moonshot") {
+        Some("moonshot".to_string())
+    } else {
+        None
     }
 }
 
@@ -546,7 +596,12 @@ mod tests {
         let model = OpenAiCompatibleModel::new(
             server.uri(),
             "m",
-            Some("FORGE_PROVIDERS_TEST_KEY".to_string()),
+            Some(crate::credentials::ResolvedCredential::api_key(
+                "test-key-12345",
+                crate::credentials::CredentialSource::EnvVar(
+                    "FORGE_PROVIDERS_TEST_KEY".to_string(),
+                ),
+            )),
             ModelCapabilities::default(),
             Duration::from_secs(5),
         )
@@ -777,7 +832,7 @@ mod tests {
         let model = OpenAiCompatibleModel::new(
             server.uri(),
             "m",
-            Some("FORGE_PROVIDERS_DEFINITELY_MISSING_KEY".to_string()),
+            None,
             ModelCapabilities::default(),
             Duration::from_secs(5),
         )

@@ -123,6 +123,12 @@ pub enum Command {
         command: RouterCommand,
     },
 
+    /// Credential detection and auth inspection.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+
     /// Configuration inspection.
     Config {
         #[command(subcommand)]
@@ -214,6 +220,12 @@ pub enum RouterCommand {
         #[arg(long, value_name = "PORT", default_value = "8788")]
         port: u16,
     },
+}
+
+#[derive(Subcommand)]
+pub enum AuthCommand {
+    /// Show detected credentials (sources only — never values).
+    Status,
 }
 
 #[derive(Subcommand)]

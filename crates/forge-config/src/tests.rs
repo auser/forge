@@ -66,7 +66,7 @@ fn defaults_when_nothing_set() {
     );
     // Built-in model registry with cost metadata.
     let models = resolved.config.model_entries();
-    assert_eq!(models.len(), 3);
+    assert_eq!(models.len(), 5);
     assert_eq!(models["qwen3-coder"].cost_input_per_mtok, 0.0);
     assert_eq!(models["deepseek-chat"].cost_input_per_mtok, 0.14);
     assert_eq!(
@@ -251,8 +251,8 @@ fn models_table_deep_merges_by_name() {
 
     let resolved = Config::load(Some(&project), &CliOverrides::default()).expect("load");
     let models = &resolved.config.models;
-    // 3 built-in defaults + 3 from the layered files.
-    assert_eq!(models.len(), 6);
+    // 5 built-in defaults + 3 from the layered files.
+    assert_eq!(models.len(), 8);
     // Project entry replaces the same-named user entry entirely.
     assert_eq!(models["shared"].cost_input_per_mtok, 9.0);
     assert_eq!(

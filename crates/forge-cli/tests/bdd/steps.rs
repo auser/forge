@@ -1110,6 +1110,11 @@ async fn models_with_costs(
     world.add_config_block(
         "[models.qwen3-coder]\ncost_input_per_mtok = 99.9\ncost_output_per_mtok = 99.9".to_string(),
     );
+    // claude-sonnet is also free by default; reprice it out of the way.
+    world.add_config_block(
+        "[models.claude-sonnet]\ncost_input_per_mtok = 99.9\ncost_output_per_mtok = 99.9"
+            .to_string(),
+    );
 }
 
 #[given(expr = "router mode {string}")]
@@ -1227,4 +1232,77 @@ fn env_file_sets_model(world: &mut BddWorld, model: String) {
 #[given(expr = "a .env.local file setting the model to {string}")]
 fn env_local_file_sets_model(world: &mut BddWorld, model: String) {
     world.write_file(".env.local", &format!("FORGE_MODEL={model}\n"));
+}
+
+// ---------------------------------------------------------------------------
+// auth.feature
+// ---------------------------------------------------------------------------
+
+#[given("a Claude Code credentials file with a dummy token")]
+fn claude_credentials_file(world: &mut BddWorld) {
+    // The harness sets HOME to <project>/home for each forge invocation.
+    world.write_file(
+        "home/.claude/.credentials.json",
+        r#"{"claudeOauth": {"accessToken": "sk-ant-oat01-bdd-dummy-token", "expiresAt": 1}}"#,
+    );
+}
+
+#[given(expr = "the environment sets {string} to a dummy key")]
+fn environment_sets_dummy_key(world: &mut BddWorld, name: String) {
+    world.env.insert(name, "sk-bdd-dummy-env-key".to_string());
+}
+
+#[when("I check auth status")]
+async fn i_check_auth_status(world: &mut BddWorld) {
+    world.run_forge(&["auth", "status"]).await;
+}
+
+#[then("anthropic is reported detected without leaking the token")]
+fn anthropic_detected_without_leak(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let anthropic = world
+        .last_stdout
+        .lines()
+        .find(|l| l.starts_with("anthropic"))
+        .unwrap_or_else(|| panic!("no anthropic row: {}", world.last_stdout));
+    assert!(anthropic.contains("claude-sonnet"), "row: {anthropic}");
+    assert!(
+        anthropic.contains(".claude/.credentials.json"),
+        "row: {anthropic}"
+    );
+    assert!(anthropic.contains("oauth"), "row: {anthropic}");
+    for output in [&world.last_stdout, &world.last_stderr] {
+        assert!(
+            !output.contains("sk-ant-oat01-bdd-dummy-token"),
+            "token leaked: {output}"
+        );
+    }
+}
+
+#[then("deepseek is reported detected via environment")]
+fn deepseek_detected_via_env(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let row = world
+        .last_stdout
+        .lines()
+        .find(|l| l.starts_with("deepseek"))
+        .unwrap_or_else(|| panic!("no deepseek row: {}", world.last_stdout));
+    assert!(row.contains("deepseek-chat"), "row: {row}");
+    assert!(row.contains("DEEPSEEK_API_KEY"), "row: {row}");
+    assert!(row.contains("api-key"), "row: {row}");
+    assert!(
+        !world.last_stdout.contains("sk-bdd-dummy-env-key"),
+        "key leaked: {}",
+        world.last_stdout
+    );
+}
+
+#[then("missing credentials are reported without failing")]
+fn missing_credentials_reported(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    assert!(
+        world.last_stdout.contains("not found"),
+        "stdout: {}",
+        world.last_stdout
+    );
 }

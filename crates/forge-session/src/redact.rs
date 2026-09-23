@@ -33,6 +33,7 @@ impl Redactor {
 
         let patterns = [
             r"sk-[A-Za-z0-9]{8,}",
+            r"sk-ant-[A-Za-z0-9_-]{8,}",
             r"Bearer\s+\S+",
             r"ghp_[A-Za-z0-9]{8,}",
             r"xox[baprs]-[A-Za-z0-9-]{8,}",

@@ -1,3 +1,4 @@
+pub mod auth_cmd;
 pub mod config_cmd;
 pub mod doctor;
 pub mod graph_cmd;
@@ -75,6 +76,9 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             Ok(())
         }
         Command::Doctor => doctor::run(&ctx).await,
+        Command::Auth { command } => match command {
+            crate::cli::AuthCommand::Status => auth_cmd::status(&ctx),
+        },
         Command::Config { command } => config_cmd::run(&ctx, command),
 
         Command::Run { prompt, max_turns } => run_cmd::run(&ctx, prompt, max_turns).await,
