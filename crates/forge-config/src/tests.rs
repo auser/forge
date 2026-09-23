@@ -212,3 +212,59 @@ fn max_turns_default_env_and_invalid() {
     let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
     assert!(matches!(err, ForgeError::Config(_)));
 }
+
+#[test]
+#[serial]
+fn models_table_deep_merges_by_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let xdg = tmp.path().join("xdg");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    let _guard = EnvGuard::isolated(&xdg);
+
+    write_user_config(
+        &xdg,
+        "[models.shared]\ncost_input_per_mtok = 1.0\n\n[models.user-only]\ncost_input_per_mtok = 2.0\n",
+    );
+    write_project_config(
+        &project,
+        "[models.shared]\ncost_input_per_mtok = 9.0\ndescription = \"project wins\"\n\n[models.proj-only]\ncost_input_per_mtok = 0.5\n",
+    );
+
+    let resolved = Config::load(Some(&project), &CliOverrides::default()).expect("load");
+    let models = &resolved.config.models;
+    assert_eq!(models.len(), 3);
+    // Project entry replaces the same-named user entry entirely.
+    assert_eq!(models["shared"].cost_input_per_mtok, 9.0);
+    assert_eq!(
+        models["shared"].description.as_deref(),
+        Some("project wins")
+    );
+    assert_eq!(models["user-only"].cost_input_per_mtok, 2.0);
+    assert_eq!(models["proj-only"].cost_input_per_mtok, 0.5);
+    assert_eq!(
+        resolved.explain("models").map(|(_, o)| o),
+        Some(Origin::ProjectFile)
+    );
+}
+
+#[test]
+#[serial]
+fn router_confidence_threshold_and_fallback_defaults_and_env() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.router_confidence_threshold, 0.7);
+    assert_eq!(resolved.config.router_fallback, "static");
+
+    unsafe { std::env::set_var("FORGE_ROUTER_CONFIDENCE_THRESHOLD", "0.9") };
+    unsafe { std::env::set_var("FORGE_ROUTER_FALLBACK", "cheapest") };
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.router_confidence_threshold, 0.9);
+    assert_eq!(resolved.config.router_fallback, "cheapest");
+
+    unsafe { std::env::set_var("FORGE_ROUTER_CONFIDENCE_THRESHOLD", "high") };
+    let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
+    assert!(matches!(err, ForgeError::Config(_)));
+}

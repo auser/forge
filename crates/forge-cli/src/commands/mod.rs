@@ -73,7 +73,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             }
             Ok(())
         }
-        Command::Doctor => doctor::run(&ctx),
+        Command::Doctor => doctor::run(&ctx).await,
         Command::Config { command } => config_cmd::run(&ctx, command),
 
         Command::Run { prompt, max_turns } => run_cmd::run(&ctx, prompt, max_turns).await,

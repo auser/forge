@@ -174,6 +174,7 @@ async fn local_system_one_router(world: &mut BddWorld) {
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/route"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "selected_model": "routed-model",
             "confidence": 0.9,
@@ -181,10 +182,23 @@ async fn local_system_one_router(world: &mut BddWorld) {
         })))
         .mount(&server)
         .await;
+    // The routed model resolves through its `[models]` entry, served by
+    // the same mock server (OpenAI-compatible completion).
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "routed answer" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&server)
+        .await;
     world.write_file(
         ".forge/config.toml",
         &format!(
-            "router = \"http\"\nrouter_url = \"{}/route\"\nrouter_timeout_ms = 5000\n",
+            "router = \"http\"\nrouter_url = \"{}/route\"\nrouter_timeout_ms = 5000\n\n[models.routed-model]\nbase_url = \"{}\"\n",
+            server.uri(),
             server.uri()
         ),
     );
@@ -1044,5 +1058,145 @@ fn v1_events_are_shown(world: &mut BddWorld) {
         world.last_stdout.contains("completed"),
         "stdout: {}",
         world.last_stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cost-routing.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "models {string} costing {float} and {string} costing {float}")]
+async fn models_with_costs(
+    world: &mut BddWorld,
+    cheap: String,
+    cheap_cost: f64,
+    pricey: String,
+    pricey_cost: f64,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The cheap model is served by a local OpenAI-compatible mock so the
+    // run completes offline; the pricey one points at a closed port.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "cheap answer" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    let chat_url = server.uri();
+    world.chat_mock = Some(server);
+    // The active model is part of the table (otherwise the built-in free
+    // mock would always win cheapest).
+    world.set_config("model", &format!("\"{cheap}\""));
+    world.add_config_block(format!(
+        "[models.{cheap}]\ncost_input_per_mtok = {cheap_cost}\ndescription = \"cheap test model\"\nbase_url = \"{chat_url}\""
+    ));
+    world.add_config_block(format!(
+        "[models.{pricey}]\ncost_input_per_mtok = {pricey_cost}\ndescription = \"pricey test model\"\nbase_url = \"http://127.0.0.1:9\""
+    ));
+}
+
+#[given(expr = "router mode {string}")]
+fn router_mode(world: &mut BddWorld, mode: String) {
+    world.set_config("router", &format!("\"{mode}\""));
+}
+
+#[then(expr = "the cheapest model {string} is selected with a cost reason")]
+fn cheapest_model_selected(world: &mut BddWorld, model: String) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let outcome: serde_json::Value =
+        serde_json::from_str(world.last_stdout.trim()).expect("run json");
+    let decision = outcome["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|e| e["type"] == "routing_decision_made")
+        .expect("routing decision");
+    assert_eq!(decision["selected_model"], model);
+    assert_eq!(decision["router"], "cheapest");
+    let reason = decision["reason"].as_str().expect("reason");
+    assert!(reason.contains("cheapest"), "reason: {reason}");
+    assert!(reason.contains("$0.1"), "reason: {reason}");
+    // The cheap endpoint actually served the completion.
+    assert_eq!(outcome["text"], "cheap answer");
+}
+
+#[given(expr = "a local Laya router answering {string} with confidence {float}")]
+async fn laya_router_answering(world: &mut BddWorld, choice: String, confidence: f64) {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "answers": { "model": { "choice": choice, "confidence": confidence } },
+            "routing": { "backend": "laya" }
+        })))
+        .mount(&server)
+        .await;
+    world.set_config("router", "\"laya\"");
+    world.set_config("router_url", &format!("\"{}\"", server.uri()));
+    world.router_mock = Some(server);
+}
+
+#[then(expr = "the model {string} is selected with recorded confidence {float}")]
+fn model_selected_with_confidence(world: &mut BddWorld, model: String, confidence: f64) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let log = world.session_log();
+    let decision = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "routing_decision_made")
+        .unwrap_or_else(|| panic!("no routing decision in: {log}"));
+    assert_eq!(decision["selected_model"], model);
+    assert_eq!(decision["router"], "laya");
+    assert_eq!(decision["fallback_used"], false);
+    let recorded = decision["confidence"].as_f64().expect("confidence");
+    assert!(
+        (recorded - confidence).abs() < 0.001,
+        "confidence: {recorded}"
+    );
+}
+
+#[given("the Laya router is unavailable")]
+fn laya_router_unavailable(world: &mut BddWorld) {
+    world.set_config("router", "\"laya\"");
+    world.set_config("router_url", "\"http://127.0.0.1:9/decide\"");
+    world.set_config("router_timeout_ms", "300");
+}
+
+#[given(expr = "the static fallback selects {string}")]
+fn static_fallback_selects(world: &mut BddWorld, model: String) {
+    world.set_config("model", &format!("\"{model}\""));
+    world.set_config("router_fallback", "\"static\"");
+}
+
+#[given(expr = "the confidence threshold is {float}")]
+fn confidence_threshold(world: &mut BddWorld, threshold: f64) {
+    world.set_config("router_confidence_threshold", &threshold.to_string());
+}
+
+#[then("the routing decision fell back to static routing")]
+fn routing_decision_fell_back(world: &mut BddWorld) {
+    let log = world.session_log();
+    let decision = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "routing_decision_made")
+        .unwrap_or_else(|| panic!("no routing decision in: {log}"));
+    assert_eq!(decision["fallback_used"], true);
+    assert_eq!(decision["router"], "static");
+    // The low-confidence reason is logged on stderr (the event schema
+    // carries the decision, not the reason text).
+    assert!(
+        world.last_stderr.contains("below threshold"),
+        "stderr: {}",
+        world.last_stderr
     );
 }

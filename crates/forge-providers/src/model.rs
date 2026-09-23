@@ -384,25 +384,53 @@ pub fn model_from_config(
             Ok(Arc::new(ScriptedMockModel::from_path(&path)?))
         }
         name => {
-            let base_url = config.model_base_url.clone().unwrap_or_else(|| {
-                tracing::warn!(
-                    model = name,
-                    "no model_base_url configured; requests will fail"
-                );
-                "http://127.0.0.1:9".to_string()
-            });
+            // A `[models.<name>]` entry resolves the endpoint and can
+            // override capabilities; unset fields inherit the global
+            // model_base_url/model_key_env.
+            let entry = config.models.get(name);
+            let base_url = entry
+                .and_then(|e| e.base_url.clone())
+                .or_else(|| config.model_base_url.clone())
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        model = name,
+                        "no model_base_url configured; requests will fail"
+                    );
+                    "http://127.0.0.1:9".to_string()
+                });
+            let key_env = entry
+                .and_then(|e| e.key_env.clone())
+                .or_else(|| config.model_key_env.clone());
+            let mut capabilities = ModelCapabilities {
+                streaming: true,
+                tools: true,
+                structured_output: false,
+                vision: false,
+                max_context: 32_768,
+            };
+            if let Some(entry) = entry {
+                // Explicit overrides win over the OpenAI-compatible defaults.
+                if let Some(v) = entry.tools {
+                    capabilities.tools = v;
+                }
+                if let Some(v) = entry.streaming {
+                    capabilities.streaming = v;
+                }
+                if let Some(v) = entry.structured_output {
+                    capabilities.structured_output = v;
+                }
+                if let Some(v) = entry.vision {
+                    capabilities.vision = v;
+                }
+                if let Some(v) = entry.max_context {
+                    capabilities.max_context = v;
+                }
+            }
             Ok(Arc::new(OpenAiCompatibleModel::new(
                 base_url,
                 name,
-                config.model_key_env.clone(),
-                // Explicit: OpenAI-compatible servers get tools+streaming.
-                ModelCapabilities {
-                    streaming: true,
-                    tools: true,
-                    structured_output: false,
-                    vision: false,
-                    max_context: 32_768,
-                },
+                key_env,
+                capabilities,
                 Duration::from_secs(120),
             )?))
         }

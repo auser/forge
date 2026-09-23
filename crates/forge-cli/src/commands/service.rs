@@ -36,7 +36,15 @@ pub fn build_service(ctx: &Context) -> Result<AgentService, ForgeError> {
     let root = ctx.project_root()?;
 
     let model = forge_providers::model_from_config(&resolved.config, &root)?;
-    let registry = vec![(model.name().to_string(), model.capabilities())];
+    // Routing registry: `[models]` entries that declare capabilities are
+    // known; the rest stay optimistic-unknown.
+    let mut registry: Vec<(String, forge_core::ModelCapabilities)> = resolved
+        .config
+        .model_entries()
+        .iter()
+        .filter_map(|(name, entry)| entry.capabilities_if_known().map(|c| (name.clone(), c)))
+        .collect();
+    registry.push((model.name().to_string(), model.capabilities()));
     let router = forge_providers::router_from_config(&resolved.config, &registry)?;
 
     let execution = build_execution(&resolved.config, &root)?;
@@ -51,8 +59,20 @@ pub fn build_service(ctx: &Context) -> Result<AgentService, ForgeError> {
         .filter(|g| g.graph_file().is_file())
         .map(|g| Arc::new(g) as Arc<dyn forge_core::ProjectGraph>);
 
+    // Resolve a provider per routed model name: `[models]` entries supply
+    // endpoint/key/capability overrides; anything else falls back to the
+    // global model_* settings or the built-in mock.
+    let cfg = resolved.config.clone();
+    let root_for_factory = root.clone();
+    let factory = move |name: &str| -> Result<Arc<dyn forge_core::ModelProvider>, ForgeError> {
+        let mut cfg = cfg.clone();
+        cfg.model = name.to_string();
+        forge_providers::model_from_config(&cfg, &root_for_factory)
+    };
+
     Ok(
         AgentService::new(model, router, execution, skills, sessions, resolved.config)
-            .with_graph(graph),
+            .with_graph(graph)
+            .with_model_factory(Arc::new(factory)),
     )
 }

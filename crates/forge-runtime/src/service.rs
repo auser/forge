@@ -29,6 +29,10 @@ impl SkillRegistry for NullSkillRegistry {
     }
 }
 
+/// Factory resolving a model provider for a routed model name.
+pub type ModelFactory =
+    Arc<dyn Fn(&str) -> Result<Arc<dyn ModelProvider>, ForgeError> + Send + Sync>;
+
 /// Result of a completed run.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunOutcome {
@@ -96,6 +100,9 @@ pub struct AgentService {
     sessions: Arc<JsonlSessionStore>,
     config: Config,
     graph: Option<Arc<dyn ProjectGraph>>,
+    /// Resolves a provider for the routed model name; defaults to the
+    /// single configured model for every selection.
+    model_factory: Option<ModelFactory>,
     broadcasters: Mutex<HashMap<String, broadcast::Sender<Event>>>,
     inputs: Mutex<HashMap<String, InputState>>,
     cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
@@ -118,6 +125,7 @@ impl AgentService {
             sessions,
             config,
             graph: None,
+            model_factory: None,
             broadcasters: Mutex::new(HashMap::new()),
             inputs: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
@@ -127,6 +135,14 @@ impl AgentService {
     /// Attach a project graph for context seeding and graph tools.
     pub fn with_graph(mut self, graph: Option<Arc<dyn ProjectGraph>>) -> Self {
         self.graph = graph;
+        self
+    }
+
+    /// Attach a factory resolving a provider for the routed model name
+    /// (e.g. a `[models]` entry with its own `base_url`). Without one, the
+    /// configured model serves every selection.
+    pub fn with_model_factory(mut self, factory: ModelFactory) -> Self {
+        self.model_factory = Some(factory);
         self
     }
 
@@ -390,10 +406,16 @@ impl AgentService {
             )?;
         }
 
+        // Candidates: the [models] table plus the configured model.
+        let mut candidates: Vec<String> = self.config.model_entries().keys().cloned().collect();
+        if !candidates.contains(&self.config.model) {
+            candidates.push(self.config.model.clone());
+        }
+        candidates.sort();
         let routing_request = RoutingRequest {
             task: prompt.to_string(),
             required_capabilities: Vec::new(),
-            candidates: vec![self.config.model.clone()],
+            candidates,
         };
         let decision = match self.router.route(&routing_request).await {
             Ok(decision) => decision,
@@ -417,6 +439,7 @@ impl AgentService {
                     selected_model: decision.selected_model.clone(),
                     confidence: decision.confidence,
                     fallback_used: decision.fallback_used,
+                    reason: decision.reason.clone(),
                 },
             ),
         )?;
@@ -470,7 +493,18 @@ impl AgentService {
         }
         messages.push(Message::user(prompt));
 
-        let tools = if self.model.capabilities().tools {
+        // Resolve the provider for the routed model (defaults to the
+        // configured one).
+        let model = match &self.model_factory {
+            Some(factory) => match factory(&decision.selected_model) {
+                Ok(provider) => provider,
+                Err(e) => return Err(fail(&mut collected, e)),
+            },
+            None => self.model.clone(),
+        };
+        tracing::debug!(model = %model.name(), "model resolved for run");
+
+        let tools = if model.capabilities().tools {
             tool_definitions()
         } else {
             Vec::new()
@@ -480,7 +514,7 @@ impl AgentService {
             // Single-turn path: providers without tool support behave
             // exactly as a plain completion.
             let request = CompletionRequest::new(decision.selected_model.clone(), messages);
-            let response = match self.model.complete(request).await {
+            let response = match model.complete(request).await {
                 Ok(response) => response,
                 Err(e) => return Err(fail(&mut collected, e)),
             };
@@ -518,7 +552,7 @@ impl AgentService {
 
             let request = CompletionRequest::new(selected.clone(), messages.clone())
                 .with_tools(tools.clone());
-            let response = match self.model.complete(request).await {
+            let response = match model.complete(request).await {
                 Ok(response) => response,
                 Err(e) => return Err(fail(&mut collected, e)),
             };

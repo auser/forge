@@ -13,6 +13,53 @@ use std::path::{Path, PathBuf};
 use forge_core::ForgeError;
 use serde::{Deserialize, Serialize};
 
+/// A `[models.<name>]` entry: cost metadata, optional endpoint, and
+/// capability overrides. Cost is USD per million tokens; unset costs mean
+/// free (0.0). Entries without any capability override are treated as
+/// "unknown capabilities" (optimistic) by routers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelEntry {
+    /// Free-text routing criteria (used by laya-style routers).
+    pub description: Option<String>,
+    pub cost_input_per_mtok: f64,
+    pub cost_output_per_mtok: f64,
+    pub base_url: Option<String>,
+    pub key_env: Option<String>,
+    pub tools: Option<bool>,
+    pub streaming: Option<bool>,
+    pub structured_output: Option<bool>,
+    pub vision: Option<bool>,
+    pub max_context: Option<usize>,
+}
+
+impl ModelEntry {
+    pub fn costs(&self) -> (f64, f64) {
+        (self.cost_input_per_mtok, self.cost_output_per_mtok)
+    }
+
+    /// Capabilities when the entry declares at least one override
+    /// (unset fields default to false then — declaring is explicit);
+    /// `None` when nothing is declared (routers treat as optimistic).
+    pub fn capabilities_if_known(&self) -> Option<forge_core::ModelCapabilities> {
+        let declared = self.tools.is_some()
+            || self.streaming.is_some()
+            || self.structured_output.is_some()
+            || self.vision.is_some()
+            || self.max_context.is_some();
+        if !declared {
+            return None;
+        }
+        Some(forge_core::ModelCapabilities {
+            tools: self.tools.unwrap_or(false),
+            streaming: self.streaming.unwrap_or(false),
+            structured_output: self.structured_output.unwrap_or(false),
+            vision: self.vision.unwrap_or(false),
+            max_context: self.max_context.unwrap_or(8_192),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -33,6 +80,14 @@ pub struct Config {
     pub server_port: u16,
     /// Agent-loop turn budget.
     pub max_turns: u32,
+    /// Reject http/laya routing decisions below this confidence.
+    pub router_confidence_threshold: f64,
+    /// Fallback router when the primary fails or is below threshold
+    /// ("static" or "cheapest").
+    pub router_fallback: String,
+    /// Named models with cost/capability metadata. Deep-merged by name
+    /// across config files; not settable via env/CLI flags.
+    pub models: BTreeMap<String, ModelEntry>,
     /// Unknown keys are tolerated and preserved.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -55,6 +110,9 @@ impl Default for Config {
             server_host: "127.0.0.1".to_string(),
             server_port: 7_341,
             max_turns: 25,
+            router_confidence_threshold: 0.7,
+            router_fallback: "static".to_string(),
+            models: BTreeMap::new(),
             extra: toml::Table::new(),
         }
     }
@@ -135,6 +193,11 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_SERVER_HOST", "server_host"),
     ("FORGE_SERVER_PORT", "server_port"),
     ("FORGE_MAX_TURNS", "max_turns"),
+    (
+        "FORGE_ROUTER_CONFIDENCE_THRESHOLD",
+        "router_confidence_threshold",
+    ),
+    ("FORGE_ROUTER_FALLBACK", "router_fallback"),
 ];
 
 impl Config {
@@ -151,6 +214,12 @@ impl Config {
             .join(".config")
             .join("forge")
             .join("config.toml")
+    }
+
+    /// All configured `[models]` entries (name → entry), used to build
+    /// routing candidates and cost tables.
+    pub fn model_entries(&self) -> &BTreeMap<String, ModelEntry> {
+        &self.models
     }
 
     pub fn project_config_path(project_root: &Path) -> PathBuf {
@@ -220,6 +289,26 @@ fn apply_layer(
     origin: Origin,
 ) {
     for (key, value) in layer {
+        // The models table merges by entry name: a later layer's entry
+        // replaces the same-named entry, other entries survive.
+        if key == "models"
+            && let Some(toml::Value::Table(existing)) = merged.get("models")
+            && let toml::Value::Table(new_entries) = &value
+        {
+            let mut combined = existing.clone();
+            for (name, entry) in new_entries {
+                combined.insert(name.clone(), entry.clone());
+            }
+            sources.insert(
+                key.clone(),
+                ConfigSource {
+                    value: format!("{} model(s)", combined.len()),
+                    origin,
+                },
+            );
+            merged.insert(key, toml::Value::Table(combined));
+            continue;
+        }
         sources.insert(
             key.clone(),
             ConfigSource {
@@ -259,6 +348,11 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
                     "{env_name} must be a positive integer, got {raw:?}"
                 ))
             })?),
+            "router_confidence_threshold" => {
+                toml::Value::Float(raw.parse::<f64>().map_err(|_| {
+                    ForgeError::config(format!("{env_name} must be a number in [0,1], got {raw:?}"))
+                })?)
+            }
             _ => toml::Value::String(raw),
         };
         table.insert((*key).to_string(), value);

@@ -319,40 +319,307 @@ impl DecisionRouter for FallbackRouter {
     }
 }
 
-/// Build the decision router from configuration: `static`, `mock`, or
-/// `http` (requires `router_url`). Non-static routers are wrapped in a
-/// `FallbackRouter` with a static fallback so a router outage degrades to
-/// deterministic routing instead of failing the run.
-pub fn router_from_config(
+/// Cost-aware router: among capability-satisfying candidates, pick the
+/// lowest `cost_input_per_mtok` (tie-break: output cost, then name
+/// ascending). Deterministic (confidence 1.0). Candidates absent from the
+/// cost table count as free (0.0).
+pub struct CheapestRouter {
+    costs: std::collections::HashMap<String, (f64, f64)>,
+    registry: Vec<(String, ModelCapabilities)>,
+}
+
+impl CheapestRouter {
+    pub fn new(
+        costs: std::collections::HashMap<String, (f64, f64)>,
+        registry: Vec<(String, ModelCapabilities)>,
+    ) -> Self {
+        Self { costs, registry }
+    }
+}
+
+#[async_trait]
+impl DecisionRouter for CheapestRouter {
+    async fn route(&self, task: &RoutingRequest) -> Result<RoutingDecision, ForgeError> {
+        // Pool: requested candidates, or every known model.
+        let pool: Vec<(String, ModelCapabilities)> = if task.candidates.is_empty() {
+            self.registry.clone()
+        } else {
+            task.candidates
+                .iter()
+                .map(|name| {
+                    let caps = self
+                        .registry
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, c)| *c)
+                        .unwrap_or_else(optimistic_caps);
+                    (name.clone(), caps)
+                })
+                .collect()
+        };
+        let capable = filter_candidates(&pool, &task.required_capabilities);
+        if capable.is_empty() {
+            return Err(ForgeError::router(format!(
+                "no candidate satisfies the required capabilities ({:?})",
+                task.required_capabilities
+            )));
+        }
+        let cost_of = |name: &str| self.costs.get(name).copied().unwrap_or((0.0, 0.0));
+        let mut ranked = capable;
+        ranked.sort_by(|a, b| {
+            cost_of(a)
+                .0
+                .total_cmp(&cost_of(b).0)
+                .then_with(|| cost_of(a).1.total_cmp(&cost_of(b).1))
+                .then_with(|| a.cmp(b))
+        });
+        let selected = ranked[0].clone();
+        let n = ranked.len();
+        let (input, _output) = cost_of(&selected);
+        Ok(RoutingDecision {
+            selected_model: selected.clone(),
+            confidence: 1.0,
+            router_name: "cheapest".to_string(),
+            fallback_used: false,
+            reason: format!("cheapest of {n} capable candidates (${input}/1M in)"),
+        })
+    }
+}
+
+fn optimistic_caps() -> ModelCapabilities {
+    ModelCapabilities {
+        streaming: true,
+        tools: true,
+        structured_output: true,
+        vision: true,
+        max_context: usize::MAX,
+    }
+}
+
+/// Laya router: System One-compatible HTTP router specialized for Laya's
+/// typed-questions shape. POSTs
+/// `{"state": {"task", "required_capabilities"}, "questions": {"model":
+/// {"type": "choice", "instructions": ..., "criteria": {name: description}}}}`
+/// and expects `{"answers": {"model": {"choice", "confidence"}}}`.
+pub struct LayaRouter {
+    client: reqwest::Client,
+    url: String,
+    key_env: Option<String>,
+    /// Candidate name → routing criteria text (from `[models]` entries).
+    criteria: std::collections::HashMap<String, String>,
+}
+
+impl LayaRouter {
+    pub const DEFAULT_URL: &'static str = "http://127.0.0.1:8788/decide";
+
+    pub fn new(
+        url: Option<String>,
+        key_env: Option<String>,
+        timeout: Duration,
+        criteria: std::collections::HashMap<String, String>,
+    ) -> Result<Self, ForgeError> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| ForgeError::router(format!("building HTTP client: {e}")))?;
+        Ok(Self {
+            client,
+            url: url.unwrap_or_else(|| Self::DEFAULT_URL.to_string()),
+            key_env,
+            criteria,
+        })
+    }
+}
+
+#[async_trait]
+impl DecisionRouter for LayaRouter {
+    async fn route(&self, task: &RoutingRequest) -> Result<RoutingDecision, ForgeError> {
+        let candidates: Vec<&String> = if task.candidates.is_empty() {
+            self.criteria.keys().collect()
+        } else {
+            task.candidates.iter().collect()
+        };
+        let criteria: serde_json::Map<String, serde_json::Value> = candidates
+            .iter()
+            .map(|name| {
+                let desc = self
+                    .criteria
+                    .get(*name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("model {name}"));
+                (name.to_string(), serde_json::Value::String(desc))
+            })
+            .collect();
+        let body = serde_json::json!({
+            "state": {
+                "task": task.task,
+                "required_capabilities": task.required_capabilities,
+            },
+            "questions": {
+                "model": {
+                    "type": "choice",
+                    "instructions": "Which model should handle this software task?",
+                    "criteria": criteria,
+                }
+            }
+        });
+
+        let mut http = self.client.post(&self.url).json(&body);
+        if let Some(env_name) = &self.key_env
+            && let Ok(key) = std::env::var(env_name)
+            && !key.is_empty()
+        {
+            http = http.bearer_auth(key);
+        }
+        let response = http.send().await.map_err(|e| {
+            if e.is_timeout() {
+                ForgeError::router(format!("laya router request to {} timed out", self.url))
+            } else {
+                ForgeError::router(format!("laya router request to {} failed: {e}", self.url))
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ForgeError::router(format!(
+                "laya router endpoint {} returned {status}",
+                self.url
+            )));
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| ForgeError::router(format!("invalid laya router response: {e}")))?;
+        let choice = body
+            .pointer("/answers/model/choice")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ForgeError::router("laya response missing answers.model.choice"))?;
+        if !candidates.iter().any(|c| c.as_str() == choice) {
+            return Err(ForgeError::router(format!(
+                "laya answered unknown model {choice:?} (not among candidates)"
+            )));
+        }
+        let confidence = body
+            .pointer("/answers/model/confidence")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        Ok(RoutingDecision {
+            selected_model: choice.to_string(),
+            confidence,
+            router_name: "laya".to_string(),
+            fallback_used: false,
+            reason: format!("laya choice (confidence {confidence:.2})"),
+        })
+    }
+}
+
+/// Confidence gate: decisions below the threshold become router failures
+/// so the fallback chain takes over (the error message records the low
+/// confidence for the fallback reason).
+pub struct ThresholdRouter {
+    inner: Arc<dyn DecisionRouter>,
+    threshold: f64,
+}
+
+impl ThresholdRouter {
+    pub fn new(inner: Arc<dyn DecisionRouter>, threshold: f64) -> Self {
+        Self { inner, threshold }
+    }
+}
+
+#[async_trait]
+impl DecisionRouter for ThresholdRouter {
+    async fn route(&self, task: &RoutingRequest) -> Result<RoutingDecision, ForgeError> {
+        let decision = self.inner.route(task).await?;
+        if decision.confidence < self.threshold {
+            return Err(ForgeError::router(format!(
+                "confidence {:.2} below threshold {:.2}",
+                decision.confidence, self.threshold
+            )));
+        }
+        Ok(decision)
+    }
+}
+
+/// Build a router by name. `static`, `mock`, `cheapest` are local;
+/// `http`/`laya` are HTTP. Laya defaults to `127.0.0.1:8788` when
+/// `router_url` is unset.
+fn build_router(
+    name: &str,
     config: &Config,
     registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
-    let static_fallback = || {
-        Arc::new(StaticRouter::new(config.model.clone()).with_registry(registry.to_vec()))
-            as Arc<dyn DecisionRouter>
-    };
-
-    match config.router.as_str() {
-        "static" => Ok(static_fallback()),
-        "mock" => {
-            let mock = Arc::new(MockRouter::selecting(config.model.clone()));
-            Ok(Arc::new(FallbackRouter::new(mock, static_fallback())))
+    match name {
+        "static" => Ok(Arc::new(
+            StaticRouter::new(config.model.clone()).with_registry(registry.to_vec()),
+        )),
+        "mock" => Ok(Arc::new(MockRouter::selecting(config.model.clone()))),
+        "cheapest" => {
+            let costs = config
+                .model_entries()
+                .iter()
+                .map(|(name, entry)| (name.clone(), entry.costs()))
+                .collect();
+            Ok(Arc::new(CheapestRouter::new(costs, registry.to_vec())))
         }
         "http" => {
             let url = config.router_url.as_deref().ok_or_else(|| {
                 ForgeError::router("router = \"http\" requires router_url to be configured")
             })?;
-            let http = Arc::new(HttpRouter::new(
+            Ok(Arc::new(HttpRouter::new(
                 url,
                 config.router_key_env.clone(),
                 Duration::from_millis(config.router_timeout_ms),
-            )?);
-            Ok(Arc::new(FallbackRouter::new(http, static_fallback())))
+            )?))
+        }
+        "laya" => {
+            let criteria = config
+                .model_entries()
+                .iter()
+                .map(|(name, entry)| {
+                    (
+                        name.clone(),
+                        entry
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| format!("model {name}")),
+                    )
+                })
+                .collect();
+            Ok(Arc::new(LayaRouter::new(
+                config.router_url.clone(),
+                config.router_key_env.clone(),
+                Duration::from_millis(config.router_timeout_ms),
+                criteria,
+            )?))
         }
         other => Err(ForgeError::router(format!(
-            "unknown router {other:?} (expected static, mock, or http)"
+            "unknown router {other:?} (expected static, mock, cheapest, http, or laya)"
         ))),
     }
+}
+
+/// Build the decision router from configuration: `static`, `mock`,
+/// `cheapest`, `http`, or `laya`. HTTP-class routers are gated by
+/// `router_confidence_threshold`; when the primary differs from
+/// `router_fallback` it is wrapped in a `FallbackRouter` so failures and
+/// low-confidence decisions degrade to the fallback instead of failing
+/// the run.
+pub fn router_from_config(
+    config: &Config,
+    registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    let mut primary = build_router(&config.router, config, registry)?;
+    if matches!(config.router.as_str(), "http" | "laya") {
+        primary = Arc::new(ThresholdRouter::new(
+            primary,
+            config.router_confidence_threshold,
+        ));
+    }
+    if config.router == config.router_fallback {
+        return Ok(primary);
+    }
+    let fallback = build_router(&config.router_fallback, config, registry)?;
+    Ok(Arc::new(FallbackRouter::new(primary, fallback)))
 }
 
 #[cfg(test)]
@@ -380,7 +647,6 @@ mod tests {
         ];
         let filtered = filter_candidates(&candidates, &[Capability::Tools]);
         assert_eq!(filtered, vec!["strong".to_string()]);
-        // No requirements: everything passes.
         assert_eq!(filter_candidates(&candidates, &[]).len(), 2);
     }
 
@@ -575,11 +841,10 @@ mod tests {
             router: "http".to_string(),
             ..Config::default()
         };
-        let err = match router_from_config(&config, &[]) {
-            Err(e) => e,
+        match router_from_config(&config, &[]) {
+            Err(e) => assert!(matches!(e, ForgeError::Router(_)), "got: {e:?}"),
             Ok(_) => panic!("must fail"),
-        };
-        assert!(matches!(err, ForgeError::Router(_)));
+        }
     }
 
     #[test]
@@ -589,5 +854,274 @@ mod tests {
             ..Config::default()
         };
         assert!(router_from_config(&config, &[]).is_err());
+    }
+
+    // --- cheapest ---
+
+    fn cheapest(costs: &[(&str, f64, f64)]) -> CheapestRouter {
+        CheapestRouter::new(
+            costs
+                .iter()
+                .map(|(n, i, o)| (n.to_string(), (*i, *o)))
+                .collect(),
+            vec![],
+        )
+    }
+
+    #[tokio::test]
+    async fn cheapest_picks_lowest_input_cost() {
+        let router = cheapest(&[("pricey-b", 5.0, 10.0), ("cheap-a", 0.1, 0.2)]);
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["pricey-b".to_string(), "cheap-a".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "cheap-a");
+        assert_eq!(decision.confidence, 1.0);
+        assert_eq!(decision.router_name, "cheapest");
+        assert!(
+            decision
+                .reason
+                .contains("cheapest of 2 capable candidates ($0.1/1M in)"),
+            "reason: {}",
+            decision.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn cheapest_tie_breaks_by_output_cost_then_name() {
+        // Same input cost: lowest output cost wins ("a" beats "b").
+        let router = cheapest(&[("b", 1.0, 3.0), ("a", 1.0, 2.0), ("c", 1.0, 2.0)]);
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["b".to_string(), "a".to_string(), "c".to_string()],
+        };
+        let d1 = router.route(&request).await.expect("routes");
+        assert_eq!(d1.selected_model, "a");
+
+        // Full tie (input + output): name ascending wins.
+        let router2 = cheapest(&[("c", 1.0, 2.0), ("a", 1.0, 2.0)]);
+        let request2 = RoutingRequest {
+            candidates: vec!["c".to_string(), "a".to_string()],
+            ..request
+        };
+        let d2 = router2.route(&request2).await.expect("routes");
+        assert_eq!(d2.selected_model, "a");
+    }
+
+    #[tokio::test]
+    async fn cheapest_filters_by_capability() {
+        let router = CheapestRouter::new(
+            [
+                ("cheap".to_string(), (0.1, 0.1)),
+                ("strong".to_string(), (9.0, 9.0)),
+            ]
+            .into_iter()
+            .collect(),
+            vec![
+                ("cheap".to_string(), caps(false)),
+                ("strong".to_string(), caps(true)),
+            ],
+        );
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![Capability::Tools],
+            candidates: vec!["cheap".to_string(), "strong".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "strong");
+    }
+
+    #[tokio::test]
+    async fn cheapest_errors_when_nothing_capable() {
+        let router = CheapestRouter::new(
+            [("cheap".to_string(), (0.1, 0.1))].into_iter().collect(),
+            vec![("cheap".to_string(), caps(false))],
+        );
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![Capability::Tools],
+            candidates: vec!["cheap".to_string()],
+        };
+        assert!(matches!(
+            router.route(&request).await,
+            Err(ForgeError::Router(_))
+        ));
+    }
+
+    // --- threshold ---
+
+    #[tokio::test]
+    async fn threshold_router_escalates_low_confidence() {
+        let inner: Arc<dyn DecisionRouter> = Arc::new(MockRouter::new(RoutingDecision {
+            selected_model: "some-model".to_string(),
+            confidence: 0.3,
+            router_name: "mock".to_string(),
+            fallback_used: false,
+            reason: "meh".to_string(),
+        }));
+        let router = ThresholdRouter::new(inner, 0.7);
+        let err = router
+            .route(&RoutingRequest::new("x"))
+            .await
+            .expect_err("below threshold");
+        match err {
+            ForgeError::Router(msg) => {
+                assert!(msg.contains("0.30"), "got: {msg}");
+                assert!(msg.contains("threshold"), "got: {msg}");
+            }
+            other => panic!("expected router error, got {other:?}"),
+        }
+
+        let ok_inner: Arc<dyn DecisionRouter> = Arc::new(MockRouter::new(RoutingDecision {
+            selected_model: "some-model".to_string(),
+            confidence: 0.9,
+            router_name: "mock".to_string(),
+            fallback_used: false,
+            reason: "good".to_string(),
+        }));
+        let router = ThresholdRouter::new(ok_inner, 0.7);
+        assert!(router.route(&RoutingRequest::new("x")).await.is_ok());
+    }
+
+    // --- laya ---
+
+    fn laya_body(choice: &str, confidence: f64) -> serde_json::Value {
+        serde_json::json!({
+            "answers": { "model": { "choice": choice, "confidence": confidence } },
+            "routing": {}
+        })
+    }
+
+    #[tokio::test]
+    async fn laya_router_maps_typed_answer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/decide"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(laya_body("cheap-a", 0.95)))
+            .mount(&server)
+            .await;
+
+        let criteria = [
+            ("cheap-a".to_string(), "cheap general model".to_string()),
+            ("pricey-b".to_string(), "expensive strong model".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let router = LayaRouter::new(
+            Some(format!("{}/decide", server.uri())),
+            None,
+            Duration::from_secs(5),
+            criteria,
+        )
+        .expect("construct");
+
+        let request = RoutingRequest {
+            task: "fix the bug".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["cheap-a".to_string(), "pricey-b".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "cheap-a");
+        assert!((decision.confidence - 0.95).abs() < f64::EPSILON);
+        assert_eq!(decision.router_name, "laya");
+
+        // The request body used the typed-questions contract.
+        let received = server.received_requests().await.expect("requests");
+        let body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("request json");
+        assert_eq!(body["state"]["task"], "fix the bug");
+        assert_eq!(body["questions"]["model"]["type"], "choice");
+        assert_eq!(
+            body["questions"]["model"]["criteria"]["cheap-a"],
+            "cheap general model"
+        );
+    }
+
+    #[tokio::test]
+    async fn laya_router_rejects_unknown_choice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(laya_body("ghost", 0.9)))
+            .mount(&server)
+            .await;
+
+        let router = LayaRouter::new(
+            Some(server.uri()),
+            None,
+            Duration::from_secs(5),
+            std::collections::HashMap::new(),
+        )
+        .expect("construct");
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["cheap-a".to_string()],
+        };
+        let err = router.route(&request).await.expect_err("unknown choice");
+        match err {
+            ForgeError::Router(msg) => assert!(msg.contains("ghost"), "got: {msg}"),
+            other => panic!("expected router error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn laya_unavailable_falls_back_via_config_chain() {
+        let mut config = Config {
+            router: "laya".to_string(),
+            router_url: Some("http://127.0.0.1:9/decide".to_string()),
+            router_timeout_ms: 200,
+            router_fallback: "static".to_string(),
+            model: "local-coder".to_string(),
+            ..Config::default()
+        };
+        config.models.insert(
+            "local-coder".to_string(),
+            forge_config::ModelEntry {
+                description: Some("local coder model".to_string()),
+                ..Default::default()
+            },
+        );
+        let router = router_from_config(&config, &[]).expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("offline task"))
+            .await
+            .expect("fallback routes");
+        assert_eq!(decision.selected_model, "local-coder");
+        assert!(decision.fallback_used);
+    }
+
+    #[tokio::test]
+    async fn laya_low_confidence_escalates_to_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(laya_body("cheap-a", 0.3)))
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            router: "laya".to_string(),
+            router_url: Some(server.uri()),
+            router_confidence_threshold: 0.7,
+            router_fallback: "static".to_string(),
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("builds");
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["cheap-a".to_string(), "mock-local".to_string()],
+        };
+        let decision = router.route(&request).await.expect("fallback routes");
+        assert_eq!(decision.selected_model, "mock-local");
+        assert!(decision.fallback_used);
+        assert!(
+            decision.reason.contains("confidence"),
+            "{}",
+            decision.reason
+        );
     }
 }

@@ -111,13 +111,64 @@ These are the three pluggable seams (traits in `forge-core`):
   server (oMLX and friends) via `model_base_url`. Capabilities (streaming, tools,
   structured output, vision, context size) are explicit per provider, never assumed.
 - **DecisionRouter** — chooses the model per task and records the decision with a
-  confidence score. `static` (deterministic rules), `mock`, or `http`
-  (System One-compatible: POST `{task, candidates, required_capabilities}` to
-  `router_url`, bearer token from `router_key_env`). Any non-static router is
-  wrapped in a fallback router: if the configured router is unreachable or times
-  out, static routing takes over and the decision is marked `fallback_used`.
-  TypeSafe Jev / Kev services work through the `http` backend — nothing is
-  hard-coded.
+  confidence score. Five modes:
+  - `static` (deterministic rules; default),
+  - `mock` (preset decision, for tests),
+  - `cheapest` (lowest-cost candidate from the `[models]` cost table;
+    tie-breaks by output cost then name),
+  - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
+    to `router_url`, bearer token from `router_key_env`),
+  - `laya` (Laya typed-questions shape; defaults to
+    `http://127.0.0.1:8788/decide`, the reference adapter below).
+
+  `http`/`laya` decisions below `router_confidence_threshold` (default 0.7) are
+  rejected and escalate through the fallback chain: any router is wrapped in a
+  fallback (`router_fallback`, default `static`, may be `cheapest`), so an
+  unreachable, timing-out, or unconfident router degrades to deterministic
+  routing with `fallback_used: true`. TypeSafe Jev / Kev services work through
+  the `http` backend — nothing is hard-coded.
+
+### Model registry with costs
+
+```toml
+# .forge/config.toml
+router = "cheapest"           # or "laya"
+router_fallback = "cheapest"  # used when the primary fails / is unconfident
+
+[models.mock-fast]
+description = "fast local mock for trivial tasks"
+cost_input_per_mtok = 0.0
+
+[models.deepseek-coder]
+description = "strong coding model"
+base_url = "http://127.0.0.1:8080"   # oMLX / OpenAI-compatible endpoint
+key_env = "DEEPSEEK_API_KEY"          # env var holding the API key
+cost_input_per_mtok = 0.14
+cost_output_per_mtok = 0.28
+tools = true                          # capability overrides are explicit
+```
+
+The `[models]` table deep-merges by name across user/project config files
+(env/CLI flags don't set entries). The runtime builds routing candidates from
+it, and when the router selects a model with a `base_url`, Forge constructs the
+OpenAI-compatible provider for it automatically. `forge model list` shows the
+cost table.
+
+### Laya via the reference adapter
+
+Laya (open-source System One decision model) is a Python SDK with no official
+server. `adapters/laya-http.py` is a small stdlib-only bridge:
+
+```bash
+pip install laya
+python3 adapters/laya-http.py 8788   # listens on 127.0.0.1:8788
+```
+
+then set `router = "laya"` (and optionally `router_url`). Forge POSTs
+`{"state": {"task", "required_capabilities"}, "questions": {"model": {"type":
+"choice", "instructions": ..., "criteria": {name: description}}}}` and expects
+`{"answers": {"model": {"choice", "confidence"}}}`. The adapter is optional;
+Forge never requires Python.
 - **ExecutionProvider** — all command/script execution AND file
   reads/writes/edits/deletes go through this trait (the runtime never spawns
   processes or touches files directly). Risk classification: reads are `Safe`,

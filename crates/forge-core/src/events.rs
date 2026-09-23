@@ -69,6 +69,9 @@ pub enum EventKind {
         selected_model: String,
         confidence: f64,
         fallback_used: bool,
+        /// Why this model was selected ("" for older logs).
+        #[serde(default)]
+        reason: String,
     },
     SkillActivated {
         name: String,
@@ -147,6 +150,7 @@ mod tests {
                 selected_model: "mock-local".into(),
                 confidence: 1.0,
                 fallback_used: false,
+                reason: "test".into(),
             },
         );
         let value = serde_json::to_value(&event).expect("serialize");

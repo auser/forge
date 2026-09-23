@@ -37,6 +37,8 @@ pub struct BddWorld {
     pub base_url: String,
     /// Wiremock server standing in for a System One-compatible router.
     pub router_mock: Option<wiremock::MockServer>,
+    /// Wiremock server standing in for an OpenAI-compatible model endpoint.
+    pub chat_mock: Option<wiremock::MockServer>,
     // Server scenario state.
     pub health_status: u16,
     pub health_body: String,
@@ -49,6 +51,8 @@ pub struct BddWorld {
     /// Pending `.forge/config.toml` lines, flushed before the next
     /// command or server start (lets several Given steps each set keys).
     pub config_lines: Vec<String>,
+    /// Pending `[table]` config blocks (e.g. `[models.x]`).
+    pub config_blocks: Vec<String>,
 }
 
 impl BddWorld {
@@ -68,6 +72,7 @@ impl BddWorld {
     /// Run the compiled forge binary against the scenario project with a
     /// hermetic environment.
     pub async fn run_forge(&mut self, args: &[&str]) {
+        self.flush_config();
         let root = self.project();
         let home = root.join("home");
         let xdg = root.join("xdg");
@@ -151,11 +156,24 @@ impl BddWorld {
         self.config_lines.push(format!("{prefix} {value}"));
     }
 
+    /// Append a `[table ...]` block (replaces a block with the same
+    /// header line).
+    pub fn add_config_block(&mut self, block: String) {
+        let header = block.lines().next().expect("block header").to_string();
+        self.config_blocks.retain(|b| !b.starts_with(&header));
+        self.config_blocks.push(block);
+    }
+
     pub fn flush_config(&mut self) {
-        if self.config_lines.is_empty() {
+        if self.config_lines.is_empty() && self.config_blocks.is_empty() {
             return;
         }
-        let content = self.config_lines.join("\n") + "\n";
+        let mut content = self.config_lines.join("\n");
+        if !self.config_blocks.is_empty() {
+            content.push('\n');
+            content.push_str(&self.config_blocks.join("\n\n"));
+        }
+        content.push('\n');
         self.write_file(".forge/config.toml", &content);
     }
 

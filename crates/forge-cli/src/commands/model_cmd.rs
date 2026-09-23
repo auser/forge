@@ -35,16 +35,25 @@ fn list(ctx: &Context) -> Result<(), ForgeError> {
     let caps = active.capabilities();
 
     if ctx.global.json {
-        let out = serde_json::json!({
-            "models": [{
-                "name": active.name(),
-                "active": true,
-                "capabilities": caps,
-            }],
-        });
+        let mut models = vec![serde_json::json!({
+            "name": active.name(),
+            "active": true,
+            "capabilities": caps,
+        })];
+        for (name, entry) in resolved.config.model_entries() {
+            models.push(serde_json::json!({
+                "name": name,
+                "active": false,
+                "description": entry.description,
+                "cost_input_per_mtok": entry.cost_input_per_mtok,
+                "cost_output_per_mtok": entry.cost_output_per_mtok,
+                "base_url": entry.base_url,
+                "capabilities": entry.capabilities_if_known(),
+            }));
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&out)
+            serde_json::to_string_pretty(&serde_json::json!({ "models": models }))
                 .map_err(|e| ForgeError::provider(format!("serializing models: {e}")))?
         );
     } else {
@@ -59,6 +68,20 @@ fn list(ctx: &Context) -> Result<(), ForgeError> {
         );
         if resolved.config.model != "mock-local" && resolved.config.model != "mock" {
             println!("mock-local (built-in, available offline)");
+        }
+        for (name, entry) in resolved.config.model_entries() {
+            let desc = entry.description.as_deref().unwrap_or("");
+            println!(
+                "{name} — cost_in=${}/1M cost_out=${}/1M {} {}",
+                entry.cost_input_per_mtok,
+                entry.cost_output_per_mtok,
+                entry
+                    .base_url
+                    .as_deref()
+                    .map(|u| format!("base_url={u}"))
+                    .unwrap_or_default(),
+                desc
+            );
         }
     }
     Ok(())

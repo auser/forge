@@ -18,7 +18,7 @@ struct Check {
 
 /// Environment and configuration health report. Exits non-zero (via
 /// `ForgeError`) only when something is actually broken.
-pub fn run(ctx: &Context) -> Result<(), ForgeError> {
+pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
     let mut checks: Vec<Check> = Vec::new();
 
     let root = ctx.project_root()?;
@@ -148,6 +148,38 @@ pub fn run(ctx: &Context) -> Result<(), ForgeError> {
             label: "decision router".into(),
             detail: format!("{} ({})", config.router, router_note(&config.router)),
         });
+
+        // Reachability of http/laya routers (warn, never fail).
+        if matches!(config.router.as_str(), "http" | "laya") {
+            let url = config
+                .router_url
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:8788/decide".to_string());
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(1_500))
+                .build()
+                .ok();
+            let check = match client {
+                Some(client) => match client.get(&url).send().await {
+                    Ok(_) => Some(format!("{url} is reachable")),
+                    Err(e) if e.is_connect() || e.is_timeout() => None,
+                    Err(_) => Some(format!("{url} responded")),
+                },
+                None => None,
+            };
+            checks.push(match check {
+                Some(detail) => Check {
+                    level: Level::Ok,
+                    label: "router endpoint".into(),
+                    detail,
+                },
+                None => Check {
+                    level: Level::Warn,
+                    label: "router endpoint".into(),
+                    detail: format!("{url} unreachable; fallback routing will apply"),
+                },
+            });
+        }
         checks.push(Check {
             level: Level::Ok,
             label: "execution provider".into(),
@@ -246,7 +278,9 @@ fn router_note(router: &str) -> &'static str {
     match router {
         "static" => "deterministic rules, available offline",
         "mock" => "deterministic mock, available offline",
+        "cheapest" => "lowest-cost capable candidate, available offline",
         "http" => "System One-compatible HTTP router (uses router_url)",
+        "laya" => "Laya typed-questions router (uses router_url, default 127.0.0.1:8788)",
         _ => "unrecognized router name",
     }
 }

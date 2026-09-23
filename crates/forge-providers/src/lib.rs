@@ -7,6 +7,7 @@ mod scripted;
 
 pub use model::{MockModel, OpenAiCompatibleModel, model_from_config};
 pub use router::{
-    FallbackRouter, HttpRouter, MockRouter, StaticRouter, filter_candidates, router_from_config,
+    CheapestRouter, FallbackRouter, HttpRouter, LayaRouter, MockRouter, StaticRouter,
+    ThresholdRouter, filter_candidates, router_from_config,
 };
 pub use scripted::{ScriptedMockModel, ScriptedReply, scripted_mock_from_path};
