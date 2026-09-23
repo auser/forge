@@ -16,6 +16,8 @@ built-in mock providers.
 
 ## Quickstart
 
+Zero setup, fully offline (mock model, static router, native execution):
+
 ```bash
 cargo build --release          # or: just release
 cd /path/to/your/project
@@ -26,8 +28,70 @@ forge serve                    # REST/SSE on http://127.0.0.1:7341
 curl http://127.0.0.1:7341/health
 ```
 
-Out of the box Forge uses the built-in mock model, static router, and native execution,
-so every command above works with no accounts, keys, or network.
+With a real model (any OpenAI-compatible server, e.g. oMLX):
+
+```toml
+# .forge/config.toml
+model = "my-coder"
+model_base_url = "http://127.0.0.1:8080"
+model_key_env = "MY_API_KEY"   # name of the env var, never the key itself
+```
+
+With cost-aware routing (see [Model registry with costs](#model-registry-with-costs)):
+
+```toml
+# .forge/config.toml
+router = "cheapest"            # or "laya" with the reference adapter running
+
+[models.local-small]
+description = "fast local model for simple edits"
+cost_input_per_mtok = 0.0
+
+[models.frontier]
+description = "strong frontier model for hard tasks"
+base_url = "https://api.example.com"
+key_env = "FRONTIER_API_KEY"
+cost_input_per_mtok = 3.0
+cost_output_per_mtok = 15.0
+```
+
+## Usage
+
+Run the agent loop (multi-turn, tool-using when the model supports it):
+
+```bash
+forge run "add a hello function to main.rs"   # edits files via tools
+forge run --max-turns 10 "refactor the parser"
+forge run --json "summarize this repo" | jq .text
+```
+
+Approval, when a tool call needs it (`approval = "prompt"`):
+
+```bash
+forge run "clean up build artifacts"     # interactive y/N on a terminal
+echo y | forge run "delete old logs"     # non-interactive: pipe answers
+```
+
+Interrupt and continue:
+
+```bash
+forge cancel <run-id>        # works from another terminal while a run is live
+forge resume <run-id>        # continues the completed run in its session
+forge session list           # what happened, per session
+forge session show <id>      # full event history (JSONL, one event per line)
+```
+
+Drive it over HTTP:
+
+```bash
+forge serve &
+curl -s -X POST http://127.0.0.1:7341/v1/runs \
+  -H 'content-type: application/json' -d '{"prompt": "explain this project"}'
+curl -s http://127.0.0.1:7341/v1/runs/<run-id>          # status + events
+curl -N http://127.0.0.1:7341/v1/runs/<run-id>/events   # live SSE stream
+curl -s -X POST http://127.0.0.1:7341/v1/runs/<run-id>/input \
+  -H 'content-type: application/json' -d '{"input": "y"}'   # approve a pause
+```
 
 ## Command line
 
@@ -53,7 +117,7 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
---router <r>          override the router (static|mock|http)
+--router <r>          override the router (static|mock|cheapest|http|laya)
 --execution <p>       override the execution provider (native|mock)
 --local-only          restrict to local providers
 --approval <mode>     auto | prompt | prompt-dangerous | deny
@@ -84,10 +148,12 @@ Key settings (all optional):
 | `mock_script` | — | `FORGE_MOCK_SCRIPT` | JSON script path for `scripted-mock` (project-relative) |
 | `model_base_url` | — | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `static` | `FORGE_ROUTER` | `static` \| `mock` \| `http` |
-| `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint |
+| `router` | `static` | `FORGE_ROUTER` | `static` \| `mock` \| `cheapest` \| `http` \| `laya` |
+| `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key |
 | `router_timeout_ms` | `5000` | — | HTTP router timeout |
+| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya decisions escalate to the fallback |
+| `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` \| `mock` |
 | `approval` | `prompt` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny` |
 | `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers |
@@ -105,28 +171,36 @@ forge config explain model   # winning value + source, e.g. model = "cli-model" 
 
 ## Models, routing, execution
 
-These are the three pluggable seams (traits in `forge-core`):
+These are the three pluggable seams (traits in `forge-core`).
 
-- **ModelProvider** — `mock` (offline, deterministic) or any OpenAI-compatible
-  server (oMLX and friends) via `model_base_url`. Capabilities (streaming, tools,
-  structured output, vision, context size) are explicit per provider, never assumed.
-- **DecisionRouter** — chooses the model per task and records the decision with a
-  confidence score. Five modes:
-  - `static` (deterministic rules; default),
-  - `mock` (preset decision, for tests),
-  - `cheapest` (lowest-cost candidate from the `[models]` cost table;
-    tie-breaks by output cost then name),
-  - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
-    to `router_url`, bearer token from `router_key_env`),
-  - `laya` (Laya typed-questions shape; defaults to
-    `http://127.0.0.1:8788/decide`, the reference adapter below).
+### ModelProvider
 
-  `http`/`laya` decisions below `router_confidence_threshold` (default 0.7) are
-  rejected and escalate through the fallback chain: any router is wrapped in a
-  fallback (`router_fallback`, default `static`, may be `cheapest`), so an
-  unreachable, timing-out, or unconfident router degrades to deterministic
-  routing with `fallback_used: true`. TypeSafe Jev / Kev services work through
-  the `http` backend — nothing is hard-coded.
+`mock` (offline, deterministic), `scripted-mock` (JSON-scripted replies incl.
+tool calls, for tests/demos), or any OpenAI-compatible server (oMLX and friends)
+via `model_base_url`. Capabilities (streaming, tools, structured output, vision,
+context size) are explicit per provider, never assumed; a provider without
+`tools` receives single-turn requests only.
+
+### DecisionRouter
+
+Chooses the model per task and records the decision with a confidence score.
+Five modes:
+
+- `static` (deterministic rules; default),
+- `mock` (preset decision, for tests),
+- `cheapest` (lowest-cost candidate from the `[models]` cost table;
+  tie-breaks by output cost then name),
+- `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
+  to `router_url`, bearer token from `router_key_env`),
+- `laya` (Laya typed-questions shape; defaults to
+  `http://127.0.0.1:8788/decide`, the reference adapter below).
+
+`http`/`laya` decisions below `router_confidence_threshold` (default 0.7) are
+rejected and escalate through the fallback chain: any router is wrapped in a
+fallback (`router_fallback`, default `static`, may be `cheapest`), so an
+unreachable, timing-out, or unconfident router degrades to deterministic
+routing with `fallback_used: true`. TypeSafe Jev / Kev services work through
+the `http` backend — nothing is hard-coded.
 
 ### Model registry with costs
 
@@ -169,17 +243,19 @@ then set `router = "laya"` (and optionally `router_url`). Forge POSTs
 "choice", "instructions": ..., "criteria": {name: description}}}}` and expects
 `{"answers": {"model": {"choice", "confidence"}}}`. The adapter is optional;
 Forge never requires Python.
-- **ExecutionProvider** — all command/script execution AND file
-  reads/writes/edits/deletes go through this trait (the runtime never spawns
-  processes or touches files directly). Risk classification: reads are `Safe`,
-  in-project writes/edits are `Risky`, deletes and out-of-project paths are
-  `Destructive`. `native` runs locally with approval gating: `Risky` operations
-  pause for approval under `approval = "prompt"`, while `prompt-dangerous` asks
-  only for `Destructive` ones (non-interactive stdin → typed "approval required"
-  error, which the agent loop treats as a pause: answer via piped stdin lines,
-  e.g. `echo y | forge run ...`). `auto` runs, `deny` blocks. `mock` records
-  requests for tests. MVM/container/remote executors plug into the same trait
-  later.
+
+### ExecutionProvider
+
+All command/script execution AND file reads/writes/edits/deletes go through
+this trait (the runtime never spawns processes or touches files directly).
+Risk classification: reads are `Safe`, in-project writes/edits are `Risky`,
+deletes and out-of-project paths are `Destructive`. `native` runs locally with
+approval gating: `Risky` operations pause for approval under
+`approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
+ones (non-interactive stdin → typed "approval required" error, which the agent
+loop treats as a pause: answer via piped stdin lines, e.g.
+`echo y | forge run ...`). `auto` runs, `deny` blocks. `mock` records requests
+for tests. MVM/container/remote executors plug into the same trait later.
 
 ## Skills
 
@@ -292,7 +368,8 @@ crates/
   forge-core        traits, event protocol, typed errors (no heavy deps)
   forge-config      config loading, precedence, provenance
   forge-execution   native + mock execution providers
-  forge-providers   mock + OpenAI-compatible models; static/mock/HTTP routers
+  forge-providers   mock/scripted + OpenAI-compatible models; static, mock,
+                    cheapest, HTTP, and Laya routers
   forge-session     append-only JSONL store + secret redaction
   forge-skills      SKILL.md discovery, progressive disclosure
   forge-graph       deterministic incremental project graph
@@ -313,7 +390,7 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 16 features / 24 scenarios / 93 steps.
+  mock providers — fully offline. Currently 17 features / 28 scenarios / 108 steps.
 
 ## Known limitations (v0.3)
 
