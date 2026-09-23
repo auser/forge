@@ -264,11 +264,30 @@ pub async fn ensure_weights(needle: &NeedleConfig) -> Result<WeightsStatus, Forg
     };
 
     if path.is_file() {
-        if verify(&path, &expected_sha256)? {
-            return Ok(WeightsStatus::Present(path));
+        match verify(&path, &expected_sha256) {
+            Ok(true) => return Ok(WeightsStatus::Present(path)),
+            Ok(false) => {
+                // Truncated/corrupt bytes on disk: don't trust them,
+                // refetch below.
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => {
+                // Can't even read the existing file (permission denied,
+                // transient I/O, ...): this is exactly the kind of
+                // degradable condition ensure_weights promises never to
+                // hard-error on. Treat it the same as a checksum mismatch
+                // — drop it and fall through to fetch; if the path is
+                // genuinely unusable (e.g. a directory), the fetch below
+                // will fail too and that failure degrades to `Missing`
+                // through the normal retry path instead of propagating.
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not verify existing needle weights file, refetching"
+                );
+                let _ = std::fs::remove_file(&path);
+            }
         }
-        // Truncated/corrupt bytes on disk: don't trust them, refetch below.
-        let _ = std::fs::remove_file(&path);
     }
 
     match fetch_and_verify(&spec.url, &path, &expected_sha256).await {
@@ -353,6 +372,88 @@ mod tests {
         let good = hex_sha256(b"hello weights");
         assert!(verify(&path, &good).expect("verify"));
         assert!(!verify(&path, &"0".repeat(64)).expect("verify"));
+    }
+
+    #[test]
+    fn verify_returns_err_not_false_for_an_unreadable_path() {
+        // A directory can't be re-hashed as file bytes: `File::open`/read
+        // fails with something other than `NotFound`. `verify` must
+        // surface that as `Err`, not silently report `Ok(false)` (a
+        // checksum mismatch) — `ensure_weights` relies on being able to
+        // tell "doesn't match" apart from "couldn't even check" so it
+        // knows to degrade rather than trust a false negative.
+        let dir = tempfile::tempdir().expect("tmp");
+        let err = verify(dir.path(), &"0".repeat(64));
+        assert!(
+            err.is_err(),
+            "expected Err for a directory path, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn ensure_weights_refetches_instead_of_hard_erroring_when_existing_file_is_unreadable() {
+        // Regression test: ensure_weights's pre-existing-file branch used
+        // to do `if verify(&path, &expected_sha256)? { .. }`, which
+        // propagated any non-checksum-mismatch `Err` from `verify`
+        // (permission denied, transient I/O, ...) straight out of
+        // `ensure_weights` — bypassing the delete-and-refetch/Missing
+        // degradation every other verify-failure path takes. Simulate
+        // that with a real permission error (chmod 0) rather than a
+        // directory: `path.is_file()` is false for a directory, so that
+        // wouldn't reach the branch under test at all.
+        use std::os::unix::fs::PermissionsExt;
+
+        let server = wiremock::MockServer::start().await;
+        let body = b"refetched-after-unreadable-existing-file".to_vec();
+        let sha = hex_sha256(&body);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("w.bin");
+        std::fs::write(&path, b"pre-existing bytes").expect("seed existing file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+        if std::fs::File::open(&path).is_ok() {
+            // Running with privileges that bypass file permissions (e.g.
+            // root in some containers): chmod 0 doesn't reproduce the
+            // "can't read" condition this test targets. Skip rather than
+            // false-failing.
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+            return;
+        }
+
+        unsafe {
+            std::env::set_var(BASE_URL_ENV, server.uri());
+            std::env::set_var(TEST_SHA256_ENV, &sha);
+        }
+        let cfg = NeedleConfig {
+            variant: "full".to_string(),
+            weights_path: path.display().to_string(),
+            autofetch: true,
+            weights_sha256: String::new(),
+        };
+
+        let result = ensure_weights(&cfg).await;
+
+        // Restore permissions unconditionally before any assertion can
+        // panic, so tempdir cleanup and other tests are never affected.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        unsafe {
+            std::env::remove_var(BASE_URL_ENV);
+            std::env::remove_var(TEST_SHA256_ENV);
+        }
+
+        match result {
+            Ok(WeightsStatus::Fetched(_)) => {}
+            other => panic!(
+                "expected ensure_weights to degrade by refetching rather than hard-erroring, got {other:?}"
+            ),
+        }
     }
 
     #[test]
