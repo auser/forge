@@ -46,12 +46,14 @@ pub trait NeedleBackend: Send + 'static {
     ) -> Result<Option<NeedleToolCall>, BackendError>;
 }
 
-/// Default cache location for weights when `[needle].weights_path` is
-/// unset: `~/.cache/forge/models/needle3-<variant>.bin`. Mirrors the
-/// `std::env::home_dir()` fallback pattern `forge_config::Config` uses for
-/// `~/.config/forge/config.toml`. Task 6 replaces this with real
-/// variant-aware resolution; for now every caller resolves the "medium"
-/// path, matching `NeedleConfig::default().variant`.
+/// Generic fallback cache location, used only by `UnavailableBackend`'s
+/// `Default` impl (tests, and any caller without a resolved
+/// `NeedleConfig` to hand): `~/.cache/forge/models/needle3-medium.bin`.
+/// Mirrors the `std::env::home_dir()` fallback pattern `forge_config::Config`
+/// uses for `~/.config/forge/config.toml`. Real, variant-aware resolution
+/// (including the pinned filename and any `weights_path` override) lives in
+/// `crate::weights::weights_path` (Task 6); `engine_from_config` always
+/// resolves through that and passes the result to `UnavailableBackend::new`.
 pub(crate) fn default_weights_path() -> PathBuf {
     std::env::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -69,6 +71,14 @@ pub(crate) fn default_weights_path() -> PathBuf {
 /// `router = "needle"` a safe, honest default before real inference exists.
 pub struct UnavailableBackend {
     weights_path: PathBuf,
+}
+
+impl UnavailableBackend {
+    /// Build one that reports the real resolved weights path (from
+    /// `weights::weights_path`, Task 6) instead of the generic default.
+    pub fn new(weights_path: PathBuf) -> Self {
+        Self { weights_path }
+    }
 }
 
 impl Default for UnavailableBackend {

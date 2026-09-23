@@ -281,11 +281,35 @@ adds `router_name: "needle"` and confidence — no schema change.
 
 ## 8. Risks & open questions
 
-- **Licensing/redistribution of libneedle and weights is unverified**
-  (Cactus's site does not state terms). The
-  `NEEDLE_LIB_DIR`/vendored/download-at-build resolution order keeps
-  forge shippable under any outcome; verify before enabling the
-  `embed-weights` feature or vendoring binaries.
+- **Licensing/redistribution of weights: resolved, Apache-2.0** (verified
+  2026-09-23, Task 6). `Cactus-Compute/needle3` on Hugging Face carries
+  `cardData.license: apache-2.0` and ships a `LICENSE` file with the
+  standard Apache License 2.0 text — permissive, redistribution and
+  autofetch-from-origin are both fine. `libneedle` itself (the C
+  API/engine binaries under each platform folder in the same repo) is
+  covered by the same repo license; still worth a second look before
+  vendoring binaries into forge's own release artifacts, since forge
+  currently only fetches weights at runtime (autofetch), not the engine.
+  The `NEEDLE_LIB_DIR`/vendored/download-at-build resolution order still
+  keeps forge shippable under any outcome there.
+- **Artifact layout differs from the original plan: only one variant is
+  a downloadable file.** The design assumed three separately-hosted
+  weight variants (`small`/`medium`/`full`). In reality Cactus-Compute
+  publishes a single 20-layer file per release (`needle3.cact`, ~35 MB,
+  mapped to `needle.variant = "full"`); `small` and `medium` are produced
+  locally by slicing that file with the `needle build --layers N` CLI
+  (part of the `cactus-needle` Python package), not hosted separately.
+  `forge-needle`'s `weights::spec_for` therefore only pins `"full"` (SHA-256
+  verified independently with both `shasum -a 256` and Python's
+  `hashlib.sha256`); asking for `"small"` or `"medium"` returns a typed
+  error naming `"full"` as the available variant, and `ensure_weights`
+  degrades that to `WeightsStatus::Missing` (static routing continues) —
+  it never blocks `forge init` or the router. Since `medium` is
+  `NeedleConfig::default().variant`, **a fresh `forge init` with no
+  config overrides does not fetch anything today**; a project must set
+  `needle.variant = "full"` to get real weights. Either vendor a
+  small/medium cut later (once Cactus hosts one, or forge builds its own
+  via the CLI) or reconsider the default variant in a follow-up task.
 - **C API stability**: Needle 3 shipped 2026-09-18; pin an exact
   library + weights version, verify by checksum.
 - **Quality bar**: Needle's routing/guardrail accuracy on forge's

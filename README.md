@@ -67,7 +67,7 @@ Prereqs: an OpenAI-compatible server running `qwen3-coder` at
 
 ```bash
 cd /path/to/your/project
-forge init                     # creates .forge/, starter config, gitignore entry, builds graph
+forge init                     # creates .forge/, starter config, gitignore entry, builds graph, fetches Needle weights
 forge doctor                   # probes model + router endpoints, warns if down
 forge run "Explain this project"
 forge serve                    # REST/SSE on http://127.0.0.1:7341
@@ -80,10 +80,15 @@ No GPU, no accounts, just evaluating? The mock is one explicit flag away:
 forge --model mock-local --router static run "Explain this project"
 ```
 
-Needle's weights aren't fetched yet (that lands in a later phase): routing
-falls back to deterministic static routing (`fallback_used: true` in the
-events) and the run proceeds with the configured model — this is the expected,
-fully offline default today. To point at a different endpoint or use an API
+`forge init` fetches and verifies Needle's weights when `needle.autofetch`
+is on (the default) — a one-time download, typically 8-29 MB depending on
+`needle.variant`, cached under `~/.cache/forge/models/`; re-running `init`
+re-verifies the checksum and skips the download if it already matches.
+Whenever weights aren't present (no network, `--local-only`, or a variant
+with nothing to fetch yet — see below), routing falls back to deterministic
+static routing (`fallback_used: true` in the events) and the run proceeds
+with the configured model; this is a fully supported, fully offline mode,
+not a degraded one. To point at a different endpoint or use an API
 key, override per project:
 
 ```toml
@@ -238,9 +243,9 @@ Key settings (all optional):
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
 | `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
-| `needle.variant` | `medium` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small ≈ 8 MB / medium / full ≈ 29 MB) |
+| `needle.variant` | `medium` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small \| medium \| full); **only `full` has a downloadable artifact today** — Cactus-Compute publishes one 20-layer file, `needle build --layers N` slices smaller ones locally, so `small`/`medium` currently report "no pinned weights artifact" and fall back to static routing |
 | `needle.weights_path` | — | — | Weights override; empty → ~/.cache/forge/models/ |
-| `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights |
+| `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~34 MB for `full`) |
 
 Unknown keys are tolerated. Inspect the resolved configuration:
 
@@ -307,9 +312,12 @@ assumed; a provider without `tools` receives single-turn requests only.
 Chooses the model per task and records the decision with a confidence score.
 Six modes:
 
-- `needle` (embedded on-device Needle 3 decision model, no network calls;
-  **default**; falls back to static when weights are unavailable — the
-  current state, since weights resolution lands in a later phase),
+- `needle` (embedded on-device Needle 3 decision model, no network calls
+  once weights are on disk; **default**; `forge init` fetches/verifies
+  weights for `needle.variant = "full"`, the one variant Cactus-Compute
+  currently publishes as a standalone artifact; falls back to static when
+  weights are unavailable — unpinned variant, `--local-only`, no network,
+  or the FFI inference backend itself, which lands in a later phase),
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `static` (deterministic rules),

@@ -20,6 +20,7 @@ forge-config.workspace = true
 forge-core.workspace = true
 forge-execution.workspace = true
 forge-graph.workspace = true
+forge-needle.workspace = true
 forge-providers.workspace = true
 forge-runtime.workspace = true
 forge-server.workspace = true
