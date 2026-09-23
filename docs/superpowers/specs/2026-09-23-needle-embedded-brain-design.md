@@ -35,12 +35,24 @@ Decision plane: **Needle 3 (embedded, ~ms, free) → Jev (opt-in cloud,
 
 Generation plane: **local model first** (any OpenAI-compatible endpoint:
 oMLX, llama.cpp `llama-server`, Ollama, LM Studio — configurable via
-`model_url`) → **hosted LLM providers only when** the routing decision
-requires capabilities the local model lacks **and** a credential exists.
-Providers with detected credentials join the router's candidate list;
-without credentials, cloud candidates do not exist. Any decision that
-selects a cloud model must carry a human-readable `reason` in the
-session event.
+`model_base_url`) → **hosted LLM providers only when** the routing
+decision requires capabilities the local model lacks **and** a
+credential exists. Credentials include both **API keys and existing
+cloud subscriptions** — Claude Code OAuth tokens, Codex CLI auth, Kimi/
+Moonshot, and similar CLI credential stores (detection already landing
+in `forge-providers/src/credentials.rs`; `forge auth status` reports
+what was found). Providers with detected credentials join the router's
+candidate list; without credentials, cloud candidates do not exist. Any
+decision that selects a cloud model must carry a human-readable
+`reason` in the session event. (Subscription OAuth tokens are intended
+by providers for their own CLIs — forge surfaces the terms caveat and
+treats API keys as the supported path.)
+
+**Positioning**: forge should be the premier way to make AI work
+**cheapest, fastest, and local-first** — free embedded decisions, free
+local generation, subscriptions you already pay for next, metered API
+keys last — with automatic, transparent fallback up that ladder only
+when a task demands it.
 
 Needle can genuinely *call functions* (select + fill arguments,
 grammar-guaranteed). Jev can only *select among options* (choice /
@@ -61,6 +73,18 @@ Each sub-project gets its own spec → plan → implementation cycle:
    mistral.rs FFI behind the existing `ModelProvider` trait; removes the
    last external server from the local stack. (Weights are GBs; needs
    its own design.)
+
+Parallel track (in progress on main): **cloud subscription support** —
+credential detection for Claude Code OAuth, Codex, Kimi/Moonshot and
+friends (`forge auth status`), extending the generation-plane candidate
+list. Remaining gaps tracked there: OAuth-only Codex (ChatGPT Responses
+backend), macOS Keychain lookup, and additional subscription providers
+as they expose usable credentials.
+
+**Documentation requirement**: every sub-project keeps `README.md`
+accurate in the same change that lands behavior — the README describes
+what forge does today, never the roadmap; design direction lives in
+this spec and `specs/roadmap.md`.
 
 ## 3. Architecture (sub-project 1)
 

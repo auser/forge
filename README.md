@@ -14,6 +14,9 @@ for tests and demos but are strictly opt-in (`model = "mock-local"`).
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
 - Implementation plan: [`specs/implementation-plan.md`](specs/implementation-plan.md)
 - Roadmap and future directions: [`specs/roadmap.md`](specs/roadmap.md)
+- Needle/Jev embedded-brain design (next direction: on-device decisions,
+  cheapest-first routing, ACP/MCP editor integration):
+  [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md)
 - BDD features: [`tests/features/`](tests/features/)
 
 ## Installation
