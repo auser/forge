@@ -1214,3 +1214,17 @@ fn routing_decision_fell_back(world: &mut BddWorld) {
         world.last_stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// env-files.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a project with a .env file setting the model to {string}")]
+fn env_file_sets_model(world: &mut BddWorld, model: String) {
+    world.write_file(".env", &format!("FORGE_MODEL={model}\n"));
+}
+
+#[given(expr = "a .env.local file setting the model to {string}")]
+fn env_local_file_sets_model(world: &mut BddWorld, model: String) {
+    world.write_file(".env.local", &format!("FORGE_MODEL={model}\n"));
+}

@@ -18,11 +18,23 @@ approval = \"prompt\"
 
 const GITIGNORE_ENTRY: &str = ".forge/";
 
+/// Known provider API keys and the built-in model entry they unlock
+/// (None = no built-in entry; still worth reporting).
+const KNOWN_PROVIDER_KEYS: &[(&str, Option<&str>)] = &[
+    ("DEEPSEEK_API_KEY", Some("deepseek-chat")),
+    ("MOONSHOT_API_KEY", Some("kimi-k2.7-code")),
+    ("OPENAI_API_KEY", None),
+    ("ANTHROPIC_API_KEY", None),
+    ("OPENROUTER_API_KEY", None),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ItemStatus {
     Created,
     Updated,
     Unchanged,
+    /// Informational: existing environment/file detected, nothing changed.
+    Detected,
 }
 
 impl ItemStatus {
@@ -31,6 +43,7 @@ impl ItemStatus {
             Self::Created => "created  ",
             Self::Updated => "updated  ",
             Self::Unchanged => "unchanged",
+            Self::Detected => "detected ",
         }
     }
 }
@@ -90,8 +103,41 @@ pub fn run(ctx: &Context) -> Result<(), ForgeError> {
 
     items.push(update_gitignore(&root)?);
     items.push(build_graph(&root)?);
+    items.extend(detect_environment(&root));
 
     report(&root, &items, ctx.global.json)
+}
+
+/// Drop-in conveniences: report `.env`/`.env.local` files (loaded at
+/// startup) and known provider API keys (names only, never values).
+/// Read-only: nothing is written or modified.
+fn detect_environment(root: &Path) -> Vec<InitItem> {
+    let mut items = Vec::new();
+    for name in [".env.local", ".env"] {
+        let path = root.join(name);
+        if path.is_file() {
+            items.push(InitItem {
+                status: ItemStatus::Detected,
+                path: path.clone(),
+                note: Some("loaded at startup".to_string()),
+            });
+        }
+    }
+    for (key, model) in KNOWN_PROVIDER_KEYS {
+        let present = std::env::var(key).is_ok_and(|v| !v.is_empty());
+        if present {
+            let note = match model {
+                Some(entry) => format!("{key} → {entry} routable"),
+                None => format!("{key} present (no built-in model entry)"),
+            };
+            items.push(InitItem {
+                status: ItemStatus::Detected,
+                path: root.to_path_buf(),
+                note: Some(note),
+            });
+        }
+    }
+    items
 }
 
 /// Build the structural graph unless the stored one is already fresh.

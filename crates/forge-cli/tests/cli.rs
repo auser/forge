@@ -626,22 +626,32 @@ fn router_serve_help_and_prerequisite_error() {
         assert!(stderr.contains("pip install laya"), "stderr was: {stderr}");
     } else {
         // Smoke: start the adapter on an ephemeral port, probe liveness, kill.
+        // Child stdio goes to files so the adapter (a grandchild process)
+        // can never hold the test harness's pipes open after cleanup.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("bind")
             .local_addr()
             .expect("addr")
             .port();
+        let log = std::fs::File::create(tmp.path().join("router-serve.log")).expect("log");
         let mut child = forge(tmp.path())
             .args(["--project"])
             .arg(&project)
             .args(["router", "serve", "--port"])
             .arg(port.to_string())
+            .stdout(log.try_clone().expect("clone"))
+            .stderr(log)
             .spawn()
             .expect("spawn");
+
+        // Laya preloads its model checkpoint on first start — allow 120s.
         let mut up = false;
-        for _ in 0..100 {
+        for _ in 0..600 {
             if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
                 use std::io::{Read, Write};
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("timeout");
                 let mut body = String::new();
                 let attempt = stream
                     .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -655,6 +665,100 @@ fn router_serve_help_and_prerequisite_error() {
         }
         child.kill().ok();
         child.wait().ok();
-        assert!(up, "adapter never came up");
+        // Kill the adapter grandchild too (it outlives forge otherwise).
+        std::process::Command::new("pkill")
+            .args(["-f", &format!("laya-http.py {port}")])
+            .output()
+            .ok();
+        let log_text =
+            std::fs::read_to_string(tmp.path().join("router-serve.log")).unwrap_or_default();
+        assert!(up, "adapter never came up; log:\n{log_text}");
     }
+}
+
+#[test]
+fn dotenv_loading_precedence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    std::fs::write(project.join(".env"), "FORGE_MODEL=dotenv-model\n").expect("write .env");
+
+    // .env provides the model; origin is environment.
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["config", "explain", "model"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert_eq!(
+        stdout.trim(),
+        "model = \"dotenv-model\" (source: environment)"
+    );
+
+    // .env.local overrides .env.
+    std::fs::write(
+        project.join(".env.local"),
+        "FORGE_MODEL=local-override-model\n",
+    )
+    .expect("write .env.local");
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["config", "explain", "model"])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert_eq!(
+        stdout.trim(),
+        "model = \"local-override-model\" (source: environment)"
+    );
+
+    // A real shell env var beats both files.
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["config", "explain", "model"])
+        .env("FORGE_MODEL", "shell-model")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert_eq!(
+        stdout.trim(),
+        "model = \"shell-model\" (source: environment)"
+    );
+}
+
+#[test]
+fn dotenv_loaded_keys_are_redacted_from_session_logs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    std::fs::write(
+        project.join(".env"),
+        "FORGE_MODEL=mock-local\nFORGE_ROUTER=static\nDEEPSEEK_API_KEY=dotenvvalue98765432\n",
+    )
+    .expect("write .env");
+
+    // The key matches no built-in redaction pattern; only the
+    // store's env snapshot (taken after .env bootstrap) can redact it.
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "the key is dotenvvalue98765432 ok"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+
+    let sessions = project.join(".forge").join("sessions");
+    let mut log = String::new();
+    for entry in std::fs::read_dir(&sessions).expect("sessions dir") {
+        log.push_str(&std::fs::read_to_string(entry.expect("entry").path()).expect("read"));
+    }
+    assert!(
+        !log.contains("dotenvvalue98765432"),
+        "key leaked into session log: {log}"
+    );
+    assert!(log.contains("[REDACTED]"), "expected redaction: {log}");
 }

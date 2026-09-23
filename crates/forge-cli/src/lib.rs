@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod cli;
 pub mod commands;
 pub mod tracing_setup;
@@ -11,6 +12,9 @@ use crate::cli::Cli;
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     tracing_setup::init(cli.global.verbose, cli.global.no_color);
+    // .env / .env.local load before config resolution and before any
+    // provider construction or session-store env snapshot.
+    bootstrap::load_dotenv(&cli.global);
     tracing::trace!("command line parsed; dispatching");
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

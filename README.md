@@ -86,6 +86,21 @@ model_base_url = "http://127.0.0.1:8080/v1"   # include the /v1 prefix
 model_key_env = "MY_API_KEY"   # name of the env var, never the key itself
 ```
 
+### Drop-in setup for existing projects
+
+`forge init` works in any existing project: at startup Forge loads `.env` and
+`.env.local` from the project root (shell env wins over `.env.local`, which
+wins over `.env`), and init reports what it found — e.g.
+`detected  DEEPSEEK_API_KEY → deepseek-chat routable` (key names only, values
+are never printed or written anywhere). With keys in place, the default Laya
+router plus the built-in `[models]` registry give you Jev-style model
+selection out of the box — no config file needed.
+
+Full environment precedence: **shell env** (incl. `FORGE_*` vars) →
+`.env.local` → `.env` → project config file → user config file → defaults;
+CLI flags beat everything. Values loaded from `.env` files are covered by
+session-log secret redaction just like shell-set keys.
+
 ## Usage
 
 Run the agent loop (multi-turn, tool-using when the model supports it):
@@ -171,6 +186,13 @@ built-in defaults → ~/.config/forge/config.toml → .forge/config.toml → FOR
 
 (`$XDG_CONFIG_HOME/forge/config.toml` is honored when set. `--config <path>` layers
 an extra file after the project config.)
+
+At startup, before config resolution, Forge loads `.env.local` then `.env`
+from the project root (never overriding the shell environment, so the chain is
+shell env → `.env.local` → `.env`). Parse errors warn and never abort startup.
+This is where provider keys like `DEEPSEEK_API_KEY` normally live; `FORGE_*`
+variables set in `.env` files behave as environment config (origin
+`environment`), below real shell vars and CLI flags.
 
 Key settings (all optional):
 
