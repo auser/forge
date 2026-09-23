@@ -1,16 +1,42 @@
 #!/usr/bin/env bash
-# Forge installer — builds and installs the `forge` binary.
-#
-# Usage:
-#   ./install.sh [--prefix DIR] [--uninstall] [--help]
-#
-# Supported platforms: macOS (x86_64, arm64), Linux (x86_64, aarch64),
-# Windows via Git Bash / MSYS2 (x86_64). Requires Cargo (rustup.rs) unless a
-# prebuilt binary already exists in target/release/.
-#
-# Honors NO_COLOR and non-interactive terminals (no ANSI colors then).
+# Forge installer — installs the `forge` binary from GitHub releases,
+# falling back to `cargo install`. Works from a checkout (./install.sh)
+# or piped from curl. See usage() below or run with --help.
 
 set -euo pipefail
+
+GITHUB_REPO="auser/forge"
+FORGE_REPO_HTTPS="https://github.com/${GITHUB_REPO}.git"
+DEFAULT_RELEASE_BASE="https://github.com/${GITHUB_REPO}/releases/latest/download"
+
+usage() {
+    cat <<'EOF'
+Forge installer — installs the `forge` binary.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/auser/forge/main/install.sh | bash
+  curl -fsSL ... | bash -s -- --prefix /usr/local/bin
+  ./install.sh [--prefix DIR] [--uninstall] [--help]   # from a checkout
+
+Install strategy, in order:
+  1. prebuilt release asset for your platform (checksum-verified)
+  2. cargo install from git (or from this checkout, when run locally)
+
+Supported platforms: macOS (x86_64, arm64), Linux (x86_64, aarch64),
+Windows via Git Bash / MSYS2 (x86_64).
+
+Options:
+  --prefix DIR   install directory (default: ~/.local/bin, or $FORGE_PREFIX)
+  --uninstall    remove the installed binary
+  -h, --help     show this help
+
+Environment:
+  FORGE_PREFIX         same as --prefix
+  FORGE_REPO           git URL for the cargo fallback
+  FORGE_RELEASE_BASE  override the release download base URL
+  NO_COLOR             disable colored output
+EOF
+}
 
 # --- colors ---------------------------------------------------------------
 
@@ -45,9 +71,15 @@ case "$ARCH" in
     arm64|aarch64)  ARCH="aarch64" ;;
     *) die "unsupported architecture: $ARCH (supported: x86_64, aarch64)" ;;
 esac
-if [[ "$PLATFORM" == "windows" && "$ARCH" != "x86_64" ]]; then
-    die "unsupported Windows architecture: $ARCH (supported: x86_64)"
-fi
+
+case "$PLATFORM/$ARCH" in
+    macos/x86_64)    TRIPLE="x86_64-apple-darwin" ;;
+    macos/aarch64)   TRIPLE="aarch64-apple-darwin" ;;
+    linux/x86_64)    TRIPLE="x86_64-unknown-linux-gnu" ;;
+    linux/aarch64)   TRIPLE="aarch64-unknown-linux-gnu" ;;
+    windows/x86_64)  TRIPLE="x86_64-pc-windows-msvc" ;;
+    *) die "unsupported platform: $PLATFORM/$ARCH" ;;
+esac
 
 # --- arguments ----------------------------------------------------------------
 
@@ -58,19 +90,17 @@ while [[ $# -gt 0 ]]; do
         --prefix)    [[ $# -ge 2 ]] || die "--prefix requires a directory"; PREFIX="$2"; shift 2 ;;
         --prefix=*)  PREFIX="${1#*=}"; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
-        -h|--help)
-            sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
-            exit 0
-            ;;
+        -h|--help)   usage; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
 
 BIN_NAME="forge${EXE}"
 TARGET="$PREFIX/$BIN_NAME"
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+RELEASE_BASE="${FORGE_RELEASE_BASE:-$DEFAULT_RELEASE_BASE}"
+ASSET="forge-${TRIPLE}.tar.gz"
 
-# --- uninstall ------------------------------------------------------------------
+# --- uninstall (no download needed) --------------------------------------------
 
 if [[ "$UNINSTALL" == "1" ]]; then
     if [[ -f "$TARGET" ]]; then
@@ -82,26 +112,70 @@ if [[ "$UNINSTALL" == "1" ]]; then
     exit 0
 fi
 
-# --- install --------------------------------------------------------------------
-
-info "platform: $PLATFORM/$ARCH"
+info "platform: $PLATFORM/$ARCH ($TRIPLE)"
 info "installing to: $PREFIX"
 
-PREBUILT="$ROOT/target/release/$BIN_NAME"
-if command -v cargo >/dev/null 2>&1; then
-    [[ -f "$ROOT/Cargo.toml" ]] || die "Cargo.toml not found next to install.sh; run it from the forge checkout"
-    info "building release binary (this can take a few minutes on first run)"
-    (cd "$ROOT" && cargo build --release --locked -p forge-cli)
-    [[ -f "$PREBUILT" ]] || die "build finished but $PREBUILT is missing"
-elif [[ -f "$PREBUILT" ]]; then
-    warn "cargo not found; using existing prebuilt binary at $PREBUILT"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        die "neither shasum nor sha256sum found; cannot verify downloads"
+    fi
+}
+
+# --- strategy 1: prebuilt release asset ------------------------------------------
+
+INSTALLED=""
+if command -v curl >/dev/null 2>&1; then
+    info "trying release asset: $RELEASE_BASE/$ASSET"
+    if curl -fsSL "$RELEASE_BASE/$ASSET" -o "$WORK/$ASSET" 2>/dev/null; then
+        if curl -fsSL "$RELEASE_BASE/$ASSET.sha256" -o "$WORK/$ASSET.sha256" 2>/dev/null; then
+            EXPECTED="$(awk '{print $1}' "$WORK/$ASSET.sha256")"
+            ACTUAL="$(sha256_of "$WORK/$ASSET")"
+            [[ "$EXPECTED" == "$ACTUAL" ]] \
+                || die "checksum mismatch for $ASSET (expected $EXPECTED, got $ACTUAL); aborting"
+            ok "checksum verified"
+        else
+            warn "no checksum file published for $ASSET; skipping verification"
+        fi
+        tar -xzf "$WORK/$ASSET" -C "$WORK"
+        [[ -f "$WORK/$BIN_NAME" ]] || die "release asset did not contain $BIN_NAME"
+        mkdir -p "$PREFIX"
+        install -m 0755 "$WORK/$BIN_NAME" "$TARGET"
+        INSTALLED=1
+        ok "installed from release asset"
+    else
+        warn "no release asset for $TRIPLE (yet); falling back to cargo"
+    fi
 else
-    die "cargo not found and no prebuilt binary at $PREBUILT. Install Rust via https://rustup.rs and re-run."
+    warn "curl not found; falling back to cargo"
 fi
 
-mkdir -p "$PREFIX"
-install -m 0755 "$PREBUILT" "$TARGET"
-ok "installed $TARGET"
+# --- strategy 2: cargo install ----------------------------------------------------
+
+if [[ -z "$INSTALLED" ]]; then
+    command -v cargo >/dev/null 2>&1 \
+        || die "cargo not found and no release asset available. Install Rust via https://rustup.rs and re-run."
+    SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || true
+    if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/Cargo.toml" ]]; then
+        info "installing with cargo from this checkout"
+        cargo install --path "$SCRIPT_DIR/crates/forge-cli" --locked --root "$WORK/cargo-root"
+    else
+        REPO="${FORGE_REPO:-$FORGE_REPO_HTTPS}"
+        info "installing with cargo from $REPO"
+        cargo install --git "$REPO" forge-cli --locked --root "$WORK/cargo-root"
+    fi
+    mkdir -p "$PREFIX"
+    install -m 0755 "$WORK/cargo-root/bin/$BIN_NAME" "$TARGET"
+    ok "installed via cargo"
+fi
+
+# --- verify -----------------------------------------------------------------------
 
 if [[ -x "$TARGET" ]]; then
     VERSION="$("$TARGET" version 2>/dev/null || true)"

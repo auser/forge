@@ -16,25 +16,36 @@ built-in mock providers.
 
 ## Installation
 
-From a checkout of this repository — either with Cargo:
+One line, using the latest prebuilt release (macOS, Linux, and Windows via
+Git Bash/MSYS2; detects OS/architecture and verifies the checksum):
 
 ```bash
-cargo install --path crates/forge-cli --locked   # installs the `forge` binary
+curl -fsSL https://raw.githubusercontent.com/auser/forge/main/install.sh | bash
 ```
 
-or with the installer script (macOS, Linux, and Windows via Git Bash/MSYS2;
-detects OS/architecture and fails with a clear error on unsupported combos):
+Or with Cargo, no script needed:
+
+```bash
+cargo install --git https://github.com/auser/forge forge-cli --locked
+```
+
+From a local checkout:
 
 ```bash
 ./install.sh                        # installs to ~/.local/bin
 ./install.sh --prefix /usr/local/bin
 ./install.sh --uninstall
+# or: cargo install --path crates/forge-cli --locked
 ```
 
-The script builds the release binary with `cargo build --release --locked`
-(or reuses an existing `target/release/forge` when Cargo is absent), verifies
-`forge version`, and warns if the prefix is not on your `PATH`. It respects
-`NO_COLOR` and non-interactive terminals.
+The script downloads the release asset for your platform
+(`forge-<target-triple>.tar.gz` from the latest GitHub release, verified
+against its published SHA-256) and falls back to `cargo install` when no
+prebuilt asset exists yet. It installs to `~/.local/bin` by default
+(`--prefix` or `FORGE_PREFIX` to override), warns if that directory is not
+on your `PATH`, and respects `NO_COLOR` and non-interactive terminals.
+Release assets are built by CI for every `v*` tag (see
+`.github/workflows/release.yml`).
 
 ## Quickstart
 

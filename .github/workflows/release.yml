@@ -1,0 +1,62 @@
+# Builds release binaries for every supported platform and attaches them
+# to the GitHub release when a version tag (v*) is pushed. Asset names
+# match what install.sh downloads: forge-<target-triple>.tar.gz[.sha256].
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked -p forge-cli --target ${{ matrix.target }}
+
+      - name: Package asset (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/forge" dist/
+          tar -czf "dist/forge-${{ matrix.target }}.tar.gz" -C dist forge
+          shasum -a 256 "dist/forge-${{ matrix.target }}.tar.gz" \
+            | awk '{print $1}' > "dist/forge-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Package asset (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/forge.exe" dist/
+          tar -czf "dist/forge-${{ matrix.target }}.tar.gz" -C dist forge.exe
+          sha256sum "dist/forge-${{ matrix.target }}.tar.gz" \
+            | awk '{print $1}' > "dist/forge-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/forge-*.tar.gz*
