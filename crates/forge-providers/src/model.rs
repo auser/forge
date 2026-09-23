@@ -274,11 +274,16 @@ impl ModelProvider for OpenAiCompatibleModel {
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut http = self.client.post(&url).json(&body);
-        if let Some(env_name) = &self.api_key_env
-            && let Ok(key) = std::env::var(env_name)
-            && !key.is_empty()
-        {
-            http = http.bearer_auth(key);
+        if let Some(env_name) = &self.api_key_env {
+            match std::env::var(env_name) {
+                Ok(key) if !key.is_empty() => http = http.bearer_auth(key),
+                // Configured key env var missing/empty: send unauthenticated
+                // but warn loudly — this is the classic silent-401 cause.
+                _ => tracing::warn!(
+                    "model_key_env {env_name} is configured but the environment variable \
+                     is not set; requests will be sent without authentication"
+                ),
+            }
         }
 
         let response = http.send().await.map_err(|e| {
@@ -713,6 +718,41 @@ mod tests {
             Err(ForgeError::Config(_)) => {}
             other => panic!("expected config error, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[tokio::test]
+    async fn missing_key_env_sends_no_auth_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let model = OpenAiCompatibleModel::new(
+            server.uri(),
+            "m",
+            Some("FORGE_PROVIDERS_DEFINITELY_MISSING_KEY".to_string()),
+            ModelCapabilities::default(),
+            Duration::from_secs(5),
+        )
+        .expect("construct");
+        let response = model
+            .complete(CompletionRequest::new("m", vec![Message::user("x")]))
+            .await
+            .expect("completes without auth");
+        assert_eq!(response.content, "ok");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            !requests[0]
+                .headers
+                .keys()
+                .any(|k| k.as_str().eq_ignore_ascii_case("authorization")),
+            "no Authorization header must be sent"
+        );
     }
 
     #[tokio::test]

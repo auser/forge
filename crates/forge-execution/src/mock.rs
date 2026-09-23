@@ -127,6 +127,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_records_inherit_stdio_flag() {
+        let mock = MockExecution::new(std::env::temp_dir());
+        mock.execute(ExecRequest::new("python3", RiskLevel::Safe).inheriting_stdio())
+            .await
+            .expect("ok");
+        assert!(mock.recorded()[0].inherit_stdio);
+        assert!(!mock.recorded().is_empty());
+    }
+
+    #[test]
+    fn exec_request_inherit_stdio_defaults_to_false() {
+        let request: ExecRequest =
+            serde_json::from_str(r#"{"command": "ls", "risk": "safe"}"#).expect("parses");
+        assert!(!request.inherit_stdio);
+        let with_flag: ExecRequest =
+            serde_json::from_str(r#"{"command": "ls", "risk": "safe", "inherit_stdio": true}"#)
+                .expect("parses");
+        assert!(with_flag.inherit_stdio);
+    }
+
+    #[tokio::test]
     async fn mock_records_file_ops_and_serves_canned_reads() {
         let mock =
             MockExecution::new(std::env::temp_dir()).with_read_content("canned file content");

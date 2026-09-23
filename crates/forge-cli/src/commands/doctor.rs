@@ -173,11 +173,18 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
                     label: "router endpoint".into(),
                     detail,
                 },
-                None => Check {
-                    level: Level::Warn,
-                    label: "router endpoint".into(),
-                    detail: format!("{url} unreachable; fallback routing will apply"),
-                },
+                None => {
+                    let hint = if config.router == "laya" {
+                        "; start the local adapter with `forge router serve`"
+                    } else {
+                        ""
+                    };
+                    Check {
+                        level: Level::Warn,
+                        label: "router endpoint".into(),
+                        detail: format!("{url} unreachable; fallback routing will apply{hint}"),
+                    }
+                }
             });
         }
         checks.push(Check {

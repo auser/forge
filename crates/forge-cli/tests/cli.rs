@@ -578,3 +578,72 @@ fn max_turns_flag_bounds_the_loop() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn router_serve_help_and_prerequisite_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+
+    // Help always works.
+    let help = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["router", "serve", "--help"])
+        .output()
+        .expect("run");
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout).expect("utf8");
+    assert!(stdout.contains("Laya"), "help: {stdout}");
+
+    // Branch on the real environment: laya importable or not.
+    let laya_present = std::process::Command::new("python3")
+        .args(["-c", "import laya"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !laya_present {
+        let output = forge(tmp.path())
+            .args(["--project"])
+            .arg(&project)
+            .args(["router", "serve"])
+            .output()
+            .expect("run");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("utf8");
+        assert!(stderr.contains("pip install laya"), "stderr was: {stderr}");
+    } else {
+        // Smoke: start the adapter on an ephemeral port, probe liveness, kill.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let mut child = forge(tmp.path())
+            .args(["--project"])
+            .arg(&project)
+            .args(["router", "serve", "--port"])
+            .arg(port.to_string())
+            .spawn()
+            .expect("spawn");
+        let mut up = false;
+        for _ in 0..100 {
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                use std::io::{Read, Write};
+                let mut body = String::new();
+                let attempt = stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .and_then(|()| stream.read_to_string(&mut body).map(|_| ()));
+                if attempt.is_ok() && body.contains("\"status\": \"ok\"") {
+                    up = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        child.kill().ok();
+        child.wait().ok();
+        assert!(up, "adapter never came up");
+    }
+}

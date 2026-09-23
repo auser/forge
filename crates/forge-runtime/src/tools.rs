@@ -247,6 +247,7 @@ impl ToolDispatcher {
                     args: arg_string_vec(args, "args"),
                     cwd: None,
                     risk,
+                    inherit_stdio: false,
                 };
                 let result = if approved {
                     self.exec.execute_approved(request).await

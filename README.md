@@ -138,6 +138,7 @@ forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
 forge graph build|check|map|grep|callers|blast|context
 forge skill list|show|test
+forge router serve [--host --port]  Run the local Laya decision-router adapter
 forge model list|test
 forge config show|path|explain <key>
 forge doctor                        Environment/config health check
@@ -265,14 +266,21 @@ cost table.
 ### Laya via the reference adapter
 
 Laya (open-source System One decision model) is a Python SDK with no official
-server. `adapters/laya-http.py` is a small stdlib-only bridge:
+server. The easiest way to run it is built into Forge (the adapter script is
+embedded in the binary — no repo checkout needed):
 
 ```bash
 pip install laya
-python3 adapters/laya-http.py 8788   # listens on 127.0.0.1:8788
+forge router serve                 # 127.0.0.1:8788, foreground, Ctrl-C to stop
+forge router serve --port 9000     # custom port/host via --host/--port
 ```
 
-then set `router = "laya"` (and optionally `router_url`). Forge POSTs
+then set `router = "laya"` (and optionally `router_url`). `forge router serve`
+checks prerequisites (`python3`, the `laya` package) through the configured
+execution provider and reports actionable typed errors.
+
+Without Forge, the same adapter ships as a plain script:
+`python3 adapters/laya-http.py [port] [--host ...]`. Forge POSTs
 `{"state": {"task", "required_capabilities"}, "questions": {"model": {"type":
 "choice", "instructions": ..., "criteria": {name: description}}}}` and expects
 `{"answers": {"model": {"choice", "confidence"}}}`. The adapter is optional;

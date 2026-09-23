@@ -131,6 +131,25 @@ impl NativeExecution {
         }
         tracing::debug!(command = %request.command, risk = ?request.risk, "executing command");
 
+        if request.inherit_stdio {
+            // Foreground server mode: the child talks to the terminal
+            // directly; there is no captured output.
+            let status = command
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .status()
+                .await
+                .map_err(|e| {
+                    ForgeError::execution(format!("failed to spawn `{}`: {e}", request.command))
+                })?;
+            return Ok(ExecResult {
+                exit_code: status.code().unwrap_or(-1),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
         let output = command.output().await.map_err(|e| {
             ForgeError::execution(format!("failed to spawn `{}`: {e}", request.command))
         })?;
@@ -209,6 +228,7 @@ mod tests {
             args: vec!["hello".to_string()],
             cwd: None,
             risk: RiskLevel::Safe,
+            inherit_stdio: false,
         }
     }
 
@@ -233,6 +253,7 @@ mod tests {
                 args: vec!["-c".to_string(), "echo oops >&2; exit 3".to_string()],
                 cwd: None,
                 risk: RiskLevel::Safe,
+                inherit_stdio: false,
             })
             .await
             .expect("spawn succeeds");

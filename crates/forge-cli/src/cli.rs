@@ -117,6 +117,12 @@ pub enum Command {
         command: ModelCommand,
     },
 
+    /// Laya router adapter management.
+    Router {
+        #[command(subcommand)]
+        command: RouterCommand,
+    },
+
     /// Configuration inspection.
     Config {
         #[command(subcommand)]
@@ -195,6 +201,18 @@ pub enum ModelCommand {
     Test {
         #[arg(value_name = "MODEL")]
         model: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RouterCommand {
+    /// Start the local Laya decision-router adapter (open-source System One
+    /// router); use with router = "laya"
+    Serve {
+        #[arg(long, value_name = "HOST", default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, value_name = "PORT", default_value = "8788")]
+        port: u16,
     },
 }
 

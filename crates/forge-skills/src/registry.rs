@@ -194,6 +194,7 @@ impl FsSkillRegistry {
             args: vec![script.to_string_lossy().to_string()],
             cwd: Some(dir.to_path_buf()),
             risk: RiskLevel::Risky,
+            inherit_stdio: false,
         };
         exec.execute(request).await.map(Some)
     }

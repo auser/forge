@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod graph_cmd;
 pub mod init;
 pub mod model_cmd;
+pub mod router_cmd;
 pub mod run_cmd;
 pub mod serve_cmd;
 pub mod service;
@@ -84,6 +85,11 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             SessionCommand::Show { id } => session_cmd::show(&ctx, &id),
         },
         Command::Model { command } => model_cmd::run(&ctx, command).await,
+        Command::Router { command } => match command {
+            crate::cli::RouterCommand::Serve { host, port } => {
+                router_cmd::serve(&ctx, host, port).await
+            }
+        },
         Command::Graph { command } => graph_cmd::run(&ctx, command),
         Command::Skill { command } => skill_cmd::run(&ctx, command).await,
         Command::Serve { host, port } => serve_cmd::run(&ctx, host, port).await,

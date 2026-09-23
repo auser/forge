@@ -56,6 +56,11 @@ pub struct ExecRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     pub risk: RiskLevel,
+    /// Inherit the parent's stdio instead of capturing output (for
+    /// long-running foreground servers); the result then carries empty
+    /// stdout/stderr.
+    #[serde(default)]
+    pub inherit_stdio: bool,
 }
 
 impl ExecRequest {
@@ -65,7 +70,13 @@ impl ExecRequest {
             args: Vec::new(),
             cwd: None,
             risk,
+            inherit_stdio: false,
         }
+    }
+
+    pub fn inheriting_stdio(mut self) -> Self {
+        self.inherit_stdio = true;
+        self
     }
 }
 

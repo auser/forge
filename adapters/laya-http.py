@@ -95,10 +95,15 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global ROUTER
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Laya HTTP adapter for Forge")
+    parser.add_argument("port", nargs="?", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--host", default="127.0.0.1")
+    args = parser.parse_args()
     ROUTER = load_router()
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"laya-http adapter listening on http://127.0.0.1:{port}/decide")
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"laya-http adapter listening on http://{args.host}:{args.port}/decide")
     server.serve_forever()
 
 
