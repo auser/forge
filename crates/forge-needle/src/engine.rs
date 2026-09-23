@@ -42,21 +42,19 @@ impl NeedleEngine {
             .spawn(move || {
                 let mut loaded: Option<Result<(), BackendError>> = None;
                 while let Some(job) = rx.blocking_recv() {
-                    // Lazy load once; a failed load is reported per job,
-                    // retried only when the failure was WeightsMissing
-                    // (weights may appear after `forge init`).
-                    if !matches!(loaded, Some(Ok(()))) {
-                        let attempt = backend.load();
-                        let retryable = matches!(attempt, Err(BackendError::WeightsMissing(_)));
-                        if attempt.is_ok() || !retryable {
-                            loaded = Some(attempt);
-                        } else {
-                            respond_err(job, attempt.err());
-                            continue;
-                        }
-                    }
-                    if let Some(Err(_)) = &loaded {
-                        respond_err(job, Some(BackendError::NotLoaded));
+                    // Lazy load once. Never-attempted -> try. Failed with
+                    // WeightsMissing -> retry every job (weights may appear
+                    // after `forge init`). Failed with anything else ->
+                    // sticky: never call load() again, and keep answering
+                    // every job with that original error.
+                    let status = match loaded.take() {
+                        None => backend.load(),
+                        Some(Err(BackendError::WeightsMissing(_))) => backend.load(),
+                        Some(other) => other,
+                    };
+                    loaded = Some(status.clone());
+                    if let Err(e) = status {
+                        respond_err(job, e);
                         continue;
                     }
                     match job {
@@ -117,14 +115,13 @@ impl NeedleEngine {
     }
 }
 
-fn respond_err(job: Job, err: Option<BackendError>) {
-    let e = err.unwrap_or(BackendError::NotLoaded);
+fn respond_err(job: Job, err: BackendError) {
     match job {
-        Job::Decide(_, _, tx) => drop(tx.send(Err(e))),
-        Job::Embed(_, tx) => drop(tx.send(Err(e))),
-        Job::Extract(_, _, tx) => drop(tx.send(Err(e))),
-        Job::ToolCall(_, _, tx) => drop(tx.send(Err(e))),
-        Job::Info(tx) => drop(tx.send(Err(e))),
+        Job::Decide(_, _, tx) => drop(tx.send(Err(err))),
+        Job::Embed(_, tx) => drop(tx.send(Err(err))),
+        Job::Extract(_, _, tx) => drop(tx.send(Err(err))),
+        Job::ToolCall(_, _, tx) => drop(tx.send(Err(err))),
+        Job::Info(tx) => drop(tx.send(Err(err))),
     }
 }
 
@@ -163,8 +160,93 @@ impl Embedder for EngineEmbedder {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::hash_backend::HashBackend;
+
+    /// Backend whose `load()` fails with `WeightsMissing` a fixed number
+    /// of times, then succeeds. Lets tests assert the engine keeps
+    /// retrying a transient (weights-not-yet-fetched) load failure.
+    struct FlakyLoadBackend {
+        load_calls: Arc<AtomicUsize>,
+        fail_times: usize,
+    }
+
+    impl NeedleBackend for FlakyLoadBackend {
+        fn load(&mut self) -> Result<(), BackendError> {
+            let attempt = self.load_calls.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.fail_times {
+                Err(BackendError::WeightsMissing(PathBuf::from("/weights")))
+            } else {
+                Ok(())
+            }
+        }
+        fn model_id(&self) -> String {
+            "flaky".to_string()
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn decide(&mut self, _task: &str, options: &[String]) -> Result<Decision, BackendError> {
+            Ok(Decision {
+                choice: options.first().cloned().unwrap_or_default(),
+                confidence: 1.0,
+                reason: "flaky-ok".to_string(),
+            })
+        }
+        fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, BackendError> {
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+        fn extract(&mut self, _text: &str, _schema_json: &str) -> Result<String, BackendError> {
+            Ok("{}".to_string())
+        }
+        fn tool_call(
+            &mut self,
+            _prompt: &str,
+            _tools_json: &str,
+        ) -> Result<Option<NeedleToolCall>, BackendError> {
+            Ok(None)
+        }
+    }
+
+    /// Backend whose `load()` always fails with a non-retryable error.
+    /// Lets tests assert the engine calls `load()` exactly once and then
+    /// answers every later job with the original error, without ever
+    /// calling `load()` again.
+    struct PermanentFailBackend {
+        load_calls: Arc<AtomicUsize>,
+    }
+
+    impl NeedleBackend for PermanentFailBackend {
+        fn load(&mut self) -> Result<(), BackendError> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            Err(BackendError::Inference("corrupt weights".to_string()))
+        }
+        fn model_id(&self) -> String {
+            "permanent-fail".to_string()
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn decide(&mut self, _task: &str, _options: &[String]) -> Result<Decision, BackendError> {
+            Err(BackendError::Declined)
+        }
+        fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, BackendError> {
+            Err(BackendError::Declined)
+        }
+        fn extract(&mut self, _text: &str, _schema_json: &str) -> Result<String, BackendError> {
+            Err(BackendError::Declined)
+        }
+        fn tool_call(
+            &mut self,
+            _prompt: &str,
+            _tools_json: &str,
+        ) -> Result<Option<NeedleToolCall>, BackendError> {
+            Err(BackendError::Declined)
+        }
+    }
 
     #[tokio::test]
     async fn engine_decides_via_backend() {
@@ -201,5 +283,51 @@ mod tests {
         let engine = NeedleEngine::spawn(HashBackend::new());
         let err = engine.decide("task".to_string(), vec![]).await;
         assert!(err.is_err()); // Declined maps to ForgeError, caller falls back
+    }
+
+    #[tokio::test]
+    async fn engine_retries_load_on_weights_missing_until_it_succeeds() {
+        let load_calls = Arc::new(AtomicUsize::new(0));
+        let engine = NeedleEngine::spawn(FlakyLoadBackend {
+            load_calls: load_calls.clone(),
+            fail_times: 2,
+        });
+
+        // First two jobs hit WeightsMissing; the engine must retry load()
+        // on each of them rather than giving up.
+        let first = engine.decide("t".to_string(), vec!["a".to_string()]).await;
+        assert!(first.is_err());
+        let second = engine.decide("t".to_string(), vec!["a".to_string()]).await;
+        assert!(second.is_err());
+
+        // Third job: load() succeeds, and the job itself succeeds too.
+        let third = engine.decide("t".to_string(), vec!["a".to_string()]).await;
+        assert!(third.is_ok());
+
+        assert_eq!(load_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn engine_sticky_load_failure_preserves_error_and_stops_retrying() {
+        let load_calls = Arc::new(AtomicUsize::new(0));
+        let engine = NeedleEngine::spawn(PermanentFailBackend {
+            load_calls: load_calls.clone(),
+        });
+
+        let first = engine
+            .decide("t".to_string(), vec!["a".to_string()])
+            .await
+            .expect_err("first job fails");
+        assert!(first.to_string().contains("corrupt weights"));
+
+        let second = engine
+            .decide("t".to_string(), vec!["a".to_string()])
+            .await
+            .expect_err("second job also fails, without a fresh load attempt");
+        assert!(second.to_string().contains("corrupt weights"));
+
+        // load() must have been called exactly once: the failure is
+        // sticky, not retried on every job.
+        assert_eq!(load_calls.load(Ordering::SeqCst), 1);
     }
 }

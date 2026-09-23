@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 /// Error surface of a Needle backend. `Declined` is a designed outcome:
 /// Needle refuses to guess; callers must fall back, never retry blindly.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum BackendError {
     #[error("needle backend not loaded")]
     NotLoaded,
