@@ -45,3 +45,72 @@ pub trait NeedleBackend: Send + 'static {
         tools_json: &str,
     ) -> Result<Option<NeedleToolCall>, BackendError>;
 }
+
+/// Default cache location for weights when `[needle].weights_path` is
+/// unset: `~/.cache/forge/models/needle3-<variant>.bin`. Mirrors the
+/// `std::env::home_dir()` fallback pattern `forge_config::Config` uses for
+/// `~/.config/forge/config.toml`. Task 6 replaces this with real
+/// variant-aware resolution; for now every caller resolves the "medium"
+/// path, matching `NeedleConfig::default().variant`.
+pub(crate) fn default_weights_path() -> PathBuf {
+    std::env::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache")
+        .join("forge")
+        .join("models")
+        .join("needle3-medium.bin")
+}
+
+/// Placeholder backend used by `engine_from_config` until the real FFI
+/// backend (Task 8) and weights resolution (Task 6) land. `load()` always
+/// fails with `WeightsMissing`, so any `NeedleRouter` built on it always
+/// errors and the `FallbackRouter` wrapping it in `router_from_config`
+/// degrades to the configured fallback (`static`, by default). This makes
+/// `router = "needle"` a safe, honest default before real inference exists.
+pub struct UnavailableBackend {
+    weights_path: PathBuf,
+}
+
+impl Default for UnavailableBackend {
+    fn default() -> Self {
+        Self {
+            weights_path: default_weights_path(),
+        }
+    }
+}
+
+impl NeedleBackend for UnavailableBackend {
+    fn load(&mut self) -> Result<(), BackendError> {
+        Err(BackendError::WeightsMissing(self.weights_path.clone()))
+    }
+
+    fn model_id(&self) -> String {
+        "unavailable".to_string()
+    }
+
+    fn dimensions(&self) -> usize {
+        0
+    }
+
+    // `load()` always fails, so the engine never dispatches jobs to these —
+    // they exist only to satisfy the trait.
+    fn decide(&mut self, _task: &str, _options: &[String]) -> Result<Decision, BackendError> {
+        Err(BackendError::NotLoaded)
+    }
+
+    fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, BackendError> {
+        Err(BackendError::NotLoaded)
+    }
+
+    fn extract(&mut self, _text: &str, _schema_json: &str) -> Result<String, BackendError> {
+        Err(BackendError::NotLoaded)
+    }
+
+    fn tool_call(
+        &mut self,
+        _prompt: &str,
+        _tools_json: &str,
+    ) -> Result<Option<NeedleToolCall>, BackendError> {
+        Err(BackendError::NotLoaded)
+    }
+}

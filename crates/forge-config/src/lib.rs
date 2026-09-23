@@ -124,8 +124,9 @@ pub struct Config {
     /// Named models with cost/capability metadata. Deep-merged by name
     /// across config files; not settable via env/CLI flags.
     pub models: BTreeMap<String, ModelEntry>,
-    /// The embedded on-device Needle brain. Not yet the default router
-    /// (that's a later phase); configurable ahead of the flip.
+    /// The embedded on-device Needle brain: config for the default
+    /// `router = "needle"`. Weights resolution lands in a later phase;
+    /// until then, routing built on it degrades to `router_fallback`.
     pub needle: NeedleConfig,
     /// Unknown keys are tolerated and preserved.
     #[serde(flatten)]
@@ -134,10 +135,13 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        // Default stack: Laya (open-source System One router) → local oMLX
-        // model. Mock providers stay available but are opt-in
-        // (`model = "mock-local"`). Hosted models are only called when a
-        // router selects them or the user sets `model` explicitly.
+        // Default stack: embedded Needle 3 (on-device decision routing,
+        // static fallback when weights are unavailable) → local oMLX
+        // model. Laya (open-source System One) and other HTTP-style
+        // routers remain available as alternates. Mock providers stay
+        // available but are opt-in (`model = "mock-local"`). Hosted models
+        // are only called when a router selects them or the user sets
+        // `model` explicitly.
         let models = [
             ModelEntry {
                 description: Some("local coding model via oMLX (Qwen3-Coder)".to_string()),
@@ -222,7 +226,7 @@ impl Default for Config {
             model_base_url: Some("http://127.0.0.1:8080/v1".to_string()),
             model_key_env: None,
             mock_script: None,
-            router: "laya".to_string(),
+            router: "needle".to_string(),
             router_url: None,
             router_key_env: None,
             router_timeout_ms: 5_000,

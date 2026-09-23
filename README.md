@@ -5,10 +5,12 @@ interactive coding agent core, provider-neutral model access, configurable decis
 routing, progressive-disclosure skills, a deterministic incremental project graph,
 pluggable execution, and both CLI and REST/SSE interfaces over one shared runtime.
 
-No Node.js, database, or daemon is required. The default stack is Laya
-(open-source System One decision routing) in front of a local oMLX coding model
-— no mock in the default path, no hosted account needed. Mock providers exist
-for tests and demos but are strictly opt-in (`model = "mock-local"`).
+No Node.js, database, or daemon is required. The default stack is an embedded
+Needle 3 decision router (on-device, no network calls) in front of a local
+oMLX coding model — no mock in the default path, no hosted account needed.
+Laya (open-source System One) and other HTTP-style routers remain available
+as alternates. Mock providers exist for tests and demos but are strictly
+opt-in (`model = "mock-local"`).
 
 - Project spec: [`specs/project.md`](specs/project.md)
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
@@ -54,17 +56,17 @@ Release assets are built by CI for every `v*` tag (see
 
 ## Quickstart
 
-The default stack routes Jev-style: Laya (open-source System One) → a real
-local model via oMLX — no mock anywhere in the default path.
+The default stack routes on-device: embedded Needle 3 → a real local model
+via oMLX — no mock anywhere in the default path, no separate router process
+to start.
 
 Prereqs: an OpenAI-compatible server running `qwen3-coder` at
-`http://127.0.0.1:8080/v1` (oMLX or compatible), and the Laya router
-(`pip install laya`). After [installing](#installation) (or with
-`cargo build --release` and `./target/release/forge` in place of `forge`):
+`http://127.0.0.1:8080/v1` (oMLX or compatible). After
+[installing](#installation) (or with `cargo build --release` and
+`./target/release/forge` in place of `forge`):
 
 ```bash
 cd /path/to/your/project
-forge router serve &           # Laya decision router on 127.0.0.1:8788
 forge init                     # creates .forge/, starter config, gitignore entry, builds graph
 forge doctor                   # probes model + router endpoints, warns if down
 forge run "Explain this project"
@@ -78,10 +80,11 @@ No GPU, no accounts, just evaluating? The mock is one explicit flag away:
 forge --model mock-local --router static run "Explain this project"
 ```
 
-Without Laya installed, routing still works: the decision falls back to
-deterministic static routing (`fallback_used: true` in the events) and the run
-proceeds with the configured model. To point at a different endpoint or use an
-API key, override per project:
+Needle's weights aren't fetched yet (that lands in a later phase): routing
+falls back to deterministic static routing (`fallback_used: true` in the
+events) and the run proceeds with the configured model — this is the expected,
+fully offline default today. To point at a different endpoint or use an API
+key, override per project:
 
 ```toml
 # .forge/config.toml
@@ -95,9 +98,9 @@ model_key_env = "MY_API_KEY"   # name of the env var, never the key itself
 `.env.local` from the project root (shell env wins over `.env.local`, which
 wins over `.env`), and init reports what it found — e.g.
 `detected  DEEPSEEK_API_KEY → deepseek-chat routable` (key names only, values
-are never printed or written anywhere). With keys in place, the default Laya
-router plus the built-in `[models]` registry give you Jev-style model
-selection out of the box — no config file needed.
+are never printed or written anywhere). With keys in place, the default
+embedded Needle router plus the built-in `[models]` registry give you
+Jev-style model selection out of the box — no config file needed.
 
 Full environment precedence: **shell env** (incl. `FORGE_*` vars) →
 `.env.local` → `.env` → project config file → user config file → defaults;
@@ -184,7 +187,7 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
---router <r>          override the router (static|mock|cheapest|http|laya)
+--router <r>          override the router (static|mock|cheapest|http|laya|needle)
 --execution <p>       override the execution provider (native|mock)
 --local-only          restrict to local providers
 --approval <mode>     auto | prompt | prompt-dangerous | deny
@@ -222,11 +225,11 @@ Key settings (all optional):
 | `mock_script` | — | `FORGE_MOCK_SCRIPT` | JSON script path for `scripted-mock` (project-relative) |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `laya` | `FORGE_ROUTER` | `laya` \| `static` \| `cheapest` \| `mock` \| `http` |
+| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `laya` \| `static` \| `cheapest` \| `mock` \| `http` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key |
-| `router_timeout_ms` | `5000` | — | HTTP router timeout |
-| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya decisions escalate to the fallback |
+| `router_timeout_ms` | `5000` | — | HTTP/needle router timeout |
+| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle decisions escalate to the fallback |
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` \| `mock` |
@@ -302,25 +305,27 @@ assumed; a provider without `tools` receives single-turn requests only.
 ### DecisionRouter
 
 Chooses the model per task and records the decision with a confidence score.
-Five modes:
+Six modes:
 
+- `needle` (embedded on-device Needle 3 decision model, no network calls;
+  **default**; falls back to static when weights are unavailable — the
+  current state, since weights resolution lands in a later phase),
 - `laya` (open-source System One decision model via the reference adapter;
-  **default**; falls back to static when the adapter is down),
+  falls back to static when the adapter is down),
 - `static` (deterministic rules),
 - `mock` (preset decision, for tests),
 - `cheapest` (lowest-cost candidate from the `[models]` cost table;
   tie-breaks by output cost then name),
 - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
-  to `router_url`, bearer token from `router_key_env`),
-- `laya` (Laya typed-questions shape; defaults to
-  `http://127.0.0.1:8788/decide`, the reference adapter below).
+  to `router_url`, bearer token from `router_key_env`).
 
-`http`/`laya` decisions below `router_confidence_threshold` (default 0.7) are
-rejected and escalate through the fallback chain: any router is wrapped in a
-fallback (`router_fallback`, default `static`, may be `cheapest`), so an
-unreachable, timing-out, or unconfident router degrades to deterministic
-routing with `fallback_used: true`. TypeSafe Jev / Kev services work through
-the `http` backend — nothing is hard-coded.
+`http`/`laya`/`needle` decisions below `router_confidence_threshold` (default
+0.7) are rejected and escalate through the fallback chain: any router is
+wrapped in a fallback (`router_fallback`, default `static`, may be
+`cheapest`), so an unreachable, timing-out, unconfident, or (for `needle`)
+not-yet-loaded router degrades to deterministic routing with
+`fallback_used: true`. TypeSafe Jev / Kev services work through the `http`
+backend — nothing is hard-coded.
 
 ### Model registry with costs
 

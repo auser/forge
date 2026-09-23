@@ -47,13 +47,14 @@ fn defaults_when_nothing_set() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
 
-    // Default stack: local oMLX model + Laya router (mocks are opt-in).
+    // Default stack: local oMLX model + embedded Needle router (mocks are
+    // opt-in).
     assert_eq!(resolved.config.model, "qwen3-coder");
     assert_eq!(
         resolved.config.model_base_url.as_deref(),
         Some("http://127.0.0.1:8080/v1")
     );
-    assert_eq!(resolved.config.router, "laya");
+    assert_eq!(resolved.config.router, "needle");
     assert_eq!(resolved.config.router_timeout_ms, 5_000);
     assert_eq!(resolved.config.execution, "native");
     assert_eq!(resolved.config.approval, "prompt");
@@ -107,7 +108,7 @@ fn project_file_overrides_user_file_and_defaults() {
     // Untouched key stays default.
     assert_eq!(
         resolved.explain("router"),
-        Some(("\"laya\"".to_string(), Origin::Default))
+        Some(("\"needle\"".to_string(), Origin::Default))
     );
 }
 

@@ -7,11 +7,11 @@ use crate::commands::Context;
 
 const STARTER_CONFIG: &str = "\
 # Forge project configuration.
-# Defaults: local oMLX model + Laya (open-source System One) router.
+# Defaults: local oMLX model + embedded Needle 3 decision router.
 # Precedence: user config -> this file -> FORGE_* env -> CLI flags.
 # See `forge config explain <key>`.
 model = \"qwen3-coder\"        # served by oMLX at model_base_url
-router = \"laya\"              # open-source Jev; falls back to static when down
+router = \"needle\"            # on-device decisions; falls back to static when unavailable
 execution = \"native\"
 approval = \"prompt\"
 ";

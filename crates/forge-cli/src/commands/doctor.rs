@@ -368,6 +368,7 @@ fn check_config_file(checks: &mut Vec<Check>, label: &str, path: &Path) {
 
 fn router_note(router: &str) -> &'static str {
     match router {
+        "needle" => "embedded on-device Needle 3 decisions, available offline",
         "static" => "deterministic rules, available offline",
         "mock" => "deterministic mock, available offline",
         "cheapest" => "lowest-cost capable candidate, available offline",
