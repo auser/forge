@@ -67,7 +67,7 @@ With a real model (any OpenAI-compatible server, e.g. oMLX):
 ```toml
 # .forge/config.toml
 model = "my-coder"
-model_base_url = "http://127.0.0.1:8080"
+model_base_url = "http://127.0.0.1:8080/v1"   # include the /v1 prefix
 model_key_env = "MY_API_KEY"   # name of the env var, never the key itself
 ```
 
@@ -249,7 +249,7 @@ cost_input_per_mtok = 0.0
 
 [models.deepseek-coder]
 description = "strong coding model"
-base_url = "http://127.0.0.1:8080"   # oMLX / OpenAI-compatible endpoint
+base_url = "http://127.0.0.1:8080/v1"   # oMLX / OpenAI-compatible endpoint, incl. /v1
 key_env = "DEEPSEEK_API_KEY"          # env var holding the API key
 cost_input_per_mtok = 0.14
 cost_output_per_mtok = 0.28
