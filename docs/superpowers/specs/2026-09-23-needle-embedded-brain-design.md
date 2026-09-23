@@ -81,6 +81,19 @@ Each sub-project gets its own spec → plan → implementation cycle:
    last external server from the local stack. (Weights are GBs; needs
    its own design.)
 
+6. **Interactive CLI (TUI) with slash commands** — a fully-featured
+   interactive mode (`forge` with no subcommand, or `forge chat`)
+   matching the UX users know from Claude Code, Kimi Code, and similar
+   harnesses: a persistent conversational session with `/` commands
+   (e.g. `/model`, `/config`, `/skills`, `/graph`, `/session`,
+   `/approval`, `/help`, `/quit`) mapping onto the same `AgentService`
+   the CLI and server already share. Skills discovered from the
+   existing roots surface as `/name` commands (the `.claude/skills/`
+   root means Claude Code skills just work). Needle's direct-dispatch
+   fast path (§5) makes slash/plain-text intent routing instant and
+   on-device. Needs its own design (TUI framework, streaming render,
+   keybindings, approval UX).
+
 Parallel track (in progress on main): **cloud subscription support** —
 credential detection for Claude Code OAuth, Codex, Kimi/Moonshot and
 friends (`forge auth status`), extending the generation-plane candidate
