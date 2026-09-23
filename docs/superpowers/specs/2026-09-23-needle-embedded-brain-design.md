@@ -44,9 +44,16 @@ in `forge-providers/src/credentials.rs`; `forge auth status` reports
 what was found). Providers with detected credentials join the router's
 candidate list; without credentials, cloud candidates do not exist. Any
 decision that selects a cloud model must carry a human-readable
-`reason` in the session event. (Subscription OAuth tokens are intended
-by providers for their own CLIs — forge surfaces the terms caveat and
-treats API keys as the supported path.)
+`reason` in the session event.
+
+**Subscription and/or API key — both first-class.** Each cloud
+provider is usable through either credential kind, whichever is
+present: subscription alone, API key alone, or both (explicit
+`key_env` → conventional env vars → CLI subscription stores, per the
+documented precedence). `forge auth status` reports source and kind
+per provider. Forge surfaces the terms caveat for subscription OAuth
+tokens (providers intend them for their own CLIs) but does not
+privilege one kind over the other.
 
 **Positioning**: forge should be the premier way to make AI work
 **cheapest, fastest, and local-first** — free embedded decisions, free
