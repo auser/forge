@@ -1,6 +1,7 @@
 //! Forge core: pluggable runtime traits, shared types, versioned event
 //! protocol, and typed errors shared by every adapter (CLI, server, TUI).
 
+pub mod embed;
 pub mod error;
 pub mod events;
 pub mod execution;
