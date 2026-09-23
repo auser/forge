@@ -14,12 +14,35 @@ built-in mock providers.
 - Roadmap and future directions: [`specs/roadmap.md`](specs/roadmap.md)
 - BDD features: [`tests/features/`](tests/features/)
 
-## Quickstart
+## Installation
 
-Zero setup, fully offline (mock model, static router, native execution):
+From a checkout of this repository — either with Cargo:
 
 ```bash
-cargo build --release          # or: just release
+cargo install --path crates/forge-cli --locked   # installs the `forge` binary
+```
+
+or with the installer script (macOS, Linux, and Windows via Git Bash/MSYS2;
+detects OS/architecture and fails with a clear error on unsupported combos):
+
+```bash
+./install.sh                        # installs to ~/.local/bin
+./install.sh --prefix /usr/local/bin
+./install.sh --uninstall
+```
+
+The script builds the release binary with `cargo build --release --locked`
+(or reuses an existing `target/release/forge` when Cargo is absent), verifies
+`forge version`, and warns if the prefix is not on your `PATH`. It respects
+`NO_COLOR` and non-interactive terminals.
+
+## Quickstart
+
+Zero setup, fully offline (mock model, static router, native execution).
+After [installing](#installation) (or with `cargo build --release` and
+`./target/release/forge` in place of `forge`):
+
+```bash
 cd /path/to/your/project
 forge init                     # creates .forge/, starter config, gitignore entry, builds graph
 forge doctor                   # health report

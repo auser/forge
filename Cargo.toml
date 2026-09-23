@@ -17,7 +17,6 @@ members = [
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
-repository = "https://example.com/forge"
 
 [workspace.dependencies]
 forge-core = { path = "crates/forge-core" }
