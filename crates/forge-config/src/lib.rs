@@ -85,6 +85,9 @@ pub struct Config {
     /// Fallback router when the primary fails or is below threshold
     /// ("static" or "cheapest").
     pub router_fallback: String,
+    /// When `router = "laya"`, `forge serve` auto-starts the local Laya
+    /// adapter if the router endpoint is unreachable.
+    pub router_autostart: bool,
     /// Named models with cost/capability metadata. Deep-merged by name
     /// across config files; not settable via env/CLI flags.
     pub models: BTreeMap<String, ModelEntry>,
@@ -154,6 +157,7 @@ impl Default for Config {
             max_turns: 25,
             router_confidence_threshold: 0.7,
             router_fallback: "static".to_string(),
+            router_autostart: true,
             models: [
                 ("qwen3-coder".to_string(), models[0].clone()),
                 ("deepseek-chat".to_string(), models[1].clone()),
@@ -246,6 +250,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
         "router_confidence_threshold",
     ),
     ("FORGE_ROUTER_FALLBACK", "router_fallback"),
+    ("FORGE_ROUTER_AUTOSTART", "router_autostart"),
 ];
 
 impl Config {
@@ -387,7 +392,9 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
             continue;
         };
         let value = match *key {
-            "local_only" => toml::Value::Boolean(parse_env_bool(env_name, &raw)?),
+            "local_only" | "router_autostart" => {
+                toml::Value::Boolean(parse_env_bool(env_name, &raw)?)
+            }
             "server_port" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
                 ForgeError::config(format!("{env_name} must be a valid port, got {raw:?}"))
             })?),

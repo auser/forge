@@ -16,7 +16,7 @@ pub use error::ForgeError;
 pub use events::{EVENT_SCHEMA_VERSION, Event, EventKind};
 pub use execution::{
     ApprovalPolicy, ExecRequest, ExecResult, ExecutionProvider, FileOp, FileOpResult, RiskLevel,
-    path_escapes_root,
+    RunningProcess, path_escapes_root,
 };
 pub use graph::{ContextHit, GraphStats, GrepMatch, ProjectGraph, SymbolInfo};
 pub use model::{

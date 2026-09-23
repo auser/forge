@@ -762,3 +762,140 @@ fn dotenv_loaded_keys_are_redacted_from_session_logs() {
     );
     assert!(log.contains("[REDACTED]"), "expected redaction: {log}");
 }
+
+#[test]
+fn serve_laya_autostart() {
+    let laya_present = std::process::Command::new("python3")
+        .args(["-c", "import laya"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+
+    let free_port = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port()
+    };
+    let server_port = free_port();
+    let adapter_port = free_port();
+
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        format!(
+            "model = \"mock-local\"\nrouter = \"laya\"\nrouter_url = \"http://127.0.0.1:{adapter_port}/decide\"\nrouter_timeout_ms = 1000\n"
+        ),
+    )
+    .expect("write config");
+
+    let log_path = tmp.path().join("serve-autostart.log");
+    let log = std::fs::File::create(&log_path).expect("log file");
+    let mut child = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["serve", "--host", "127.0.0.1", "--port"])
+        .arg(server_port.to_string())
+        .stdout(log.try_clone().expect("clone"))
+        .stderr(log)
+        .spawn()
+        .expect("spawn forge serve");
+
+    let http_get = |port: u16, path: &str| -> Option<String> {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        use std::io::{Read, Write};
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .ok()?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .ok()?;
+        let mut body = String::new();
+        stream.read_to_string(&mut body).ok()?;
+        Some(body)
+    };
+
+    // Wait for the server (adapter preload can take 2 minutes cold).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(360);
+    let mut health = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(body) = http_get(server_port, "/health")
+            && body.contains("\"status\":\"ok\"")
+        {
+            health = Some(body);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    if !laya_present {
+        // Server must still come up; the adapter stays down (warned).
+        assert!(health.is_some(), "server did not start without laya");
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log_text.contains("laya adapter not started") || log_text.contains("listening on"),
+            "log: {log_text}"
+        );
+    } else {
+        assert!(
+            health.is_some(),
+            "server did not start; log: {}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        // The adapter was autostarted and answers liveness.
+        let adapter = http_get(adapter_port, "/").expect("adapter responds");
+        assert!(
+            adapter.contains("\"status\": \"ok\""),
+            "adapter liveness: {adapter}"
+        );
+        // The server itself works end to end.
+        let run = {
+            let mut stream =
+                std::net::TcpStream::connect(("127.0.0.1", server_port)).expect("connect");
+            use std::io::{Read, Write};
+            let body = r#"{"prompt":"hi"}"#;
+            let request = format!(
+                "POST /v1/runs HTTP/1.1\r\nHost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(request.as_bytes()).expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read");
+            response
+        };
+        assert!(run.contains("202"), "run response: {run}");
+    }
+
+    // SIGINT → graceful shutdown → adapter must be gone.
+    std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .output()
+        .ok();
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    child.kill().ok();
+    child.wait().ok();
+    if laya_present {
+        let gone = std::net::TcpStream::connect(("127.0.0.1", adapter_port)).is_err();
+        if !gone {
+            // Cleanup fallback so the machine never keeps an orphan.
+            std::process::Command::new("pkill")
+                .args(["-f", &format!("laya-http.py {adapter_port}")])
+                .output()
+                .ok();
+        }
+        assert!(gone, "adapter still listening on {adapter_port}");
+    }
+}

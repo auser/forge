@@ -53,6 +53,7 @@ async fn check_prerequisites(exec: &Arc<dyn ExecutionProvider>) -> Result<(), Fo
             cwd: None,
             risk: RiskLevel::Safe,
             inherit_stdio: false,
+            log_label: None,
         })
         .await;
     match python {
@@ -67,10 +68,18 @@ async fn check_prerequisites(exec: &Arc<dyn ExecutionProvider>) -> Result<(), Fo
     let import = exec
         .execute(ExecRequest {
             command: "python3".to_string(),
-            args: vec!["-c".to_string(), "import laya".to_string()],
+            args: vec![
+                "-c".to_string(),
+                // Presence check WITHOUT importing laya: a real import
+                // pulls in torch and can take minutes; find_spec is
+                // instant. The adapter itself does the real import.
+                "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('laya') else 1)"
+                    .to_string(),
+            ],
             cwd: None,
             risk: RiskLevel::Safe,
             inherit_stdio: false,
+            log_label: None,
         })
         .await;
     match import {
@@ -81,6 +90,41 @@ async fn check_prerequisites(exec: &Arc<dyn ExecutionProvider>) -> Result<(), Fo
     }
 }
 
+/// Prerequisite checks + materialization, shared by `router serve` and
+/// the `forge serve` autostart path. Returns the cached script path.
+pub(crate) async fn prepare_adapter(
+    exec: &Arc<dyn ExecutionProvider>,
+) -> Result<PathBuf, ForgeError> {
+    check_prerequisites(exec).await?;
+    let script = adapter_cache_path();
+    materialize_adapter(&script)?;
+    Ok(script)
+}
+
+/// Spawn the adapter as a managed child (no wait), output forwarded to
+/// tracing with the `[laya]` label.
+pub(crate) async fn spawn_adapter(
+    exec: &Arc<dyn ExecutionProvider>,
+    host: &str,
+    port: u16,
+) -> Result<Box<dyn forge_core::RunningProcess>, ForgeError> {
+    let script = prepare_adapter(exec).await?;
+    exec.spawn(ExecRequest {
+        command: "python3".to_string(),
+        args: vec![
+            script.to_string_lossy().to_string(),
+            port.to_string(),
+            "--host".to_string(),
+            host.to_string(),
+        ],
+        cwd: None,
+        risk: RiskLevel::Safe,
+        inherit_stdio: false,
+        log_label: Some("laya".to_string()),
+    })
+    .await
+}
+
 /// `forge router serve [--host --port]` — run the embedded Laya adapter in
 /// the foreground (like `forge serve`), blocking until Ctrl-C.
 pub async fn serve(ctx: &Context, host: String, port: u16) -> Result<(), ForgeError> {
@@ -88,10 +132,7 @@ pub async fn serve(ctx: &Context, host: String, port: u16) -> Result<(), ForgeEr
     let root = ctx.project_root()?;
     let exec = build_execution(&resolved.config, &root)?;
 
-    check_prerequisites(&exec).await?;
-
-    let script = adapter_cache_path();
-    materialize_adapter(&script)?;
+    let script = prepare_adapter(&exec).await?;
 
     if ctx.global.json {
         println!(
@@ -116,6 +157,7 @@ pub async fn serve(ctx: &Context, host: String, port: u16) -> Result<(), ForgeEr
             cwd: None,
             risk: RiskLevel::Safe,
             inherit_stdio: true,
+            log_label: Some("laya".to_string()),
         })
         .await?;
     if result.success() {

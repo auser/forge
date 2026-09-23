@@ -276,6 +276,14 @@ fn router_confidence_threshold_and_fallback_defaults_and_env() {
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
     assert_eq!(resolved.config.router_confidence_threshold, 0.7);
     assert_eq!(resolved.config.router_fallback, "static");
+    assert!(resolved.config.router_autostart);
+    unsafe { std::env::set_var("FORGE_ROUTER_AUTOSTART", "false") };
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert!(!resolved.config.router_autostart);
+    assert_eq!(
+        resolved.explain("router_autostart"),
+        Some(("false".to_string(), Origin::Environment))
+    );
 
     unsafe { std::env::set_var("FORGE_ROUTER_CONFIDENCE_THRESHOLD", "0.9") };
     unsafe { std::env::set_var("FORGE_ROUTER_FALLBACK", "cheapest") };

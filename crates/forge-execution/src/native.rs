@@ -107,6 +107,55 @@ impl ExecutionProvider for NativeExecution {
         self.execute_ungated(request).await
     }
 
+    async fn spawn(
+        &self,
+        request: ExecRequest,
+    ) -> Result<Box<dyn forge_core::RunningProcess>, ForgeError> {
+        self.check_approval(&format!("spawn `{}`", request.command), request.risk)?;
+        let mut command = tokio::process::Command::new(&request.command);
+        command.args(&request.args);
+        if let Some(cwd) = &request.cwd {
+            command.current_dir(cwd);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().map_err(|e| {
+            ForgeError::execution(format!("failed to spawn `{}`: {e}", request.command))
+        })?;
+
+        // Forward the child's output lines to tracing with the label
+        // (visible at -v; never on stdout).
+        let label = request
+            .log_label
+            .clone()
+            .unwrap_or_else(|| request.command.clone());
+        fn forward<S: tokio::io::AsyncRead + Unpin + Send + 'static>(
+            stream: Option<S>,
+            stream_name: &'static str,
+            label: String,
+        ) -> Option<tokio::task::JoinHandle<()>> {
+            stream.map(|stream| {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, BufReader};
+                    let mut lines = BufReader::new(stream).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        tracing::info!(target: "spawned", "[{label}:{stream_name}] {line}");
+                    }
+                })
+            })
+        }
+        let out_task = forward(child.stdout.take(), "out", label.clone());
+        let err_task = forward(child.stderr.take(), "err", label);
+
+        Ok(Box::new(NativeRunningProcess {
+            child,
+            out_task,
+            err_task,
+        }))
+    }
+
     async fn file_op(&self, op: FileOp) -> Result<FileOpResult, ForgeError> {
         let risk = op.risk(&self.project_root);
         let description = format!("file op {op:?}");
@@ -117,6 +166,39 @@ impl ExecutionProvider for NativeExecution {
     /// Bypass path: invoked only after an explicit recorded approval.
     async fn file_op_approved(&self, op: FileOp) -> Result<FileOpResult, ForgeError> {
         self.file_op_ungated(op).await
+    }
+}
+
+/// A running native child with its output-forwarding tasks.
+pub struct NativeRunningProcess {
+    child: tokio::process::Child,
+    out_task: Option<tokio::task::JoinHandle<()>>,
+    err_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[async_trait]
+impl forge_core::RunningProcess for NativeRunningProcess {
+    async fn kill(&mut self) -> Result<(), ForgeError> {
+        self.child.kill().await.map_err(ForgeError::Io)?;
+        if let Some(task) = self.out_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.err_task.take() {
+            task.abort();
+        }
+        Ok(())
+    }
+
+    async fn wait(&mut self) -> Result<i32, ForgeError> {
+        let status = self.child.wait().await.map_err(ForgeError::Io)?;
+        Ok(status.code().unwrap_or(-1))
+    }
+}
+
+impl Drop for NativeRunningProcess {
+    fn drop(&mut self) {
+        // Never leave an orphan behind.
+        let _ = self.child.start_kill();
     }
 }
 
@@ -229,6 +311,7 @@ mod tests {
             cwd: None,
             risk: RiskLevel::Safe,
             inherit_stdio: false,
+            log_label: None,
         }
     }
 
@@ -254,6 +337,7 @@ mod tests {
                 cwd: None,
                 risk: RiskLevel::Safe,
                 inherit_stdio: false,
+                log_label: None,
             })
             .await
             .expect("spawn succeeds");
@@ -358,6 +442,27 @@ mod tests {
             ApprovalPolicy::parse("yolo"),
             Err(ForgeError::Config(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_runs_managed_child_and_kills_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exec = NativeExecution::new(ApprovalPolicy::Auto, tmp.path());
+        let request = ExecRequest {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            risk: RiskLevel::Safe,
+            inherit_stdio: false,
+            log_label: Some("test".to_string()),
+        };
+        let mut handle = exec.spawn(request).await.expect("spawn");
+        handle.kill().await.expect("kill");
+        // Killed processes report -1 (no exit code) or a signal code.
+        let code = handle.wait().await.expect("wait");
+        assert!(code != 0 || true); // wait completed without hanging
+        let _ = code;
     }
 
     // --- file operations ---

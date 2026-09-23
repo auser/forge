@@ -225,6 +225,7 @@ Key settings (all optional):
 | `router_timeout_ms` | `5000` | — | HTTP router timeout |
 | `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya decisions escalate to the fallback |
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
+| `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` \| `mock` |
 | `approval` | `prompt` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny` |
 | `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers |
@@ -391,6 +392,17 @@ forge graph context <query>    # ranked files/symbols for agent context
 `forge serve` exposes the same `AgentService` the CLI uses (transport-neutral by
 design; gRPC can be added as another adapter). Binds to `127.0.0.1:7341` by
 default.
+
+When `router = "laya"` and the router endpoint is unreachable, `forge serve`
+auto-starts the embedded Laya adapter as a managed child (`router_autostart`,
+default `true`): the adapter script is materialized from the binary, python/laya
+prerequisites are checked, the server waits for adapter liveness before
+printing the listening line, and Ctrl-C kills the adapter first — one command
+brings up the whole stack. The adapter binds its HTTP port immediately and
+preloads its model in the background, so routing requests while it loads get a
+503 that the fallback router absorbs. Set `router_autostart = false` (or
+`FORGE_ROUTER_AUTOSTART=false`) for the old behavior, or use
+`forge router serve` to run the adapter standalone.
 
 ```text
 GET  /health                   liveness + version

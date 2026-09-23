@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use forge_core::{ExecRequest, ExecResult, ExecutionProvider, FileOp, FileOpResult, ForgeError};
+use forge_core::{
+    ExecRequest, ExecResult, ExecutionProvider, FileOp, FileOpResult, ForgeError, RunningProcess,
+};
 
 /// Records every command and file op, returning canned results. Used by
 /// unit tests and offline BDD scenarios.
@@ -76,6 +78,14 @@ impl ExecutionProvider for MockExecution {
         Ok(self.result.clone())
     }
 
+    async fn spawn(&self, request: ExecRequest) -> Result<Box<dyn RunningProcess>, ForgeError> {
+        self.recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request);
+        Ok(Box::new(MockRunningProcess))
+    }
+
     async fn file_op(&self, op: FileOp) -> Result<FileOpResult, ForgeError> {
         let changed = !matches!(op, FileOp::Read { .. });
         let content = if matches!(op, FileOp::Read { .. }) {
@@ -88,6 +98,20 @@ impl ExecutionProvider for MockExecution {
             .unwrap_or_else(|e| e.into_inner())
             .push(op);
         Ok(FileOpResult { content, changed })
+    }
+}
+
+/// Fake handle returned by the mock; nothing to kill or wait for.
+struct MockRunningProcess;
+
+#[async_trait]
+impl RunningProcess for MockRunningProcess {
+    async fn kill(&mut self) -> Result<(), ForgeError> {
+        Ok(())
+    }
+
+    async fn wait(&mut self) -> Result<i32, ForgeError> {
+        Ok(0)
     }
 }
 
@@ -145,6 +169,18 @@ mod tests {
             serde_json::from_str(r#"{"command": "ls", "risk": "safe", "inherit_stdio": true}"#)
                 .expect("parses");
         assert!(with_flag.inherit_stdio);
+    }
+
+    #[tokio::test]
+    async fn mock_spawn_records_request_and_returns_fake_handle() {
+        let mock = MockExecution::new(std::env::temp_dir());
+        let request = ExecRequest::new("python3", RiskLevel::Safe).inheriting_stdio();
+        let mut handle = mock.spawn(request).await.expect("spawn");
+        assert_eq!(handle.wait().await.expect("wait"), 0);
+        handle.kill().await.expect("kill");
+        let recorded = mock.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].command, "python3");
     }
 
     #[tokio::test]

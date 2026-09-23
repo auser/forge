@@ -79,15 +79,27 @@ pub async fn bind(
 
 /// Serve with graceful shutdown on ctrl-c.
 pub async fn serve(router: Router, host: &str, port: u16) -> Result<(), ForgeError> {
+    serve_with_shutdown(router, host, port, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+/// Serve with a caller-provided graceful-shutdown signal. The CLI passes
+/// one that kills managed child processes (e.g. the Laya adapter) first.
+pub async fn serve_with_shutdown(
+    router: Router,
+    host: &str,
+    port: u16,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), ForgeError> {
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .map_err(ForgeError::Io)?;
     let addr = listener.local_addr().map_err(ForgeError::Io)?;
     tracing::info!(%addr, "forge server listening");
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown)
         .await
         .map_err(ForgeError::Io)
 }

@@ -248,6 +248,7 @@ impl ToolDispatcher {
                     cwd: None,
                     risk,
                     inherit_stdio: false,
+                    log_label: None,
                 };
                 let result = if approved {
                     self.exec.execute_approved(request).await

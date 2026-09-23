@@ -195,6 +195,7 @@ impl FsSkillRegistry {
             cwd: Some(dir.to_path_buf()),
             risk: RiskLevel::Risky,
             inherit_stdio: false,
+            log_label: None,
         };
         exec.execute(request).await.map(Some)
     }

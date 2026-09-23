@@ -61,6 +61,10 @@ pub struct ExecRequest {
     /// stdout/stderr.
     #[serde(default)]
     pub inherit_stdio: bool,
+    /// Label used when forwarding a spawned process's output to tracing
+    /// (e.g. "laya"); defaults to the command name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_label: Option<String>,
 }
 
 impl ExecRequest {
@@ -71,6 +75,7 @@ impl ExecRequest {
             cwd: None,
             risk,
             inherit_stdio: false,
+            log_label: None,
         }
     }
 
@@ -184,6 +189,18 @@ pub struct FileOpResult {
     pub changed: bool,
 }
 
+/// A long-running managed child process (e.g. the Laya adapter), spawned
+/// without waiting. Output is forwarded to tracing by the implementation
+/// (see `ExecRequest::log_label`).
+#[async_trait]
+pub trait RunningProcess: Send {
+    /// Terminate the process (SIGKILL-equivalent).
+    async fn kill(&mut self) -> Result<(), ForgeError>;
+
+    /// Wait for exit and return the exit code (-1 when unknown/signaled).
+    async fn wait(&mut self) -> Result<i32, ForgeError>;
+}
+
 /// Runs commands and mutations. The runtime never invokes processes or
 /// touches the filesystem outside this trait; implementations include
 /// native, mock, container, MVM, remote.
@@ -196,6 +213,10 @@ pub trait ExecutionProvider: Send + Sync {
     /// Perform a file operation. Implementations must classify risk via
     /// `FileOp::risk` and apply the same approval gating as `execute`.
     async fn file_op(&self, op: FileOp) -> Result<FileOpResult, ForgeError>;
+
+    /// Spawn a long-running managed child without waiting for it. Used
+    /// for services Forge manages (e.g. the Laya adapter).
+    async fn spawn(&self, request: ExecRequest) -> Result<Box<dyn RunningProcess>, ForgeError>;
 
     /// Execute bypassing approval gating. Invoked ONLY by the agent loop
     /// after an explicit, recorded user approval (an `ApprovalDecided`
