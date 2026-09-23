@@ -26,11 +26,7 @@ pub use weights::{WeightsSpec, WeightsStatus, ensure_weights, spec_for, verify, 
 pub fn engine_from_config(
     needle: &forge_config::NeedleConfig,
 ) -> Result<NeedleEngine, forge_core::error::ForgeError> {
-    let path = weights::weights_path(needle).unwrap_or_else(|_| {
-        // No pinned spec for this variant (or another resolution failure):
-        // fall back to the generic default path just for error reporting.
-        backend::default_weights_path()
-    });
+    let path = weights::weights_path(needle).unwrap_or_else(|_| weights::best_effort_path(needle));
 
     #[cfg(feature = "ffi")]
     {

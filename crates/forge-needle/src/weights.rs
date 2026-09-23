@@ -129,8 +129,9 @@ pub fn weights_path(needle: &NeedleConfig) -> Result<PathBuf, ForgeError> {
 
 /// Best-effort path for [`WeightsStatus::Missing`] when `needle.variant`
 /// has no pinned spec at all — there's no real filename to anchor to, but
-/// callers still want a path to show/log.
-fn best_effort_path(needle: &NeedleConfig) -> PathBuf {
+/// callers still want a path to show/log. Also used by `engine_from_config`
+/// for the same reason.
+pub(crate) fn best_effort_path(needle: &NeedleConfig) -> PathBuf {
     if !needle.weights_path.trim().is_empty() {
         return PathBuf::from(&needle.weights_path);
     }
