@@ -619,6 +619,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-needle"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "forge-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "forge-providers"
 version = "0.1.0"
 dependencies = [

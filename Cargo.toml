@@ -6,6 +6,7 @@ members = [
     "crates/forge-core",
     "crates/forge-execution",
     "crates/forge-graph",
+    "crates/forge-needle",
     "crates/forge-providers",
     "crates/forge-runtime",
     "crates/forge-server",
@@ -23,6 +24,7 @@ forge-core = { path = "crates/forge-core" }
 forge-config = { path = "crates/forge-config" }
 forge-execution = { path = "crates/forge-execution" }
 forge-graph = { path = "crates/forge-graph" }
+forge-needle = { path = "crates/forge-needle" }
 forge-providers = { path = "crates/forge-providers" }
 forge-runtime = { path = "crates/forge-runtime" }
 forge-server = { path = "crates/forge-server" }
