@@ -16,6 +16,9 @@ and always skipped under `--local-only`. Laya (open-source System One) and
 other HTTP-style routers remain available as alternates. Mock providers
 exist for tests and demos but are strictly opt-in (`model = "mock-local"`).
 
+- **How it all fits together** — the decision plane (Needle → Jev/OpenJev →
+  static), the generation plane (local → subscription → API-key cloud), the
+  fast path, and every trait seam: [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - Project spec: [`specs/project.md`](specs/project.md)
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
 - Implementation plan: [`specs/implementation-plan.md`](specs/implementation-plan.md)
