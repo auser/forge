@@ -388,6 +388,16 @@ async fn needle_check(config: &forge_config::Config) -> Check {
     }
 
     let using_hash_backend = std::env::var("FORGE_NEEDLE_BACKEND").as_deref() == Ok("hash");
+    // Set once this function's own checksum step confirms weights are
+    // present and verified on disk — used below to give an honest message
+    // when `engine_from_config` still fails with a weights-missing-shaped
+    // error (today it always does: no `ffi` backend exists yet, so it
+    // always spawns `UnavailableBackend`, whose `load()` always reports
+    // `WeightsMissing` regardless of what's actually on disk). Without this
+    // flag the probe would print a `forge init` hint that's actively wrong
+    // — the weights *are* fetched and verified; the binary just can't load
+    // them yet.
+    let mut weights_verified = false;
 
     if !using_hash_backend {
         let path = match forge_needle::weights_path(&config.needle) {
@@ -428,7 +438,7 @@ async fn needle_check(config: &forge_config::Config) -> Check {
             }
         };
         match forge_needle::verify(&path, &expected_sha256) {
-            Ok(true) => {}
+            Ok(true) => weights_verified = true,
             Ok(false) => {
                 return Check {
                     level: Level::Warn,
@@ -492,6 +502,20 @@ async fn needle_check(config: &forge_config::Config) -> Check {
                 detail: format!("decide succeeded but model info failed: {e}"),
             },
         },
+        Ok(Err(e)) if weights_verified && is_weights_missing_shaped(&e) => Check {
+            // This function's own checksum check above just confirmed the
+            // weights ARE present and verified — a `forge init` hint here
+            // would be actively wrong. What's actually true: no `ffi`
+            // backend is built into this binary yet (Task 8), so
+            // `engine_from_config` always yields a stub that can't load
+            // any weights, verified or not.
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!(
+                "weights present and verified, but the embedded inference backend is not built into this binary yet; falls back to {} routing",
+                config.router_fallback
+            ),
+        },
         Ok(Err(e)) => Check {
             level: Level::Warn,
             label: LABEL.into(),
@@ -503,6 +527,16 @@ async fn needle_check(config: &forge_config::Config) -> Check {
             detail: format!("decide timed out after {} ms", timeout.as_millis()),
         },
     }
+}
+
+/// `NeedleEngine::decide`'s error is a stringly-typed `ForgeError::Router`
+/// by the time it reaches doctor — the engine layer collapses
+/// `BackendError` into a message rather than preserving the variant. This
+/// matches on the exact wording `BackendError::WeightsMissing`'s `Display`
+/// impl produces (`forge-needle/src/backend.rs`) so `needle_check` can tell
+/// "no ffi backend built in" apart from a genuine inference failure.
+fn is_weights_missing_shaped(err: &ForgeError) -> bool {
+    err.to_string().contains("weights missing at")
 }
 
 fn router_note(router: &str) -> &'static str {
@@ -532,6 +566,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[serial]
     async fn needle_check_when_router_is_not_needle_is_ok_and_informational() {
         let config = forge_config::Config {
             router: "static".to_string(),
@@ -543,6 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn needle_check_reports_missing_weights_as_warn_not_fail() {
         let mut config = forge_config::Config::default();
         config.needle.weights_path = "/nonexistent/needle.bin".to_string();
@@ -552,6 +588,51 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn needle_check_gives_honest_message_when_weights_verified_but_no_ffi_backend() {
+        // Weights genuinely present and checksum-verified on disk, but
+        // `engine_from_config` still can't load them (no `ffi` backend
+        // built into this binary until Task 8). The probe must not blame
+        // this on missing weights or suggest `forge init` — that would be
+        // actively wrong, since the checksum step just succeeded.
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("weights.bin");
+        let bytes = b"arbitrary-bytes-standing-in-for-real-needle-weights";
+        std::fs::write(&path, bytes).expect("write fake weights");
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+
+        let config = forge_config::Config {
+            needle: forge_config::NeedleConfig {
+                variant: "full".to_string(),
+                weights_path: path.display().to_string(),
+                autofetch: true,
+                // Operator-supplied override bypasses the pinned-spec
+                // checksum lookup entirely, so an arbitrary payload can
+                // verify cleanly.
+                weights_sha256: sha256,
+            },
+            ..forge_config::Config::default()
+        };
+
+        let check = needle_check(&config).await;
+
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            !check.detail.contains("forge init"),
+            "must not suggest `forge init` once weights are already verified: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("not built into this binary"),
+            "detail: {}",
+            check.detail
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn needle_check_warns_for_unpinned_variant_without_panicking() {
         // "medium" is config-valid but has no pinned artifact yet (see
         // forge-needle's weights module doc) — must degrade to Warn, never

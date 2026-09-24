@@ -41,5 +41,6 @@ cucumber = "0.21"
 reqwest.workspace = true
 serde_json.workspace = true
 serial_test.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true
