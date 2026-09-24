@@ -92,6 +92,51 @@ impl JevRouter {
             registry,
         })
     }
+
+    /// Fluent alternative to [`JevRouter::new`]'s four positional
+    /// arguments; `new` stays for backwards compatibility with existing
+    /// call sites.
+    pub fn builder() -> JevRouterBuilder {
+        JevRouterBuilder::default()
+    }
+}
+
+/// Builder for [`JevRouter`]. All fields default the same way `new`'s
+/// `None`/empty-`Vec` arguments would; `timeout` defaults to
+/// [`Duration::ZERO`] (`Duration` has no natural "unset" value), so callers
+/// building for real use always set it explicitly.
+#[derive(Default)]
+pub struct JevRouterBuilder {
+    url: Option<String>,
+    key_env: Option<String>,
+    timeout: Duration,
+    registry: Vec<(String, ModelCapabilities)>,
+}
+
+impl JevRouterBuilder {
+    pub fn url(mut self, url: Option<String>) -> Self {
+        self.url = url;
+        self
+    }
+
+    pub fn key_env(mut self, key_env: Option<String>) -> Self {
+        self.key_env = key_env;
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn registry(mut self, registry: Vec<(String, ModelCapabilities)>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn build(self) -> Result<JevRouter, ForgeError> {
+        JevRouter::new(self.url, self.key_env, self.timeout, self.registry)
+    }
 }
 
 #[async_trait]
@@ -465,5 +510,33 @@ mod tests {
             0,
             "no network call should be attempted when nothing is capable"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn jev_router_builder_produces_a_working_router() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-jev-key") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.9)))
+            .mount(&server)
+            .await;
+
+        let router = JevRouter::builder()
+            .url(Some(server.uri()))
+            .timeout(Duration::from_secs(5))
+            .registry(vec![("cheap-a".to_string(), caps(true))])
+            .build()
+            .expect("builder constructs");
+
+        let decision = router
+            .route(&RoutingRequest::new("anything"))
+            .await
+            .expect("routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        assert_eq!(decision.selected_model, "cheap-a");
+        assert_eq!(decision.router_name, "jev");
     }
 }
