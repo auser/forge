@@ -386,7 +386,7 @@ impl DecisionRouter for CheapestRouter {
     }
 }
 
-fn optimistic_caps() -> ModelCapabilities {
+pub(crate) fn optimistic_caps() -> ModelCapabilities {
     ModelCapabilities {
         streaming: true,
         tools: true,
@@ -428,6 +428,49 @@ impl LayaRouter {
             key_env,
             criteria,
         })
+    }
+
+    /// Fluent alternative to [`LayaRouter::new`]'s four positional
+    /// arguments; `new` stays for backwards compatibility with existing
+    /// call sites.
+    pub fn builder() -> LayaRouterBuilder {
+        LayaRouterBuilder::default()
+    }
+}
+
+/// Builder for [`LayaRouter`]. All fields default the same way `new`'s
+/// `None`/zero-length arguments would.
+#[derive(Default)]
+pub struct LayaRouterBuilder {
+    url: Option<String>,
+    key_env: Option<String>,
+    timeout: Duration,
+    criteria: std::collections::HashMap<String, String>,
+}
+
+impl LayaRouterBuilder {
+    pub fn url(mut self, url: Option<String>) -> Self {
+        self.url = url;
+        self
+    }
+
+    pub fn key_env(mut self, key_env: Option<String>) -> Self {
+        self.key_env = key_env;
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn criteria(mut self, criteria: std::collections::HashMap<String, String>) -> Self {
+        self.criteria = criteria;
+        self
+    }
+
+    pub fn build(self) -> Result<LayaRouter, ForgeError> {
+        LayaRouter::new(self.url, self.key_env, self.timeout, self.criteria)
     }
 }
 
@@ -540,96 +583,344 @@ impl DecisionRouter for ThresholdRouter {
     }
 }
 
-/// Build a router by name. `static`, `mock`, `cheapest` are local;
-/// `http`/`laya` are HTTP; `needle` is the embedded on-device Needle 3
-/// decision router (env `FORGE_NEEDLE_BACKEND=hash` selects the
-/// deterministic test/BDD backend instead of the real weights-backed
-/// engine). Laya defaults to `127.0.0.1:8788` when `router_url` is unset.
+/// One router-mode constructor: builds a fresh router from config/registry,
+/// ignoring whichever parameter it doesn't need. Kept as a plain function
+/// (not a trait) per YAGNI — there is exactly one thing every mode does
+/// ("build me one of these"), and a name -> fn-pointer table already gives
+/// dispatch without a trait that would only ever have these seven impls.
+type RouterCtor =
+    fn(&Config, &[(String, ModelCapabilities)]) -> Result<Arc<dyn DecisionRouter>, ForgeError>;
+
+/// `static`, `mock`, `cheapest` are local; `http`/`laya` are HTTP; `needle`
+/// is the embedded on-device Needle 3 decision router (env
+/// `FORGE_NEEDLE_BACKEND=hash` selects the deterministic test/BDD backend
+/// instead of the real weights-backed engine); `jev` here is always the
+/// *primary*-role constructor (escalation goes through [`build_jev`]
+/// directly with the escalation-role credential resolution — see
+/// [`resolved_jev_url`]).
+const ROUTER_CTORS: &[(&str, RouterCtor)] = &[
+    ("static", build_static),
+    ("mock", build_mock),
+    ("cheapest", build_cheapest),
+    ("http", build_http),
+    ("laya", build_laya),
+    ("needle", build_needle),
+    ("jev", build_jev_primary),
+];
+
+/// Build a router by name via the [`ROUTER_CTORS`] dispatch table.
 fn build_router(
     name: &str,
     config: &Config,
     registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
-    match name {
-        "static" => Ok(Arc::new(
-            StaticRouter::new(config.model.clone()).with_registry(registry.to_vec()),
-        )),
-        "mock" => Ok(Arc::new(MockRouter::selecting(config.model.clone()))),
-        "cheapest" => {
-            let costs = config
-                .model_entries()
-                .iter()
-                .map(|(name, entry)| (name.clone(), entry.costs()))
-                .collect();
-            Ok(Arc::new(CheapestRouter::new(costs, registry.to_vec())))
-        }
-        "http" => {
-            let url = config.router_url.as_deref().ok_or_else(|| {
-                ForgeError::router("router = \"http\" requires router_url to be configured")
-            })?;
-            Ok(Arc::new(HttpRouter::new(
-                url,
-                config.router_key_env.clone(),
-                Duration::from_millis(config.router_timeout_ms),
-            )?))
-        }
-        "laya" => {
-            let criteria = config
-                .model_entries()
-                .iter()
-                .map(|(name, entry)| {
-                    (
-                        name.clone(),
-                        entry
-                            .description
-                            .clone()
-                            .unwrap_or_else(|| format!("model {name}")),
-                    )
-                })
-                .collect();
-            Ok(Arc::new(LayaRouter::new(
-                config.router_url.clone(),
-                config.router_key_env.clone(),
-                Duration::from_millis(config.router_timeout_ms),
-                criteria,
-            )?))
-        }
-        "needle" => {
-            let engine = forge_needle::select_engine(&config.needle)?;
-            Ok(Arc::new(forge_needle::NeedleRouter::new(
-                engine,
-                registry.to_vec(),
-                Duration::from_millis(config.router_timeout_ms),
-            )))
-        }
-        other => Err(ForgeError::router(format!(
-            "unknown router {other:?} (expected static, mock, cheapest, http, laya, or needle)"
+    match ROUTER_CTORS.iter().find(|(n, _)| *n == name) {
+        Some((_, ctor)) => ctor(config, registry),
+        None => Err(ForgeError::router(format!(
+            "unknown router {name:?} (expected static, mock, cheapest, http, laya, needle, or jev)"
         ))),
     }
 }
 
+fn build_static(
+    config: &Config,
+    registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    Ok(Arc::new(
+        StaticRouter::new(config.model.clone()).with_registry(registry.to_vec()),
+    ))
+}
+
+fn build_mock(
+    config: &Config,
+    _registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    Ok(Arc::new(MockRouter::selecting(config.model.clone())))
+}
+
+fn build_cheapest(
+    config: &Config,
+    registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    let costs = config
+        .model_entries()
+        .iter()
+        .map(|(name, entry)| (name.clone(), entry.costs()))
+        .collect();
+    Ok(Arc::new(CheapestRouter::new(costs, registry.to_vec())))
+}
+
+fn build_http(
+    config: &Config,
+    _registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    let url = config.router_url.as_deref().ok_or_else(|| {
+        ForgeError::router("router = \"http\" requires router_url to be configured")
+    })?;
+    Ok(Arc::new(HttpRouter::new(
+        url,
+        config.router_key_env.clone(),
+        Duration::from_millis(config.router_timeout_ms),
+    )?))
+}
+
+fn build_laya(
+    config: &Config,
+    _registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    let criteria = config
+        .model_entries()
+        .iter()
+        .map(|(name, entry)| {
+            (
+                name.clone(),
+                entry
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("model {name}")),
+            )
+        })
+        .collect();
+    Ok(Arc::new(
+        LayaRouter::builder()
+            .url(config.router_url.clone())
+            .key_env(config.router_key_env.clone())
+            .timeout(Duration::from_millis(config.router_timeout_ms))
+            .criteria(criteria)
+            .build()?,
+    ))
+}
+
+fn build_needle(
+    config: &Config,
+    registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    let engine = forge_needle::select_engine(&config.needle)?;
+    Ok(Arc::new(forge_needle::NeedleRouter::new(
+        engine,
+        registry.to_vec(),
+        Duration::from_millis(config.router_timeout_ms),
+    )))
+}
+
+/// `router = "jev"` as *primary* — always the primary-role credential
+/// resolution (`escalation = false`); see [`build_jev`].
+fn build_jev_primary(
+    config: &Config,
+    registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    build_jev(config, registry, false)
+}
+
+/// Resolve the Jev endpoint for a given role. **Escalation must never
+/// silently reuse a leftover `router_url`** meant for a different primary
+/// router (`http`/`laya`) — a stale `router_url` pointed at some other
+/// System One-compatible endpoint would otherwise receive the
+/// `TYPESAFE_API_KEY` credential. So escalation only ever falls back to
+/// `jev_url` or the compiled-in default, never `router_url`. The primary
+/// role (`router = "jev"`) *does* fall back to `router_url` for
+/// backwards-compatibility with how `http`/`laya` already reuse the
+/// generic field when there's no more specific one.
+pub fn resolved_jev_url(config: &Config, escalation: bool) -> Option<String> {
+    config.jev_url.clone().or_else(|| {
+        if escalation {
+            None
+        } else {
+            config.router_url.clone()
+        }
+    })
+}
+
+/// Resolve the Jev credential env var name for a given role — same scoping
+/// rationale as [`resolved_jev_url`]: escalation never falls back to the
+/// generic `router_key_env` (which could belong to an unrelated
+/// `http`/`laya` setup and send its token to `api.typesafe.ai`).
+pub fn resolved_jev_key_env(config: &Config, escalation: bool) -> String {
+    config
+        .jev_key_env
+        .clone()
+        .or_else(|| {
+            if escalation {
+                None
+            } else {
+                config.router_key_env.clone()
+            }
+        })
+        .unwrap_or_else(|| crate::JevRouter::DEFAULT_KEY_ENV.to_string())
+}
+
+/// Whether a non-empty Jev credential is present in the environment right
+/// now, using the same role-scoped resolution as [`resolved_jev_key_env`].
+/// Checked once at router-construction time (not per-request): the
+/// escalation tier is either wired into the stack or it isn't for the
+/// lifetime of this router.
+pub fn jev_credential_present(config: &Config, escalation: bool) -> bool {
+    std::env::var(resolved_jev_key_env(config, escalation))
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
+/// Build a `JevRouter` for the given role (see [`resolved_jev_url`] /
+/// [`resolved_jev_key_env`] for why the role matters).
+fn build_jev(
+    config: &Config,
+    registry: &[(String, ModelCapabilities)],
+    escalation: bool,
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    Ok(Arc::new(
+        crate::JevRouter::builder()
+            .url(resolved_jev_url(config, escalation))
+            .key_env(Some(resolved_jev_key_env(config, escalation)))
+            .timeout(Duration::from_millis(config.router_timeout_ms))
+            .registry(registry.to_vec())
+            .build()?,
+    ))
+}
+
+/// Builds the full decision-router stack from configuration. Each step is
+/// a small, independently testable method; [`router_from_config`] is a
+/// thin public shim over [`RouterStackBuilder::build`] so callers see no
+/// API change.
+struct RouterStackBuilder<'a> {
+    config: &'a Config,
+    registry: &'a [(String, ModelCapabilities)],
+}
+
+impl<'a> RouterStackBuilder<'a> {
+    fn new(config: &'a Config, registry: &'a [(String, ModelCapabilities)]) -> Self {
+        Self { config, registry }
+    }
+
+    /// The effective primary router name and its freshly-built instance
+    /// (unwrapped — no threshold gate yet, see [`Self::threshold_wrap`]).
+    ///
+    /// **`--local-only` and `jev`**: neither `http` nor `laya` are today
+    /// pruned from the stack under `local_only` (a discrepancy from this
+    /// crate's design docs, which describe local-only as hard-blocking all
+    /// network routers — recorded, not silently fixed here, since fixing it
+    /// is outside this change's scope). `jev` is a new, narrower guarantee:
+    /// since the design brief for the escalation tier explicitly requires
+    /// local-only to prune it in both roles, `router = "jev"` under
+    /// `local_only` degrades to `static` (with a warning) rather than
+    /// erroring the whole build — the same "prefer a working, less-capable
+    /// router over refusing to run" philosophy `needle`'s no-weights
+    /// fallback already uses. The escalation role is pruned the same way,
+    /// in [`Self::escalation_tier`].
+    fn resolve_primary(&self) -> Result<(String, Arc<dyn DecisionRouter>), ForgeError> {
+        let name = if self.config.router == "jev" && self.config.local_only {
+            tracing::warn!(
+                "router = \"jev\" requires network access; --local-only forces static routing instead"
+            );
+            "static".to_string()
+        } else {
+            self.config.router.clone()
+        };
+        let router = build_router(&name, self.config, self.registry)?;
+        Ok((name, router))
+    }
+
+    /// Reject-below-threshold gate for the router classes that report a
+    /// meaningful confidence (`http`/`laya`/`needle`/`jev`); everything else
+    /// (`static`, `mock`, `cheapest`) passes through unwrapped, since their
+    /// confidence is always 1.0 by construction.
+    fn threshold_wrap(
+        &self,
+        name: &str,
+        router: Arc<dyn DecisionRouter>,
+    ) -> Arc<dyn DecisionRouter> {
+        if matches!(name, "http" | "laya" | "needle" | "jev") {
+            Arc::new(ThresholdRouter::new(
+                router,
+                self.config.router_confidence_threshold,
+            ))
+        } else {
+            router
+        }
+    }
+
+    /// The needle -> jev escalation tier, if it applies: `None` when the
+    /// primary isn't `needle`, escalation is off, `--local-only` is set, or
+    /// no credential is present — in every one of those cases, today's
+    /// plain `Fallback(Threshold(needle), router_fallback)` behavior is
+    /// unchanged. The escalation tier resolves its endpoint/credential from
+    /// `jev_url`/`jev_key_env` (or the compiled-in defaults) only — see
+    /// [`resolved_jev_url`] — deliberately never from the generic
+    /// `router_url`/`router_key_env`, which in `needle` mode belong to no
+    /// router at all and, if left over from a previous `http`/`laya` setup,
+    /// would otherwise silently receive the Jev credential or send an
+    /// unrelated token to `api.typesafe.ai`.
+    ///
+    /// A `build_jev` construction failure (e.g. a bad `router_timeout_ms`
+    /// producing an unbuildable HTTP client) skips the escalation tier with
+    /// a warning (`Ok(None)`) rather than aborting the whole router build —
+    /// needle -> static must keep working even if jev can't be wired in.
+    /// A failure building `router_fallback` itself, however, still
+    /// propagates as a real `Err`: that fallback is needed regardless of
+    /// escalation, so a broken one is a genuine config error.
+    fn escalation_tier(
+        &self,
+        primary_name: &str,
+    ) -> Result<Option<Arc<dyn DecisionRouter>>, ForgeError> {
+        let escalation_applies = primary_name == "needle"
+            && self.config.router_escalate == "auto"
+            && !self.config.local_only
+            && jev_credential_present(self.config, true);
+        if !escalation_applies {
+            return Ok(None);
+        }
+
+        let jev = match build_jev(self.config, self.registry, true) {
+            Ok(jev) => jev,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "jev escalation tier failed to construct; falling back to needle -> {}",
+                    self.config.router_fallback
+                );
+                return Ok(None);
+            }
+        };
+        let jev = self.threshold_wrap("jev", jev);
+        let base_fallback = build_router(&self.config.router_fallback, self.config, self.registry)?;
+        Ok(Some(Arc::new(FallbackRouter::new(jev, base_fallback))))
+    }
+
+    /// The outer fallback wrap: `primary` unwrapped when it already *is*
+    /// `router_fallback` (avoids a redundant self-fallback hop), else
+    /// `Fallback(primary, router_fallback)`.
+    fn fallback_chain(
+        &self,
+        primary_name: &str,
+        primary: Arc<dyn DecisionRouter>,
+    ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+        if primary_name == self.config.router_fallback {
+            return Ok(primary);
+        }
+        let fallback = build_router(&self.config.router_fallback, self.config, self.registry)?;
+        Ok(Arc::new(FallbackRouter::new(primary, fallback)))
+    }
+
+    fn build(&self) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+        let (primary_name, primary) = self.resolve_primary()?;
+        let primary = self.threshold_wrap(&primary_name, primary);
+
+        if let Some(escalation) = self.escalation_tier(&primary_name)? {
+            return Ok(Arc::new(FallbackRouter::new(primary, escalation)));
+        }
+
+        self.fallback_chain(&primary_name, primary)
+    }
+}
+
 /// Build the decision router from configuration: `static`, `mock`,
-/// `cheapest`, `http`, `laya`, or `needle`. HTTP-class routers and `needle`
-/// are gated by `router_confidence_threshold`; when the primary differs
-/// from `router_fallback` it is wrapped in a `FallbackRouter` so failures
-/// and low-confidence decisions degrade to the fallback instead of failing
-/// the run.
+/// `cheapest`, `http`, `laya`, `needle`, or `jev`. See [`RouterStackBuilder`]
+/// for the decomposed steps (primary resolution, threshold gating,
+/// needle -> jev escalation, and the outer fallback wrap).
 pub fn router_from_config(
     config: &Config,
     registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
-    let mut primary = build_router(&config.router, config, registry)?;
-    if matches!(config.router.as_str(), "http" | "laya" | "needle") {
-        primary = Arc::new(ThresholdRouter::new(
-            primary,
-            config.router_confidence_threshold,
-        ));
-    }
-    if config.router == config.router_fallback {
-        return Ok(primary);
-    }
-    let fallback = build_router(&config.router_fallback, config, registry)?;
-    Ok(Arc::new(FallbackRouter::new(primary, fallback)))
+    RouterStackBuilder::new(config, registry).build()
 }
 
 #[cfg(test)]
@@ -883,6 +1174,26 @@ mod tests {
     }
 
     #[test]
+    fn build_http_requires_router_url_directly() {
+        // Direct unit test of the extracted per-mode constructor (not just
+        // through the public `router_from_config` entry point above).
+        let config = Config {
+            router: "http".to_string(),
+            ..Config::default()
+        };
+        match build_http(&config, &[]) {
+            Err(e) => assert!(matches!(e, ForgeError::Router(_)), "got: {e:?}"),
+            Ok(_) => panic!("must fail without router_url"),
+        }
+
+        let config = Config {
+            router_url: Some("http://127.0.0.1:9/route".to_string()),
+            ..config
+        };
+        assert!(build_http(&config, &[]).is_ok());
+    }
+
+    #[test]
     fn router_from_config_rejects_unknown_router() {
         let config = Config {
             router: "jev-magic".to_string(),
@@ -896,6 +1207,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn needle_router_from_config_falls_back_to_static_without_weights() {
+        // Defensive: guarantee no jev escalation kicks in here even if a
+        // prior (possibly panicked) jev test in this same process leaked a
+        // credential — this test is about needle's own fallback, not jev's.
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
         let config = Config {
             router: "needle".to_string(),
             router_fallback: "static".to_string(),
@@ -931,6 +1246,450 @@ mod tests {
         unsafe { std::env::remove_var("FORGE_NEEDLE_BACKEND") };
         assert_eq!(d.router_name, "needle");
         assert!(!d.fallback_used);
+    }
+
+    // --- jev / escalation ---
+
+    fn jev_body(choice: &str, confidence: f64) -> serde_json::Value {
+        serde_json::json!({
+            "model": "jev-1.13.0",
+            "answers": {
+                "model": {"type": "choice", "choice": choice, "confidence": confidence},
+            },
+        })
+    }
+
+    #[test]
+    fn router_from_config_builds_jev_explicitly() {
+        let config = Config {
+            router: "jev".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("jev builds");
+        drop(router);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn router_from_config_jev_escalation_used_when_needle_unavailable_and_credential_present()
+    {
+        // (a) needle unavailable (no weights) + jev credential present +
+        // wiremock jev responding -> the decision comes from "jev" and is
+        // marked fallback_used (FallbackRouter always marks a degraded hop).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("local-coder", 0.88)))
+            .mount(&server)
+            .await;
+
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let mut config = Config {
+            router: "needle".to_string(),
+            jev_url: Some(server.uri()),
+            router_fallback: "static".to_string(),
+            model: "local-coder".to_string(),
+            ..Config::default()
+        };
+        config.models.insert(
+            "local-coder".to_string(),
+            forge_config::ModelEntry::default(),
+        );
+        let router = router_from_config(&config, &[("local-coder".to_string(), caps(true))])
+            .expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("offline task"))
+            .await
+            .expect("escalation routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        assert_eq!(decision.router_name, "jev");
+        assert!(decision.fallback_used);
+        assert_eq!(decision.selected_model, "local-coder");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn router_from_config_escalation_ignores_poisoned_generic_router_url() {
+        // A leftover `router_url` from an unrelated http/laya setup must
+        // never be hijacked by the jev escalation tier: the credential
+        // must not be POSTed to it, and its response (if any) must not be
+        // used as the decision. Only `jev_url` is consulted.
+        let poisoned = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("wrong-model", 0.99)))
+            .expect(0)
+            .mount(&poisoned)
+            .await;
+
+        let real_jev = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("local-coder", 0.88)))
+            .mount(&real_jev)
+            .await;
+
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let mut config = Config {
+            router: "needle".to_string(),
+            router_url: Some(poisoned.uri()),
+            jev_url: Some(real_jev.uri()),
+            router_fallback: "static".to_string(),
+            model: "local-coder".to_string(),
+            ..Config::default()
+        };
+        config.models.insert(
+            "local-coder".to_string(),
+            forge_config::ModelEntry::default(),
+        );
+        let router = router_from_config(&config, &[("local-coder".to_string(), caps(true))])
+            .expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("offline task"))
+            .await
+            .expect("escalation routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        assert_eq!(decision.router_name, "jev");
+        assert_eq!(decision.selected_model, "local-coder");
+        assert_eq!(
+            poisoned.received_requests().await.expect("requests").len(),
+            0,
+            "the generic router_url must never be contacted by the escalation tier"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn router_from_config_no_jev_credential_keeps_todays_static_fallback() {
+        // (b) no credential -> static fallback exactly as before jev
+        // existed; jev must never even be contacted.
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("mock-local", 0.9)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            router: "needle".to_string(),
+            jev_url: Some(server.uri()),
+            router_fallback: "static".to_string(),
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("offline task"))
+            .await
+            .expect("fallback routes");
+
+        assert_eq!(decision.router_name, "static");
+        assert!(decision.fallback_used);
+        assert_eq!(
+            server.received_requests().await.expect("requests").len(),
+            0,
+            "jev must never be contacted without a credential"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn router_from_config_local_only_prunes_jev_escalation_even_with_credential() {
+        // (c) --local-only + credential present -> jev never contacted.
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("mock-local", 0.9)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            router: "needle".to_string(),
+            jev_url: Some(server.uri()),
+            router_fallback: "static".to_string(),
+            local_only: true,
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("offline task"))
+            .await
+            .expect("fallback routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        assert_eq!(decision.router_name, "static");
+        assert!(decision.fallback_used);
+        assert_eq!(
+            server.received_requests().await.expect("requests").len(),
+            0,
+            "--local-only must prune jev from the escalation tier"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn router_from_config_jev_primary_under_local_only_falls_back_to_static() {
+        // --local-only must also prune jev in the *primary* role: rather
+        // than erroring the whole build, it degrades straight to static
+        // (no FallbackRouter hop at all, since router_fallback is already
+        // "static" — matching needle's own no-weights-under-local-only
+        // philosophy of preferring a working router over refusing to run).
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let config = Config {
+            router: "jev".to_string(),
+            router_url: Some("http://127.0.0.1:9/systemone".to_string()),
+            local_only: true,
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("x"))
+            .await
+            .expect("routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        assert_eq!(decision.router_name, "static");
+        assert!(!decision.fallback_used);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn jev_unavailable_falls_back_via_config_chain() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let mut config = Config {
+            router: "jev".to_string(),
+            router_url: Some("http://127.0.0.1:9/systemone".to_string()),
+            router_timeout_ms: 200,
+            router_fallback: "static".to_string(),
+            model: "local-coder".to_string(),
+            ..Config::default()
+        };
+        config.models.insert(
+            "local-coder".to_string(),
+            forge_config::ModelEntry {
+                description: Some("local coder model".to_string()),
+                ..Default::default()
+            },
+        );
+        let router = router_from_config(&config, &[]).expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("offline task"))
+            .await
+            .expect("fallback routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert_eq!(decision.selected_model, "local-coder");
+        assert!(decision.fallback_used);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn jev_low_confidence_escalates_to_fallback() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.3)))
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            router: "jev".to_string(),
+            router_url: Some(server.uri()),
+            router_confidence_threshold: 0.7,
+            router_fallback: "static".to_string(),
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("builds");
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["cheap-a".to_string(), "mock-local".to_string()],
+        };
+        let decision = router.route(&request).await.expect("fallback routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert_eq!(decision.selected_model, "mock-local");
+        assert!(decision.fallback_used);
+        assert!(
+            decision.reason.contains("confidence"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    // --- RouterStackBuilder (direct unit tests of the decomposed steps;
+    // the full-stack tests above and below are the behavior lock) ---
+
+    #[test]
+    #[serial]
+    fn router_stack_resolve_primary_forces_static_for_jev_under_local_only() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = Config {
+            router: "jev".to_string(),
+            local_only: true,
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let (name, _router) = stack.resolve_primary().expect("resolves");
+        assert_eq!(name, "static");
+    }
+
+    #[test]
+    fn router_stack_resolve_primary_passes_through_otherwise() {
+        let config = Config {
+            router: "static".to_string(),
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let (name, _router) = stack.resolve_primary().expect("resolves");
+        assert_eq!(name, "static");
+
+        // jev primary WITHOUT local_only keeps its own name (only the
+        // local_only + jev combination substitutes "static").
+        let config = Config {
+            router: "jev".to_string(),
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let (name, _router) = stack.resolve_primary().expect("resolves");
+        assert_eq!(name, "jev");
+    }
+
+    #[tokio::test]
+    async fn router_stack_threshold_wrap_gates_threshold_classes_only() {
+        let config = Config {
+            router_confidence_threshold: 0.7,
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let low_confidence: Arc<dyn DecisionRouter> = Arc::new(MockRouter::new(RoutingDecision {
+            selected_model: "m".to_string(),
+            confidence: 0.1,
+            router_name: "mock".to_string(),
+            fallback_used: false,
+            reason: "low".to_string(),
+        }));
+
+        // "needle" is threshold-gated: a low-confidence decision errors.
+        let gated = stack.threshold_wrap("needle", low_confidence.clone());
+        assert!(gated.route(&RoutingRequest::new("x")).await.is_err());
+
+        // "static" is not: the same low-confidence decision passes through.
+        let ungated = stack.threshold_wrap("static", low_confidence);
+        assert!(ungated.route(&RoutingRequest::new("x")).await.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn router_stack_escalation_tier_none_when_primary_is_not_needle() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let config = Config::default();
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let result = stack.escalation_tier("jev").expect("no error");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn router_stack_escalation_tier_none_when_escalate_is_off() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let config = Config {
+            router_escalate: "off".to_string(),
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let result = stack.escalation_tier("needle").expect("no error");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn router_stack_escalation_tier_none_under_local_only() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let config = Config {
+            local_only: true,
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let result = stack.escalation_tier("needle").expect("no error");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn router_stack_escalation_tier_none_without_credential() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = Config::default();
+        let stack = RouterStackBuilder::new(&config, &[]);
+        assert!(stack.escalation_tier("needle").expect("no error").is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn router_stack_escalation_tier_some_when_all_conditions_met() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.9)))
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            jev_url: Some(server.uri()),
+            router_fallback: "static".to_string(),
+            model: "cheap-a".to_string(),
+            ..Config::default()
+        };
+        let registry = [("cheap-a".to_string(), caps(true))];
+        let stack = RouterStackBuilder::new(&config, &registry);
+        let escalation = stack
+            .escalation_tier("needle")
+            .expect("no error")
+            .expect("escalation tier present");
+        let decision = escalation
+            .route(&RoutingRequest::new("x"))
+            .await
+            .expect("routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert_eq!(decision.router_name, "jev");
+    }
+
+    #[test]
+    fn router_stack_fallback_chain_returns_primary_unwrapped_when_names_match() {
+        let config = Config {
+            router: "static".to_string(),
+            router_fallback: "static".to_string(),
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let primary: Arc<dyn DecisionRouter> = Arc::new(MockRouter::selecting("m"));
+        let result = stack
+            .fallback_chain("static", primary.clone())
+            .expect("builds");
+        // Same object identity: no FallbackRouter wrap was introduced.
+        assert!(Arc::ptr_eq(&primary, &result));
+    }
+
+    #[test]
+    fn router_stack_fallback_chain_wraps_when_names_differ() {
+        let config = Config {
+            router: "http".to_string(),
+            router_fallback: "static".to_string(),
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let primary: Arc<dyn DecisionRouter> = Arc::new(MockRouter::selecting("m"));
+        let result = stack
+            .fallback_chain("http", primary.clone())
+            .expect("builds");
+        assert!(!Arc::ptr_eq(&primary, &result));
     }
 
     // --- cheapest ---
@@ -1200,5 +1959,32 @@ mod tests {
             "{}",
             decision.reason
         );
+    }
+
+    #[tokio::test]
+    async fn laya_router_builder_produces_a_working_router() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/decide"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(laya_body("cheap-a", 0.95)))
+            .mount(&server)
+            .await;
+
+        let criteria = [("cheap-a".to_string(), "cheap general model".to_string())]
+            .into_iter()
+            .collect();
+        let router = LayaRouter::builder()
+            .url(Some(format!("{}/decide", server.uri())))
+            .timeout(Duration::from_secs(5))
+            .criteria(criteria)
+            .build()
+            .expect("builder constructs");
+
+        let decision = router
+            .route(&RoutingRequest::new("fix the bug"))
+            .await
+            .expect("routes");
+        assert_eq!(decision.selected_model, "cheap-a");
+        assert_eq!(decision.router_name, "laya");
     }
 }

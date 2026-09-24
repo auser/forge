@@ -236,6 +236,7 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
         });
 
         checks.push(needle_check(config).await);
+        checks.push(jev_check(config));
 
         // Reachability of http/laya routers (warn, never fail).
         if matches!(config.router.as_str(), "http" | "laya") {
@@ -549,6 +550,80 @@ fn is_weights_missing_shaped(err: &ForgeError) -> bool {
     err.to_string().contains("weights missing at")
 }
 
+/// Probe the Jev escalation tier: credential + endpoint only, no network
+/// probe (consistent with `needle_check` — this stays fast and offline).
+/// Meaningful whenever jev could actually be contacted: as the primary
+/// router (`router = "jev"`), or as needle's escalation tier
+/// (`router = "needle"`, `router_escalate = "auto"`). Never returns
+/// `Level::Fail` — an absent credential just means jev stays out of the
+/// stack, which `router_from_config` already handles gracefully.
+fn jev_check(config: &forge_config::Config) -> Check {
+    const LABEL: &str = "jev";
+    let is_primary = config.router == "jev";
+    let escalation_configured = config.router == "needle" && config.router_escalate == "auto";
+
+    if !is_primary && !escalation_configured {
+        return Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: "not active (router is neither \"jev\" nor escalating from \"needle\")".into(),
+        };
+    }
+
+    if config.local_only {
+        // `--local-only` prunes jev in both roles at construction time
+        // (see `router_from_config`); this mirrors why it never even gets
+        // asked about a credential. Primary always degrades straight to
+        // "static" (a literal, hardcoded target in `router_from_config`,
+        // not `router_fallback` — name the actual behavior, not a
+        // plausible-looking but wrong guess).
+        let detail = if is_primary {
+            "not active (--local-only forces static routing)".to_string()
+        } else {
+            "escalation disabled (--local-only)".to_string()
+        };
+        return Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail,
+        };
+    }
+
+    // Role-scoped resolution, shared with `router_from_config` so this
+    // check can never drift from what the router actually does: escalation
+    // never falls back to the generic `router_url`/`router_key_env` (which
+    // could belong to an unrelated http/laya setup), but the primary role
+    // does, for backwards compatibility.
+    let escalation = !is_primary;
+    let key_env = forge_providers::resolved_jev_key_env(config, escalation);
+    let endpoint = forge_providers::resolved_jev_url(config, escalation)
+        .unwrap_or_else(|| forge_providers::JevRouter::DEFAULT_URL.to_string());
+    let key_present = forge_providers::jev_credential_present(config, escalation);
+
+    if key_present {
+        Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: format!("credential detected ({key_env}); endpoint {endpoint}"),
+        }
+    } else if is_primary {
+        Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!(
+                "no credential ({key_env}); requests to {endpoint} will fail (falls back to {})",
+                config.router_fallback
+            ),
+        }
+    } else {
+        Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: format!("jev escalation: no credential ({key_env}) — on-device only"),
+        }
+    }
+}
+
 fn router_note(router: &str) -> &'static str {
     match router {
         "needle" => "embedded on-device Needle 3 decisions, available offline",
@@ -557,6 +632,9 @@ fn router_note(router: &str) -> &'static str {
         "cheapest" => "lowest-cost capable candidate, available offline",
         "http" => "System One-compatible HTTP router (uses router_url)",
         "laya" => "Laya typed-questions router (uses router_url, default 127.0.0.1:8788)",
+        "jev" => {
+            "Jev/OpenJev System One router (TYPESAFE_API_KEY or router_url for self-hosted OpenJev)"
+        }
         _ => "unrecognized router name",
     }
 }
@@ -677,5 +755,176 @@ mod tests {
         }
         assert_eq!(check.level, Level::Ok);
         assert!(check.detail.contains("ms")); // measured decide() latency
+    }
+
+    // --- jev ---
+
+    #[test]
+    #[serial]
+    fn jev_check_inactive_when_router_is_neither_jev_nor_escalating() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = forge_config::Config {
+            router: "static".to_string(),
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("not active"), "{}", check.detail);
+    }
+
+    #[test]
+    #[serial]
+    fn jev_check_reports_credential_detected_for_escalation() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "dummy-value-for-test") };
+        let config = forge_config::Config::default(); // router = "needle", escalate = "auto"
+        let check = jev_check(&config);
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check
+                .detail
+                .contains("credential detected (TYPESAFE_API_KEY)"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("api.typesafe.ai"), "{}", check.detail);
+    }
+
+    #[test]
+    #[serial]
+    fn jev_check_reports_informational_message_when_escalation_has_no_credential() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = forge_config::Config::default(); // router = "needle", escalate = "auto"
+        let check = jev_check(&config);
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(
+            check.detail,
+            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn jev_check_warns_when_primary_router_has_no_credential() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = forge_config::Config {
+            router: "jev".to_string(),
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("no credential"), "{}", check.detail);
+        assert!(check.detail.contains("static"), "{}", check.detail);
+    }
+
+    #[test]
+    #[serial]
+    fn jev_check_local_only_prunes_both_roles() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "dummy-value-for-test") };
+
+        let escalation = forge_config::Config {
+            local_only: true,
+            ..forge_config::Config::default() // router = "needle", escalate = "auto"
+        };
+        let check = jev_check(&escalation);
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("--local-only"), "{}", check.detail);
+
+        // `router_fallback` deliberately set to something other than
+        // "static": `router_from_config` always forces "static" under
+        // --local-only for a jev primary (a literal, not `router_fallback`
+        // substituted in) — the message must say "static", not "cheapest",
+        // or it would describe behavior that never happens.
+        let primary = forge_config::Config {
+            router: "jev".to_string(),
+            router_fallback: "cheapest".to_string(),
+            local_only: true,
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&primary);
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("--local-only"), "{}", check.detail);
+        assert!(
+            check.detail.contains("static") && !check.detail.contains("cheapest"),
+            "must name the router_from_config's actual hardcoded fallback (static), not \
+             router_fallback: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn jev_check_primary_falls_back_to_generic_router_key_env_and_router_url() {
+        // Primary role backwards-compat: with no jev_url/jev_key_env set,
+        // `router = "jev"` reuses the generic fields, same as http/laya do.
+        unsafe { std::env::set_var("MY_JEV_KEY", "dummy-value-for-test") };
+        let config = forge_config::Config {
+            router: "jev".to_string(),
+            router_key_env: Some("MY_JEV_KEY".to_string()),
+            router_url: Some("https://openjev.example.internal/v1/systemone".to_string()),
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        unsafe { std::env::remove_var("MY_JEV_KEY") };
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("MY_JEV_KEY"), "{}", check.detail);
+        assert!(
+            check.detail.contains("openjev.example.internal"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn jev_check_escalation_ignores_generic_router_key_env_and_router_url() {
+        // Escalation role must NOT fall back to router_url/router_key_env
+        // (a leftover setting from an unrelated http/laya config): with no
+        // jev_url/jev_key_env, escalation reports the compiled-in defaults
+        // regardless of what router_url/router_key_env say.
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = forge_config::Config {
+            router: "needle".to_string(),
+            router_key_env: Some("SOME_OTHER_ROUTERS_KEY".to_string()),
+            router_url: Some("https://poisoned.example.internal/route".to_string()),
+            ..forge_config::Config::default() // escalate = "auto"
+        };
+        let check = jev_check(&config);
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(
+            check.detail,
+            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only"
+        );
+        assert!(
+            !check.detail.contains("poisoned.example.internal")
+                && !check.detail.contains("SOME_OTHER_ROUTERS_KEY"),
+            "escalation must never surface the generic router_url/router_key_env: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn jev_check_honors_jev_url_and_jev_key_env_for_escalation() {
+        unsafe { std::env::set_var("MY_JEV_KEY", "dummy-value-for-test") };
+        let config = forge_config::Config {
+            router: "needle".to_string(),
+            jev_key_env: Some("MY_JEV_KEY".to_string()),
+            jev_url: Some("https://openjev.example.internal/v1/systemone".to_string()),
+            // A poisoned generic router_url must be ignored too.
+            router_url: Some("https://poisoned.example.internal/route".to_string()),
+            ..forge_config::Config::default() // escalate = "auto"
+        };
+        let check = jev_check(&config);
+        unsafe { std::env::remove_var("MY_JEV_KEY") };
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("MY_JEV_KEY"), "{}", check.detail);
+        assert!(
+            check.detail.contains("openjev.example.internal"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.contains("poisoned.example.internal"));
     }
 }
