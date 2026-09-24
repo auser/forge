@@ -1,0 +1,43 @@
+# CI gate for PRs and the merge queue: fmt, clippy, tests, BDD.
+# The `verify` job name is the required status check on `main`.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Default features only: the `ffi` feature links libneedle, a native
+      # engine binary CI runners don't have. `cargo clippy` never links, so
+      # the ffi/e2e code still gets full type+lint coverage via the second
+      # step (this mirrors `just lint` + `just lint-ffi` + `just test`).
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (ffi, link-free)
+        run: cargo clippy -p forge-needle --features "ffi needle-e2e" --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: BDD
+        run: cargo test -p forge-cli --test bdd

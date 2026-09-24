@@ -825,3 +825,11 @@ go in `specs/adrs/`.
   pre-embedded, task-embedding-ranked selection the design describes —
   both are deferred to the same follow-up as the semantic-blend sharing
   above.
+
+## Contributing
+
+`main` is protected: changes land via pull request only (direct pushes,
+force pushes, and branch deletion are rejected). Every PR must pass the
+`verify` CI job (`cargo fmt --check`, clippy with `-D warnings`, all tests,
+and the BDD suite — the same as `just verify` locally). No approvals are
+required for now; keep PRs small and green.
