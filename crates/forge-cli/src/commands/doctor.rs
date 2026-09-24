@@ -4,6 +4,7 @@ use forge_core::ForgeError;
 
 use crate::commands::Context;
 
+#[derive(Debug, PartialEq)]
 enum Level {
     Ok,
     Warn,
@@ -234,6 +235,8 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
             detail: format!("{} ({})", config.router, router_note(&config.router)),
         });
 
+        checks.push(needle_check(config).await);
+
         // Reachability of http/laya routers (warn, never fail).
         if matches!(config.router.as_str(), "http" | "laya") {
             let url = config
@@ -366,6 +369,142 @@ fn check_config_file(checks: &mut Vec<Check>, label: &str, path: &Path) {
     }
 }
 
+/// Probe the embedded Needle brain: only meaningful when `router = "needle"`
+/// (else purely informational). Never returns `Level::Fail` — a broken or
+/// missing brain degrades to the configured static fallback, so forge stays
+/// usable either way; this check exists to surface *why* it degraded.
+///
+/// Filesystem/checksum only: this never fetches weights over the network
+/// (that's `forge init`'s job), so `forge doctor` stays fast and offline.
+async fn needle_check(config: &forge_config::Config) -> Check {
+    const LABEL: &str = "needle brain";
+
+    if config.router != "needle" {
+        return Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: "not the active router".into(),
+        };
+    }
+
+    let using_hash_backend = std::env::var("FORGE_NEEDLE_BACKEND").as_deref() == Ok("hash");
+
+    if !using_hash_backend {
+        let path = match forge_needle::weights_path(&config.needle) {
+            Ok(path) => path,
+            Err(e) => {
+                // Typically an unpinned variant (e.g. "small"/"medium") —
+                // name the situation rather than pretending it's fixable
+                // with `forge init`.
+                return Check {
+                    level: Level::Warn,
+                    label: LABEL.into(),
+                    detail: format!("{e} (falling back to {} routing)", config.router_fallback),
+                };
+            }
+        };
+        if !path.is_file() {
+            return Check {
+                level: Level::Warn,
+                label: LABEL.into(),
+                detail: format!(
+                    "weights missing at {}; run `forge init` to fetch them",
+                    path.display()
+                ),
+            };
+        }
+        let expected_sha256 = if !config.needle.weights_sha256.trim().is_empty() {
+            config.needle.weights_sha256.clone()
+        } else {
+            match forge_needle::spec_for(&config.needle.variant) {
+                Ok(spec) => spec.sha256.to_string(),
+                Err(e) => {
+                    return Check {
+                        level: Level::Warn,
+                        label: LABEL.into(),
+                        detail: e.to_string(),
+                    };
+                }
+            }
+        };
+        match forge_needle::verify(&path, &expected_sha256) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Check {
+                    level: Level::Warn,
+                    label: LABEL.into(),
+                    detail: format!(
+                        "weights at {} failed checksum verification; run `forge init` to refetch them",
+                        path.display()
+                    ),
+                };
+            }
+            Err(e) => {
+                return Check {
+                    level: Level::Warn,
+                    label: LABEL.into(),
+                    detail: format!(
+                        "could not verify weights at {}: {e}; run `forge init`",
+                        path.display()
+                    ),
+                };
+            }
+        }
+    }
+
+    let engine_result = if using_hash_backend {
+        Ok(forge_needle::NeedleEngine::spawn(
+            forge_needle::HashBackend::new(),
+        ))
+    } else {
+        forge_needle::engine_from_config(&config.needle)
+    };
+    let engine = match engine_result {
+        Ok(engine) => engine,
+        Err(e) => {
+            return Check {
+                level: Level::Warn,
+                label: LABEL.into(),
+                detail: format!("engine unavailable: {e}"),
+            };
+        }
+    };
+
+    let timeout = std::time::Duration::from_millis(config.router_timeout_ms);
+    let started = std::time::Instant::now();
+    let decide_result = tokio::time::timeout(
+        timeout,
+        engine.decide("doctor smoke test".to_string(), vec!["ok".to_string()]),
+    )
+    .await;
+    let elapsed_ms = started.elapsed().as_millis();
+
+    match decide_result {
+        Ok(Ok(_decision)) => match engine.info().await {
+            Ok((model_id, _dims)) => Check {
+                level: Level::Ok,
+                label: LABEL.into(),
+                detail: format!("ok (model {model_id}, decide {elapsed_ms} ms)"),
+            },
+            Err(e) => Check {
+                level: Level::Warn,
+                label: LABEL.into(),
+                detail: format!("decide succeeded but model info failed: {e}"),
+            },
+        },
+        Ok(Err(e)) => Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!("decide failed: {e}"),
+        },
+        Err(_) => Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!("decide timed out after {} ms", timeout.as_millis()),
+        },
+    }
+}
+
 fn router_note(router: &str) -> &'static str {
     match router {
         "needle" => "embedded on-device Needle 3 decisions, available offline",
@@ -383,5 +522,60 @@ fn execution_note(execution: &str) -> &'static str {
         "native" => "local process execution, available",
         "mock" => "recorded mock execution, available offline",
         _ => "unrecognized execution provider",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn needle_check_when_router_is_not_needle_is_ok_and_informational() {
+        let config = forge_config::Config {
+            router: "static".to_string(),
+            ..forge_config::Config::default()
+        };
+        let check = needle_check(&config).await;
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("not the active router"));
+    }
+
+    #[tokio::test]
+    async fn needle_check_reports_missing_weights_as_warn_not_fail() {
+        let mut config = forge_config::Config::default();
+        config.needle.weights_path = "/nonexistent/needle.bin".to_string();
+        let check = needle_check(&config).await;
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("forge init"));
+    }
+
+    #[tokio::test]
+    async fn needle_check_warns_for_unpinned_variant_without_panicking() {
+        // "medium" is config-valid but has no pinned artifact yet (see
+        // forge-needle's weights module doc) — must degrade to Warn, never
+        // panic or Fail.
+        let mut config = forge_config::Config::default();
+        config.needle.variant = "medium".to_string();
+        let check = needle_check(&config).await;
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("medium"), "detail: {}", check.detail);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn needle_check_with_hash_backend_reports_ok_and_latency() {
+        // SAFETY: test-only env mutation, serialized via #[serial] against
+        // any other test touching FORGE_NEEDLE_BACKEND in this crate.
+        unsafe {
+            std::env::set_var("FORGE_NEEDLE_BACKEND", "hash");
+        }
+        let check = needle_check(&forge_config::Config::default()).await;
+        unsafe {
+            std::env::remove_var("FORGE_NEEDLE_BACKEND");
+        }
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("ms")); // measured decide() latency
     }
 }

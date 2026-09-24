@@ -68,7 +68,7 @@ Prereqs: an OpenAI-compatible server running `qwen3-coder` at
 ```bash
 cd /path/to/your/project
 forge init                     # creates .forge/, starter config, gitignore entry, builds graph, fetches Needle weights
-forge doctor                   # probes model + router endpoints, warns if down
+forge doctor                   # probes model + router endpoints and the embedded needle brain (weights, load, decision latency), warns if down
 forge run "Explain this project"
 forge serve                    # REST/SSE on http://127.0.0.1:7341
 curl http://127.0.0.1:7341/health
