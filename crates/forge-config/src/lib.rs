@@ -71,7 +71,7 @@ impl ModelEntry {
 #[serde(default)]
 pub struct NeedleConfig {
     /// Weights ladder: "small" (~8 MB), "medium", or "full" (default;
-    /// ~29 MB; currently the only variant with a hosted, pinned artifact —
+    /// ~35 MB; currently the only variant with a hosted, pinned artifact —
     /// see `forge-needle`'s `weights::VARIANTS`).
     pub variant: String,
     /// Override path to weights; empty means the default cache location

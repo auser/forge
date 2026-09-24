@@ -131,13 +131,19 @@ impl FileOp {
         }
     }
 
-    /// Risk classification: Read is always Safe; Write/Edit inside the
-    /// project are Risky; Delete, or any path escaping the project root,
-    /// is Destructive.
+    /// Risk classification: Read inside the project is Safe; Write/Edit
+    /// inside the project are Risky; Delete, or any path escaping the
+    /// project root (including a Read), is Destructive.
+    ///
+    /// The escape check runs for every variant, `Read` included: `Safe` is
+    /// the one risk level every `ApprovalPolicy` — even `Deny` — lets
+    /// through unconditionally (see `NativeExecution::check_approval`), so
+    /// exempting `Read` from the escape check would let a model read
+    /// arbitrary files outside the project (`../../secret`, `/etc/passwd`,
+    /// ...) under any policy. An escaping read is classified `Destructive`
+    /// rather than `Risky` because it can exfiltrate secrets outside the
+    /// project in one shot, the same severity as an escaping write.
     pub fn risk(&self, project_root: &Path) -> RiskLevel {
-        if matches!(self, Self::Read { .. }) {
-            return RiskLevel::Safe;
-        }
         if path_escapes_root(self.path(), project_root) {
             return RiskLevel::Destructive;
         }
@@ -178,6 +184,52 @@ pub fn path_escapes_root(path: &Path, root: &Path) -> bool {
     }
     let normalized: PathBuf = parts.iter().collect();
     !normalized.starts_with(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_root_read_is_safe() {
+        let root = Path::new("/project");
+        let read = FileOp::Read {
+            path: PathBuf::from("src/lib.rs"),
+        };
+        assert_eq!(read.risk(root), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn relative_escaping_read_is_gated() {
+        let root = Path::new("/project");
+        let read = FileOp::Read {
+            path: PathBuf::from("../outside.txt"),
+        };
+        // Doc comment: "any path escaping the project root is Destructive" —
+        // a `Read` must not be exempted from that rule, or a model could
+        // read arbitrary files (`../../secret`, `/etc/passwd`, ...) through
+        // a risk level that every `ApprovalPolicy` (including `Deny`) lets
+        // through unconditionally.
+        assert_eq!(read.risk(root), RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn absolute_escaping_read_is_gated() {
+        let root = Path::new("/project");
+        let read = FileOp::Read {
+            path: PathBuf::from("/etc/passwd"),
+        };
+        assert_eq!(read.risk(root), RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn absolute_in_root_read_is_safe() {
+        let root = Path::new("/project");
+        let read = FileOp::Read {
+            path: PathBuf::from("/project/src/lib.rs"),
+        };
+        assert_eq!(read.risk(root), RiskLevel::Safe);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

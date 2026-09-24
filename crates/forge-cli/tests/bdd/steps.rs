@@ -1306,3 +1306,154 @@ fn missing_credentials_reported(world: &mut BddWorld) {
         world.last_stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// needle_routing.feature
+// ---------------------------------------------------------------------------
+
+#[given("an initialized project with no needle weights")]
+async fn initialized_project_no_needle_weights(world: &mut BddWorld) {
+    // `run_forge` already injects `FORGE_NEEDLE_AUTOFETCH=false` and leaves
+    // `FORGE_NEEDLE_BACKEND` unset for every invocation, so the starter
+    // config's default `router = "needle"` ends up with no usable engine:
+    // no weights fetched, no hash test backend selected, no `ffi` feature.
+    world.run_forge(&["init"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[given("an initialized project with the hash needle backend")]
+async fn initialized_project_hash_needle_backend(world: &mut BddWorld) {
+    world
+        .env
+        .insert("FORGE_NEEDLE_BACKEND".to_string(), "hash".to_string());
+    world.run_forge(&["init"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[when(expr = "I run forge with prompt {string} and model {string}")]
+async fn run_forge_with_prompt_and_model(world: &mut BddWorld, prompt: String, model: String) {
+    world.run_forge(&["--model", &model, "run", &prompt]).await;
+}
+
+#[then("the run completes successfully")]
+fn the_run_completes_successfully(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[then("the session events contain a routing decision with fallback_used true")]
+fn session_events_routing_decision_fallback_used(world: &mut BddWorld) {
+    let log = world.session_log();
+    let decision = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "routing_decision_made")
+        .unwrap_or_else(|| panic!("no routing decision in session log: {log}"));
+    assert_eq!(decision["fallback_used"], true, "decision: {decision}");
+}
+
+#[then(expr = "the session events contain a routing decision from router {string}")]
+fn session_events_routing_decision_from_router(world: &mut BddWorld, router: String) {
+    let log = world.session_log();
+    let decision = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "routing_decision_made")
+        .unwrap_or_else(|| panic!("no routing decision in session log: {log}"));
+    assert_eq!(decision["router"], router, "decision: {decision}");
+}
+
+#[when("I run forge doctor")]
+async fn run_forge_doctor(world: &mut BddWorld) {
+    world.run_forge(&["doctor"]).await;
+}
+
+#[then(expr = "the doctor output mentions {string}")]
+fn doctor_output_mentions(world: &mut BddWorld, needle: String) {
+    assert!(
+        world.last_stdout.contains(&needle),
+        "stdout: {}",
+        world.last_stdout
+    );
+}
+
+#[given("a fresh project directory")]
+fn fresh_project_directory(world: &mut BddWorld) {
+    world.project();
+}
+
+#[when("I run forge init with --local-only")]
+async fn run_forge_init_local_only(world: &mut BddWorld) {
+    world.run_forge(&["init", "--local-only"]).await;
+}
+
+#[then(expr = "the init output mentions {string}")]
+fn init_output_mentions(world: &mut BddWorld, text: String) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    assert!(
+        world.last_stdout.contains(&text),
+        "stdout: {}",
+        world.last_stdout
+    );
+}
+
+#[then("no file exists under the forge cache models directory")]
+fn no_file_under_cache_models_dir(world: &mut BddWorld) {
+    // `weights_path`/`cache_dir` resolve against `std::env::home_dir()`,
+    // which `run_forge` points at `<scenario>/home` — the same hermetic
+    // HOME every other scenario uses.
+    let models_dir = world
+        .project()
+        .join("home")
+        .join(".cache")
+        .join("forge")
+        .join("models");
+    let has_files = models_dir.is_dir()
+        && std::fs::read_dir(&models_dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+    assert!(
+        !has_files,
+        "unexpected file(s) under {}",
+        models_dir.display()
+    );
+}
+
+#[given("an initialized project with the hash needle backend and a built graph")]
+async fn initialized_project_hash_backend_and_built_graph(world: &mut BddWorld) {
+    world
+        .env
+        .insert("FORGE_NEEDLE_BACKEND".to_string(), "hash".to_string());
+    world.write_file(
+        "src/parser.rs",
+        "pub fn parse_document(input: &str) -> usize {\n    input.len()\n}\n",
+    );
+    world.run_forge(&["init"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    // `forge init` builds the graph's structure but never embeds (no
+    // model calls from `init`, ever); an explicit `graph build` with the
+    // hash backend available produces the semantic index.
+    world.run_forge(&["graph", "build"]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[when(expr = "I run forge graph grep --semantic {string}")]
+async fn run_forge_graph_grep_semantic(world: &mut BddWorld, query: String) {
+    world
+        .run_forge(&["graph", "grep", "--semantic", &query])
+        .await;
+}
+
+#[then("the output lists at least one symbol")]
+fn output_lists_at_least_one_symbol(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    assert!(
+        !world.last_stdout.contains("no semantic matches"),
+        "stdout: {}",
+        world.last_stdout
+    );
+    assert!(
+        world.last_stdout.contains("::"),
+        "expected at least one `file::symbol` result, stdout: {}",
+        world.last_stdout
+    );
+}

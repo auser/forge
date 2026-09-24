@@ -81,8 +81,10 @@ forge --model mock-local --router static run "Explain this project"
 ```
 
 `forge init` fetches and verifies Needle's weights when `needle.autofetch`
-is on (the default) — a one-time download, typically 8-29 MB depending on
-`needle.variant`, cached under `~/.cache/forge/models/`; re-running `init`
+is on (the default) — a one-time ~35 MB download for `needle.variant = "full"`
+(the only variant with a hosted, pinned artifact today; `small`/`medium`
+report "no pinned weights artifact" and fall back to static routing),
+cached under `~/.cache/forge/models/`; re-running `init`
 re-verifies the checksum and skips the download if it already matches.
 Whenever weights aren't present (no network, `--local-only`, or a variant
 with nothing to fetch yet — see below), routing falls back to deterministic
@@ -107,16 +109,14 @@ are never printed or written anywhere). With keys in place, the default
 embedded Needle router plus the built-in `[models]` registry give you
 Jev-style model selection out of the box — no config file needed.
 
+```bash
+forge init     # loads .env/.env.local, detects known provider keys, builds the graph
+```
+
 Full environment precedence: **shell env** (incl. `FORGE_*` vars) →
 `.env.local` → `.env` → project config file → user config file → defaults;
 CLI flags beat everything. Values loaded from `.env` files are covered by
 session-log secret redaction just like shell-set keys.
-
-### Drop-in setup for existing projects
-
-```bash
-forge init     # loads .env/.env.local, detects known provider keys, builds the graph
-```
 
 Forge ships ready-made config presets — copy one into `.forge/config.toml`
 (or `~/.config/forge/config.toml` for all projects) and you're done:
@@ -262,7 +262,7 @@ Key settings (all optional):
 | `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
 | `needle.variant` | `full` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small \| medium \| full); **only `full` has a downloadable artifact today** — Cactus-Compute publishes one 20-layer file, `needle build --layers N` slices smaller ones locally, so `small`/`medium` currently report "no pinned weights artifact" and fall back to static routing. `full` is the default precisely because it's the one that actually fetches; revisit once a smaller rung is hosted |
 | `needle.weights_path` | — | — | Weights override; empty → ~/.cache/forge/models/ |
-| `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~34 MB for `full`) |
+| `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~35 MB for `full`) |
 | `needle.weights_sha256` | — | `FORGE_NEEDLE_WEIGHTS_SHA256` | Operator override for the expected weights checksum (64 hex chars); empty → use the compiled-in pin. Pairs with `weights_path`/a custom base URL to run your own weights without recompiling |
 
 Unknown keys are tolerated. Inspect the resolved configuration:
@@ -357,8 +357,10 @@ backend — nothing is hard-coded.
 
 ### Model registry with costs
 
-Three entries ship as built-in defaults (prices as of September 2026 — prices
-change; check provider pages):
+Five entries ship as built-in defaults (`qwen3-coder`, `deepseek-chat`,
+`claude-sonnet`, `gpt-5`, `kimi-k2.7-code`; prices as of September 2026 —
+prices change; check provider pages). A representative few, shown below
+(`claude-sonnet` is shown in [Authentication](#authentication) above):
 
 ```toml
 [models.qwen3-coder]      # local default, free
@@ -421,9 +423,12 @@ Forge never requires Python.
 
 All command/script execution AND file reads/writes/edits/deletes go through
 this trait (the runtime never spawns processes or touches files directly).
-Risk classification: reads are `Safe`, in-project writes/edits are `Risky`,
-deletes and out-of-project paths are `Destructive`. `native` runs locally with
-approval gating: `Risky` operations pause for approval under
+Risk classification: in-project reads are `Safe`; in-project writes/edits are
+`Risky`; deletes, and any operation (including a read) whose path escapes the
+project root, are `Destructive` — a read outside the project can exfiltrate a
+secret just as effectively as a write can overwrite one, so it gets the same
+gating rather than the free pass `Safe` gives every approval policy. `native`
+runs locally with approval gating: `Risky` operations pause for approval under
 `approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
 ones (non-interactive stdin → typed "approval required" error, which the agent
 loop treats as a pause: answer via piped stdin lines, e.g.
@@ -686,7 +691,7 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 17 features / 28 scenarios / 108 steps.
+  mock providers — fully offline. Currently 20 features / 38 scenarios / 141 steps.
 - Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
   `just verify` — they need a native engine and real weights. See [Embedded
   Needle brain (`ffi`)](#embedded-needle-brain-ffi).
@@ -700,3 +705,16 @@ go in `specs/adrs/`.
   terminal-first eviction); the session store persists across restarts.
 - Input delivery is in-process: `POST /v1/runs/:id/input` for a run owned by
   another process records the event but that loop does not consume it.
+- The needle direct-dispatch fast path is read-only by design (`read_file`,
+  `graph_context`, `graph_grep` only); writes, edits, deletes, and commands
+  always go through the full agent loop and its approval gating.
+- `forge init` builds the project graph's structure but never embeds it (no
+  model calls from `init`, ever); run `forge graph build` afterwards to
+  populate the semantic index once needle weights are available.
+- Needle extraction and fast-path tool-call quality depend on the weights
+  variant loaded; only `full` ships a downloadable artifact today, so
+  `small`/`medium` quality is untested until Cactus-Compute hosts them.
+- Jev-tier escalation (routing across a ladder of models by task difficulty,
+  with `extract()`-based argument repair in the agent loop) is not
+  implemented yet; it needs real-model quality data first and is deferred to
+  a later spec sub-project.

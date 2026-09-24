@@ -175,17 +175,34 @@ fn command_risk(args: &serde_json::Value) -> RiskLevel {
 /// [`FileOp::risk`], commands to the same [`command_risk`] clamp
 /// `dispatch_inner` applies, and the graph tools never reach an
 /// `ExecutionProvider` (so nothing can gate them). `FileOp::risk` needs a
-/// project root to tell `Risky` from `Destructive`, which the tool layer
-/// does not know; the sentinel root below is sound for this contract
-/// because `Safe` is the one answer that cannot depend on the root (reads
-/// return it before any path is examined) and because under-reporting
-/// `Destructive` as `Risky` is exactly the "lowest possible" promise. Only
+/// project root to tell `Risky` from `Destructive` — and, since it also
+/// gates `Read` against the escape check, to tell `Safe` from
+/// `Destructive` — which the tool layer does not know.
+///
+/// The sentinel root below is a single-component absolute path
+/// (`/forge-dispatch-risk-sentinel`) rather than an empty path. An empty
+/// path is not a safe stand-in here: `Path::starts_with` treats every path
+/// as starting with the empty path, so `path_escapes_root` can never
+/// observe an escape against it — an absolute path like `/etc/passwd`, or
+/// a relative walk-up like `../../secret`, would silently normalize back
+/// to "inside root" and this function would keep answering `Safe`. A
+/// non-empty sentinel does not have that problem: any absolute path other
+/// than one actually rooted at the sentinel fails `starts_with`, and any
+/// relative path with a net leading `..` (a walk-up past its own root)
+/// pops the sentinel's one component and fails too — which is exactly
+/// correct, because `..` from a project root by definition leaves that
+/// root **regardless of how deep the real root is**. The one remaining
+/// gap this can't close is under-reporting `Destructive` as `Risky` for a
+/// `Write`/`Edit` escape, which is exactly the "lowest possible risk"
+/// promise this function makes and is harmless here: gate 5 only checks
+/// for `Safe`, and neither `Risky` nor `Destructive` is `Safe`. Only
 /// `Some(RiskLevel::Safe)` is therefore a guarantee: it means no approval
 /// policy can gate this call (see `NativeExecution::check_approval`, which
 /// returns early for `Safe`).
 pub(crate) fn minimum_dispatch_risk(call: &ToolCall) -> Option<RiskLevel> {
+    const SENTINEL_ROOT: &str = "/forge-dispatch-risk-sentinel";
     if let Some(op) = file_op_for(call) {
-        return Some(op.ok()?.risk(std::path::Path::new("")));
+        return Some(op.ok()?.risk(std::path::Path::new(SENTINEL_ROOT)));
     }
     match call.name.as_str() {
         "run_command" => Some(command_risk(&call.arguments)),
@@ -378,5 +395,38 @@ impl ToolDispatcher {
             }
             other => invalid(format!("unknown tool {other:?}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall::new("test-1", name, args)
+    }
+
+    #[test]
+    fn in_root_read_is_safe() {
+        let c = call("read_file", serde_json::json!({"path": "src/lib.rs"}));
+        assert_eq!(minimum_dispatch_risk(&c), Some(RiskLevel::Safe));
+    }
+
+    #[test]
+    fn relative_escaping_read_is_not_safe() {
+        // The tool layer has no project root, so `minimum_dispatch_risk`
+        // must classify an escaping read as non-`Safe` without one — this
+        // is gate 5 of the needle fast path (see `service.rs`), the one
+        // gate that keeps a read-only "optimization" from ever reaching
+        // `check_approval`'s Safe-always-runs fast path for a path outside
+        // the project.
+        let c = call("read_file", serde_json::json!({"path": "../../secret"}));
+        assert_ne!(minimum_dispatch_risk(&c), Some(RiskLevel::Safe));
+    }
+
+    #[test]
+    fn absolute_escaping_read_is_not_safe() {
+        let c = call("read_file", serde_json::json!({"path": "/etc/passwd"}));
+        assert_ne!(minimum_dispatch_risk(&c), Some(RiskLevel::Safe));
     }
 }

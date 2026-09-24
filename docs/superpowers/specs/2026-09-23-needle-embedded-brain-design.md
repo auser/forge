@@ -445,3 +445,43 @@ adds `router_name: "needle"` and confidence — no schema change.
   decision phrasing must be validated during implementation; the
   confidence threshold and static fallback bound the blast radius of
   wrong-but-confident decisions.
+
+- **Amendment (Task 11, plan closeout, 2026-09-23).** All 11 tasks are
+  merged; this sub-project (embedded on-device decision routing) is
+  complete, with BDD coverage in `tests/features/needle_routing.feature`
+  (default no-weights fallback, hash-backend on-device routing, the
+  doctor probe, `--local-only` init, and semantic grep) added alongside
+  the final README/spec sweep.
+
+  Final verification surfaced one real safety gap worth recording here
+  rather than just in a commit message: `FileOp::risk` documented "any
+  path escaping the project root is Destructive", but its `Read` arm
+  early-returned `Safe` *before* the escape check ran, so reading
+  `../../secret` or `/etc/passwd` classified `Safe` — the one risk level
+  every `ApprovalPolicy` (including `Deny`) lets through unconditionally,
+  and the one the needle fast path's gate 5 (`minimum_dispatch_risk`)
+  uses to decide it may dispatch without the call ever reaching
+  `check_approval`. Fixed in both places: `FileOp::risk` now runs the
+  escape check for `Read` too (an escaping read is now `Destructive`,
+  gated exactly like an escaping write), and `minimum_dispatch_risk`'s
+  sentinel root — previously an empty path, which made
+  `path_escapes_root` structurally unable to observe *any* escape,
+  because every path trivially "starts with" an empty path — is now a
+  single-component absolute path, which correctly rejects both absolute
+  and relative-walk-up reads without the tool layer ever knowing the
+  real project root. Unit tests cover both layers (`forge-core`'s
+  `execution::tests` and `forge-runtime`'s `tools::tests`).
+
+  Known limitations that shipped as part of this plan (see the README's
+  "Known limitations" section for the current, authoritative list): the
+  needle direct-dispatch fast path is read-only by design, and never
+  attempts writes/edits/deletes/commands; `forge init` builds the
+  project graph's structure but never embeds it (no model calls from
+  `init`, ever), so `forge graph build` is the documented follow-up once
+  weights are available; and the e2e latency reference (~47 ms idle,
+  release build) is asserted only against a loose 2 s ceiling, because
+  wall-clock latency here tracks machine load far more than it tracks
+  forge (see "Latency is real but noisy" above). Jev-tier escalation,
+  ACP, MCP, a TUI, and embedded generation remain explicitly out of
+  scope for this sub-project (see the plan's self-review) and are
+  deferred to later spec sub-projects.
