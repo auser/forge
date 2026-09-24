@@ -631,9 +631,15 @@ fn jev_check(config: &forge_config::Config) -> Check {
 /// Every credential env var the *effective* configuration actually names,
 /// paired with the config key that named it. Only roles that can really be
 /// contacted are included: the active model's `key_env` (or the global
-/// `model_key_env`), `router_key_env` when an http/laya/jev primary uses
-/// it, and `jev_key_env` when jev is primary or needle's escalation tier.
-/// Names only — no value ever leaves this function.
+/// `model_key_env`), and `router_key_env` when an `http`/`laya` router uses
+/// it. Names only — no value ever leaves this function.
+///
+/// **One owner per root cause.** Anything in a jev role — `router = "jev"`
+/// (which also resolves `router_key_env`) and needle's escalation tier — is
+/// [`jev_check`]'s alone: it already reports that credential with the
+/// endpoint and the `--local-only`/escalation semantics attached, and a
+/// second warn about the same unset variable is exactly the noise this
+/// check exists to remove.
 fn named_credential_envs(config: &forge_config::Config) -> Vec<(&'static str, String)> {
     let mut named: Vec<(&'static str, String)> = Vec::new();
 
@@ -658,21 +664,12 @@ fn named_credential_envs(config: &forge_config::Config) -> Vec<(&'static str, St
         }
     }
 
-    let jev_primary = config.router == "jev";
-    if (matches!(config.router.as_str(), "http" | "laya") || jev_primary)
+    // `router = "jev"` deliberately absent: that role's credential (which
+    // may itself be `router_key_env`) belongs to `jev_check`.
+    if matches!(config.router.as_str(), "http" | "laya")
         && let Some(name) = config.router_key_env.clone()
     {
         named.push(("router_key_env", name));
-    }
-    // jev is reachable as primary, or as needle's escalation tier. Under
-    // `--local-only` it is pruned in both roles (see `jev_check`), so an
-    // unset var is not a mismatch worth reporting.
-    let jev_escalating = config.router == "needle" && config.router_escalate == "auto";
-    if (jev_primary || jev_escalating)
-        && !config.local_only
-        && let Some(name) = config.jev_key_env.clone()
-    {
-        named.push(("jev_key_env", name));
     }
     named
 }
@@ -695,18 +692,18 @@ fn credential_env_checks(config: &forge_config::Config) -> Vec<Check> {
                     detail: format!("{config_key} names {env_name} and it is set"),
                 }
             } else {
-                let remove_hint =
-                    if config_key == "model_key_env" || config_key == "[models] key_env" {
-                        format!(" or remove {config_key} if the endpoint needs no key")
-                    } else {
-                        String::new()
-                    };
+                // Both halves, for every key: a self-hosted endpoint can be
+                // keyless whether it serves models (oMLX with auth off) or
+                // routing decisions (a local laya adapter, a self-hosted
+                // OpenJev), so "delete the line" is a real fix in every
+                // case, not just for model credentials.
                 Check {
                     level: Level::Warn,
                     label: "credential env".into(),
                     detail: format!(
                         "{config_key} names {env_name} but it is not set — \
-                         export {env_name}=...{remove_hint}"
+                         export {env_name}=... or remove {config_key} if the \
+                         endpoint needs no key"
                     ),
                 }
             }
@@ -1124,41 +1121,57 @@ mod tests {
         let checks = credential_env_checks(&config);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].level, Level::Warn);
-        assert!(
-            checks[0]
-                .detail
-                .contains("router_key_env names LEFTOVER_ROUTER_KEY"),
-            "{}",
-            checks[0].detail
+        // A self-hosted laya adapter can be keyless too, so the router key
+        // gets the same "or delete the line" alternative as a model key.
+        assert_eq!(
+            checks[0].detail,
+            "router_key_env names LEFTOVER_ROUTER_KEY but it is not set — \
+             export LEFTOVER_ROUTER_KEY=... or remove router_key_env if the endpoint needs no key"
         );
-        // A router key has no "endpoint needs no key" escape hatch.
-        assert!(!checks[0].detail.contains("remove"), "{}", checks[0].detail);
     }
 
+    /// One owner per root cause: `jev_check` reports jev's credential in
+    /// both roles (with endpoint and escalation semantics attached), so
+    /// `credential_env_checks` must stay out of it — otherwise one unset
+    /// variable produces two warns, which is the noise this batch fights.
     #[test]
     #[serial]
-    fn credential_env_reports_jev_key_env_for_the_escalation_tier_but_not_under_local_only() {
+    fn jev_credentials_are_reported_once_by_jev_check_only() {
         unsafe { std::env::remove_var("MY_JEV_KEY") };
-        let config = forge_config::Config {
+
+        // Primary role: jev_check warns, and it is the *only* warn.
+        let primary = forge_config::Config {
+            router: "jev".to_string(),
+            jev_key_env: Some("MY_JEV_KEY".to_string()),
+            // A primary jev also resolves `router_key_env`; that is
+            // jev_check's business too, so it must not double up here.
+            router_key_env: Some("MY_JEV_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        let mut checks = vec![jev_check(&primary)];
+        checks.extend(credential_env_checks(&primary));
+        let warns: Vec<&Check> = checks
+            .iter()
+            .filter(|c| c.level == Level::Warn && c.detail.contains("MY_JEV_KEY"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one warn per root cause: {:?}",
+            checks.iter().map(|c| &c.detail).collect::<Vec<_>>()
+        );
+        assert_eq!(warns[0].label, "jev");
+
+        // Escalation role: jev_check reports it informationally (Ok), and
+        // credential_env_checks still adds nothing.
+        let escalating = forge_config::Config {
             jev_key_env: Some("MY_JEV_KEY".to_string()),
             ..forge_config::Config::default() // router = needle, escalate = auto
         };
-        let checks = credential_env_checks(&config);
-        assert_eq!(checks.len(), 1);
+        assert_eq!(jev_check(&escalating).level, Level::Ok);
         assert!(
-            checks[0].detail.contains("MY_JEV_KEY"),
-            "{}",
-            checks[0].detail
-        );
-
-        let config = forge_config::Config {
-            jev_key_env: Some("MY_JEV_KEY".to_string()),
-            local_only: true,
-            ..forge_config::Config::default()
-        };
-        assert!(
-            credential_env_checks(&config).is_empty(),
-            "--local-only prunes jev in both roles, so its var is not a mismatch"
+            credential_env_checks(&escalating).is_empty(),
+            "jev's credential is jev_check's to report, in either role"
         );
     }
 
