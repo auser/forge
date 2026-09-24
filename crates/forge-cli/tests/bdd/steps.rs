@@ -1457,3 +1457,23 @@ fn output_lists_at_least_one_symbol(world: &mut BddWorld) {
         world.last_stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// jev_escalation.feature
+// ---------------------------------------------------------------------------
+
+#[given("a Jev credential is set to a dummy key")]
+fn jev_credential_dummy_key(world: &mut BddWorld) {
+    world
+        .env
+        .insert("TYPESAFE_API_KEY".to_string(), "dummy-jev-key".to_string());
+}
+
+#[given("the Jev router endpoint is unreachable")]
+fn jev_router_endpoint_unreachable(world: &mut BddWorld) {
+    // Port 9 (discard) is closed on loopback in every CI/dev environment
+    // this suite runs in, so the connection is refused immediately instead
+    // of hanging — the same convention `configured_router_unavailable` uses
+    // for the http/laya routers above.
+    world.set_config("router_url", "\"http://127.0.0.1:9/systemone\"");
+}

@@ -91,6 +91,9 @@ pub struct NeedleConfig {
 /// Weights ladder values accepted by `[needle].variant`.
 const NEEDLE_VARIANTS: &[&str] = &["small", "medium", "full"];
 
+/// Valid values for `router_escalate`.
+const ROUTER_ESCALATE_VALUES: &[&str] = &["auto", "off"];
+
 impl Default for NeedleConfig {
     fn default() -> Self {
         Self {
@@ -118,6 +121,11 @@ pub struct Config {
     pub router: String,
     pub router_url: Option<String>,
     pub router_key_env: Option<String>,
+    /// When `router = "needle"`: escalate to the Jev tier
+    /// (`forge_providers::JevRouter`) once needle declines/fails, iff
+    /// `!local_only` and a Jev credential is present at build time. `"auto"`
+    /// (default) or `"off"`.
+    pub router_escalate: String,
     pub router_timeout_ms: u64,
     pub execution: String,
     pub approval: String,
@@ -242,6 +250,7 @@ impl Default for Config {
             router: "needle".to_string(),
             router_url: None,
             router_key_env: None,
+            router_escalate: "auto".to_string(),
             router_timeout_ms: 5_000,
             execution: "native".to_string(),
             approval: "prompt".to_string(),
@@ -336,6 +345,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_ROUTER", "router"),
     ("FORGE_ROUTER_URL", "router_url"),
     ("FORGE_ROUTER_KEY_ENV", "router_key_env"),
+    ("FORGE_ROUTER_ESCALATE", "router_escalate"),
     ("FORGE_EXECUTION", "execution"),
     ("FORGE_APPROVAL", "approval"),
     ("FORGE_LOCAL_ONLY", "local_only"),
@@ -383,6 +393,13 @@ impl Config {
     /// can't express. Called at the end of [`Config::load`] so every caller
     /// gets it for free.
     pub fn validate(&self) -> Result<(), ForgeError> {
+        if !ROUTER_ESCALATE_VALUES.contains(&self.router_escalate.as_str()) {
+            return Err(ForgeError::config(format!(
+                "router_escalate must be one of {} (got {:?})",
+                ROUTER_ESCALATE_VALUES.join(", "),
+                self.router_escalate
+            )));
+        }
         if !NEEDLE_VARIANTS.contains(&self.needle.variant.as_str()) {
             return Err(ForgeError::config(format!(
                 "needle.variant must be one of {} (got {:?})",

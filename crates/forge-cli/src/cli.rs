@@ -34,7 +34,7 @@ pub struct GlobalOpts {
     #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Override the configured router (static|mock|cheapest|http|laya|needle).
+    /// Override the configured router (static|mock|cheapest|http|laya|needle|jev).
     #[arg(long, global = true, value_name = "ROUTER")]
     pub router: Option<String>,
 

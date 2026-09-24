@@ -442,3 +442,53 @@ fn router_confidence_threshold_and_fallback_defaults_and_env() {
     let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
     assert!(matches!(err, ForgeError::Config(_)));
 }
+
+#[test]
+fn router_escalate_defaults_to_auto_and_validates() {
+    let c = Config::default();
+    assert_eq!(c.router_escalate, "auto");
+    assert!(c.validate().is_ok());
+
+    let off: Config = toml::from_str("router_escalate = \"off\"").expect("parses");
+    assert_eq!(off.router_escalate, "off");
+    assert!(off.validate().is_ok());
+}
+
+#[test]
+fn router_escalate_invalid_value_names_valid_values() {
+    let c: Config = toml::from_str("router_escalate = \"always\"").expect("parses");
+    let err = c
+        .validate()
+        .expect_err("invalid router_escalate rejected")
+        .to_string();
+    assert!(
+        err.contains("always") && err.contains("auto") && err.contains("off"),
+        "err: {err}"
+    );
+}
+
+#[test]
+#[serial]
+fn router_escalate_env_override_and_explain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.router_escalate, "auto");
+    assert_eq!(
+        resolved.explain("router_escalate"),
+        Some(("\"auto\"".to_string(), Origin::Default))
+    );
+
+    unsafe { std::env::set_var("FORGE_ROUTER_ESCALATE", "off") };
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.router_escalate, "off");
+    assert_eq!(
+        resolved.explain("router_escalate"),
+        Some(("\"off\"".to_string(), Origin::Environment))
+    );
+
+    unsafe { std::env::set_var("FORGE_ROUTER_ESCALATE", "bogus") };
+    let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
+    assert!(matches!(err, ForgeError::Config(_)));
+}

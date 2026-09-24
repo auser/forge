@@ -8,9 +8,13 @@ pluggable execution, and both CLI and REST/SSE interfaces over one shared runtim
 No Node.js, database, or daemon is required. The default stack is an embedded
 Needle 3 decision router (on-device, no network calls) in front of a local
 oMLX coding model — no mock in the default path, no hosted account needed.
-Laya (open-source System One) and other HTTP-style routers remain available
-as alternates. Mock providers exist for tests and demos but are strictly
-opt-in (`model = "mock-local"`).
+When needle declines or fails, forge can escalate to Jev (TypeSafe's hosted
+System One API, or a self-hosted OpenJev server) before falling all the way
+back to deterministic static routing — opt-in only when a Jev credential is
+configured (`router_escalate = "auto"`, the default, is a no-op without one)
+and always skipped under `--local-only`. Laya (open-source System One) and
+other HTTP-style routers remain available as alternates. Mock providers
+exist for tests and demos but are strictly opt-in (`model = "mock-local"`).
 
 - Project spec: [`specs/project.md`](specs/project.md)
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
@@ -247,11 +251,12 @@ Key settings (all optional):
 | `mock_script` | — | `FORGE_MOCK_SCRIPT` | JSON script path for `scripted-mock` (project-relative) |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `laya` \| `static` \| `cheapest` \| `mock` \| `http` |
-| `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`) |
-| `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key |
-| `router_timeout_ms` | `5000` | — | HTTP/needle router timeout |
-| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle decisions escalate to the fallback |
+| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `laya` \| `static` \| `cheapest` \| `mock` \| `http` \| `jev` |
+| `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`; jev default: `https://api.typesafe.ai/v1/systemone`, or a self-hosted OpenJev server's `/v1/systemone`) |
+| `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key (jev default: `TYPESAFE_API_KEY`) |
+| `router_escalate` | `auto` | `FORGE_ROUTER_ESCALATE` | `auto` \| `off` — when `router = "needle"`, escalate to the Jev tier before the static fallback once a Jev credential is present (`auto`, the default) or never (`off`); no-op unless a credential exists and `--local-only` is off |
+| `router_timeout_ms` | `5000` | — | HTTP/needle/jev router timeout |
+| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle/jev decisions escalate to the fallback |
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` \| `mock` |
@@ -300,6 +305,14 @@ credential lookup is not implemented yet.
 > their own CLIs; using them elsewhere may violate provider terms. API keys
 > are the supported path.
 
+**Jev escalation** (decision plane, not generation): `TYPESAFE_API_KEY`
+enables the Jev tier (see [DecisionRouter](#decisionrouter) below) — set it
+and `router_escalate = "auto"` (the default) starts escalating there once
+needle declines or fails. `forge doctor` reports credential detection (env
+var name only, never the value) the same way it does for model providers.
+No terms caveat applies here: it's a metered API key, not a subscription
+OAuth token repurposed from another CLI.
+
 A provider entry looks like:
 
 ```toml
@@ -328,7 +341,7 @@ assumed; a provider without `tools` receives single-turn requests only.
 ### DecisionRouter
 
 Chooses the model per task and records the decision with a confidence score.
-Six modes:
+Seven modes:
 
 - `needle` (embedded on-device Needle 3 decision model, no network calls
   once weights are on disk; **default**; `forge init` fetches/verifies
@@ -338,6 +351,11 @@ Six modes:
   (`ffi`)](#embedded-needle-brain-ffi) — and falls back to static without
   it, or when weights are unavailable: unpinned variant, `--local-only`,
   no network),
+- `jev` (Jev/OpenJev System One decision model — TypeSafe's hosted API at
+  `https://api.typesafe.ai/v1/systemone` by default, or a self-hosted
+  [OpenJev](https://github.com/razorback16/openjev) server via `router_url`;
+  bearer token from `router_key_env`, default `TYPESAFE_API_KEY`; falls back
+  to static when unreachable or uncredentialed),
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `static` (deterministic rules),
@@ -347,13 +365,34 @@ Six modes:
 - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
   to `router_url`, bearer token from `router_key_env`).
 
-`http`/`laya`/`needle` decisions below `router_confidence_threshold` (default
-0.7) are rejected and escalate through the fallback chain: any router is
-wrapped in a fallback (`router_fallback`, default `static`, may be
+`http`/`laya`/`needle`/`jev` decisions below `router_confidence_threshold`
+(default 0.7) are rejected and escalate through the fallback chain: any
+router is wrapped in a fallback (`router_fallback`, default `static`, may be
 `cheapest`), so an unreachable, timing-out, unconfident, or (for `needle`)
 not-yet-loaded router degrades to deterministic routing with
-`fallback_used: true`. TypeSafe Jev / Kev services work through the `http`
-backend — nothing is hard-coded.
+`fallback_used: true`.
+
+#### Escalation ladder: needle → Jev → static
+
+With the default `router = "needle"` and `router_escalate = "auto"`, forge
+composes a three-tier decision ladder: **needle** (embedded, on-device,
+free) tries first; if it declines, errors, or falls below
+`router_confidence_threshold`, forge escalates to **Jev** — but *only* when
+a `TYPESAFE_API_KEY` (or `router_key_env` override) is actually present at
+startup and `--local-only` is off; otherwise escalation is skipped entirely
+and today's needle → static behavior is unchanged. If Jev is also
+unreachable, uncredentialed-after-all, or unconfident, forge falls through
+to **static** (or `router_fallback`, if set to `cheapest`). Every hop is
+recorded in the session's routing-decision event (`router`, `confidence`,
+`fallback_used`), so a run never blocks on the escalation tier being down.
+
+Setting `router = "jev"` directly makes Jev the primary router (still
+threshold-gated, still falling back to `router_fallback`) instead of an
+escalation tier behind needle. Either way, `--local-only` prunes Jev
+entirely — as primary, it degrades to static with a warning instead of
+erroring the build; as an escalation tier, it's simply never wired in. Jev
+and Kev-family services also work through the plain `http` backend if
+you'd rather speak the flat contract yourself — nothing is hard-coded.
 
 ### Model registry with costs
 

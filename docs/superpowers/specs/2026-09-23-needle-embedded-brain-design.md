@@ -71,7 +71,9 @@ Each sub-project gets its own spec → plan → implementation cycle:
 
 1. **`forge-needle` embedded brain** — this spec.
 2. **Jev escalation tier** — `JevRouter` (TypeSafe API) + credential
-   gating; composes into the existing router stack.
+   gating; composes into the existing router stack. **Implemented** — see
+   the §8 amendment for the verified wire contract, endpoint, and
+   OpenJev-compatibility notes.
 3. **`forge acp`** — Agent Client Protocol adapter over stdio (Zed,
    JetBrains, neovim, other ACP clients get forge as an in-editor agent).
 4. **`forge mcp`** — MCP server exposing graph search, skills, and runs
@@ -545,3 +547,96 @@ adds `router_name: "needle"` and confidence — no schema change.
     embedder (the blend refactor above is the natural place to introduce
     it), skill matching can move onto it instead of duplicating an ad hoc
     lookup per call site.
+
+- **Amendment (sub-project 2, Jev escalation tier, implemented 2026-09-24).**
+  `JevRouter` (`crates/forge-providers/src/jev.rs`) plus credential-gated
+  escalation wiring in `router_from_config`
+  (`crates/forge-providers/src/router.rs`) landed as a bounded follow-up to
+  sub-project 1.
+
+  **Verified wire contract** (network-checked before writing any code, per
+  three independent, mutually-corroborating sources fetched 2026-09-24):
+  TypeSafe's own API reference (`docs.typesafe.ai/api.md`), LiteLLM's
+  TypeSafe pass-through docs (`docs.litellm.ai/docs/pass_through/typesafe`),
+  and both OpenJev READMEs (`github.com/razorback16/openjev`,
+  `github.com/GitHub30/OpenJev` — both explicitly documented as
+  wire-compatible with TypeSafe's official `typesafe-sdk`). All four agree:
+  `POST /v1/systemone`, `Authorization: Bearer <key>`,
+  `{state: "<free text>", model: "<inference model id>", questions: {<id>:
+  {type: "choice"|"noul"|"score", instructions, criteria}}}` →
+  `{model, answers: {<id>: {type, choice, probabilities, confidence}},
+  usage}`. The hosted endpoint is `https://api.typesafe.ai/v1/systemone`
+  (the brief's suggested `console.typesafe.ai` was not it — the actual host
+  is `api.typesafe.ai`). This **genuinely differs** from `LayaRouter`'s
+  assumed shape in this codebase (`state` as a structured object with no
+  top-level `model` field, no `usage`), so `JevRouter` stays self-contained
+  rather than sharing request/response types with `LayaRouter`. Model alias
+  sent: `jev-latest`, documented by OpenJev as accepted by both TypeSafe and
+  OpenJev servers ("so TypeSafe SDK defaults work"), so one alias
+  round-trips against either backend.
+
+  **OpenJev as the self-hosted path**: both `razorback16/openjev` (Python/
+  vLLM/MLX, DiffusionGemma-26B) and `GitHub30/OpenJev` (any HF instruct
+  model) implement the identical `/v1/systemone` contract, so `router_url`
+  pointed at either serves as a credential-free (or self-issued-credential)
+  self-hosted alternative to TypeSafe's hosted API — the same
+  `JevRouter`/config plumbing serves both without a separate code path.
+
+  **Router semantics implemented as specced**: `JevRouter::new(url,
+  key_env, timeout, registry)`, capability filtering via `filter_candidates`
+  (unlike `LayaRouter`, which doesn't filter), unknown-choice rejected as an
+  error, and — a deliberate departure from `HttpRouter`/`LayaRouter` — a
+  missing credential is itself a typed `Err` naming the env var (no
+  silent unauthenticated request), since the brief named "missing key" as
+  an explicit error case.
+
+  **Escalation composition**: `router = "needle"` + `router_escalate =
+  "auto"` (default) + `!local_only` + a non-empty credential at
+  build time composes `Fallback(Threshold(needle), Fallback(Threshold(jev),
+  router_fallback))`; any missing condition leaves the pre-existing
+  `Fallback(Threshold(needle), router_fallback)` stack unchanged. `router =
+  "jev"` as primary gets the same threshold wrap as `http`/`laya`/`needle`.
+
+  **`--local-only` finding, as the brief asked to report**: `http` and
+  `laya` are, today, *not* specially pruned under `local_only` in
+  `router_from_config` — §3's "`--local-only` prunes any network router
+  from the stack at construction time" describes intended behavior that
+  isn't actually implemented for those two (a pre-existing gap, left
+  unfixed here — out of this bounded change's scope; `local_only` already
+  independently blocks the *generation*-plane network calls those routers'
+  decisions would otherwise lead to, and `forge init` separately skips
+  needle's own network fetch under `local_only`, so no build is actually
+  network-silent through a router alone today). `jev` gets the stricter,
+  brief-mandated behavior instead: pruned in **both** roles it could play.
+  As an escalation tier, `!local_only` is one of the direct gating
+  conditions above, so it's simply never wired in. As primary
+  (`router = "jev"` with `--local-only`), `router_from_config` degrades to
+  `static` with a `tracing::warn!`, rather than erroring the whole build —
+  chosen to match the rest of this stack's established philosophy (`needle`
+  with no weights doesn't error either; it degrades to a working, if less
+  capable, router) over hard-failing a misconfiguration that has an obvious
+  safe substitute.
+
+  **Doctor**: a `jev` check line (`crates/forge-cli/src/commands/doctor.rs`)
+  reports credential-detected (env var name only) + endpoint when jev could
+  actually be contacted (primary or active escalation), the brief's exact
+  "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only"
+  message when escalation is configured but uncredentialed, and an
+  informational line otherwise (including under `--local-only`). No network
+  probe, matching the needle probe's philosophy; never `Level::Fail`.
+
+  **Tests**: wiremock unit tests for `JevRouter` (decision round-trip incl.
+  bearer header, unknown-choice rejection, missing-credential typed error
+  with zero network calls, timeout, capability filtering);
+  `#[serial]`/`unsafe` env-gated composition tests in `router.rs` covering
+  all three brief-specified escalation scenarios (available+credentialed,
+  no-credential, `--local-only`) plus the jev-as-primary local-only and
+  low-confidence/timeout-fallback cases; a BDD scenario
+  (`tests/features/jev_escalation.feature`) proving an unreachable jev
+  endpoint still completes a run with `fallback_used: true`; a
+  `forge-config` validate/env/explain suite for the new `router_escalate`
+  key; and `jev_check` unit tests in `doctor.rs`. `TYPESAFE_API_KEY` was
+  added to the BDD harness's env-hygiene scrub list
+  (`crates/forge-cli/tests/bdd/world.rs`) so a developer's shell can't leak
+  a real credential into an otherwise-hermetic scenario and cause a live
+  escalation attempt against `api.typesafe.ai`.
