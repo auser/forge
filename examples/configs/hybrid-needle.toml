@@ -1,27 +1,19 @@
-# The Laya adapter example: route each task with Laya (open-source System
-# One) instead of the embedded brain. Easy tasks stay local and free; hard
-# ones escalate to hosted models.
-#
-# NOTE: laya is NOT the default any more — the embedded needle brain is.
-# This preset needs a separate process:
-#
-#   pip install laya && forge router serve    # 127.0.0.1:8788
-#
-# Delete the `router` line below to use the embedded needle brain instead
-# (see local-first.toml / hybrid-needle.toml).
+# Recommended: the embedded Needle brain routes each task to the cheapest
+# model that can handle it. Easy tasks stay local and free; hard ones
+# escalate to hosted models. No router process to start, no network calls
+# for the routing decision itself.
 # Prices below are current list prices (Sept 2026) — check provider pages.
 
-model = "qwen3-coder"         # used when Laya is down (static fallback)
-router = "laya"
-router_url = "http://127.0.0.1:8788/decide"
-router_fallback = "cheapest"  # if Laya is down/unconfident: cheapest capable
+model = "qwen3-coder"         # used when the brain has no weights yet
+router = "needle"             # on-device decisions (the built-in default)
+router_fallback = "cheapest"  # no weights / low confidence: cheapest capable
 router_confidence_threshold = 0.7
 execution = "native"
 approval = "prompt"
 
 [models.qwen3-coder]          # local via oMLX, free
 description = "local coding model, free, good for routine edits and questions"
-base_url = "http://127.0.0.1:8080/v1"
+base_url = "http://127.0.0.1:8080/v1"   # NOT model_base_url — that's top-level only
 cost_input_per_mtok = 0.0
 cost_output_per_mtok = 0.0
 tools = true
@@ -29,7 +21,7 @@ tools = true
 [models.deepseek-chat]        # DeepSeek V4-class, very low cost
 description = "low-cost hosted model for general coding tasks"
 base_url = "https://api.deepseek.com/v1"
-key_env = "DEEPSEEK_API_KEY"
+key_env = "DEEPSEEK_API_KEY"   # name of the env var, never the key itself
 cost_input_per_mtok = 0.14
 cost_output_per_mtok = 0.28
 tools = true

@@ -8,8 +8,8 @@ approval = "prompt"
 
 [models.deepseek-chat]        # DeepSeek V4-class (Sept 2026 list prices)
 description = "low-cost hosted model for general coding tasks"
-base_url = "https://api.deepseek.com/v1"
-key_env = "DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com/v1"   # NOT model_base_url — that's top-level only
+key_env = "DEEPSEEK_API_KEY"               # name of the env var, never the key itself
 cost_input_per_mtok = 0.14
 cost_output_per_mtok = 0.28
 tools = true
@@ -22,5 +22,7 @@ cost_input_per_mtok = 0.95
 cost_output_per_mtok = 4.00
 tools = true
 
-# Tip: switch to `router = "laya"` any time — this registry is already
-# shaped for it (descriptions are Laya's routing criteria).
+# Tip: delete the `router` line to use the embedded needle brain (the
+# built-in default) — this registry is already shaped for it (descriptions
+# are the routing criteria), and `router_fallback = "cheapest"` keeps
+# today's behavior whenever the brain has no answer.

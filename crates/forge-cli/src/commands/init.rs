@@ -105,11 +105,34 @@ pub fn run(ctx: &Context) -> Result<(), ForgeError> {
     items.push(build_graph(&root)?);
 
     let resolved = ctx.resolve_config()?;
+    items.extend(legacy_config_item(&root, &resolved.config));
     items.push(needle_weights_item(&root, &resolved.config));
 
     items.extend(detect_environment(&root));
 
     report(&root, &items, ctx.global.json)
+}
+
+/// Pre-needle settings that a config written against an older Forge still
+/// carries. `init` is where someone comes back to a project, so it is the
+/// right place to say that the default moved: `router = "laya"` reads as
+/// deliberate, but usually it only means "this file predates the embedded
+/// brain" — and it costs a working default plus a separate process.
+/// Read-only and informational; nothing is rewritten.
+fn legacy_config_item(root: &Path, config: &forge_config::Config) -> Option<InitItem> {
+    if config.router != "laya" {
+        return None;
+    }
+    Some(InitItem {
+        status: ItemStatus::Detected,
+        path: forge_config::Config::project_config_path(root),
+        note: Some(
+            "note: router = \"laya\" is set; the built-in default is now the embedded \
+             needle brain — delete the router line to use it (or keep laya and run \
+             `forge router serve`)"
+                .to_string(),
+        ),
+    })
 }
 
 /// `forge init`'s weights step: fetch/verify `[needle]` weights when the
@@ -370,6 +393,29 @@ fn report(root: &Path, items: &[InitItem], json: bool) -> Result<(), ForgeError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_config_item_reports_configured_laya_and_names_both_fixes() {
+        let config = forge_config::Config {
+            router: "laya".to_string(),
+            ..forge_config::Config::default()
+        };
+        let item = legacy_config_item(Path::new("/proj"), &config).expect("laya is reported");
+        assert_eq!(item.status, ItemStatus::Detected);
+        let note = item.note.expect("note");
+        assert!(note.contains("router = \"laya\" is set"), "note: {note}");
+        assert!(note.contains("embedded needle brain"), "note: {note}");
+        assert!(note.contains("delete the router line"), "note: {note}");
+        // The note points at the file that has to be edited.
+        assert!(item.path.ends_with(".forge/config.toml"), "{:?}", item.path);
+    }
+
+    #[test]
+    fn legacy_config_item_is_silent_for_the_default_router() {
+        let config = forge_config::Config::default();
+        assert_eq!(config.router, "needle");
+        assert!(legacy_config_item(Path::new("/proj"), &config).is_none());
+    }
 
     /// Regression test for the fix that made this path feature-aware: a
     /// default build (no `needle-ffi` — this is exactly how `cargo test`

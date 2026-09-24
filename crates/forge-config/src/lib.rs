@@ -36,6 +36,11 @@ pub struct ModelEntry {
     pub structured_output: Option<bool>,
     pub vision: Option<bool>,
     pub max_context: Option<usize>,
+    /// Unknown keys inside this entry, kept so [`Config::validate`] can
+    /// reject the field names that look right but silently do nothing (see
+    /// [`WRONG_MODEL_ENTRY_KEYS`]).
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl ModelEntry {
@@ -93,6 +98,14 @@ const NEEDLE_VARIANTS: &[&str] = &["small", "medium", "full"];
 
 /// Valid values for `router_escalate`.
 const ROUTER_ESCALATE_VALUES: &[&str] = &["auto", "off"];
+
+/// Top-level key names that are meaningless *inside* a `[models.<name>]`
+/// entry, mapped to the field that was meant. Writing `model_base_url`
+/// under `[models.foo]` parses fine and then silently does nothing — the
+/// endpoint stays unset and every request goes somewhere else — so
+/// [`Config::validate`] rejects it by name instead of letting it no-op.
+const WRONG_MODEL_ENTRY_KEYS: &[(&str, &str)] =
+    &[("model_base_url", "base_url"), ("model_key_env", "key_env")];
 
 impl Default for NeedleConfig {
     fn default() -> Self {
@@ -190,6 +203,7 @@ impl Default for Config {
                 structured_output: None,
                 vision: None,
                 max_context: Some(32_768),
+                extra: toml::Table::new(),
             },
             ModelEntry {
                 description: Some("DeepSeek V4-class chat/coding model, very low cost".to_string()),
@@ -204,6 +218,7 @@ impl Default for Config {
                 structured_output: None,
                 vision: None,
                 max_context: Some(128_000),
+                extra: toml::Table::new(),
             },
             ModelEntry {
                 description: Some(
@@ -222,6 +237,7 @@ impl Default for Config {
                 structured_output: None,
                 vision: None,
                 max_context: Some(200_000),
+                extra: toml::Table::new(),
             },
             ModelEntry {
                 description: Some(
@@ -239,6 +255,7 @@ impl Default for Config {
                 structured_output: None,
                 vision: None,
                 max_context: Some(256_000),
+                extra: toml::Table::new(),
             },
             ModelEntry {
                 description: Some("Moonshot Kimi K2.7 Code, frontier-quality coding".to_string()),
@@ -253,6 +270,7 @@ impl Default for Config {
                 structured_output: None,
                 vision: None,
                 max_context: Some(256_000),
+                extra: toml::Table::new(),
             },
         ];
         Self {
@@ -430,6 +448,16 @@ impl Config {
                 "needle.weights_sha256 must be empty or 64 hex characters (got {:?})",
                 sha
             )));
+        }
+        for (name, entry) in &self.models {
+            for (wrong, right) in WRONG_MODEL_ENTRY_KEYS {
+                if entry.extra.contains_key(*wrong) {
+                    return Err(ForgeError::config(format!(
+                        "[models.{name}] has {wrong}, which does nothing inside a model entry \
+                         (it is a top-level key); rename it to {right}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
