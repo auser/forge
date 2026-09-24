@@ -11,3 +11,4 @@ Feature: Jev escalation tier
     When I run forge with prompt "explain this project" and model "mock-local"
     Then the run completes successfully
     And the session events contain a routing decision with fallback_used true
+    And the routing decision reason mentions "jev"

@@ -16,6 +16,8 @@ pub const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_ROUTER_URL",
     "FORGE_ROUTER_KEY_ENV",
     "FORGE_ROUTER_ESCALATE",
+    "FORGE_JEV_URL",
+    "FORGE_JEV_KEY_ENV",
     // Jev's default credential env var is a conventional provider-style
     // name, not a FORGE_* one — scrubbed here too so a developer's shell
     // can't make the default `router = "needle"`, `router_escalate =

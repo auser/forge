@@ -1469,11 +1469,35 @@ fn jev_credential_dummy_key(world: &mut BddWorld) {
         .insert("TYPESAFE_API_KEY".to_string(), "dummy-jev-key".to_string());
 }
 
+#[then(expr = "the routing decision reason mentions {string}")]
+fn routing_decision_reason_mentions(world: &mut BddWorld, needle: String) {
+    // Discriminates the escalation path from a plain needle->static run:
+    // both satisfy "fallback_used true" alone, but only a run that actually
+    // tried jev has the jev error folded into the FallbackRouter reason
+    // chain (see `FallbackRouter::route`'s `"primary router failed ({err});
+    // {reason}"` composition — the jev leg's error text names "jev router
+    // request to ... failed/timed out").
+    let log = world.session_log();
+    let decision = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "routing_decision_made")
+        .unwrap_or_else(|| panic!("no routing decision in session log: {log}"));
+    let reason = decision["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains(&needle),
+        "reason {reason:?} does not mention {needle:?}"
+    );
+}
+
 #[given("the Jev router endpoint is unreachable")]
 fn jev_router_endpoint_unreachable(world: &mut BddWorld) {
-    // Port 9 (discard) is closed on loopback in every CI/dev environment
-    // this suite runs in, so the connection is refused immediately instead
-    // of hanging — the same convention `configured_router_unavailable` uses
-    // for the http/laya routers above.
-    world.set_config("router_url", "\"http://127.0.0.1:9/systemone\"");
+    // `jev_url`, not `router_url`: the escalation tier resolves its
+    // endpoint from `jev_url` only (never the generic `router_url`, which
+    // in `router = "needle"` mode belongs to no router at all — see
+    // `resolved_jev_url` in forge-providers). Port 9 (discard) is closed on
+    // loopback in every CI/dev environment this suite runs in, so the
+    // connection is refused immediately instead of hanging — the same
+    // convention `configured_router_unavailable` uses for http/laya above.
+    world.set_config("jev_url", "\"http://127.0.0.1:9/systemone\"");
 }

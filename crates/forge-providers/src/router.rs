@@ -602,36 +602,77 @@ fn build_router(
                 Duration::from_millis(config.router_timeout_ms),
             )))
         }
-        "jev" => Ok(Arc::new(crate::JevRouter::new(
-            config.router_url.clone(),
-            config.router_key_env.clone(),
-            Duration::from_millis(config.router_timeout_ms),
-            registry.to_vec(),
-        )?)),
+        // "jev" as *primary* — escalation builds JevRouter directly via
+        // `build_jev` (see `router_from_config`) so it can use the
+        // escalation-role resolution instead of this (primary-role) one.
+        "jev" => build_jev(config, registry, false),
         other => Err(ForgeError::router(format!(
             "unknown router {other:?} (expected static, mock, cheapest, http, laya, needle, or jev)"
         ))),
     }
 }
 
-/// Env var name carrying the Jev credential: `router_key_env` if set, else
-/// `JevRouter::DEFAULT_KEY_ENV` (`TYPESAFE_API_KEY`). Shared logic for
-/// deciding whether the escalation tier can even be wired in.
-fn jev_key_env(config: &Config) -> String {
+/// Resolve the Jev endpoint for a given role. **Escalation must never
+/// silently reuse a leftover `router_url`** meant for a different primary
+/// router (`http`/`laya`) — a stale `router_url` pointed at some other
+/// System One-compatible endpoint would otherwise receive the
+/// `TYPESAFE_API_KEY` credential. So escalation only ever falls back to
+/// `jev_url` or the compiled-in default, never `router_url`. The primary
+/// role (`router = "jev"`) *does* fall back to `router_url` for
+/// backwards-compatibility with how `http`/`laya` already reuse the
+/// generic field when there's no more specific one.
+pub fn resolved_jev_url(config: &Config, escalation: bool) -> Option<String> {
+    config.jev_url.clone().or_else(|| {
+        if escalation {
+            None
+        } else {
+            config.router_url.clone()
+        }
+    })
+}
+
+/// Resolve the Jev credential env var name for a given role — same scoping
+/// rationale as [`resolved_jev_url`]: escalation never falls back to the
+/// generic `router_key_env` (which could belong to an unrelated
+/// `http`/`laya` setup and send its token to `api.typesafe.ai`).
+pub fn resolved_jev_key_env(config: &Config, escalation: bool) -> String {
     config
-        .router_key_env
+        .jev_key_env
         .clone()
+        .or_else(|| {
+            if escalation {
+                None
+            } else {
+                config.router_key_env.clone()
+            }
+        })
         .unwrap_or_else(|| crate::JevRouter::DEFAULT_KEY_ENV.to_string())
 }
 
 /// Whether a non-empty Jev credential is present in the environment right
-/// now. Checked once at router-construction time (not per-request): the
+/// now, using the same role-scoped resolution as [`resolved_jev_key_env`].
+/// Checked once at router-construction time (not per-request): the
 /// escalation tier is either wired into the stack or it isn't for the
 /// lifetime of this router.
-fn jev_key_present(config: &Config) -> bool {
-    std::env::var(jev_key_env(config))
+pub fn jev_credential_present(config: &Config, escalation: bool) -> bool {
+    std::env::var(resolved_jev_key_env(config, escalation))
         .map(|v| !v.is_empty())
         .unwrap_or(false)
+}
+
+/// Build a `JevRouter` for the given role (see [`resolved_jev_url`] /
+/// [`resolved_jev_key_env`] for why the role matters).
+fn build_jev(
+    config: &Config,
+    registry: &[(String, ModelCapabilities)],
+    escalation: bool,
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    Ok(Arc::new(crate::JevRouter::new(
+        resolved_jev_url(config, escalation),
+        Some(resolved_jev_key_env(config, escalation)),
+        Duration::from_millis(config.router_timeout_ms),
+        registry.to_vec(),
+    )?))
 }
 
 /// Build the decision router from configuration: `static`, `mock`,
@@ -659,7 +700,13 @@ fn jev_key_present(config: &Config) -> bool {
 /// Fallback(Threshold(jev), router_fallback))` — needle declines/fails,
 /// then jev is tried, then the configured fallback. Any missing condition
 /// leaves today's `Fallback(Threshold(needle), router_fallback)` behavior
-/// unchanged.
+/// unchanged. The escalation tier resolves its endpoint/credential from
+/// `jev_url`/`jev_key_env` (or the compiled-in defaults) only — see
+/// [`resolved_jev_url`] — deliberately never from the generic
+/// `router_url`/`router_key_env`, which in `needle` mode belong to no
+/// router at all and, if left over from a previous `http`/`laya` setup,
+/// would otherwise silently receive the Jev credential or send an
+/// unrelated token to `api.typesafe.ai`.
 pub fn router_from_config(
     config: &Config,
     registry: &[(String, ModelCapabilities)],
@@ -684,16 +731,32 @@ pub fn router_from_config(
     if router_name == "needle"
         && config.router_escalate == "auto"
         && !config.local_only
-        && jev_key_present(config)
+        && jev_credential_present(config, true)
     {
-        let jev = build_router("jev", config, registry)?;
-        let jev = Arc::new(ThresholdRouter::new(
-            jev,
-            config.router_confidence_threshold,
-        ));
-        let base_fallback = build_router(&config.router_fallback, config, registry)?;
-        let escalation = Arc::new(FallbackRouter::new(jev, base_fallback));
-        return Ok(Arc::new(FallbackRouter::new(primary, escalation)));
+        // A construction failure here (e.g. a bad `router_timeout_ms`
+        // producing an unbuildable HTTP client) skips the escalation tier
+        // with a warning rather than aborting the whole router build —
+        // needle -> static must keep working even if jev can't be wired
+        // in, matching this stack's "never fabricate, always degrade"
+        // philosophy.
+        match build_jev(config, registry, true) {
+            Ok(jev) => {
+                let jev = Arc::new(ThresholdRouter::new(
+                    jev,
+                    config.router_confidence_threshold,
+                ));
+                let base_fallback = build_router(&config.router_fallback, config, registry)?;
+                let escalation = Arc::new(FallbackRouter::new(jev, base_fallback));
+                return Ok(Arc::new(FallbackRouter::new(primary, escalation)));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "jev escalation tier failed to construct; falling back to needle -> {}",
+                    config.router_fallback
+                );
+            }
+        }
     }
 
     if router_name == config.router_fallback {
@@ -1045,7 +1108,7 @@ mod tests {
         unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
         let mut config = Config {
             router: "needle".to_string(),
-            router_url: Some(server.uri()),
+            jev_url: Some(server.uri()),
             router_fallback: "static".to_string(),
             model: "local-coder".to_string(),
             ..Config::default()
@@ -1069,6 +1132,56 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn router_from_config_escalation_ignores_poisoned_generic_router_url() {
+        // A leftover `router_url` from an unrelated http/laya setup must
+        // never be hijacked by the jev escalation tier: the credential
+        // must not be POSTed to it, and its response (if any) must not be
+        // used as the decision. Only `jev_url` is consulted.
+        let poisoned = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("wrong-model", 0.99)))
+            .expect(0)
+            .mount(&poisoned)
+            .await;
+
+        let real_jev = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("local-coder", 0.88)))
+            .mount(&real_jev)
+            .await;
+
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let mut config = Config {
+            router: "needle".to_string(),
+            router_url: Some(poisoned.uri()),
+            jev_url: Some(real_jev.uri()),
+            router_fallback: "static".to_string(),
+            model: "local-coder".to_string(),
+            ..Config::default()
+        };
+        config.models.insert(
+            "local-coder".to_string(),
+            forge_config::ModelEntry::default(),
+        );
+        let router = router_from_config(&config, &[("local-coder".to_string(), caps(true))])
+            .expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("offline task"))
+            .await
+            .expect("escalation routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        assert_eq!(decision.router_name, "jev");
+        assert_eq!(decision.selected_model, "local-coder");
+        assert_eq!(
+            poisoned.received_requests().await.expect("requests").len(),
+            0,
+            "the generic router_url must never be contacted by the escalation tier"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn router_from_config_no_jev_credential_keeps_todays_static_fallback() {
         // (b) no credential -> static fallback exactly as before jev
         // existed; jev must never even be contacted.
@@ -1083,7 +1196,7 @@ mod tests {
 
         let config = Config {
             router: "needle".to_string(),
-            router_url: Some(server.uri()),
+            jev_url: Some(server.uri()),
             router_fallback: "static".to_string(),
             model: "mock-local".to_string(),
             ..Config::default()
@@ -1118,7 +1231,7 @@ mod tests {
 
         let config = Config {
             router: "needle".to_string(),
-            router_url: Some(server.uri()),
+            jev_url: Some(server.uri()),
             router_fallback: "static".to_string(),
             local_only: true,
             model: "mock-local".to_string(),

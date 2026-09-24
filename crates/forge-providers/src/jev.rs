@@ -436,8 +436,14 @@ mod tests {
     #[serial]
     async fn jev_router_errors_when_nothing_capable() {
         unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-jev-key") };
+        // Pointed at a mock (never actually hit, since the capability
+        // filter must reject before any network attempt) rather than
+        // `None`/the real DEFAULT_URL — so a future reordering of the
+        // credential/capability checks can't turn this unit test into a
+        // live call against api.typesafe.ai.
+        let server = MockServer::start().await;
         let router = JevRouter::new(
-            None,
+            Some(server.uri()),
             None,
             Duration::from_secs(5),
             vec![("weak".to_string(), caps(false))],
@@ -454,5 +460,10 @@ mod tests {
             ForgeError::Router(msg) => assert!(msg.contains("required capabilities")),
             other => panic!("expected router error, got {other:?}"),
         }
+        assert_eq!(
+            server.received_requests().await.expect("requests").len(),
+            0,
+            "no network call should be attempted when nothing is capable"
+        );
     }
 }

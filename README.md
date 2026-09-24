@@ -255,9 +255,11 @@ Key settings (all optional):
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
 | `router` | `needle` | `FORGE_ROUTER` | `needle` \| `laya` \| `static` \| `cheapest` \| `mock` \| `http` \| `jev` |
-| `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`; jev default: `https://api.typesafe.ai/v1/systemone`, or a self-hosted OpenJev server's `/v1/systemone`) |
-| `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key (jev default: `TYPESAFE_API_KEY`) |
+| `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
+| `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key. Same primary-only fallback rule as `router_url` — the escalation tier never uses it (see `jev_key_env`) |
 | `router_escalate` | `auto` | `FORGE_ROUTER_ESCALATE` | `auto` \| `off` — when `router = "needle"`, escalate to the Jev tier before the static fallback once a Jev credential is present (`auto`, the default) or never (`off`); no-op unless a credential exists and `--local-only` is off |
+| `jev_url` | — | `FORGE_JEV_URL` | Jev/OpenJev endpoint, default `https://api.typesafe.ai/v1/systemone` (or a self-hosted OpenJev server's `/v1/systemone`). Scoped separately from `router_url` so a leftover http/laya `router_url` can never be hijacked into carrying the Jev credential to the wrong host — the escalation tier resolves **only** `jev_url` (or the default); `router = "jev"` as primary also accepts `router_url` as a secondary fallback |
+| `jev_key_env` | — | `FORGE_JEV_KEY_ENV` | Name of the env var holding the Jev credential, default `TYPESAFE_API_KEY`. Same scoping as `jev_url`: the escalation tier never falls back to `router_key_env` |
 | `router_timeout_ms` | `5000` | — | HTTP/needle/jev router timeout |
 | `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle/jev decisions escalate to the fallback |
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
@@ -308,13 +310,17 @@ credential lookup is not implemented yet.
 > their own CLIs; using them elsewhere may violate provider terms. API keys
 > are the supported path.
 
-**Jev escalation** (decision plane, not generation): `TYPESAFE_API_KEY`
-enables the Jev tier (see [DecisionRouter](#decisionrouter) below) — set it
-and `router_escalate = "auto"` (the default) starts escalating there once
-needle declines or fails. `forge doctor` reports credential detection (env
-var name only, never the value) the same way it does for model providers.
-No terms caveat applies here: it's a metered API key, not a subscription
-OAuth token repurposed from another CLI.
+**Jev escalation** (decision plane, not generation): `TYPESAFE_API_KEY` (or
+`jev_key_env` override) enables the Jev tier (see
+[DecisionRouter](#decisionrouter) below) — set it and `router_escalate =
+"auto"` (the default) starts escalating there once needle declines or
+fails. This credential env var, and the Jev endpoint (`jev_url`), are
+scoped separately from the generic `router_url`/`router_key_env` so a
+leftover `http`/`laya` router configuration can never receive the Jev
+credential or redirect it to the wrong host. `forge doctor` reports
+credential detection (env var name only, never the value) the same way it
+does for model providers. No terms caveat applies here: it's a metered API
+key, not a subscription OAuth token repurposed from another CLI.
 
 A provider entry looks like:
 
@@ -356,9 +362,10 @@ Seven modes:
   no network),
 - `jev` (Jev/OpenJev System One decision model — TypeSafe's hosted API at
   `https://api.typesafe.ai/v1/systemone` by default, or a self-hosted
-  [OpenJev](https://github.com/razorback16/openjev) server via `router_url`;
-  bearer token from `router_key_env`, default `TYPESAFE_API_KEY`; falls back
-  to static when unreachable or uncredentialed),
+  [OpenJev](https://github.com/razorback16/openjev) server via `jev_url`;
+  bearer token from `jev_key_env`, default `TYPESAFE_API_KEY`; as primary,
+  also accepts `router_url`/`router_key_env` as a fallback; falls back to
+  static when unreachable or uncredentialed),
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `static` (deterministic rules),
@@ -381,13 +388,19 @@ With the default `router = "needle"` and `router_escalate = "auto"`, forge
 composes a three-tier decision ladder: **needle** (embedded, on-device,
 free) tries first; if it declines, errors, or falls below
 `router_confidence_threshold`, forge escalates to **Jev** — but *only* when
-a `TYPESAFE_API_KEY` (or `router_key_env` override) is actually present at
+a `TYPESAFE_API_KEY` (or `jev_key_env` override) is actually present at
 startup and `--local-only` is off; otherwise escalation is skipped entirely
-and today's needle → static behavior is unchanged. If Jev is also
-unreachable, uncredentialed-after-all, or unconfident, forge falls through
-to **static** (or `router_fallback`, if set to `cheapest`). Every hop is
-recorded in the session's routing-decision event (`router`, `confidence`,
-`fallback_used`), so a run never blocks on the escalation tier being down.
+and today's needle → static behavior is unchanged. The escalation tier's
+endpoint/credential come from `jev_url`/`jev_key_env` (or the compiled-in
+defaults) **only** — never from `router_url`/`router_key_env`, which in
+`needle` mode belong to no router at all and, if left over from an earlier
+`http`/`laya` setup, would otherwise silently carry the Jev credential to
+the wrong host. If Jev is also unreachable, uncredentialed-after-all, or
+unconfident, forge falls through to **static** (or `router_fallback`, if
+set to `cheapest`). Every hop is recorded in the session's
+routing-decision event (`router`, `confidence`, `fallback_used`, `reason`
+— the fallback chain's `reason` names which tier actually failed), so a
+run never blocks on the escalation tier being down.
 
 Setting `router = "jev"` directly makes Jev the primary router (still
 threshold-gated, still falling back to `router_fallback`) instead of an

@@ -126,6 +126,19 @@ pub struct Config {
     /// `!local_only` and a Jev credential is present at build time. `"auto"`
     /// (default) or `"off"`.
     pub router_escalate: String,
+    /// Jev endpoint, scoped separately from `router_url` so a leftover
+    /// `router_url` from an unrelated `http`/`laya` setup can never be
+    /// hijacked into carrying the Jev credential to the wrong host (or
+    /// vice versa). Resolution: the escalation tier uses `jev_url` or the
+    /// compiled-in default only — never `router_url`. `router = "jev"` as
+    /// primary uses `jev_url`, then `router_url` (for backwards
+    /// compatibility with how other routers already use the generic
+    /// field), then the default.
+    pub jev_url: Option<String>,
+    /// Env var holding the Jev credential; same scoping rationale as
+    /// `jev_url`. Escalation uses `jev_key_env` or `TYPESAFE_API_KEY` only;
+    /// `router = "jev"` as primary also falls back to `router_key_env`.
+    pub jev_key_env: Option<String>,
     pub router_timeout_ms: u64,
     pub execution: String,
     pub approval: String,
@@ -251,6 +264,8 @@ impl Default for Config {
             router_url: None,
             router_key_env: None,
             router_escalate: "auto".to_string(),
+            jev_url: None,
+            jev_key_env: None,
             router_timeout_ms: 5_000,
             execution: "native".to_string(),
             approval: "prompt".to_string(),
@@ -346,6 +361,8 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_ROUTER_URL", "router_url"),
     ("FORGE_ROUTER_KEY_ENV", "router_key_env"),
     ("FORGE_ROUTER_ESCALATE", "router_escalate"),
+    ("FORGE_JEV_URL", "jev_url"),
+    ("FORGE_JEV_KEY_ENV", "jev_key_env"),
     ("FORGE_EXECUTION", "execution"),
     ("FORGE_APPROVAL", "approval"),
     ("FORGE_LOCAL_ONLY", "local_only"),
