@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 forge-config.workspace = true
 forge-core.workspace = true
+forge-needle.workspace = true
 forge-session.workspace = true
 serde.workspace = true
 serde_json.workspace = true

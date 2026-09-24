@@ -164,9 +164,16 @@ fn serve_serves_health_on_ephemeral_port() {
     let mut ok = false;
     for _ in 0..100 {
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-            stream
+            // A connection accepted before the server is really ready can
+            // already be reset here (EINVAL/ECONNRESET on macOS); that is a
+            // retry, not a test failure.
+            if stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .expect("timeout");
+                .is_err()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
             let attempt = stream
                 .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 .and_then(|()| stream.read_to_string(&mut body).map(|_| ()));
@@ -1029,4 +1036,69 @@ fn serve_laya_autostart() {
         }
         assert!(gone, "adapter still listening on {adapter_port}");
     }
+}
+
+#[test]
+fn run_fast_paths_a_tool_prompt_through_the_needle_brain() {
+    // End-to-end proof that `forge run` wires the brain into AgentService:
+    // with FORGE_NEEDLE_BACKEND=hash the deterministic engine fills a
+    // `read_file` call for an exact "<tool>: <json>" prompt, so the run is
+    // answered by the tool itself and the model is never called.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    std::fs::write(project.join("hello.txt"), "hello from disk\n").expect("write");
+    let prompt = "read_file: {\"path\": \"hello.txt\"}";
+    let args = [
+        "--model",
+        "mock-local",
+        "--router",
+        "static",
+        "--json",
+        "run",
+        prompt,
+    ];
+    let routers = |outcome: &serde_json::Value| -> Vec<String> {
+        outcome["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter_map(|e| e["router"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let fast = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(args)
+        .output()
+        .expect("run");
+    assert!(fast.status.success(), "{fast:?}");
+    let outcome: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&fast.stdout).trim()).expect("run json");
+    assert_eq!(outcome["text"], "hello from disk\n");
+    assert_eq!(outcome["turns"], 0, "no model turn: {outcome}");
+    assert!(
+        routers(&outcome).iter().any(|r| r == "needle-dispatch"),
+        "routers: {:?}",
+        routers(&outcome)
+    );
+
+    // Without an available engine the very same prompt runs the model loop.
+    let normal = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(args)
+        .output()
+        .expect("run");
+    assert!(normal.status.success(), "{normal:?}");
+    let outcome: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&normal.stdout).trim()).expect("run json");
+    assert_eq!(outcome["turns"], 1, "plain loop: {outcome}");
+    assert!(
+        !routers(&outcome).iter().any(|r| r == "needle-dispatch"),
+        "routers: {:?}",
+        routers(&outcome)
+    );
 }

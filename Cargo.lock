@@ -668,6 +668,7 @@ dependencies = [
  "forge-core",
  "forge-execution",
  "forge-graph",
+ "forge-needle",
  "forge-providers",
  "forge-session",
  "serde",

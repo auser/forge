@@ -27,6 +27,24 @@ pub fn build_execution(
     }
 }
 
+/// [`build_service`] plus the on-device Needle brain, which enables the
+/// direct-dispatch fast path for fresh prompts (`AgentService::with_needle`).
+///
+/// The engine is attached only when it can actually answer — that check is
+/// `forge_needle::engine_if_available`, the same seam `forge graph build`
+/// uses, so env `FORGE_NEEDLE_BACKEND=hash` and the `[needle]` config are
+/// honoured in exactly one place. Unavailable (no `ffi` feature, weights not
+/// fetched) yields `None` and the plain agent loop.
+///
+/// Commands that never start a fresh prompt (`resume`, `cancel`, session
+/// inspection) use plain [`build_service`]: the fast path cannot apply to
+/// them, so probing the engine would only cost them latency.
+pub async fn build_run_service(ctx: &Context) -> Result<AgentService, ForgeError> {
+    let service = build_service(ctx)?;
+    let engine = forge_needle::engine_if_available(service.config()).await;
+    Ok(service.with_needle(engine))
+}
+
 /// Build the transport-neutral agent runtime from the resolved
 /// configuration: model provider, decision router (with fallback),
 /// execution provider, filesystem skill registry, and the JSONL session

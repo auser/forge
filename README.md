@@ -139,6 +139,17 @@ forge run --max-turns 10 "refactor the parser"
 forge run --json "summarize this repo" | jq .text
 ```
 
+Well-defined requests skip the LLM entirely. When the embedded Needle brain
+both picks a tool and fills its arguments confidently (at least
+`router_confidence_threshold`) and a second on-device check finds the call
+non-destructive, Forge dispatches it directly — no model call at all, and
+the run records `router: "needle-dispatch"` with `turns: 0`. Everything the
+brain declines, is unsure about, judges destructive, or that needs approval
+runs the full agent loop instead. The fast path is purely an optimization:
+it dispatches through the same approval-gated execution provider as the
+loop, so it can never do something a normal run could not, and without a
+working brain (no `ffi` feature, weights missing) it simply never engages.
+
 Approval, when a tool call needs it (`approval = "prompt"`):
 
 ```bash
