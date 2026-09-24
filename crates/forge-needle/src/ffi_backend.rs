@@ -136,6 +136,15 @@ impl FfiBackend {
         let capacity = i32::try_from(self.out.len()).map_err(|_| {
             BackendError::Inference("output buffer larger than the C API's int capacity".into())
         })?;
+        // The buffer is reused across calls and the NUL terminator is the only
+        // length signal we get. Clearing the first byte means that if
+        // `needle_complete` ever returns success without writing anything, the
+        // scan below finds an empty string and errors — rather than finding the
+        // *previous* call's terminator and returning a stale answer as fresh.
+        // It also makes the truncation heuristic trustworthy.
+        if let Some(first) = self.out.first_mut() {
+            *first = 0;
+        }
 
         // SAFETY: all pointers come from live `CString`/`Vec` values owned by
         // this stack frame and outlive the calls. The engine is serialised
@@ -336,26 +345,7 @@ impl NeedleBackend for FfiBackend {
             .collect();
         let tools_json = to_json(&tools)?;
 
-        let envelope = self.run(&tools_json, task)?;
-        envelope.check_engine_error()?;
-        let call = envelope
-            .function_calls
-            .first()
-            .ok_or(BackendError::Declined)?;
-        let choice = unique
-            .iter()
-            .find(|option| ***option == call.name)
-            .ok_or_else(|| {
-                BackendError::Inference(format!(
-                    "needle selected {:?}, which is not one of the offered options",
-                    call.name
-                ))
-            })?;
-        Ok(Decision {
-            choice: (*choice).clone(),
-            confidence: envelope.calibrated_confidence(),
-            reason: envelope.reasoning.clone().unwrap_or_default(),
-        })
+        self.run(&tools_json, task)?.decision(&unique)
     }
 
     /// One vector per text, L2-normalised by the engine, `dimensions()` long.
@@ -405,8 +395,11 @@ impl NeedleBackend for FfiBackend {
     /// mirroring the Python SDK, where a Pydantic model's class name does the
     /// same job.
     ///
-    /// A refusal (nothing extracted, or a record withheld for low confidence)
-    /// is [`BackendError::Declined`], never an invented record.
+    /// A refusal (nothing extracted, a record withheld for low confidence, or
+    /// a call whose `arguments` are not a JSON object) is
+    /// [`BackendError::Declined`], never an invented record. In particular the
+    /// returned string is always a JSON **object**, so callers can rely on
+    /// parsing it into a map rather than defensively handling `"null"`.
     fn extract(&mut self, text: &str, schema_json: &str) -> Result<String, BackendError> {
         let schema: Value = serde_json::from_str(schema_json)
             .map_err(|e| BackendError::Inference(format!("extraction schema is not JSON: {e}")))?;
@@ -432,19 +425,15 @@ impl NeedleBackend for FfiBackend {
         })];
         let tools_json = to_json(&tools)?;
 
-        let envelope = self.run(&tools_json, text)?;
-        envelope.check_engine_error()?;
-        let record = envelope
-            .function_calls
-            .first()
-            .ok_or(BackendError::Declined)?;
-        to_json(&record.arguments)
+        self.run(&tools_json, text)?.record()
     }
 
     /// Native tool calling with the caller's tools JSON verbatim. `None` is
     /// Needle's refusal: an off-topic prompt returns empty `function_calls`
     /// (and a withheld low-confidence call lands in `suppressed_calls`)
-    /// rather than a fabricated call.
+    /// rather than a fabricated call. A call whose `arguments` are not a JSON
+    /// object is also `None` — `arguments_json` is always a serialised object,
+    /// so callers never have to defend against `"null"`.
     fn tool_call(
         &mut self,
         prompt: &str,
@@ -463,16 +452,7 @@ impl NeedleBackend for FfiBackend {
             }
         }
 
-        let envelope = self.run(tools_json, prompt)?;
-        envelope.check_engine_error()?;
-        let Some(call) = envelope.function_calls.first() else {
-            return Ok(None);
-        };
-        Ok(Some(NeedleToolCall {
-            name: call.name.clone(),
-            arguments_json: to_json(&call.arguments)?,
-            confidence: envelope.calibrated_confidence(),
-        }))
+        self.run(tools_json, prompt)?.needle_tool_call()
     }
 }
 
@@ -514,8 +494,26 @@ struct Envelope {
 #[derive(Debug, serde::Deserialize)]
 struct Call {
     name: String,
+    /// Absent in the envelope (or present but not an object) leaves this
+    /// `Value::Null` — see [`Call::arguments_object`], which is the only way
+    /// callers are allowed to read it.
     #[serde(default)]
     arguments: Value,
+}
+
+impl Call {
+    /// The call's arguments, but only if they are a JSON **object**.
+    ///
+    /// This exists because `serde(default)` turns a missing `arguments` key
+    /// into `Value::Null`, and `to_string()` on that is the string `"null"` —
+    /// which is *valid JSON*, so it parses cleanly downstream and would sail
+    /// through a consumer that only checks "does this parse?". An empty object
+    /// is fine (a no-argument tool really does return `{}`, and a schema of
+    /// all-optional fields can legitimately extract nothing); anything that is
+    /// not an object at all is not a usable record or call.
+    fn arguments_object(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.arguments.as_object()
+    }
 }
 
 impl Envelope {
@@ -539,6 +537,75 @@ impl Envelope {
     /// confident one.
     fn calibrated_confidence(&self) -> f64 {
         self.confidence.unwrap_or(0.0).clamp(0.0, 1.0)
+    }
+
+    /// The chosen option, for [`FfiBackend::decide`]. `options` is the
+    /// deduplicated candidate list the tool surface was built from.
+    ///
+    /// Split out from `decide` so the envelope-to-`Decision` mapping — the
+    /// refusal and not-an-offered-option branches especially — is unit
+    /// testable without a linked engine or real weights.
+    fn decision(&self, options: &[&String]) -> Result<Decision, BackendError> {
+        self.check_engine_error()?;
+        // No call at all is Needle's refusal, and a call withheld into
+        // `suppressed_calls` for low confidence is the same answer: don't
+        // guess, let the caller fall back.
+        let call = self.function_calls.first().ok_or(BackendError::Declined)?;
+        let choice = options
+            .iter()
+            .find(|option| **option == &call.name)
+            .ok_or_else(|| {
+                BackendError::Inference(format!(
+                    "needle selected {:?}, which is not one of the offered options",
+                    call.name
+                ))
+            })?;
+        Ok(Decision {
+            choice: (*choice).clone(),
+            confidence: self.calibrated_confidence(),
+            reason: self.reasoning.clone().unwrap_or_default(),
+        })
+    }
+
+    /// The extracted record as a JSON object string, for
+    /// [`FfiBackend::extract`].
+    fn record(&self) -> Result<String, BackendError> {
+        self.check_engine_error()?;
+        let call = self.function_calls.first().ok_or(BackendError::Declined)?;
+        match call.arguments_object() {
+            Some(arguments) => to_json(arguments),
+            None => {
+                tracing::warn!(
+                    tool = %call.name,
+                    arguments = %call.arguments,
+                    "needle returned an extraction call whose arguments are not a JSON object; \
+                     declining rather than passing it on"
+                );
+                Err(BackendError::Declined)
+            }
+        }
+    }
+
+    /// The tool call, for [`FfiBackend::tool_call`]. `Ok(None)` is a refusal.
+    fn needle_tool_call(&self) -> Result<Option<NeedleToolCall>, BackendError> {
+        self.check_engine_error()?;
+        let Some(call) = self.function_calls.first() else {
+            return Ok(None);
+        };
+        let Some(arguments) = call.arguments_object() else {
+            tracing::warn!(
+                tool = %call.name,
+                arguments = %call.arguments,
+                "needle returned a tool call whose arguments are not a JSON object; \
+                 treating it as a refusal rather than passing it on"
+            );
+            return Ok(None);
+        };
+        Ok(Some(NeedleToolCall {
+            name: call.name.clone(),
+            arguments_json: to_json(arguments)?,
+            confidence: self.calibrated_confidence(),
+        }))
     }
 }
 
@@ -588,6 +655,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // These tests exercise the pure envelope/argument handling, which is
     // where the wrapper's decisions live. Anything that calls into
@@ -596,6 +664,10 @@ mod tests {
 
     fn envelope(json: &str) -> Envelope {
         serde_json::from_str(json).expect("test envelope parses")
+    }
+
+    fn options(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
     }
 
     #[test]
@@ -677,7 +749,10 @@ mod tests {
         assert_eq!(FfiBackend::new(PathBuf::from("/")).model_id(), "needle3");
     }
 
+    // `#[serial]`: asserts on the process-global `LIVE` claim, so it must not
+    // race any other test that could take it.
     #[test]
+    #[serial]
     fn missing_weights_are_reported_before_any_global_claim_is_taken() {
         // Must be `WeightsMissing` (which the engine retries) and must not
         // consume the process-global claim — otherwise a backend waiting for
@@ -733,5 +808,140 @@ mod tests {
         let mut backend = FfiBackend::new(PathBuf::from("/definitely/not/here/needle3.cact"));
         assert!(backend.extract("text", "[]").is_err());
         assert!(backend.extract("text", "not json").is_err());
+    }
+
+    // ---- the arguments contract: never hand "null" downstream -------------
+    //
+    // `serde(default)` makes a missing `arguments` key `Value::Null`, and
+    // `"null"` is *valid JSON* — so a consumer that only asks "does this
+    // parse?" (e.g. a fast-path gate) would accept it as a record. Both
+    // `record()` and `needle_tool_call()` must refuse instead.
+
+    #[test]
+    fn a_call_with_no_arguments_key_is_not_passed_off_as_a_null_record() {
+        let e = envelope(r#"{"type":"call","success":true,"function_calls":[{"name":"x"}]}"#);
+        assert!(e.function_calls[0].arguments.is_null());
+        assert!(
+            e.function_calls[0].arguments_object().is_none(),
+            "null arguments must not be readable as a record"
+        );
+        assert!(
+            matches!(e.record(), Err(BackendError::Declined)),
+            "extract must decline, not return the string \"null\""
+        );
+        assert!(
+            matches!(e.needle_tool_call(), Ok(None)),
+            "tool_call must refuse, not return arguments_json == \"null\""
+        );
+    }
+
+    #[test]
+    fn non_object_arguments_of_every_shape_are_refused() {
+        for bad in [r#""a string""#, "[1,2]", "42", "null", "true"] {
+            let e = envelope(&format!(
+                r#"{{"type":"call","success":true,"function_calls":[{{"name":"x","arguments":{bad}}}]}}"#
+            ));
+            assert!(
+                e.function_calls[0].arguments_object().is_none(),
+                "{bad} must not count as a record"
+            );
+            assert!(
+                matches!(e.record(), Err(BackendError::Declined)),
+                "record() must decline for arguments {bad}"
+            );
+            assert!(
+                matches!(e.needle_tool_call(), Ok(None)),
+                "needle_tool_call() must refuse for arguments {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_object_is_a_valid_record_and_a_valid_no_arg_call() {
+        // A no-argument tool genuinely returns `{}` (the engine emits exactly
+        // that for the tools `decide` builds), and an all-optional schema can
+        // legitimately extract nothing. `{}` must survive.
+        let e = envelope(
+            r#"{"type":"call","success":true,
+                "function_calls":[{"name":"test_runner","arguments":{}}],"confidence":0.9}"#,
+        );
+        assert_eq!(e.record().expect("empty object is a record"), "{}");
+        let call = e
+            .needle_tool_call()
+            .expect("succeeds")
+            .expect("a call is present");
+        assert_eq!(call.name, "test_runner");
+        assert_eq!(call.arguments_json, "{}");
+    }
+
+    #[test]
+    fn a_real_record_round_trips_as_an_object() {
+        // Captured shape from the real engine.
+        let e = envelope(
+            r#"{"type":"call","success":true,
+                "function_calls":[{"name":"record","arguments":{"city":"Paris"}}],
+                "confidence":1.0}"#,
+        );
+        let record = e.record().expect("extracts");
+        let parsed: Value = serde_json::from_str(&record).expect("parses");
+        assert!(parsed.is_object(), "must always be an object: {record}");
+        assert_eq!(parsed["city"], "Paris");
+    }
+
+    // ---- decide's envelope mapping ---------------------------------------
+
+    #[test]
+    fn decision_maps_the_selected_tool_back_to_the_offered_option() {
+        let opts = options(&["qwen3-coder", "chat-model"]);
+        let refs: Vec<&String> = opts.iter().collect();
+        let e = envelope(
+            r#"{"type":"call","success":true,
+                "function_calls":[{"name":"qwen3-coder","arguments":{}}],
+                "reasoning":"refactor -> coder","confidence":0.78}"#,
+        );
+        let decision = e.decision(&refs).expect("decides");
+        assert_eq!(decision.choice, "qwen3-coder");
+        assert_eq!(decision.reason, "refactor -> coder");
+        assert!((decision.confidence - 0.78).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decision_declines_when_needle_makes_no_call() {
+        let opts = options(&["a", "b"]);
+        let refs: Vec<&String> = opts.iter().collect();
+        // Off-topic input: empty function_calls is Needle's refusal.
+        let e = envelope(r#"{"type":"call","success":true,"function_calls":[]}"#);
+        assert!(matches!(e.decision(&refs), Err(BackendError::Declined)));
+    }
+
+    #[test]
+    fn decision_rejects_a_choice_that_was_never_offered() {
+        // Guards against silently accepting a hallucinated or mis-echoed tool
+        // name as a routing target.
+        let opts = options(&["a", "b"]);
+        let refs: Vec<&String> = opts.iter().collect();
+        let e = envelope(
+            r#"{"type":"call","success":true,"function_calls":[{"name":"c","arguments":{}}]}"#,
+        );
+        let err = e.decision(&refs).expect_err("must not accept 'c'");
+        assert!(err.to_string().contains("not one of the offered"), "{err}");
+    }
+
+    #[test]
+    fn an_engine_error_envelope_beats_everything_else() {
+        // Even with a plausible-looking call attached, a failed envelope must
+        // surface as an error rather than being read for content.
+        let opts = options(&["a"]);
+        let refs: Vec<&String> = opts.iter().collect();
+        let e = envelope(
+            r#"{"type":"error","error":"needle_init not called",
+                "function_calls":[{"name":"a","arguments":{}}]}"#,
+        );
+        assert!(matches!(e.decision(&refs), Err(BackendError::Inference(_))));
+        assert!(matches!(e.record(), Err(BackendError::Inference(_))));
+        assert!(matches!(
+            e.needle_tool_call(),
+            Err(BackendError::Inference(_))
+        ));
     }
 }

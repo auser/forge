@@ -10,5 +10,7 @@ license.workspace = true
 # linkage would be a second claim on the same global state.
 links = "needle"
 
-[build-dependencies]
-bindgen = "0.72"
+# No build-dependencies on purpose: the six `extern "C"` declarations are
+# hand-written in src/lib.rs rather than generated, so build.rs needs no
+# bindgen and therefore no libclang — which would otherwise become an
+# undocumented prerequisite of every default workspace build.

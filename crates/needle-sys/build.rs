@@ -1,4 +1,7 @@
-//! Resolve `libneedle` + `needle.h` and generate bindings for them.
+//! Resolve `libneedle` and emit its link flags. That is all this does — the
+//! `extern "C"` declarations are hand-written in `src/lib.rs` (see that file
+//! for why there is no `bindgen` here), so this build script has no
+//! dependencies and needs no libclang, no header parsing and no codegen.
 //!
 //! **Artifact provenance** (verified 2026-09-23): the Needle 3 engine is
 //! published per platform in the same Hugging Face repo as the weights,
@@ -18,9 +21,15 @@
 //!
 //! The binary is **not** committed (see `.gitignore`): it is a 1.1 MB
 //! per-platform blob and forge only needs it when the `ffi` feature is on.
-//! `needle.h` *is* committed, because it is the API contract this crate is
-//! written against and bindgen needs it for a plain `cargo check` on any
-//! machine — including ones that will never link the engine.
+//! `needle.h` *is* committed, as the contract of record for the hand-written
+//! declarations.
+//!
+//! A *missing* library is not an error here: `cargo check` and `cargo clippy`
+//! never invoke the linker, so they work fine without it, and that is what
+//! keeps `just verify` green on a fresh checkout. Only a build that actually
+//! links code calling the engine needs it, which is why the absence is a
+//! loud warning rather than a panic. A `NEEDLE_LIB_DIR` that is *set but
+//! wrong* is operator error and does panic.
 
 use std::path::{Path, PathBuf};
 
@@ -30,17 +39,11 @@ const LIB_DIR_ENV: &str = "NEEDLE_LIB_DIR";
 
 fn main() {
     println!("cargo:rerun-if-env-changed={LIB_DIR_ENV}");
-    println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-changed=needle.h");
 
     let manifest = PathBuf::from(env("CARGO_MANIFEST_DIR"));
     let target = env("TARGET");
     let vendor = manifest.join("vendor").join(&target);
 
-    // An explicitly configured directory that doesn't hold the engine is an
-    // operator mistake worth failing loudly on; a merely absent vendor
-    // directory is the normal state of a fresh checkout and only matters at
-    // link time (see `emit_link_flags`).
     let configured = std::env::var(LIB_DIR_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty());
@@ -62,26 +65,6 @@ fn main() {
         None => static_lib(&vendor, &target).map(|_| vendor.clone()),
     };
 
-    // Header resolution: prefer whatever ships next to the library actually
-    // being linked, so the bindings always match that engine's ABI. Fall
-    // back to this crate's committed copy.
-    let header_dir = lib_dir
-        .as_ref()
-        .filter(|dir| dir.join("needle.h").is_file())
-        .cloned()
-        .unwrap_or_else(|| manifest.clone());
-    if !header_dir.join("needle.h").is_file() {
-        panic!(
-            "needle.h not found in {} (and no committed fallback at {}/needle.h)",
-            header_dir.display(),
-            manifest.display()
-        );
-    }
-    println!(
-        "cargo:rerun-if-changed={}",
-        header_dir.join("needle.h").display()
-    );
-
     match &lib_dir {
         Some(dir) => emit_link_flags(dir, &target),
         None => println!(
@@ -93,8 +76,6 @@ fn main() {
             lib_file_name(&target),
         ),
     }
-
-    generate_bindings(&manifest, &header_dir);
 }
 
 fn env(key: &str) -> String {
@@ -138,34 +119,5 @@ fn emit_link_flags(dir: &Path, target: &str) {
         println!("cargo:rustc-link-lib=static=c++abi");
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
-    }
-}
-
-fn generate_bindings(manifest: &Path, header_dir: &Path) {
-    let out = PathBuf::from(env("OUT_DIR")).join("bindings.rs");
-    let bindings = bindgen::Builder::default()
-        .header(manifest.join("wrapper.h").display().to_string())
-        .clang_arg(format!("-I{}", header_dir.display()))
-        // The header declares exactly six functions and no types; keeping the
-        // allowlist tight means a future header that grows unrelated
-        // declarations can't silently widen this crate's surface.
-        .allowlist_function("needle_.*")
-        .generate_comments(true)
-        .layout_tests(false)
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .generate();
-
-    match bindings {
-        Ok(bindings) => {
-            if let Err(e) = bindings.write_to_file(&out) {
-                panic!("writing {}: {e}", out.display());
-            }
-        }
-        Err(e) => panic!(
-            "bindgen failed on {}/needle.h: {e}\n\
-             (bindgen needs libclang; on macOS install the Xcode command line tools, \
-             on Debian/Ubuntu `apt install libclang-dev`.)",
-            header_dir.display()
-        ),
     }
 }

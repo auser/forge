@@ -557,16 +557,24 @@ Substitute the platform folder for your target (`macos-arm64`,
 `linux-mipsel`, `windows-x86_64`, `windows-arm64`, `android-arm64`, ...; the
 full list is in `crates/needle-sys/build.rs`). `NEEDLE_LIB_DIR=/path/to/dir`
 overrides the vendored location. `crates/needle-sys/vendor/` is gitignored;
-`needle.h` is committed, because it is the API contract and `cargo check`
-needs it on machines that will never link the engine.
+`needle.h` is committed as the contract of record — `needle-sys` hand-writes
+its six `extern "C"` declarations rather than generating them (no `bindgen`, so
+no libclang needed to build forge), and a unit test fails if the committed
+header ever stops matching those declarations.
 
 Then:
 
 ```bash
 just verify-ffi   # clippy + unit tests with `ffi` on
 just e2e          # real-weights end-to-end suite (release build)
-forge_bin() { cargo build --release -p forge-cli --features needle-ffi; }
+
+# build the forge binary itself against the real engine
+cargo build --release -p forge-cli --features needle-ffi
 ```
+
+`just verify` already type- and lint-checks the `ffi` code on every run via
+`just lint-ffi` — `cargo clippy` never links, so that needs no engine binary.
+The recipes above are what additionally *run* it.
 
 `just e2e` needs weights as well as the engine:
 
@@ -579,8 +587,15 @@ the engine loads, that `decide` picks `test-runner` for "run the tests" with
 calibrated confidence, that embeddings are 3072-dimensional, L2-normalised
 and deterministic, that `extract` pulls `{"city":"Paris"}` out of prose, that
 an unsupported request refuses instead of guessing, and that a warm route
-round-trip stays under 500 ms (measured ~47 ms release / ~100 ms debug on an
-idle macos-arm64 machine).
+round-trip is not pathologically slow.
+
+On latency: a warm round-trip measures **~47 ms** in a release build on an
+idle macos-arm64 machine (~100 ms debug). The suite prints every sample
+against that reference but asserts only a loose 2 s ceiling, because
+wall-clock latency here tracks machine load far more than it tracks forge —
+the same bit-identical inference measured 47 ms idle and 1.3 s at load average
+347. Read the printed numbers for drift; the assertion exists to catch gross
+regressions (skipping `needle_init` per call once took a round-trip to 16.5 s).
 
 The "no network calls once weights are on disk" claim holds for this backend:
 `libneedle.a` has no network-capable symbols at all (`nm -u` shows only libc
@@ -614,7 +629,7 @@ crates/
   forge-runtime     AgentService — the one runtime shared by CLI and server
   forge-server      axum REST/SSE adapter
   forge-cli         clap command tree, tracing, the forge binary
-  needle-sys        raw bindgen FFI to libneedle (built only with `ffi`)
+  needle-sys        raw FFI declarations for libneedle + its link config
 tests/features/     Gherkin scenarios (executable via just bdd)
 specs/              project spec, ADRs, implementation plan
 ```

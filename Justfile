@@ -19,6 +19,15 @@ fmt:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Type- and lint-check the FFI backend and its e2e test WITHOUT linking.
+# `cargo clippy` never invokes the linker, so this needs no libneedle.a and no
+# weights — yet it is the only thing in the default gate that compiles
+# ffi_backend.rs (700+ lines, most of the crate's unsafe) and tests/e2e.rs at
+# all. Without it, `ffi` code could stop compiling and `just verify` would
+# still pass.
+lint-ffi:
+    cargo clippy -p forge-needle --features "ffi needle-e2e" --all-targets -- -D warnings
+
 # unit + integration tests (see `lint` for why not --all-features)
 test:
     cargo test --workspace
@@ -28,15 +37,15 @@ test:
 bdd:
     cargo test -p forge-cli --test bdd
 
-# fmt --check + check + lint + test + bdd
-verify: check lint test bdd
+# fmt --check + check + lint (incl. link-free ffi lint) + test + bdd
+verify: check lint lint-ffi test bdd
     cargo fmt --all --check
 
 # The libneedle FFI backend. Needs a per-platform engine: set NEEDLE_LIB_DIR,
 # or drop libneedle.a into crates/needle-sys/vendor/<target-triple>/ — see
 # crates/needle-sys/build.rs for the download URL and platform list.
 verify-ffi:
-    cargo clippy -p needle-sys -p forge-needle --all-targets --features ffi -- -D warnings
+    cargo clippy -p needle-sys -p forge-needle --all-targets --features "ffi needle-e2e" -- -D warnings
     cargo test -p forge-needle --features ffi
 
 # Real-weights end-to-end suite for the FFI backend. Needs the engine (as
