@@ -83,8 +83,12 @@ service speaking the Jev wire protocol:
   (`https://api.typesafe.ai/v1/systemone`, bearer `TYPESAFE_API_KEY`).
 - **Self-hosted OpenJev** — wire-compatible open servers
   ([razorback16/openjev](https://github.com/razorback16/openjev),
-  [GitHub30/OpenJev](https://github.com/GitHub30/OpenJev)); point
-  `router_url` at yours and escalation stays on your infrastructure.
+  [GitHub30/OpenJev](https://github.com/GitHub30/OpenJev)); point `jev_url`
+  (and, if needed, `jev_key_env`) at yours and escalation stays on your
+  infrastructure. Deliberately **not** `router_url`/`router_key_env`: those
+  belong to the `http`/`laya` routers, and the escalation tier never
+  consults them — a leftover value from an unrelated router setup must
+  never be able to receive the Jev credential or redirect it elsewhere.
 
 Escalation is **opt-in by credential**: `router_escalate = "auto"` (the
 default) does nothing until the key env var is set, and `--local-only`
