@@ -14,3 +14,8 @@ links = "needle"
 # hand-written in src/lib.rs rather than generated, so build.rs needs no
 # bindgen and therefore no libclang — which would otherwise become an
 # undocumented prerequisite of every default workspace build.
+
+[dev-dependencies]
+# The build-script behavior tests drive real `cargo build` runs into a
+# throwaway target dir (build scripts are never covered by `cargo test`).
+tempfile.workspace = true

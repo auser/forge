@@ -887,6 +887,16 @@ cargo build --release -p forge-cli --features needle-ffi
 `just lint-ffi` — `cargo clippy` never links, so that needs no engine binary.
 The recipes above are what additionally *run* it.
 
+**If you enable `ffi` without fetching the engine**, the build gets all the way
+to linking and then fails with undefined symbols — `ld`/`lld` naming
+`_needle_init`, `_needle_decide`, `_needle_embed` and friends (`undefined
+symbol: needle_init` on Linux, `Undefined symbols for architecture arm64` on
+macOS). That is the *only* symptom, and the fix is the `curl` step above (or
+`NEEDLE_LIB_DIR`). A default build — no `ffi` — never links the engine and
+says nothing about it: `needle-sys` prints a note only under `cargo build -vv`,
+deliberately not a `cargo:warning`, because the crate compiles on every
+workspace build whether or not anything needs the engine.
+
 `just e2e` needs weights as well as the engine:
 
 ```bash
