@@ -82,6 +82,11 @@ pub enum Command {
     /// harnesses). stdout carries the protocol; logs go to stderr.
     Mcp,
 
+    /// Serve the Agent Client Protocol over stdio, making forge an
+    /// in-editor agent (Zed and other ACP clients). stdout carries the
+    /// protocol; logs go to stderr.
+    Acp,
+
     /// Start the REST/SSE server.
     Serve {
         #[arg(long, value_name = "HOST")]

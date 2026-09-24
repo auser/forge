@@ -24,7 +24,7 @@ other HTTP-style routers remain available as alternates.
 - Roadmap and future directions: [`specs/roadmap.md`](specs/roadmap.md)
 - Needle/Jev embedded-brain design (on-device decisions, cheapest-first
   routing; MCP editor integration is [live](#mcp-server-editors-and-agent-harnesses),
-  ACP is next):
+  as is [ACP](#in-your-editor-acp)):
   [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md)
 - BDD features: [`tests/features/`](tests/features/)
 
@@ -134,6 +134,7 @@ forge graph map                    # what's in this repo
 forge skill list                   # discovered skills
 forge doctor                       # what's configured, what's missing
 forge mcp                          # serve those as tools to your editor
+forge acp                          # or be the agent in your editor (Zed)
 ```
 
 Running an agent loop (`forge run`) does need a model — that is the
@@ -294,6 +295,8 @@ forge init                          Initialize a project (idempotent)
 forge run [--max-turns N] <prompt>  Run the multi-turn agent loop
 forge serve [--host --port]         Start the REST/SSE server
 forge mcp                           Serve MCP over stdio (editors, agents)
+forge acp                           Serve ACP over stdio (forge as the agent
+                                    in Zed and other ACP editors)
 forge resume <run-or-session-id>    Continue a completed run in its session
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
@@ -799,6 +802,72 @@ poll `forge_run_status`.
   style with per-request `_meta` and `server/discover`. Framing is
   newline-delimited JSON-RPC, per the stdio binding.
 
+## In your editor (ACP)
+
+Drop this in Zed's `settings.json` and forge shows up in the agent panel:
+
+```json
+{
+  "agent_servers": {
+    "Forge": {
+      "type": "custom",
+      "command": "forge",
+      "args": ["acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+That's it. Open the agent panel, pick Forge, and type.
+
+Where `forge mcp` hands *your* editor's agent a box of forge tools, `forge acp`
+hands the editor **forge itself as the agent** — over the
+[Agent Client Protocol](https://agentclientprotocol.com), which Zed, and a
+growing set of other editors, speak natively.
+
+### What you get
+
+* **Answers as they land.** The reply arrives as soon as the turn ends, and
+  forge's own thinking shows up along the way: which model the router picked
+  (including the instant on-device fast path, which reads as
+  `Routing via needle`), and which skill activated.
+* **Tool calls you can watch.** Every read, edit, command and search appears as
+  its own entry with a live status — pending, running, done, failed. Calls that
+  touch a file carry its path, so Zed can follow along and open what forge is
+  working on.
+* **Permission prompts in the editor.** Under `approval = "prompt"`, a risky
+  operation stops and asks *in Zed's UI* — Allow or Reject, on the tool call
+  itself. Nothing to type in a terminal you can't see.
+* **Cancel that works.** Hit stop and the turn ends; the run is cancelled in
+  forge too, marker file and all, so nothing keeps running behind your back.
+* **The same sessions as everywhere else.** An editor session *is* a forge
+  session: the id Zed uses is the one `forge session show <id>` reads and
+  `forge resume <id>` continues.
+
+### Notes and current limits
+
+* **forge reads and writes files itself**, in the project directory the editor
+  opened the session for — not through the editor. So edits land on disk, which
+  means unsaved buffers in Zed are not visible to forge, and you'll want to save
+  before asking about a file. (Bridging editor buffers is a planned follow-up;
+  `initialize` honestly advertises that we don't use the client's filesystem.)
+* **No token-by-token streaming yet.** forge's loop produces a finished answer
+  rather than a token stream, so the reply arrives as one message rather than
+  typing itself out. Tool calls, by contrast, *are* live. We'd rather ship the
+  honest version than chop up finished text to imitate a stream.
+* **Text prompts only** — no images or audio, and `initialize` says so rather
+  than accepting them and dropping them on the floor. File mentions work
+  either way: whether your editor sends a link or the file's contents, forge
+  reads it.
+* Global flags work as usual, in `args`: `["--project", "/path/to/repo", "acp"]`,
+  `--model`, `--router`, `--local-only`, `--approval`. stdio only, so the trust
+  boundary is the process — same machine, same user, no network listener and no
+  authentication.
+* stdout carries the protocol and nothing else; logs go to stderr (`-v`, `-vv`,
+  `-vvv` are safe to add). `--json` is meaningless here.
+* Protocol version 1, framed as newline-delimited JSON-RPC 2.0.
+
 ## Sessions and events
 
 Every run appends versioned events (`"v": 2`, with a monotonic per-run `seq`
@@ -953,6 +1022,9 @@ crates/
   forge-server      axum REST/SSE adapter
   forge-mcp         Model Context Protocol (stdio) adapter: tool registry,
                     schemas, dispatch
+  forge-acp         Agent Client Protocol (stdio) adapter: forge as the
+                    in-editor agent — session/prompt turns, streamed
+                    updates, editor permission prompts
   forge-cli         clap command tree, tracing, the forge binary
   needle-sys        raw FFI declarations for libneedle + its link config
 tests/features/     Gherkin scenarios (executable via just bdd)

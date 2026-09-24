@@ -24,6 +24,7 @@ default = []
 needle-ffi = ["forge-needle/ffi"]
 
 [dependencies]
+forge-acp.workspace = true
 forge-config.workspace = true
 forge-core.workspace = true
 forge-execution.workspace = true

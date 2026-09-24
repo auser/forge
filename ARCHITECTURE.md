@@ -199,6 +199,9 @@ forge-session     append-only JSONL event store, secret redaction
 forge-server      axum REST/SSE adapter over the same AgentService
 forge-mcp         Model Context Protocol (stdio) adapter over the same
                   AgentService: tool registry + schemas + dispatch
+forge-acp         Agent Client Protocol (stdio) adapter over the same
+                  AgentService: forge *as the agent* — v1 wire types,
+                  pure event→update dispatch, prompt-turn driver
 forge-cli         clap command tree, doctor, init, the forge binary
 ```
 
@@ -229,6 +232,40 @@ only `forge-cli` sees. So `forge-mcp` declares a `Diagnostics` seam and the CLI
 implements it from `commands::doctor::collect_checks` — one definition of
 "healthy" for `forge doctor`, `forge doctor --json` and the `forge_doctor`
 tool, and never a subprocess.
+
+`forge acp` is the *other* half of that story, and the distinction is worth
+stating precisely: **MCP exposes forge's capabilities as tools for someone
+else's agent; ACP exposes forge as the agent.** Same `AgentService`, same
+`build_run_service`, same stdio discipline — a different question being
+answered. An ACP client (Zed and friends) drives `initialize` → `session/new` →
+`session/prompt`, and gets the turn back as `session/update` notifications:
+tool calls with kinds, statuses and file locations, routing decisions as
+thoughts, and the final text as one `agent_message_chunk`.
+
+Three seams carry it. **The ACP session id *is* the forge session id**, so a
+turn driven from the editor is inspectable with `forge session show <id>` and
+continuable with `forge resume <id>` — no second identity space. **The client
+chooses the project root per session** (`session/new`'s `cwd`), so the runtime
+is built per session rather than per process: `forge-acp` declares a
+`ServiceFactory` seam and the CLI implements it by overriding `--project`,
+which routes the choice through the same config discovery and needle probe as
+every other subcommand. And **approval becomes a protocol request**: stdin is
+the protocol channel, so the parked-run mechanism that MCP answers with
+`forge_run_input` is answered here by `session/request_permission` —
+`ApprovalRequested` → a permission request naming the tool call → the chosen
+option mapped back to `send_input("y"/"n")`. The result is a permission prompt
+rendered by the editor, on the tool call it belongs to.
+
+Unlike `forge-mcp`, this adapter does **not** wrap an SDK. The official
+`agent-client-protocol` crate was evaluated and rejected on cost, not
+capability: 52 new transitive crates (against `rmcp`'s 13), including a second
+async reactor beside tokio and two more datetime libraries beside chrono, to
+supply a dozen message types and one newline-delimited JSON-RPC loop. So
+`forge-acp::protocol` carries the v1 types, transcribed from the authoritative
+schema crate, and `forge-acp::dispatch` keeps every protocol decision pure —
+which is both why the whole forge→ACP mapping is unit-testable without a
+process, and where an SDK would be dropped in if the subset stops keeping up.
+The crate docs record the verification evidence.
 
 Every integration in this document sits behind one of the `forge-core`
 traits. That is the load-bearing design decision: Needle could be replaced

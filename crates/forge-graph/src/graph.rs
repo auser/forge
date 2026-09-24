@@ -241,11 +241,15 @@ impl LocalGraph {
                 }
                 None => {
                     report.parsed.push(path.clone());
-                    let content =
-                        std::fs::read_to_string(self.root.join(path)).map_err(ForgeError::Io)?;
+                    // Read raw bytes, not `read_to_string`: hashing must
+                    // never care about encoding, and a file with a
+                    // source-like extension (or none at all) can contain
+                    // arbitrary binary content. One bad byte in one file
+                    // must never take down the whole graph build.
+                    let bytes = std::fs::read(self.root.join(path)).map_err(ForgeError::Io)?;
                     let hash = {
                         let mut hasher = Sha256::new();
-                        hasher.update(content.as_bytes());
+                        hasher.update(&bytes);
                         format!("{:x}", hasher.finalize())
                     };
                     files.insert(
@@ -258,8 +262,24 @@ impl LocalGraph {
                             hash,
                         },
                     );
-                    let parsed: FileParse = parse_source(path, &content);
-                    attach_parsed(&mut symbols, &mut imports, path, parsed);
+                    // Symbol/import extraction is line/regex-based over
+                    // source text, which only makes sense for valid UTF-8.
+                    // Design choice (matches the graph's "deterministic,
+                    // local, never blocks a run" contract): a non-UTF-8
+                    // file is still indexed above like any other file
+                    // (hashed, sized, classified) but is silently skipped
+                    // for symbol/import extraction — the same zero-symbol
+                    // outcome as an unrecognized extension in
+                    // `parse_source`. We deliberately do NOT fall back to
+                    // `String::from_utf8_lossy`: for genuinely binary
+                    // content the replacement-character soup would just
+                    // feed garbage into the regex heuristics and could
+                    // fabricate spurious symbols, which is worse than
+                    // reporting none.
+                    if let Ok(content) = std::str::from_utf8(&bytes) {
+                        let parsed: FileParse = parse_source(path, content);
+                        attach_parsed(&mut symbols, &mut imports, path, parsed);
+                    }
                 }
             }
         }
