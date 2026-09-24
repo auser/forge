@@ -11,16 +11,39 @@ const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_LOCAL_ONLY",
     "FORGE_SERVER_HOST",
     "FORGE_SERVER_PORT",
+    // needle config/env knobs (see forge-config's ENV_KEYS and
+    // forge-needle's weights.rs/lib.rs): removed so a developer's shell
+    // can't perturb a supposedly-hermetic run (e.g. a real
+    // FORGE_NEEDLE_WEIGHTS_BASE_URL pointed at a personal mirror, or
+    // FORGE_NEEDLE_AUTOFETCH=true left set from other work).
+    "FORGE_NEEDLE_VARIANT",
+    "FORGE_NEEDLE_AUTOFETCH",
+    "FORGE_NEEDLE_WEIGHTS_SHA256",
+    "FORGE_NEEDLE_BACKEND",
+    "FORGE_NEEDLE_WEIGHTS_BASE_URL",
+    "FORGE_NEEDLE_TEST_SHA256",
 ];
 
-/// A `forge` invocation isolated from the developer's real user config and
-/// environment: XDG_CONFIG_HOME points at a temp dir, FORGE_* vars removed.
+/// A `forge` invocation isolated from the developer's real user
+/// config/environment/cache: `HOME` and `XDG_CONFIG_HOME` point at temp
+/// subdirs, FORGE_*/FORGE_NEEDLE_* vars are removed, and autofetch is
+/// forced off. Without this, `forge init` (which defaults to
+/// `router = "needle"` with `needle.autofetch = true`) would resolve
+/// `~/.cache/forge/models/` to the developer's *real* home directory and
+/// attempt a real fetch from Hugging Face on every test run touching init.
+/// This must hold independent of which cargo features are compiled in —
+/// the `needle-ffi` feature gate in `forge init` itself (see
+/// `commands::init::needle_weights_item`) already prevents the fetch in a
+/// default build, but hermeticity here must not depend on that; a
+/// `--features needle-ffi` test run must stay just as isolated.
 fn forge(tmp: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_forge"));
     for var in FORGE_ENV_VARS {
         cmd.env_remove(var);
     }
+    cmd.env("HOME", tmp.join("home"));
     cmd.env("XDG_CONFIG_HOME", tmp.join("xdg"));
+    cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
     cmd.env("NO_COLOR", "1");
     cmd
 }
@@ -131,6 +154,43 @@ fn init_is_idempotent() {
     assert!(project.join(".forge/graph").is_dir());
     assert!(project.join(".forge/sessions").is_dir());
     assert!(project.join(".forge/config.toml").is_file());
+}
+
+/// `forge init` must never fetch the ~35 MB needle weights artifact in a
+/// build that has no inference engine to use it — this binary is compiled
+/// without the `needle-ffi` feature (the crate's `default = []`, and this
+/// integration suite builds with default features), so it should report
+/// the skip rather than silently succeeding after a real network fetch.
+#[test]
+fn init_skips_needle_weights_fetch_without_needle_ffi_feature() {
+    if cfg!(feature = "needle-ffi") {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .arg("init")
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(
+        stdout.contains("needle-ffi"),
+        "expected the feature-off skip message: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipped"),
+        "expected the feature-off skip message: {stdout}"
+    );
+    assert!(
+        !tmp.path().join("home/.cache/forge/models").exists(),
+        "init must not create/fetch into the weights cache dir without needle-ffi"
+    );
 }
 
 #[test]

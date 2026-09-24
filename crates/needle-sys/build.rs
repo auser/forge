@@ -47,6 +47,24 @@ fn main() {
     let configured = std::env::var(LIB_DIR_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty());
+
+    // Watch both candidate library paths unconditionally, even when
+    // neither exists yet: cargo happily tracks non-existent paths, so
+    // fetching the library later (e.g. the README's `curl` step) makes
+    // this build script rerun and pick it up automatically, rather than
+    // silently keeping a stale "no library" link decision until something
+    // else invalidates the build cache.
+    println!(
+        "cargo:rerun-if-changed={}",
+        vendor.join(lib_file_name(&target)).display()
+    );
+    if let Some(dir) = &configured {
+        println!(
+            "cargo:rerun-if-changed={}",
+            PathBuf::from(dir).join(lib_file_name(&target)).display()
+        );
+    }
+
     let lib_dir: Option<PathBuf> = match configured {
         Some(dir) => {
             let dir = PathBuf::from(dir);
@@ -101,10 +119,8 @@ fn static_lib(dir: &Path, target: &str) -> Option<PathBuf> {
 fn emit_link_flags(dir: &Path, target: &str) {
     println!("cargo:rustc-link-search=native={}", dir.display());
     println!("cargo:rustc-link-lib=static=needle");
-    println!(
-        "cargo:rerun-if-changed={}",
-        dir.join(lib_file_name(target)).display()
-    );
+    // `cargo:rerun-if-changed` for this path is already emitted
+    // unconditionally in `main` (covers both the found and not-found case).
 
     // libneedle is a C++ translation unit behind an `extern "C"` facade:
     // `nm libneedle.a` shows libc++ symbols plus `__cxa_*` /

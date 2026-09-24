@@ -487,13 +487,28 @@ dimensionality is discarded and rebuilt wholesale rather than mixed with new
 vectors. Without a working needle engine, this step is skipped silently — the
 build still succeeds, and no `embeddings.bin` is touched.
 
+`embeddings.bin` is a single `serde_json` blob today (an 8-byte `FRGEMB01`
+magic prefix + one JSON object), parsed in full on every load. That is fine
+at the hash backend's 64 dimensions, but the real `ffi` backend embeds at
+3072 dimensions (see [Embedded Needle brain
+(`ffi`)](#embedded-needle-brain-ffi)); a project with ~1,000 embedded symbols
+would produce a ~45 MB index under that format. A raw little-endian-`f32`
+format bump is planned — safe to do later because the magic prefix makes a
+version change non-silent (mismatch → clean rebuild, never a misread) — see
+the spec's §8 amendment for the follow-up.
+
 `forge graph grep --semantic <query>` embeds the query and returns the top 20
 matches by cosine similarity (`score  path::symbol` lines); without a working
 engine it fails with `semantic search needs needle weights (run forge init)`
 (exit 1) rather than silently falling back to literal search. `forge graph
 context <query>` blends the two signals when both an engine and a matching
 index exist: `final = 0.5 * (1 / (1 + lexical_rank)) + 0.5 * cosine`; otherwise
-its output is exactly the lexical ranking as before.
+its output is exactly the lexical ranking as before. For `--json` consumers:
+`score` is always a float — a blended 0-1 value when a needle engine and
+matching index both exist, otherwise the raw lexical rank count — whereas the
+`POST /v1/project/context` server endpoint always returns the raw lexical
+count as an integer today (see [Server](#server); it has not been wired to
+the semantic blend yet).
 
 ## Server
 
@@ -533,6 +548,13 @@ GET  /v1/skills                discovered skill metadata
 GET  /v1/project/graph         graph stats + freshness
 POST /v1/project/context       {"query": "..."} → ranked context selection
 ```
+
+`POST /v1/project/context` is lexical-only today: it calls the same
+structural ranking as `forge graph context` but does not (yet) blend in
+the semantic index the way the CLI command does — see [Known
+limitations](#known-limitations-v03) and the `forge graph context`
+paragraph under [Semantic index](#semantic-index) for the score-shape
+difference this implies for `--json`/API consumers.
 
 The server tracks at most 1024 in-flight/recent runs in memory
 (`MAX_TRACKED_RUNS`); oldest terminal entries are evicted first and remain fully
@@ -597,6 +619,10 @@ TRIPLE=$(rustc -vV | sed -n 's/^host: //p')      # e.g. aarch64-apple-darwin
 mkdir -p crates/needle-sys/vendor/$TRIPLE
 curl -L -o crates/needle-sys/vendor/$TRIPLE/libneedle.a \
   https://huggingface.co/Cactus-Compute/needle3/resolve/main/macos-arm64/libneedle.a
+
+# Verify against the pinned checksum (macos-arm64; see the spec's §8 for
+# other platforms as they get verified) before trusting the download:
+echo "60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a  crates/needle-sys/vendor/$TRIPLE/libneedle.a" | shasum -a 256 -c -
 ```
 
 Substitute the platform folder for your target (`macos-arm64`,
@@ -718,3 +744,29 @@ go in `specs/adrs/`.
   with `extract()`-based argument repair in the agent loop) is not
   implemented yet; it needs real-model quality data first and is deferred to
   a later spec sub-project.
+- Default/prebuilt builds don't include the inference engine yet: the
+  `needle-ffi` feature is off by default and in release builds, so `forge
+  init` skips fetching needle weights entirely in such builds (there is no
+  backend to use them) and reports the skip rather than downloading ~35 MB
+  that would just sit unused. Build with `--features needle-ffi` (see
+  [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi)) to get real
+  fetch-on-init behavior.
+- `POST /v1/project/context` is lexical-only: the semantic blend that
+  `forge graph context`/`graph grep --semantic` apply (needle engine +
+  embedding index, when both exist) has not been ported to the server
+  handler yet. Follow-up: share one `semantic_blend` implementation between
+  the CLI and `forge-server` via `forge-runtime`.
+- `embeddings.bin`'s whole-file `serde_json` format has a known scale limit
+  for `ffi` builds: fine at the hash backend's 64 dimensions, but the real
+  engine embeds at 3072 dimensions, where a project with ~1,000 symbols
+  would produce a ~45 MB index parsed in full on every load. A raw
+  little-endian-`f32` format bump is planned; deferred for now because the
+  `FRGEMB01` magic prefix makes that change safe to land later (a version
+  bump triggers a clean rebuild, never a misread).
+- `forge model test` reports generation-plane (`ModelProvider`) health only;
+  it has no needle/decision-plane status yet (`forge doctor`'s needle probe
+  is the current way to check that). Skill selection
+  (`SkillRegistry::match_task`) is lexical word/substring matching, not the
+  pre-embedded, task-embedding-ranked selection the design describes —
+  both are deferred to the same follow-up as the semantic-blend sharing
+  above.

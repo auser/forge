@@ -485,3 +485,63 @@ adds `router_name: "needle"` and confidence — no schema change.
   ACP, MCP, a TUI, and embedded generation remain explicitly out of
   scope for this sub-project (see the plan's self-review) and are
   deferred to later spec sub-projects.
+
+  **Amendment (final-review fix wave, 2026-09-23).** Four gaps between
+  this spec's stated behavior and what actually shipped, recorded here
+  per controller ruling rather than fixed now — each is scoped to a
+  concrete follow-up rather than left ambiguous:
+
+  - **`POST /v1/project/context` never got the semantic blend §5
+    promises.** §5 says "`forge graph grep --semantic` and `POST
+    /v1/project/context` blend lexical + semantic scores"; only the CLI
+    side does. `forge-server/src/handlers.rs::project_context` calls
+    `LocalGraph::context` directly and echoes its raw lexical score
+    (`ContextHit::score`, a `u32` rank-derived count) verbatim as JSON.
+    `semantic_blend` — needle-engine lookup, embedding-index load, `final
+    = 0.5 * lexical_rank_score + 0.5 * cosine` — lives only in
+    `forge-cli/src/commands/graph_cmd.rs`, coupled to the CLI's `Context`
+    (config resolution) type. Controller ruling: defer moving the blend
+    into a shared location rather than duplicate it ad hoc into the
+    server handler under review pressure. Follow-up: lift `semantic_blend`
+    (and the `ScoredHit` type it returns) into `forge-runtime` — or
+    another crate both `forge-cli` and `forge-server` already depend on —
+    behind the existing `Embedder`/graph traits, then have both the CLI
+    command and the handler call the one implementation. Until that
+    lands: `forge graph context`/`graph grep --semantic` return blended
+    0-1 floats when a needle engine and matching index both exist (else
+    the unchanged lexical ranking); `POST /v1/project/context` always
+    returns the raw lexical count as an integer, needle engine or not.
+  - **`embeddings.bin`'s whole-file `serde_json` format has a known scale
+    ceiling for real (non-hash) weights.** The hash backend's 64-dim
+    vectors keep the index small; the real ffi backend's `needle_embed`
+    reports 3072 dimensions (§8 above), and each vector serializes to
+    roughly 35-45 KB of JSON — a project with ~1,000 embedded symbols
+    would produce a ~45 MB `embeddings.bin` that `EmbeddingIndex::load`
+    (`forge-graph/src/embed_index.rs`) fully parses on every semantic
+    query. Controller ruling: defer the format bump; it is safe to defer
+    because the `FRGEMB01` magic prefix already makes a future format
+    change non-silent — a version bump there simply fails to match and
+    triggers a clean full rebuild rather than misreading old bytes as the
+    new layout. Planned follow-up: a raw little-endian-`f32` vector body
+    (no per-entry JSON) behind a new magic revision, keyed by a compact
+    offset table instead of a `BTreeMap<String, Entry>` that has to
+    deserialize every vector to find one.
+  - **`forge model test` has no needle status.** §4 lists it as an
+    addition: "`forge model test` — includes needle status." The
+    implemented command (`forge-cli/src/commands/model_cmd.rs::test`)
+    only pings the configured `ModelProvider` (the generation plane) and
+    reports latency/sample text; it never touches `forge-needle` or
+    reports engine/weights health. `forge doctor`'s needle probe remains
+    the only surface that reports engine state today. Follow-up: fold a
+    needle load/route smoke check into `forge model test`, or update this
+    spec to name `forge doctor` as the intended surface instead.
+  - **Skill selection is lexical, not embedding-ranked.** §5 step 5
+    describes pre-embedded skill descriptions with task-embedding-ranked
+    candidates. `SkillRegistry::match_task`
+    (`forge-skills/src/registry.rs`) is word/substring matching against
+    lowercased name + description — no embedder is involved, and there is
+    no top-k ranking. Rolls to the same follow-up as the two items above:
+    once `forge-runtime`/`forge-skills` have a shared path to a needle
+    embedder (the blend refactor above is the natural place to introduce
+    it), skill matching can move onto it instead of duplicating an ad hoc
+    lookup per call site.

@@ -119,7 +119,27 @@ pub fn run(ctx: &Context) -> Result<(), ForgeError> {
 /// (including "no pinned artifact for this variant" and network failure)
 /// degrades to an informational item, matching the design's guarantee that
 /// forge stays fully functional on static routing without weights.
+///
+/// Feature-gated first: the `needle-ffi` feature (off by default and in
+/// release builds — see `forge-cli/Cargo.toml`) is what actually lets
+/// anything *use* fetched weights (`FfiBackend` vs. `UnavailableBackend`).
+/// Without it, fetching the ~35 MB `full` artifact would only ever sit on
+/// disk unused, so this skips the fetch entirely rather than downloading
+/// bytes no build here can act on — regardless of `local_only`/`autofetch`,
+/// since the more fundamental reason to skip is "this binary has no
+/// inference backend to feed", not the config.
 fn needle_weights_item(root: &Path, config: &forge_config::Config) -> InitItem {
+    if !cfg!(feature = "needle-ffi") {
+        return InitItem {
+            status: ItemStatus::Detected,
+            path: root.to_path_buf(),
+            note: Some(
+                "needle weights: skipped (this build has no embedded inference backend; \
+                 build with --features needle-ffi); routing falls back to static"
+                    .to_string(),
+            ),
+        };
+    }
     if config.local_only {
         return InitItem {
             status: ItemStatus::Detected,
@@ -345,4 +365,46 @@ fn report(root: &Path, items: &[InitItem], json: bool) -> Result<(), ForgeError>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the fix that made this path feature-aware: a
+    /// default build (no `needle-ffi` — this is exactly how `cargo test`
+    /// compiles this crate; see `forge-cli/Cargo.toml`'s `default = []`)
+    /// must skip the fetch entirely rather than downloading ~35 MB it has
+    /// no backend to use, and must say so. Guarded with `cfg!` rather than
+    /// `#[cfg(not(feature = "needle-ffi"))]` so `cargo test --features
+    /// needle-ffi` still compiles this test (it just returns early instead
+    /// of asserting the wrong branch).
+    #[test]
+    fn needle_weights_item_skips_fetch_without_needle_ffi_feature() {
+        if cfg!(feature = "needle-ffi") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let weights_path = dir.path().join("cache").join("w.cact");
+        let mut config = forge_config::Config::default();
+        // Would autofetch if anything tried: proves the skip happens
+        // regardless of config, not because autofetch/local_only already
+        // said no.
+        config.needle.autofetch = true;
+        config.needle.weights_path = weights_path.display().to_string();
+        config.router = "needle".to_string();
+        config.local_only = false;
+
+        let item = needle_weights_item(dir.path(), &config);
+
+        let note = item.note.expect("note present");
+        assert!(note.contains("skipped"), "note: {note}");
+        assert!(note.contains("needle-ffi"), "note: {note}");
+        assert!(
+            !weights_path.exists(),
+            "no fetch should have happened, but a file exists at {}",
+            weights_path.display()
+        );
+    }
 }
