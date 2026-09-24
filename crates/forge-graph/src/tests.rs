@@ -188,6 +188,74 @@ fn embedding_candidates_key_and_text_format_disambiguate_same_named_symbols() {
     assert_ne!(a.1, b.1);
 }
 
+/// One bad byte in one file must never take down the whole graph build.
+/// A binary-content `.rs` file (source-like extension, non-UTF-8 bytes)
+/// and a binary file with no extension at all must both be indexed
+/// (hashed, counted, classified) without crashing the build; since their
+/// content isn't valid source text, symbol/import extraction is skipped
+/// for exactly those two files while every other file parses normally.
+#[test]
+fn build_tolerates_non_utf8_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fixture(tmp.path());
+
+    // Every byte value 0..=255, repeated to 512 bytes: guaranteed to
+    // contain invalid UTF-8 sequences (e.g. a lone 0xFF), deterministic
+    // and reproducible (not `rand`, no flakiness).
+    let binary: Vec<u8> = (0u8..=255u8).cycle().take(512).collect();
+    std::fs::write(tmp.path().join("src/notes.rs"), &binary).expect("write binary .rs");
+    std::fs::write(tmp.path().join("blob"), &binary).expect("write binary no-ext");
+
+    let mut graph = LocalGraph::open(tmp.path()).expect("open");
+    let stats = graph
+        .build()
+        .expect("build must succeed despite non-UTF-8 file content");
+
+    // Binary files are still indexed as files (fixture's 5 + these 2).
+    assert_eq!(stats.files, 7);
+    assert!(graph.state().files.contains_key("src/notes.rs"));
+    assert!(graph.state().files.contains_key("blob"));
+
+    // ...but contribute no symbols: their content isn't parseable source
+    // text, so symbol/import extraction is skipped for them.
+    assert!(
+        graph
+            .state()
+            .symbols
+            .iter()
+            .all(|s| s.file != "src/notes.rs" && s.file != "blob"),
+        "binary files must not yield symbols: {:?}",
+        graph.state().symbols
+    );
+    assert!(
+        graph
+            .state()
+            .imports
+            .iter()
+            .all(|i| i.from != "src/notes.rs" && i.from != "blob")
+    );
+
+    // Every other (valid UTF-8) file still parses normally alongside them.
+    let names: Vec<&str> = graph
+        .state()
+        .symbols
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    for expected in ["main", "compute", "util", "run"] {
+        assert!(names.contains(&expected), "missing {expected} in {names:?}");
+    }
+
+    // `forge graph build` is idempotent: rebuilding reuses everything,
+    // including the binary files, without re-crashing.
+    let (_, report) = graph.build_report().expect("rebuild must also succeed");
+    assert!(
+        report.parsed.is_empty(),
+        "second build reuses everything: {report:?}"
+    );
+    assert_eq!(report.reused.len(), 7);
+}
+
 #[test]
 fn skips_common_directories() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -200,6 +200,59 @@ fn init_skips_needle_weights_fetch_without_needle_ffi_feature() {
     );
 }
 
+/// A binary-content `.rs` file in the project (e.g. an accidentally
+/// committed object file, or corrupted text) must not take down `forge
+/// init`'s graph build: one bad byte in one file must never kill the run.
+/// Regression test for the "stream did not contain valid UTF-8" crash.
+#[test]
+fn init_tolerates_a_binary_source_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join("src")).expect("mkdir");
+
+    std::fs::write(
+        project.join("src/main.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .expect("write main.rs");
+    // Every byte value 0..=255: guaranteed non-UTF-8, deterministic (no
+    // `rand`, no flakiness), and disguised as a Rust source file.
+    let binary: Vec<u8> = (0u8..=255u8).cycle().take(512).collect();
+    std::fs::write(project.join("src/notes.rs"), &binary).expect("write binary .rs");
+
+    let first = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .arg("init")
+        .output()
+        .expect("run");
+    assert!(
+        first.status.success(),
+        "init must exit 0 despite a binary .rs file: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8(first.stdout).expect("utf8");
+    assert!(
+        first_stdout.contains("graph:") && first_stdout.contains("files"),
+        "expected the graph build to be reported: {first_stdout}"
+    );
+
+    // `forge graph build` (invoked again via a second `init`) is
+    // idempotent: nothing changed, so the graph is reported unchanged.
+    let second = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .arg("init")
+        .output()
+        .expect("run");
+    assert!(second.status.success(), "second init must also succeed");
+    let second_stdout = String::from_utf8(second.stdout).expect("utf8");
+    assert!(
+        second_stdout.contains("graph: unchanged"),
+        "second run must find the graph fresh: {second_stdout}"
+    );
+}
+
 #[test]
 fn serve_serves_health_on_ephemeral_port() {
     use std::io::{Read, Write};
