@@ -78,6 +78,10 @@ Each sub-project gets its own spec → plan → implementation cycle:
    JetBrains, neovim, other ACP clients get forge as an in-editor agent).
 4. **`forge mcp`** — MCP server exposing graph search, skills, and runs
    as tools (VS Code, Cursor, Claude Code, other harnesses).
+   **Implemented** — stdio adapter in `crates/forge-mcp` over the shared
+   `AgentService`; see the §8 amendment for the verified protocol reality
+   (the current revision replaced the `initialize` handshake) and the SDK
+   decision that followed from it.
 5. **`forge-llm-embedded`** — in-process generation via llama.cpp or
    mistral.rs FFI behind the existing `ModelProvider` trait; removes the
    last external server from the local stack. (Weights are GBs; needs
@@ -640,3 +644,59 @@ adds `router_name: "needle"` and confidence — no schema change.
   (`crates/forge-cli/tests/bdd/world.rs`) so a developer's shell can't leak
   a real credential into an otherwise-hermetic scenario and cause a live
   escalation attempt against `api.typesafe.ai`.
+
+  **Amendment (Task 10, `forge mcp` shipped 2026-09-24).** Two findings
+  worth recording, because both contradicted assumptions the brief was
+  written with:
+
+  - **The MCP spec moved out from under §2 item 4.** The current revision
+    is **`2026-07-28`**, and it *removed the handshake*: there is no
+    `initialize`/`notifications/initialized` lifecycle any more. Every
+    request instead declares its own version in
+    `_meta["io.modelcontextprotocol/protocolVersion"]`, servers **MUST**
+    implement a new `server/discover` RPC, results carry a `resultType`
+    discriminator, and an unsupported version is answered with
+    `UnsupportedProtocolVersionError` (`-32022`, `data.supported`).
+    Revisions `2025-11-25` and earlier ("legacy") still use the
+    handshake, and the spec explicitly blesses **dual-era** servers.
+    Verified at
+    `modelcontextprotocol.io/specification/versioning`,
+    `/2026-07-28/basic/versioning`, `/2026-07-28/server/discover`,
+    `/2026-07-28/basic/transports/stdio`, `/2026-07-28/server/tools`.
+    Framing was confirmed to be what the brief assumed: newline-delimited
+    JSON-RPC, one message per line, no `Content-Length` headers, and the
+    server "MUST NOT write anything to its `stdout` that is not a valid
+    MCP message". `forge mcp` serves **both** eras from one process,
+    which is not optional in practice: current Claude Code probes with
+    `server/discover` and (per `anthropics/claude-code` issue #96183) can
+    then still send `initialize`.
+
+  - **SDK: the official `rmcp` crate, not a hand-roll.** The brief's
+    fallback ("a few hundred lines with serde_json") was costed against
+    the old three-method handshake; dual-era negotiation is materially
+    more protocol to own. `rmcp` 3.4.1 passes every criterion the brief
+    set — stable edition-2024 (MSRV 1.88), 13 new transitive crates for
+    the `server` + `transport-io` slice with `macros`/`schemas` off, and
+    full `initialize` + `server/discover` + `tools/*` coverage — and its
+    stdio serve loop already picks the era from how the client opens.
+    Tool schemas stay hand-written `serde_json` as specified. The
+    protocol logic remains testable without a process: `ForgeTools::call`
+    takes a tool name plus a `serde_json::Value` and returns a
+    `ToolOutcome`, with process-level handshake tests
+    (`crates/forge-cli/tests/mcp.rs`) on top for both eras, stdout purity,
+    and the approval round-trip.
+
+  **Sharing, not duplicating.** Two extractions kept the adapter from
+  re-implementing CLI behavior: `forge-graph`'s new `query` module is now
+  the single lexical+semantic ranking implementation (it takes an
+  `Embedder` the caller built, so the crate stays model-free) used by
+  `forge graph context`, `forge graph grep --semantic`,
+  `forge_graph_context` and `forge_graph_grep`; and `doctor`'s checks were
+  split into `collect_checks` + `report_json`, which `forge doctor`,
+  `forge doctor --json` and the `forge_doctor` tool all render — the tool
+  reaches them through a `Diagnostics` seam implemented in `forge-cli`
+  (the checks span providers/graph/skills/needle, a combination no lower
+  crate can see), never by shelling out. `AgentService` gained
+  `start_run_with_options` so the adapter can honour a per-call
+  `max_turns`; `start_run` delegates to it, so the REST adapter is
+  unchanged.

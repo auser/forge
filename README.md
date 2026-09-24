@@ -23,8 +23,9 @@ exist for tests and demos but are strictly opt-in (`model = "mock-local"`).
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
 - Implementation plan: [`specs/implementation-plan.md`](specs/implementation-plan.md)
 - Roadmap and future directions: [`specs/roadmap.md`](specs/roadmap.md)
-- Needle/Jev embedded-brain design (next direction: on-device decisions,
-  cheapest-first routing, ACP/MCP editor integration):
+- Needle/Jev embedded-brain design (on-device decisions, cheapest-first
+  routing; MCP editor integration is [live](#mcp-server-editors-and-agent-harnesses),
+  ACP is next):
   [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md)
 - BDD features: [`tests/features/`](tests/features/)
 
@@ -285,6 +286,7 @@ curl -s -X POST http://127.0.0.1:7341/v1/runs/<run-id>/input \
 forge init                          Initialize a project (idempotent)
 forge run [--max-turns N] <prompt>  Run the multi-turn agent loop
 forge serve [--host --port]         Start the REST/SSE server
+forge mcp                           Serve MCP over stdio (editors, agents)
 forge resume <run-or-session-id>    Continue a completed run in its session
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
@@ -714,6 +716,87 @@ difference this implies for `--json`/API consumers.
 The server tracks at most 1024 in-flight/recent runs in memory
 (`MAX_TRACKED_RUNS`); oldest terminal entries are evicted first and remain fully
 retrievable from the session store (the source of truth).
+
+## MCP server (editors and agent harnesses)
+
+One command wires forge into Claude Code:
+
+```bash
+claude mcp add forge -- forge mcp
+```
+
+That's it. Your agent can now search this project's graph, read its skills, and
+run forge tasks as tools.
+
+Any other MCP client wants the same two facts — command `forge`, argument `mcp`:
+
+```json
+{
+  "mcpServers": {
+    "forge": {
+      "command": "forge",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+(VS Code: `.vscode/mcp.json`. Cursor: `.cursor/mcp.json` or the global
+`~/.cursor/mcp.json`. Add `"args": ["--project", "/path/to/repo", "mcp"]` if the
+client does not launch the server in your repository.)
+
+### The tools
+
+```text
+forge_graph_context {query, limit?}     ranked files for a task (semantic blend
+                                        when needle weights + index exist)
+forge_graph_grep    {pattern, semantic?} symbol matches by regex or by meaning
+forge_graph_map     {}                  per-directory structure summary
+forge_skill_list    {}                  skill names + descriptions (metadata only)
+forge_skill_show    {name}              a skill's full instructions
+forge_doctor        {}                  the `forge doctor` checks as JSON
+forge_run           {prompt, max_turns?, timeout_ms?}
+                                        run the agent loop; returns
+                                        {run_id, status, text}
+forge_run_status    {run_id}            status + final text + recent events
+forge_run_input     {run_id, input}     answer a waiting run (approvals)
+forge_run_cancel    {run_id}            cancel a run
+```
+
+Results come back as one text item of compact JSON, mirrored in
+`structuredContent`. Failures a model can act on (unbuilt graph, unknown run,
+missing weights) are tool errors with the fix in the message, not protocol
+errors.
+
+### Approvals
+
+`forge mcp` is non-interactive by definition: stdin is the protocol channel, so
+nothing can prompt on it. Under `approval = "prompt"`, a risky operation parks
+the run instead — `forge_run` (or `forge_run_status`) reports
+`status: "waiting_for_approval"`, and the client approves with
+
+```json
+{ "name": "forge_run_input", "arguments": { "run_id": "...", "input": "y" } }
+```
+
+Anything other than `"y"` denies. `forge_run` waits `timeout_ms` (default
+120000) for a run to finish; if the run outlives that, it keeps going and you
+poll `forge_run_status`.
+
+### Notes
+
+* Same runtime as everything else: one `AgentService`, the same routing,
+  execution, approval policy and session recording. Runs started here appear in
+  `forge session list` and are redacted like any other.
+* Global flags work as usual (`--project`, `--model`, `--router`, `--local-only`,
+  `--approval`). There is no host/port: stdio only, so the trust boundary is the
+  process — same machine, same user.
+* stdout carries the protocol and nothing else; all logs go to stderr (`-v`,
+  `-vv`, `-vvv` are safe to add). `--json` is meaningless here.
+* Both MCP eras are served from one process: the `initialize` handshake
+  (revisions `2025-11-25` and earlier) and the current `2026-07-28` stateless
+  style with per-request `_meta` and `server/discover`. Framing is
+  newline-delimited JSON-RPC, per the stdio binding.
 
 ## Sessions and events
 

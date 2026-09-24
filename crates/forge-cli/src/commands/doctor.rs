@@ -5,21 +5,36 @@ use forge_core::ForgeError;
 use crate::commands::Context;
 
 #[derive(Debug, PartialEq)]
-enum Level {
+pub enum Level {
     Ok,
     Warn,
     Fail,
 }
 
-struct Check {
+impl Level {
+    /// Wire tag, shared by the human output, `--json` and the MCP tool.
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+pub struct Check {
     level: Level,
     label: String,
     detail: String,
 }
 
-/// Environment and configuration health report. Exits non-zero (via
-/// `ForgeError`) only when something is actually broken.
-pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
+/// Every environment/configuration check, in report order.
+///
+/// This is the one definition of forge's health: `forge doctor` renders it
+/// and the MCP `forge_doctor` tool serves the same values (via
+/// [`crate::commands::mcp_cmd::CliDiagnostics`]) — never by shelling out to
+/// the CLI.
+pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
     let mut checks: Vec<Check> = Vec::new();
 
     let root = ctx.project_root()?;
@@ -303,40 +318,55 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
         }
     }
 
-    let mut failures = 0usize;
-    let mut report: Vec<serde_json::Value> = Vec::new();
-    for check in &checks {
-        let tag = match check.level {
-            Level::Ok => "ok",
-            Level::Warn => "warn",
-            Level::Fail => {
-                failures += 1;
-                "fail"
-            }
-        };
-        if ctx.global.json {
-            report.push(serde_json::json!({
-                "status": tag,
+    Ok(checks)
+}
+
+/// How many checks are outright broken (warnings do not count).
+pub fn failures(checks: &[Check]) -> usize {
+    checks.iter().filter(|c| c.level == Level::Fail).count()
+}
+
+/// The machine-readable report — exactly what `forge doctor --json` prints
+/// and what the MCP `forge_doctor` tool returns.
+pub fn report_json(checks: &[Check]) -> serde_json::Value {
+    serde_json::json!({
+        "healthy": failures(checks) == 0,
+        "checks": checks
+            .iter()
+            .map(|check| serde_json::json!({
+                "status": check.level.tag(),
                 "check": check.label,
                 "detail": check.detail,
-            }));
-        } else {
-            println!("[{tag:>4}] {}: {}", check.label, check.detail);
-        }
-    }
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
 
+/// Environment and configuration health report. Exits non-zero (via
+/// `ForgeError`) only when something is actually broken.
+pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
+    let checks = collect_checks(ctx).await?;
+    let failures = failures(&checks);
     let healthy = failures == 0;
+
     if ctx.global.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "healthy": healthy,
-                "checks": report,
-            }))
-            .map_err(|e| ForgeError::config(format!("serializing doctor report: {e}")))?
+            serde_json::to_string_pretty(&report_json(&checks))
+                .map_err(|e| ForgeError::config(format!("serializing doctor report: {e}")))?
         );
-    } else if healthy {
-        println!("doctor: healthy");
+    } else {
+        for check in &checks {
+            println!(
+                "[{:>4}] {}: {}",
+                check.level.tag(),
+                check.label,
+                check.detail
+            );
+        }
+        if healthy {
+            println!("doctor: healthy");
+        }
     }
 
     if healthy {

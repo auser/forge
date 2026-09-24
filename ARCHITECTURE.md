@@ -191,12 +191,44 @@ needle-sys        raw FFI declarations + link configuration (feature ffi)
 forge-execution   native + mock execution; approval gating lives here
 forge-runtime     AgentService: the one runtime (agent loop, fast path,
                   tool dispatch) shared by CLI and server
-forge-graph       deterministic project graph + embeddings index format
+forge-graph       deterministic project graph + embeddings index format;
+                  `query` = the one ranked-context/semantic-search
+                  implementation, taking an Embedder the caller built
 forge-skills      SKILL.md discovery, progressive disclosure
 forge-session     append-only JSONL event store, secret redaction
 forge-server      axum REST/SSE adapter over the same AgentService
+forge-mcp         Model Context Protocol (stdio) adapter over the same
+                  AgentService: tool registry + schemas + dispatch
 forge-cli         clap command tree, doctor, init, the forge binary
 ```
+
+## Editors and harnesses
+
+`forge mcp` is the stdio sibling of `forge serve`: the same `AgentService`,
+built by the same `build_run_service` path (needle seam included), exposed as
+MCP tools instead of HTTP routes. Editors and agent harnesses (Claude Code,
+VS Code, Cursor) launch it as a subprocess and get the project graph
+(`forge_graph_*`), skills (`forge_skill_*`), the doctor report, and the agent
+loop itself (`forge_run*`) as tools — so another agent can use forge's
+project intelligence without reimplementing any of it.
+
+Three properties are load-bearing. **stdout is the protocol channel**, so
+every diagnostic goes to stderr and nothing in the process may print.
+**stdin is too**, which means the approval path cannot prompt: a risky
+operation under `approval = "prompt"` parks the run
+(`status: "waiting_for_approval"`) and the client answers with
+`forge_run_input` — the same pause/deliver mechanism the REST adapter's
+`POST /v1/runs/:id/input` uses. And **protocol work is the SDK's**: `forge-mcp`
+wraps the official `rmcp` crate, which serves both the `initialize`-handshake
+revisions (`2025-11-25` and earlier) and the current stateless `2026-07-28`
+revision (per-request `_meta`, mandatory `server/discover`) from one process.
+
+Doctor is the one capability the adapter cannot reach downward for: its checks
+span providers, credentials, graph, skills and needle weights, a combination
+only `forge-cli` sees. So `forge-mcp` declares a `Diagnostics` seam and the CLI
+implements it from `commands::doctor::collect_checks` — one definition of
+"healthy" for `forge doctor`, `forge doctor --json` and the `forge_doctor`
+tool, and never a subprocess.
 
 Every integration in this document sits behind one of the `forge-core`
 traits. That is the load-bearing design decision: Needle could be replaced
@@ -238,7 +270,7 @@ degradable condition.
 
 ## What's next (per the program spec)
 
-ACP and MCP adapters (editors and harness interop), the interactive TUI with
+The ACP adapter (the other half of editor interop), the interactive TUI with
 slash commands / history replay / fork & background, and in-process
 generation (`forge-llm-embedded`) — see
 [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md) §2.

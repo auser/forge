@@ -6,6 +6,7 @@ members = [
     "crates/forge-core",
     "crates/forge-execution",
     "crates/forge-graph",
+    "crates/forge-mcp",
     "crates/forge-needle",
     "crates/forge-providers",
     "crates/forge-runtime",
@@ -25,6 +26,7 @@ forge-core = { path = "crates/forge-core" }
 forge-config = { path = "crates/forge-config" }
 forge-execution = { path = "crates/forge-execution" }
 forge-graph = { path = "crates/forge-graph" }
+forge-mcp = { path = "crates/forge-mcp" }
 forge-needle = { path = "crates/forge-needle" }
 forge-providers = { path = "crates/forge-providers" }
 forge-runtime = { path = "crates/forge-runtime" }
@@ -43,6 +45,13 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
+] }
+# Official Rust MCP SDK. Only the stdio server half: no HTTP transport, no
+# OAuth, no `macros`/`schemars` (our tool schemas are hand-written
+# serde_json), which keeps this to 13 new transitive crates.
+rmcp = { version = "3.4", default-features = false, features = [
+    "server",
+    "transport-io",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

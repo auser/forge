@@ -57,6 +57,12 @@ pub struct BddWorld {
     pub last_code: Option<i32>,
     /// Spawned `forge serve` child process.
     pub server: Option<tokio::process::Child>,
+    /// Spawned `forge mcp` child process and its protocol pipes.
+    pub mcp: Option<McpChild>,
+    /// Every line `forge mcp` wrote to stdout (the protocol channel).
+    pub mcp_lines: Vec<String>,
+    /// Tool names from the last `tools/list`.
+    pub mcp_tools: Vec<String>,
     pub base_url: String,
     /// Wiremock server standing in for a System One-compatible router.
     pub router_mock: Option<wiremock::MockServer>,
@@ -76,6 +82,15 @@ pub struct BddWorld {
     pub config_lines: Vec<String>,
     /// Pending `[table]` config blocks (e.g. `[models.x]`).
     pub config_blocks: Vec<String>,
+}
+
+/// A running `forge mcp` with its stdio pipes and JSON-RPC id counter.
+#[derive(Debug)]
+pub struct McpChild {
+    pub child: tokio::process::Child,
+    pub stdin: tokio::process::ChildStdin,
+    pub stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+    pub next_id: u64,
 }
 
 impl BddWorld {
@@ -182,6 +197,132 @@ impl BddWorld {
         }
     }
 
+    /// Spawn `forge mcp` and complete the MCP handshake.
+    ///
+    /// stdio is the protocol channel here, so stdin/stdout are pipes and
+    /// stderr is left inherited-free for diagnostics only.
+    pub async fn start_mcp(&mut self) {
+        use tokio::io::BufReader;
+
+        self.flush_config();
+        let root = self.project();
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&xdg).expect("xdg");
+
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_forge"));
+        cmd.arg("--project")
+            .arg(&root)
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("NO_COLOR", "1");
+        for var in FORGE_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+
+        let mut child = cmd.spawn().expect("spawn forge mcp");
+        let stdin = child.stdin.take().expect("mcp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+        self.mcp = Some(McpChild {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        });
+
+        let init = self
+            .mcp_request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "forge-bdd", "version": "1.0.0" },
+                }),
+            )
+            .await;
+        assert_eq!(
+            init["result"]["serverInfo"]["name"], "forge",
+            "unexpected initialize result: {init}"
+        );
+        self.mcp_notify("notifications/initialized", serde_json::json!({}))
+            .await;
+    }
+
+    /// Send a JSON-RPC notification to `forge mcp` (no response expected).
+    pub async fn mcp_notify(&mut self, method: &str, params: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+        let line = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+        .expect("serialize");
+        let mcp = self.mcp.as_mut().expect("forge mcp running");
+        mcp.stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write to mcp stdin");
+        mcp.stdin.flush().await.expect("flush mcp stdin");
+    }
+
+    /// Send a request and read newline-delimited messages until its
+    /// response arrives.
+    pub async fn mcp_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let id = {
+            let mcp = self.mcp.as_mut().expect("forge mcp running");
+            let id = mcp.next_id;
+            mcp.next_id += 1;
+            let line = serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .expect("serialize");
+            mcp.stdin
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write to mcp stdin");
+            mcp.stdin.flush().await.expect("flush mcp stdin");
+            id
+        };
+
+        loop {
+            let mut line = String::new();
+            {
+                let mcp = self.mcp.as_mut().expect("forge mcp running");
+                let read = mcp
+                    .stdout
+                    .read_line(&mut line)
+                    .await
+                    .expect("read mcp stdout");
+                assert!(read > 0, "forge mcp closed stdout unexpectedly");
+            }
+            let line = line.trim_end().to_string();
+            self.mcp_lines.push(line.clone());
+            let message: serde_json::Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("non-JSON on mcp stdout: {e}: {line:?}"));
+            if message["id"] == serde_json::json!(id) {
+                return message;
+            }
+        }
+    }
+
     /// Set/replace a config key line (TOML `key = value`); flushed to
     /// `.forge/config.toml` by `flush_config`.
     pub fn set_config(&mut self, key: &str, value: &str) {
@@ -232,6 +373,9 @@ impl Drop for BddWorld {
     fn drop(&mut self) {
         if let Some(mut child) = self.server.take() {
             let _ = child.start_kill();
+        }
+        if let Some(mut mcp) = self.mcp.take() {
+            let _ = mcp.child.start_kill();
         }
     }
 }

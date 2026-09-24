@@ -16,7 +16,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct GlobalOpts {
     /// Increase diagnostics verbosity (-v info, -vv debug, -vvv trace); diagnostics go to stderr.
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count, global = true)]
@@ -72,6 +72,10 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         max_turns: Option<u32>,
     },
+
+    /// Serve the Model Context Protocol over stdio (for editors and agent
+    /// harnesses). stdout carries the protocol; logs go to stderr.
+    Mcp,
 
     /// Start the REST/SSE server.
     Serve {
