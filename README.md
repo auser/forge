@@ -857,7 +857,9 @@ growing set of other editors, speak natively.
   typing itself out. Tool calls, by contrast, *are* live. We'd rather ship the
   honest version than chop up finished text to imitate a stream.
 * **Text prompts only** — no images or audio, and `initialize` says so rather
-  than accepting them and dropping them on the floor.
+  than accepting them and dropping them on the floor. File mentions work
+  either way: whether your editor sends a link or the file's contents, forge
+  reads it.
 * Global flags work as usual, in `args`: `["--project", "/path/to/repo", "acp"]`,
   `--model`, `--router`, `--local-only`, `--approval`. stdio only, so the trust
   boundary is the process — same machine, same user, no network listener and no

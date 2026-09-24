@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use forge_core::{Event, EventKind, ForgeError};
 use forge_runtime::{AgentService, RunOptions};
 use forge_session::{new_run_id, new_session_id};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -33,9 +33,10 @@ use crate::dispatch::{
     prompt_text, session_root, turn_end,
 };
 use crate::protocol::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, NewSessionResponse,
-    Outgoing, PromptRequest, PromptResponse, RequestPermissionRequest, RequestPermissionResponse,
-    RpcError, SessionNotification, SessionUpdate, ToolCallUpdate, client_method, method,
+    CancelNotification, CloseSessionRequest, ContentBlock, InitializeRequest, NewSessionRequest,
+    NewSessionResponse, Outgoing, PromptRequest, PromptResponse, RequestPermissionRequest,
+    RequestPermissionResponse, RpcError, SessionNotification, SessionUpdate, ToolCallUpdate,
+    client_method, method,
 };
 
 /// Builds an [`AgentService`] rooted at an ACP session's `cwd`.
@@ -53,9 +54,15 @@ pub trait ServiceFactory: Send + Sync {
 
 /// One ACP session: a project root, the runtime rooted there, and whatever
 /// turn is currently in flight.
+///
+/// The `service` is *shared* between sessions on the same project (see
+/// [`ForgeAcpServer::service_for`]); `root` is kept in the client's own
+/// spelling so paths we report back are the ones it asked about, while
+/// `service_key` is the canonicalized form used for that sharing.
 struct Session {
     service: Arc<AgentService>,
     root: PathBuf,
+    service_key: PathBuf,
     turn: Mutex<TurnSlot>,
 }
 
@@ -68,10 +75,36 @@ struct TurnSlot {
     cancel_seen: bool,
 }
 
+/// A claimed turn: everything the spawned driver needs, with the session's
+/// turn slot already taken in its name.
+struct TurnClaim {
+    session_id: String,
+    session: Arc<Session>,
+    run_id: String,
+    prompt: String,
+}
+
+/// Releases a session's turn slot when the turn's future ends — including
+/// when it ends by panic or by the task being dropped. Without this, one
+/// panicking turn would wedge its conversation permanently.
+struct TurnSlotGuard {
+    session: Arc<Session>,
+}
+
+impl Drop for TurnSlotGuard {
+    fn drop(&mut self) {
+        let mut turn = self.session.turn.lock().unwrap_or_else(|e| e.into_inner());
+        turn.active_run = None;
+    }
+}
+
 /// ACP over stdio, on top of the shared agent runtime.
 pub struct ForgeAcpServer {
     factory: Arc<dyn ServiceFactory>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    /// One runtime per *project*, keyed by canonicalized root — see
+    /// [`ForgeAcpServer::service_for`].
+    services: Mutex<HashMap<PathBuf, Arc<AgentService>>>,
     outgoing: mpsc::Sender<Outgoing>,
     /// Ids for requests *we* make of the client. Separate counter from the
     /// client's ids: the two id spaces are independent in JSON-RPC.
@@ -84,6 +117,7 @@ impl ForgeAcpServer {
         Self {
             factory,
             sessions: Mutex::new(HashMap::new()),
+            services: Mutex::new(HashMap::new()),
             outgoing,
             next_request_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -95,6 +129,10 @@ impl ForgeAcpServer {
     /// data instead of panicking mid-turn.
     fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Session>>> {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn services(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Arc<AgentService>>> {
+        self.services.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn pending(
@@ -179,14 +217,34 @@ impl ForgeAcpServer {
                         return;
                     }
                 };
-                // Spawned: a turn takes as long as the agent loop takes,
-                // and the reader must stay free to deliver session/cancel
-                // and permission answers to it.
+                // Claim the turn slot *here*, synchronously, before the task
+                // exists. The reader processes messages one at a time, so a
+                // `session/cancel` that arrives in the same batch of input
+                // then always finds the run to cancel. Claiming inside the
+                // spawned task instead would let a cancel land in the gap,
+                // find no active run, and be erased by the turn's own
+                // `cancel_seen` reset — the turn would answer `end_turn` for
+                // work the user had already stopped.
+                let claim = match self.claim_turn(request) {
+                    Ok(claim) => claim,
+                    Err(error) => {
+                        self.send(Outgoing::error(id, error)).await;
+                        return;
+                    }
+                };
+                // Spawned: a turn takes as long as the agent loop takes, and
+                // the reader must stay free to deliver session/cancel and
+                // permission answers to it.
                 let server = Arc::clone(self);
                 tokio::spawn(async move {
-                    let result = server.prompt(request).await;
+                    let result = server.drive_turn(claim).await;
                     server.respond(id, result).await;
                 });
+            }
+
+            method::SESSION_CLOSE => {
+                let result = self.close_session(params);
+                self.respond(id, result).await;
             }
 
             other => {
@@ -243,13 +301,7 @@ impl ForgeAcpServer {
             );
         }
         let root = session_root(&request)?;
-
-        let service = self.factory.build(&root).await.map_err(|e| {
-            RpcError::internal(format!(
-                "could not start a forge session in {}: {e}",
-                root.display()
-            ))
-        })?;
+        let (service, key) = self.service_for(&root).await?;
 
         // The ACP session id *is* the forge session id, so everything the
         // turn records is inspectable afterwards with `forge session show
@@ -260,6 +312,7 @@ impl ForgeAcpServer {
             Arc::new(Session {
                 service,
                 root: root.clone(),
+                service_key: key,
                 turn: Mutex::new(TurnSlot::default()),
             }),
         );
@@ -269,6 +322,85 @@ impl ForgeAcpServer {
             session_id: session_id.clone(),
         })
         .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    /// The runtime for a project root, built once and shared.
+    ///
+    /// Returns it together with the canonicalized key it is filed under.
+    ///
+    /// An editor opens many conversations against one project — several
+    /// agent threads in the same window is the *normal* case — and an
+    /// `AgentService` is not a small object: providers, session store,
+    /// project graph, needle engine handle. Building one per `session/new`
+    /// would pay that cost, and hold that memory, once per conversation for
+    /// the life of the process.
+    ///
+    /// The key is canonicalized so `/project`, `/project/.`, a symlinked
+    /// path and (on macOS) `/var` vs `/private/var` all land on one entry.
+    /// If canonicalization fails we fall back to the path as given rather
+    /// than failing the session: `session_root` already proved it exists, so
+    /// a failure here means something exotic about the filesystem, and the
+    /// worst case is a duplicate service rather than a broken session.
+    async fn service_for(&self, root: &Path) -> Result<(Arc<AgentService>, PathBuf), RpcError> {
+        let key = root.canonicalize().unwrap_or_else(|e| {
+            tracing::debug!(
+                root = %root.display(),
+                error = %e,
+                "could not canonicalize the session root; keying the runtime on the path as given"
+            );
+            root.to_path_buf()
+        });
+
+        if let Some(existing) = self.services().get(&key).cloned() {
+            tracing::debug!(root = %key.display(), "reusing the runtime already built for this project");
+            return Ok((existing, key));
+        }
+
+        let service = self.factory.build(root).await.map_err(|e| {
+            RpcError::internal(format!(
+                "could not start a forge session in {}: {e}",
+                root.display()
+            ))
+        })?;
+
+        // Another `session/new` for the same project may have finished
+        // building while we awaited: keep whichever landed first so that
+        // "one service per project" holds even under concurrent setup.
+        let mut services = self.services();
+        let shared = services.entry(key.clone()).or_insert(service).clone();
+        Ok((shared, key))
+    }
+
+    /// `session/close`: "the agent **must** cancel any ongoing work related
+    /// to the session (treat it as if `session/cancel` was called) and then
+    /// free up any resources associated with the session" — so this cancels,
+    /// forgets the session, and drops the project's runtime once no session
+    /// is using it any more.
+    fn close_session(&self, params: Value) -> Result<Value, RpcError> {
+        let request: CloseSessionRequest = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("invalid session/close params: {e}")))?;
+        let session_id = request
+            .session_id
+            .ok_or_else(|| RpcError::invalid_params("session/close requires a `sessionId`"))?;
+        // Resolve first: closing an unknown session is an error, not a no-op.
+        let session = self.session(&session_id)?;
+
+        self.cancel(&session_id);
+        self.sessions().remove(&session_id);
+
+        let key = session.service_key.clone();
+        drop(session);
+        let still_in_use = self
+            .sessions()
+            .values()
+            .any(|session| session.service_key == key);
+        if !still_in_use && self.services().remove(&key).is_some() {
+            tracing::info!(root = %key.display(), "released the runtime for this project");
+        }
+        tracing::info!(session = %session_id, "ACP session closed");
+
+        // `CloseSessionResponse` carries nothing but the optional `_meta`.
+        Ok(json!({}))
     }
 
     fn session(&self, session_id: &str) -> Result<Arc<Session>, RpcError> {
@@ -308,23 +440,25 @@ impl ForgeAcpServer {
 
     // --- the prompt turn -------------------------------------------------
 
-    async fn prompt(self: &Arc<Self>, request: PromptRequest) -> Result<Value, RpcError> {
+    /// Validate a `session/prompt` and claim the session's turn slot.
+    ///
+    /// Deliberately **synchronous**: the caller runs this on the reader task,
+    /// before spawning the turn, so that by the time the next line of input
+    /// is read the slot is already occupied and named. See the call site for
+    /// what a gap here would cost.
+    ///
+    /// One turn per session at a time, because the agent loop is a
+    /// conversation: two concurrent runs writing into one session would
+    /// interleave their events and their history.
+    fn claim_turn(&self, request: PromptRequest) -> Result<TurnClaim, RpcError> {
         let session_id = request
             .session_id
             .ok_or_else(|| RpcError::invalid_params("session/prompt requires a `sessionId`"))?;
         let session = self.session(&session_id)?;
         let prompt = prompt_text(&request.prompt)?;
 
-        // One turn per session at a time. The agent loop is a conversation,
-        // and two concurrent runs writing into one session would interleave
-        // their events and their history.
-        //
-        // The id is generated here so that claiming the slot and naming its
-        // occupant happen in the *same* critical section. Checking here and
-        // filling `active_run` inside `run_turn` would leave a window for a
-        // second spawned `session/prompt` task to pass the check, and for a
-        // `session/cancel` to find no run to cancel while a turn is in fact
-        // starting.
+        // The id is generated here so claiming the slot and naming its
+        // occupant happen in the *same* critical section.
         let run_id = new_run_id();
         {
             let mut turn = session.turn.lock().unwrap_or_else(|e| e.into_inner());
@@ -338,13 +472,30 @@ impl ForgeAcpServer {
             turn.cancel_seen = false;
         }
 
-        let result = self.run_turn(&session_id, &session, &run_id, prompt).await;
+        Ok(TurnClaim {
+            session_id,
+            session,
+            run_id,
+            prompt,
+        })
+    }
 
-        {
-            let mut turn = session.turn.lock().unwrap_or_else(|e| e.into_inner());
-            turn.active_run = None;
-        }
-        result
+    /// Run a claimed turn to completion and answer the request.
+    async fn drive_turn(self: &Arc<Self>, claim: TurnClaim) -> Result<Value, RpcError> {
+        let TurnClaim {
+            session_id,
+            session,
+            run_id,
+            prompt,
+        } = claim;
+        // Releasing the slot is a guard rather than a statement after the
+        // await: a panic inside the turn (or the task being dropped) would
+        // otherwise leave `active_run` set forever, and every later prompt in
+        // that conversation would be refused as "already running a turn".
+        let _slot = TurnSlotGuard {
+            session: Arc::clone(&session),
+        };
+        self.run_turn(&session_id, &session, &run_id, prompt).await
     }
 
     async fn run_turn(
@@ -372,7 +523,7 @@ impl ForgeAcpServer {
         );
         tracing::info!(session = session_id, run = %run_id, root = %session.root.display(), "turn started");
 
-        let mut state = dispatch::TurnState::default();
+        let mut state = dispatch::TurnState::for_run(run_id, &session.root);
         let run_result: Result<String, String> = loop {
             tokio::select! {
                 received = events.recv() => match received {
@@ -587,7 +738,15 @@ impl ForgeAcpServer {
 
     /// Route a response to whichever request is waiting for it.
     fn resolve_response(&self, id: &Value, result: Option<Value>, error: Option<Value>) {
-        let Some(key) = id.as_u64() else {
+        // We always issue numeric ids, and JSON-RPC says a response echoes the
+        // request's id — but a client that round-trips ids through a string
+        // type would send `"7"` back, and dropping that would leave the
+        // permission request hanging until shutdown. Accepting both spellings
+        // costs nothing and only ever matches an id we did issue.
+        let Some(key) = id
+            .as_u64()
+            .or_else(|| id.as_str().and_then(|text| text.parse().ok()))
+        else {
             tracing::warn!(%id, "response with an id we never issued");
             return;
         };
@@ -783,6 +942,13 @@ mod tests {
         (Arc::new(ForgeAcpServer::new(factory, tx)), rx)
     }
 
+    /// Claim then drive — exactly the two steps `handle_request` performs,
+    /// so these tests exercise the production path rather than a shortcut.
+    async fn prompt(server: &Arc<ForgeAcpServer>, params: Value) -> Result<Value, RpcError> {
+        let claim = server.claim_turn(serde_json::from_value(params).expect("prompt request"))?;
+        server.drive_turn(claim).await
+    }
+
     /// The `params` of the next outgoing message, as JSON.
     fn next(rx: &mut mpsc::Receiver<Outgoing>) -> Value {
         let message = rx.try_recv().expect("an outgoing message");
@@ -803,16 +969,15 @@ mod tests {
             .expect("session id")
             .to_string();
 
-        let response = server
-            .prompt(
-                serde_json::from_value(json!({
-                    "sessionId": session_id,
-                    "prompt": [{ "type": "text", "text": "hello" }],
-                }))
-                .expect("prompt request"),
-            )
-            .await
-            .expect("turn completed");
+        let response = prompt(
+            &server,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "hello" }],
+            }),
+        )
+        .await
+        .expect("turn completed");
         assert_eq!(response["stopReason"], "end_turn", "{response}");
 
         // The mock model answers with text, so the client must have been
@@ -833,16 +998,15 @@ mod tests {
     #[tokio::test]
     async fn a_prompt_for_an_unknown_session_is_an_invalid_params_error() {
         let (server, _rx) = server();
-        let error = server
-            .prompt(
-                serde_json::from_value(json!({
-                    "sessionId": "never-created",
-                    "prompt": [{ "type": "text", "text": "hi" }],
-                }))
-                .expect("prompt request"),
-            )
-            .await
-            .expect_err("unknown session");
+        let error = prompt(
+            &server,
+            json!({
+                "sessionId": "never-created",
+                "prompt": [{ "type": "text", "text": "hi" }],
+            }),
+        )
+        .await
+        .expect_err("unknown session");
         assert_eq!(error.code, -32602);
         assert!(error.message.contains("never-created"), "{error}");
     }
@@ -901,16 +1065,15 @@ mod tests {
             turn.active_run = Some("run-in-flight".to_string());
         }
 
-        let error = server
-            .prompt(
-                serde_json::from_value(json!({
-                    "sessionId": session_id,
-                    "prompt": [{ "type": "text", "text": "hi" }],
-                }))
-                .expect("prompt request"),
-            )
-            .await
-            .expect_err("a concurrent turn must be refused");
+        let error = prompt(
+            &server,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "hi" }],
+            }),
+        )
+        .await
+        .expect_err("a concurrent turn must be refused");
         assert_eq!(error.code, -32600);
         assert!(error.message.contains("run-in-flight"), "{error}");
     }
@@ -919,6 +1082,169 @@ mod tests {
     async fn cancelling_an_unknown_session_is_ignored() {
         let (server, _rx) = server();
         server.cancel("never-created"); // must not panic
+    }
+
+    #[tokio::test]
+    async fn sessions_on_one_project_share_a_single_runtime() {
+        // An editor opens several conversations against one project; each
+        // must not cost its own AgentService (providers, session store,
+        // graph, needle handle) for the life of the process.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).expect("other project");
+        let (server, _rx) = server();
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let created = server
+                .new_session(json!({ "cwd": tmp.path(), "mcpServers": [] }))
+                .await
+                .expect("session created");
+            ids.push(created["sessionId"].as_str().expect("id").to_string());
+        }
+        let elsewhere = server
+            .new_session(json!({ "cwd": other, "mcpServers": [] }))
+            .await
+            .expect("session created");
+        let elsewhere = elsewhere["sessionId"].as_str().expect("id").to_string();
+
+        let first = server.session(&ids[0]).expect("session").service.clone();
+        let second = server.session(&ids[1]).expect("session").service.clone();
+        let third = server.session(&elsewhere).expect("session").service.clone();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two sessions on one project must share one runtime"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a different project must get its own runtime"
+        );
+        assert_eq!(server.services().len(), 2, "one cached service per project");
+    }
+
+    #[tokio::test]
+    async fn a_non_canonical_cwd_still_shares_the_projects_runtime() {
+        // `/p` and `/p/.` are the same project; so are a symlink and its
+        // target. The cache key is canonicalized so the client's spelling
+        // cannot split one project into two runtimes.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (server, _rx) = server();
+
+        let plain = server
+            .new_session(json!({ "cwd": tmp.path(), "mcpServers": [] }))
+            .await
+            .expect("session created");
+        let dotted = server
+            .new_session(json!({ "cwd": tmp.path().join("."), "mcpServers": [] }))
+            .await
+            .expect("session created");
+
+        let a = server
+            .session(plain["sessionId"].as_str().expect("id"))
+            .expect("session")
+            .service
+            .clone();
+        let b = server
+            .session(dotted["sessionId"].as_str().expect("id"))
+            .expect("session")
+            .service
+            .clone();
+        assert!(Arc::ptr_eq(&a, &b), "{:?}", server.services().len());
+    }
+
+    #[tokio::test]
+    async fn closing_the_last_session_on_a_project_releases_its_runtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (server, _rx) = server();
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let created = server
+                .new_session(json!({ "cwd": tmp.path(), "mcpServers": [] }))
+                .await
+                .expect("session created");
+            ids.push(created["sessionId"].as_str().expect("id").to_string());
+        }
+
+        server
+            .close_session(json!({ "sessionId": ids[0] }))
+            .expect("close");
+        assert!(server.session(&ids[0]).is_err(), "the session is gone");
+        assert_eq!(
+            server.services().len(),
+            1,
+            "the runtime is still in use by the other session"
+        );
+
+        server
+            .close_session(json!({ "sessionId": ids[1] }))
+            .expect("close");
+        assert!(
+            server.services().is_empty(),
+            "the last session closing must release the project's runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_an_unknown_session_is_an_error() {
+        let (server, _rx) = server();
+        let error = server
+            .close_session(json!({ "sessionId": "never-created" }))
+            .expect_err("unknown session");
+        assert_eq!(error.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_turn_does_not_wedge_the_session() {
+        // The slot is released by a drop guard, so a turn that unwinds
+        // instead of returning must still leave the conversation usable.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (server, _rx) = server();
+        let created = server
+            .new_session(json!({ "cwd": tmp.path(), "mcpServers": [] }))
+            .await
+            .expect("session created");
+        let session_id = created["sessionId"].as_str().expect("id").to_string();
+
+        let claim = server
+            .claim_turn(
+                serde_json::from_value(json!({
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": "hi" }],
+                }))
+                .expect("prompt request"),
+            )
+            .expect("claim");
+        assert!(
+            server
+                .session(&session_id)
+                .expect("session")
+                .turn
+                .lock()
+                .expect("lock")
+                .active_run
+                .is_some(),
+            "claiming should occupy the slot"
+        );
+
+        // Dropping the claim's guard is what a panicking/aborted turn does.
+        drop(TurnSlotGuard {
+            session: Arc::clone(&claim.session),
+        });
+        drop(claim);
+
+        assert!(
+            server
+                .session(&session_id)
+                .expect("session")
+                .turn
+                .lock()
+                .expect("lock")
+                .active_run
+                .is_none(),
+            "the slot must be free again, or every later prompt is refused"
+        );
     }
 
     #[tokio::test]

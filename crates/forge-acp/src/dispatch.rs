@@ -6,7 +6,7 @@
 //! the `AgentService` calls. That split is what lets the whole
 //! forge-→-ACP mapping be tested without spawning a process or a runtime.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use forge_core::{Event, EventKind};
 use serde_json::Value;
@@ -14,8 +14,8 @@ use serde_json::Value;
 use crate::protocol::{
     AgentCapabilities, ContentBlock, Implementation, InitializeRequest, InitializeResponse,
     NewSessionRequest, PROTOCOL_VERSION, PermissionOption, PermissionOptionKind,
-    PromptCapabilities, RequestPermissionOutcome, RpcError, SessionUpdate, StopReason, ToolCall,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind,
+    PromptCapabilities, RequestPermissionOutcome, RpcError, SessionCapabilities, SessionUpdate,
+    StopReason, Supported, ToolCall, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 
 #[cfg(test)]
@@ -65,6 +65,13 @@ pub fn initialize(request: &InitializeRequest) -> InitializeResponse {
                 image: false,
                 audio: false,
                 embedded_context: false,
+            },
+            // `session/close` *is* supported, and advertising it matters:
+            // this is a long-lived process, and a client that never tells us
+            // a conversation is over leaves us holding its runtime for the
+            // life of the editor.
+            session_capabilities: SessionCapabilities {
+                close: Some(Supported {}),
             },
         },
         auth_methods: Vec::new(),
@@ -121,9 +128,20 @@ pub fn session_root(request: &NewSessionRequest) -> Result<PathBuf, RpcError> {
 /// `text` and `resource_link` are the two block types every ACP agent must
 /// accept. A resource link becomes a path mention rather than being
 /// dropped — the model can then ask to read it with `read_file`, which is
-/// how forge sees files. The capability-gated types we advertised `false`
-/// for are refused by name, so a client that sends one gets a message it
-/// can act on instead of silently losing content.
+/// how forge sees files.
+///
+/// An embedded `resource` is **degraded rather than refused**, even though we
+/// advertise `embeddedContext: false`. The spec puts the obligation on the
+/// client ("MUST adapt its interface according to `PromptCapabilities`"), so
+/// strictly this is the client's mistake — but the content is *right there*
+/// and readable, and the failure we would cause is an editor @-mention
+/// answering with `-32602` instead of doing the work. Its text is used when
+/// it has any, and its uri as a mention when it does not (a blob we cannot
+/// read is exactly a link we can name).
+///
+/// `image` and `audio` stay hard errors: there is no text in them to
+/// degrade to, and silently dropping them would answer a question the user
+/// did not ask.
 pub fn prompt_text(blocks: &[ContentBlock]) -> Result<String, RpcError> {
     if blocks.is_empty() {
         return Err(RpcError::invalid_params(
@@ -136,6 +154,29 @@ pub fn prompt_text(blocks: &[ContentBlock]) -> Result<String, RpcError> {
             ContentBlock::Text { text } => parts.push(text.clone()),
             ContentBlock::ResourceLink { uri, name } => {
                 parts.push(name.clone().unwrap_or_else(|| uri.clone()));
+            }
+            ContentBlock::Resource { resource } => {
+                let uri = resource.get("uri").and_then(Value::as_str);
+                let text = resource
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty());
+                tracing::debug!(
+                    uri = uri.unwrap_or("<none>"),
+                    embedded_text = text.is_some(),
+                    "degrading an embedded resource block we did not advertise support for"
+                );
+                match (uri, text) {
+                    (Some(uri), Some(text)) => parts.push(format!("{uri}:\n{text}")),
+                    (None, Some(text)) => parts.push(text.to_string()),
+                    (Some(uri), None) => parts.push(uri.to_string()),
+                    (None, None) => {
+                        return Err(RpcError::invalid_params(
+                            "session/prompt carried a `resource` block with neither `uri` nor \
+                             `text` (this agent advertises embeddedContext: false)",
+                        ));
+                    }
+                }
             }
             other => {
                 return Err(RpcError::invalid_params(format!(
@@ -185,8 +226,14 @@ pub enum TurnAction {
 /// *name* before attributing a status change, and opens a fresh tool call
 /// rather than relabelling someone else's if the two ever disagree. A
 /// mislabelled tool call is a lie about what the agent did.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TurnState {
+    /// Prefix making every id unique for the whole *session*, not just this
+    /// turn — see [`TurnState::for_run`].
+    prefix: String,
+    /// Absolute project root, for turning the model's project-relative path
+    /// arguments into the absolute paths `ToolCallLocation` requires.
+    root: PathBuf,
     next_id: u64,
     current: Option<CurrentCall>,
 }
@@ -200,14 +247,43 @@ struct CurrentCall {
 }
 
 impl TurnState {
+    /// State for one turn of `run_id`, in a project rooted at `root`.
+    ///
+    /// The run id becomes the tool-call id prefix because **ACP requires
+    /// `toolCallId` to be unique within the _session_, not the turn**. A
+    /// per-turn counter starting at 1 would re-issue `call_1` on the second
+    /// prompt of every conversation, and a client that upserts tool calls by
+    /// id (Zed does) would silently mutate the first turn's entry instead of
+    /// adding a new one. Run ids are fresh per turn, so prefixing with one
+    /// makes collisions impossible without any cross-turn bookkeeping.
+    pub fn for_run(run_id: &str, root: impl Into<PathBuf>) -> Self {
+        Self {
+            prefix: run_id.to_string(),
+            root: root.into(),
+            next_id: 0,
+            current: None,
+        }
+    }
+
     fn allocate(&mut self, tool: Option<&str>) -> String {
         self.next_id += 1;
-        let id = format!("call_{}", self.next_id);
+        let id = format!("{}/call_{}", self.prefix, self.next_id);
         self.current = Some(CurrentCall {
             id: id.clone(),
             tool: tool.map(str::to_string),
         });
         id
+    }
+
+    /// Resolve a path the agent loop reported (project-relative, as the
+    /// model wrote it) against the session root.
+    ///
+    /// The schema is explicit that `ToolCallLocation.path` is "the absolute
+    /// file path", and it has to be: the client resolves it to open a file,
+    /// and it does not know forge's project root. `Path::join` leaves an
+    /// already-absolute path alone, so this is safe either way.
+    fn locate(&self, path: &Path) -> ToolCallLocation {
+        ToolCallLocation::new(self.root.join(path))
     }
 
     /// Translate one run event into zero or more actions.
@@ -235,6 +311,10 @@ impl TurnState {
 
             EventKind::ToolCallRequested { tool, args_summary } => {
                 let args = Args::new(args_summary);
+                let locations = args
+                    .path()
+                    .map(|path| vec![self.locate(&path)])
+                    .unwrap_or_default();
                 let id = self.allocate(Some(tool));
                 vec![TurnAction::Notify(SessionUpdate::ToolCall(ToolCall {
                     tool_call_id: id,
@@ -242,7 +322,7 @@ impl TurnState {
                     name: Some(tool.clone()),
                     kind: tool_kind(tool),
                     status: ToolCallStatus::Pending,
-                    locations: args.location(),
+                    locations,
                     raw_input: Some(args.raw_input()),
                 }))]
             }
@@ -267,13 +347,14 @@ impl TurnState {
             EventKind::FileChanged { path } => match self.current.clone() {
                 Some(current) => {
                     let mut update = ToolCallUpdate::new(current.id);
-                    update.locations = vec![ToolCallLocation::new(path.clone())];
+                    update.locations = vec![self.locate(path)];
                     vec![TurnAction::Notify(SessionUpdate::ToolCallUpdate(update))]
                 }
                 // No call in flight (the needle fast path writes without
                 // announcing a tool call): synthesize a finished edit so
                 // the editor can still follow along to the file.
                 None => {
+                    let location = self.locate(path);
                     let id = self.allocate(None);
                     self.current = None;
                     vec![TurnAction::Notify(SessionUpdate::ToolCall(ToolCall {
@@ -282,7 +363,7 @@ impl TurnState {
                         name: None,
                         kind: ToolKind::Edit,
                         status: ToolCallStatus::Completed,
-                        locations: vec![ToolCallLocation::new(path.clone())],
+                        locations: vec![location],
                         raw_input: None,
                     }))]
                 }
@@ -449,11 +530,10 @@ impl<'a> Args<'a> {
         None
     }
 
-    /// The file this call touches, as an ACP location for follow-along.
-    fn location(&self) -> Vec<ToolCallLocation> {
-        self.field("path")
-            .map(|path| vec![ToolCallLocation::new(PathBuf::from(path))])
-            .unwrap_or_default()
+    /// The file this call touches, as the model wrote it (project-relative).
+    /// [`TurnState::locate`] makes it absolute for the wire.
+    fn path(&self) -> Option<PathBuf> {
+        self.field("path").map(PathBuf::from)
     }
 
     /// What to show the user as the call's raw input. Structured when we

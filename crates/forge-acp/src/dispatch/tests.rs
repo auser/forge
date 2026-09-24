@@ -3,6 +3,8 @@
 //! the [`Event`]s a run would emit) and assert on the ACP values that come
 //! back.
 
+use std::path::PathBuf;
+
 use forge_core::execution::RiskLevel;
 use forge_core::{Event, EventKind};
 use serde_json::json;
@@ -13,8 +15,14 @@ use crate::protocol::{
     RequestPermissionOutcome, SessionUpdate, StopReason, ToolCallStatus, ToolKind,
 };
 
+/// The run a turn under test belongs to. Tool-call ids are prefixed with it
+/// (see [`TurnState::for_run`]), so tests that assert on ids spell it out.
+const RUN: &str = "run-1";
+/// An absolute project root, since `ToolCallLocation.path` must be absolute.
+const ROOT: &str = "/projects/demo";
+
 fn event(kind: EventKind) -> Event {
-    Event::new("run-1", "session-1", kind)
+    Event::new(RUN, "session-1", kind)
 }
 
 // --- initialize ---------------------------------------------------------
@@ -178,6 +186,68 @@ fn prompt_text_rejects_blocks_we_never_advertised_support_for() {
     assert!(error.message.contains("image"), "{error}");
 }
 
+#[test]
+fn an_embedded_resource_is_degraded_to_its_text_rather_than_refused() {
+    // We advertise embeddedContext: false, so strictly a client should not
+    // send this — but an editor @-mention arriving as an embedded resource
+    // must still get an answer, not -32602.
+    let blocks = vec![
+        ContentBlock::text("what does this do?"),
+        ContentBlock::Resource {
+            resource: json!({
+                "uri": "file:///p/src/lib.rs",
+                "text": "pub fn parse() {}",
+                "mimeType": "text/x-rust",
+            }),
+        },
+    ];
+    let text = prompt_text(&blocks).expect("resource content should be usable");
+    assert!(text.contains("what does this do?"), "{text}");
+    assert!(text.contains("pub fn parse() {}"), "{text}");
+    assert!(text.contains("file:///p/src/lib.rs"), "{text}");
+}
+
+#[test]
+fn an_embedded_resource_without_text_degrades_to_its_uri() {
+    // A blob we cannot read is exactly a link we can name.
+    let blocks = vec![ContentBlock::Resource {
+        resource: json!({ "uri": "file:///p/logo.png", "blob": "aGk=" }),
+    }];
+    assert_eq!(
+        prompt_text(&blocks).expect("uri is still usable"),
+        "file:///p/logo.png"
+    );
+}
+
+#[test]
+fn an_embedded_resource_with_nothing_usable_is_still_an_error() {
+    let blocks = vec![ContentBlock::Resource {
+        resource: json!({ "mimeType": "text/plain" }),
+    }];
+    let error = prompt_text(&blocks).expect_err("nothing to degrade to");
+    assert_eq!(error.code, -32602);
+}
+
+#[test]
+fn audio_stays_a_hard_error() {
+    // Unlike a resource, there is no text in here to fall back to.
+    let error = prompt_text(&[ContentBlock::Audio { data: None }]).expect_err("audio");
+    assert_eq!(error.code, -32602);
+    assert!(error.message.contains("audio"), "{error}");
+}
+
+#[test]
+fn initialize_advertises_session_close() {
+    // Advertising it is what makes a client send it, which is the only way a
+    // long-lived process learns a conversation is over.
+    let value = serde_json::to_value(initialize(&InitializeRequest::default())).expect("serialize");
+    assert_eq!(
+        value["agentCapabilities"]["sessionCapabilities"]["close"],
+        json!({}),
+        "{value}"
+    );
+}
+
 // --- events → session/update -------------------------------------------
 
 /// Collect the notifications a synthetic event stream produces.
@@ -196,7 +266,7 @@ fn updates(state: &mut TurnState, kinds: Vec<EventKind>) -> Vec<SessionUpdate> {
 
 #[test]
 fn a_routing_decision_becomes_one_thought_chunk() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![EventKind::RoutingDecisionMade {
@@ -221,7 +291,7 @@ fn a_routing_decision_becomes_one_thought_chunk() {
 
 #[test]
 fn an_activated_skill_becomes_a_thought_chunk() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![EventKind::SkillActivated {
@@ -241,7 +311,7 @@ fn an_activated_skill_becomes_a_thought_chunk() {
 
 #[test]
 fn a_tool_call_runs_through_pending_in_progress_and_completed() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![
@@ -270,8 +340,8 @@ fn a_tool_call_runs_through_pending_in_progress_and_completed() {
     assert!(call.title.contains("notes.txt"), "title: {}", call.title);
     assert_eq!(
         call.locations.first().map(|l| l.path.clone()),
-        Some("notes.txt".into()),
-        "the path argument should become a location for follow-along"
+        Some(PathBuf::from("/projects/demo/notes.txt")),
+        "the path argument should become an ABSOLUTE location for follow-along"
     );
 
     let SessionUpdate::ToolCallUpdate(started) = &out[1] else {
@@ -289,7 +359,7 @@ fn a_tool_call_runs_through_pending_in_progress_and_completed() {
 
 #[test]
 fn a_failed_tool_call_reports_failed() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![
@@ -329,7 +399,7 @@ fn tool_kinds_follow_the_schemas_vocabulary() {
 fn a_tool_event_with_no_preceding_request_still_produces_a_tool_call() {
     // The needle fast path dispatches without emitting ToolCallRequested
     // first; the client must still see the work.
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![EventKind::ToolStarted {
@@ -348,7 +418,7 @@ fn a_status_event_for_a_different_tool_opens_its_own_call() {
     // Defensive: the loop dispatches one call at a time, so this ordering
     // should not occur. If it ever does, relabelling the call in flight
     // would report the wrong tool as completed.
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![
@@ -379,7 +449,7 @@ fn a_status_event_for_a_different_tool_opens_its_own_call() {
 
 #[test]
 fn a_changed_file_becomes_a_location_on_the_current_tool_call() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![
@@ -397,13 +467,13 @@ fn a_changed_file_becomes_a_location_on_the_current_tool_call() {
     };
     assert_eq!(
         update.locations.first().map(|l| l.path.clone()),
-        Some("notes.txt".into())
+        Some(PathBuf::from("/projects/demo/notes.txt"))
     );
 }
 
 #[test]
 fn a_changed_file_with_no_tool_call_in_flight_becomes_its_own_tool_call() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![EventKind::FileChanged {
@@ -417,7 +487,7 @@ fn a_changed_file_with_no_tool_call_in_flight_becomes_its_own_tool_call() {
     assert_eq!(call.status, ToolCallStatus::Completed);
     assert_eq!(
         call.locations.first().map(|l| l.path.clone()),
-        Some("generated.rs".into())
+        Some(PathBuf::from("/projects/demo/generated.rs"))
     );
 }
 
@@ -425,7 +495,7 @@ fn a_changed_file_with_no_tool_call_in_flight_becomes_its_own_tool_call() {
 fn bookkeeping_events_produce_no_updates() {
     // Nothing here has an honest ACP slot: inventing one would put noise
     // in the editor's transcript.
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![
@@ -455,7 +525,7 @@ fn bookkeeping_events_produce_no_updates() {
 
 #[test]
 fn tool_call_ids_are_unique_per_call() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![
@@ -485,9 +555,54 @@ fn tool_call_ids_are_unique_per_call() {
 }
 
 #[test]
+fn tool_call_ids_do_not_collide_between_turns_of_one_session() {
+    // ACP requires `toolCallId` to be unique within the SESSION, not the
+    // turn. A per-turn counter would re-issue the same id on the second
+    // prompt of a conversation, and a client that upserts tool calls by id
+    // (Zed does) would mutate the first turn's entry instead of adding one.
+    let ids_for = |run: &str| -> Vec<String> {
+        let mut state = TurnState::for_run(run, ROOT);
+        let mut out = Vec::new();
+        for kind in [
+            EventKind::ToolCallRequested {
+                tool: "read_file".into(),
+                args_summary: r#"{"path":"a.rs"}"#.into(),
+            },
+            EventKind::ToolCompleted {
+                name: "read_file".into(),
+                success: true,
+            },
+            EventKind::ToolCallRequested {
+                tool: "write_file".into(),
+                args_summary: r#"{"path":"b.rs"}"#.into(),
+            },
+        ] {
+            for action in state.on_event(&Event::new(run, "session-1", kind)) {
+                if let TurnAction::Notify(SessionUpdate::ToolCall(call)) = action {
+                    out.push(call.tool_call_id);
+                }
+            }
+        }
+        out
+    };
+
+    // Two turns of the same conversation are two runs.
+    let first = ids_for("run-A");
+    let second = ids_for("run-B");
+    assert_eq!(first.len(), 2);
+    assert_eq!(second.len(), 2);
+    for id in &first {
+        assert!(
+            !second.contains(id),
+            "turn 2 reused {id} from turn 1; ids must be session-unique: {first:?} vs {second:?}"
+        );
+    }
+}
+
+#[test]
 fn a_truncated_args_summary_still_yields_a_usable_tool_call() {
     // `args_summary` is capped at 120 chars, so it is often not valid JSON.
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let out = updates(
         &mut state,
         vec![EventKind::ToolCallRequested {
@@ -510,7 +625,7 @@ fn a_truncated_args_summary_still_yields_a_usable_tool_call() {
 
 #[test]
 fn an_approval_request_asks_the_client_for_permission() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let mut actions = Vec::new();
     for kind in [
         EventKind::ToolCallRequested {
@@ -535,12 +650,12 @@ fn an_approval_request_asks_the_client_for_permission() {
     assert_eq!(asked.len(), 1, "{actions:?}");
     // The permission request must point at the tool call already on
     // screen, not invent a second one.
-    assert_eq!(asked[0].tool_call_id, "call_1");
+    assert_eq!(asked[0].tool_call_id, format!("{RUN}/call_1"));
 }
 
 #[test]
 fn an_approval_request_with_no_tool_call_in_flight_still_asks() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let actions = state.on_event(&event(EventKind::ApprovalRequested {
         command: "rm -rf build".into(),
         risk: RiskLevel::Risky,
@@ -555,7 +670,7 @@ fn an_approval_request_with_no_tool_call_in_flight_still_asks() {
 
 #[test]
 fn the_permission_prompt_names_the_command_and_its_risk() {
-    let mut state = TurnState::default();
+    let mut state = TurnState::for_run(RUN, ROOT);
     let actions = state.on_event(&event(EventKind::ApprovalRequested {
         command: "rm -rf build".into(),
         risk: RiskLevel::Destructive,

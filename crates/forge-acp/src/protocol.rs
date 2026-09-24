@@ -187,6 +187,7 @@ pub mod method {
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_CANCEL: &str = "session/cancel";
+    pub const SESSION_CLOSE: &str = "session/close";
 }
 
 /// Client-side methods we call (schema `CLIENT_METHOD_NAMES`).
@@ -252,14 +253,14 @@ pub struct InitializeResponse {
     pub agent_info: Implementation,
 }
 
-/// What we tell the client we can do — honestly. Everything here is
-/// `false`/empty and that is the point: no `session/load`, and text-only
-/// prompts.
+/// What we tell the client we can do — honestly. No `session/load`, text-only
+/// prompts, and the one session-lifecycle method we do implement.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     pub load_session: bool,
     pub prompt_capabilities: PromptCapabilities,
+    pub session_capabilities: SessionCapabilities,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -269,6 +270,23 @@ pub struct PromptCapabilities {
     pub audio: bool,
     pub embedded_context: bool,
 }
+
+/// Session-lifecycle capabilities. Each is `Option<{}>`: the schema's
+/// convention is that an absent/null field means unsupported and an empty
+/// object means supported, so these carry no fields of their own.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCapabilities {
+    /// `session/close`. Advertising it is what makes a client send it, which
+    /// is how a long-lived process learns it may release a conversation's
+    /// resources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close: Option<Supported>,
+}
+
+/// The schema's "supported" marker: an empty object.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct Supported {}
 
 // --- session/new --------------------------------------------------------
 
@@ -285,6 +303,18 @@ pub struct NewSessionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionResponse {
     pub session_id: String,
+}
+
+// --- session/close ------------------------------------------------------
+
+/// `session/close` params. Per the schema the agent "**must** cancel any
+/// ongoing work related to the session (treat it as if `session/cancel` was
+/// called) and then free up any resources associated with the session".
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseSessionRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 // --- session/prompt -----------------------------------------------------
@@ -349,10 +379,15 @@ pub struct PromptResponse {
     pub stop_reason: StopReason,
 }
 
-/// Why a turn ended. We can produce three of the five: `MaxTokens` and
-/// `MaxTurnRequests` describe budget exhaustion the agent loop reports as
-/// a completed run, and `Refusal` would need a model that tells us it
-/// refused.
+/// Why a turn ended. We model three of the schema's five.
+///
+/// `EndTurn` and `Cancelled` are the ordinary outcomes. `Refusal` is emitted
+/// when an approval went unanswered: the risky operation did not happen and
+/// the turn stopped short of the work, which is a refusal rather than a
+/// crash. The two we never produce are `MaxTokens` and `MaxTurnRequests` —
+/// forge's loop reports turn-budget exhaustion as an ordinary completed run,
+/// so there is no signal to distinguish it from `EndTurn` without a runtime
+/// change.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
@@ -389,9 +424,13 @@ pub enum SessionUpdate {
     ToolCallUpdate(ToolCallUpdate),
 }
 
-/// A new tool call. `kind` and `status` are skipped when they hold the
-/// schema's default (`other`/`pending`), matching how the SDK serializes
-/// them.
+/// A new tool call.
+///
+/// `kind` and `status` are always sent, including at their schema defaults
+/// (`other`/`pending`) which the SDK would omit. Both spellings are valid —
+/// the defaults are defined — and being explicit means the first message
+/// about a tool call fully describes it, rather than leaving a client to
+/// remember what an absent field implies.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {

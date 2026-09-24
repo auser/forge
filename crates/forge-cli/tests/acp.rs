@@ -269,6 +269,14 @@ impl AcpClient {
         )
     }
 
+    /// Every id announced by a `tool_call` update so far, in order.
+    fn tool_call_ids(&self) -> Vec<String> {
+        self.updates_of("tool_call")
+            .iter()
+            .filter_map(|update| update["toolCallId"].as_str().map(str::to_string))
+            .collect()
+    }
+
     /// The `update` objects of one `sessionUpdate` kind, in order.
     fn updates_of(&self, kind: &str) -> Vec<&Value> {
         self.updates
@@ -385,9 +393,14 @@ fn a_prompt_turn_streams_tool_calls_and_a_final_message() {
             .contains("notes.txt"),
         "{write}"
     );
+    // The schema is explicit that a location path is "the absolute file
+    // path", and it has to be: the editor resolves it to open the file and
+    // has no idea what forge's project root is. Emitting the model's
+    // project-relative argument would make follow-along resolve nothing.
     assert_eq!(
-        write["locations"][0]["path"], "notes.txt",
-        "locations drive Zed's follow-along: {write}"
+        write["locations"][0]["path"],
+        project.join("notes.txt").to_string_lossy().as_ref(),
+        "locations must be absolute for Zed's follow-along: {write}"
     );
     let tool_call_id = write["toolCallId"].as_str().expect("toolCallId");
 
@@ -645,7 +658,7 @@ fn the_server_survives_malformed_input_and_keeps_serving() {
 }
 
 #[test]
-fn a_second_prompt_continues_the_same_session() {
+fn a_second_prompt_continues_the_same_session_with_fresh_tool_call_ids() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = scaffold(tmp.path(), "auto");
     let mut client = AcpClient::spawn(tmp.path(), &project);
@@ -654,8 +667,113 @@ fn a_second_prompt_continues_the_same_session() {
 
     let first = client.prompt(&session_id, "write the notes");
     assert_eq!(first["result"]["stopReason"], "end_turn", "{first}");
+    let after_first: Vec<String> = client.tool_call_ids();
+    assert!(!after_first.is_empty(), "the first turn ran a tool call");
+
     let second = client.prompt(&session_id, "and again");
     assert_eq!(second["result"]["stopReason"], "end_turn", "{second}");
+
+    // ACP requires `toolCallId` to be unique within the SESSION. A client
+    // that upserts tool calls by id (Zed does) would mutate the first
+    // turn's entry if the second turn reused an id.
+    let all = client.tool_call_ids();
+    let mut unique = all.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        all.len(),
+        unique.len(),
+        "tool call ids repeated across turns of one session: {all:?}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn a_cancel_arriving_right_after_a_prompt_is_not_lost() {
+    // Both messages are written before the agent has necessarily started
+    // the turn. The turn slot is claimed synchronously when the prompt is
+    // read, so the cancel that follows always finds a run to cancel; if it
+    // did not, the turn would answer `end_turn` for work the user stopped.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "prompt");
+    let mut client = AcpClient::spawn(tmp.path(), &project);
+    client.initialize();
+    let session_id = client.new_session(&project);
+
+    // One write, two messages, no reads in between.
+    let batch = format!(
+        "{}\n{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "write the notes" }],
+            },
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": session_id },
+        }),
+    );
+    client.stdin.write_all(batch.as_bytes()).expect("write");
+    client.stdin.flush().expect("flush");
+
+    // Answer any permission request with `cancelled`, per the spec's rule
+    // for a cancelling client.
+    client.answer = Answer::Cancelled;
+    let response = loop {
+        let message = client.read_message();
+        if message["id"] == json!(77) && message.get("method").is_none() {
+            break message;
+        }
+        if message["method"] == "session/request_permission" {
+            client.answer_permission(&message);
+        }
+    };
+
+    assert_eq!(
+        response["result"]["stopReason"], "cancelled",
+        "a cancel racing the prompt must not be erased: {response}"
+    );
+    assert!(
+        !project.join("notes.txt").exists(),
+        "a cancelled turn must not perform the write"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn session_close_ends_a_conversation_and_is_advertised() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let mut client = AcpClient::spawn(tmp.path(), &project);
+
+    // A client only sends session/close if we advertise it.
+    let init = client.initialize();
+    assert_eq!(
+        init["result"]["agentCapabilities"]["sessionCapabilities"]["close"],
+        json!({}),
+        "{init}"
+    );
+
+    let session_id = client.new_session(&project);
+    let closed = client.request("session/close", json!({ "sessionId": session_id }));
+    assert!(closed["result"].is_object(), "{closed}");
+
+    // The session is really gone: prompting it now is an error.
+    let after = client.prompt(&session_id, "still there?");
+    assert_eq!(after["error"]["code"], -32602, "{after}");
+
+    // And the connection is still usable for a fresh conversation.
+    let fresh = client.new_session(&project);
+    assert_ne!(fresh, session_id);
+    let done = client.prompt(&fresh, "write the notes");
+    assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
 
     client.shutdown();
 }

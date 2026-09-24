@@ -58,12 +58,23 @@
 //!   `Content-Length` headers (that is LSP). Source:
 //!   <https://agentclientprotocol.com/protocol/overview>
 //! * **Methods** we implement (agent side): `initialize`, `session/new`,
-//!   `session/prompt`, and the `session/cancel` *notification*. Methods we
-//!   call (client side): the `session/update` *notification* and the
-//!   `session/request_permission` request.
+//!   `session/prompt`, `session/close`, and the `session/cancel`
+//!   *notification*. Methods we call (client side): the `session/update`
+//!   *notification* and the `session/request_permission` request.
 //! * **`session/update` nests its payload**: `params` is
 //!   `{ sessionId, update: { sessionUpdate: "<variant>", ... } }`, where
 //!   `sessionUpdate` is the internal tag.
+//! * **`toolCallId` is unique within the _session_**, not the turn — so ids
+//!   are prefixed with the run id rather than counted from 1 per turn. A
+//!   client that upserts tool calls by id would otherwise have the second
+//!   turn of a conversation overwrite the first turn's entries.
+//! * **`ToolCallLocation.path` is "the absolute file path"**, so the model's
+//!   project-relative arguments are joined onto the session root before
+//!   going out. A relative path would resolve to nothing in the editor.
+//! * **`session/close`** is gated on advertising
+//!   `sessionCapabilities.close`, and obliges us to "cancel any ongoing work
+//!   related to the session (treat it as if `session/cancel` was called) and
+//!   then free up any resources associated with the session".
 //! * **Stop reasons** are `end_turn`, `max_tokens`, `max_turn_requests`,
 //!   `refusal`, `cancelled`. `cancelled` MUST be returned after a
 //!   `session/cancel` "even if the cancellation causes exceptions in
@@ -88,7 +99,20 @@
 //!   `agent_message_chunk`. Faking a stream by chopping up finished text
 //!   would only look like streaming.
 //! * **No `session/load`**, and text-only prompts — both advertised
-//!   honestly in `initialize`.
+//!   honestly in `initialize`. An embedded `resource` block is nonetheless
+//!   *degraded* to its text rather than refused: we would rather answer an
+//!   editor @-mention than be right about whose mistake it was. `image` and
+//!   `audio` stay hard errors, having no text to fall back to.
+//!
+//! # Resource lifetime
+//!
+//! This is a long-lived process — one per editor — so two things are shared
+//! rather than per-conversation. The `AgentService` is cached per project,
+//! keyed by canonicalized `cwd`, because several agent threads on one
+//! project is the normal case and a runtime is not a small object. And
+//! `session/close` is implemented (and advertised, or clients would never
+//! send it) so a finished conversation actually releases its session entry,
+//! and the project's runtime once the last session on it closes.
 
 pub mod dispatch;
 pub mod protocol;
