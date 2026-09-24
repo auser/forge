@@ -3,6 +3,7 @@ pub mod config_cmd;
 pub mod doctor;
 pub mod graph_cmd;
 pub mod init;
+pub mod mcp_cmd;
 pub mod model_cmd;
 pub mod router_cmd;
 pub mod run_cmd;
@@ -97,5 +98,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
         Command::Graph { command } => graph_cmd::run(&ctx, command).await,
         Command::Skill { command } => skill_cmd::run(&ctx, command).await,
         Command::Serve { host, port } => serve_cmd::run(&ctx, host, port).await,
+        Command::Mcp => mcp_cmd::run(&ctx).await,
     }
 }

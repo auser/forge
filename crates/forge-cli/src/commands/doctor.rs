@@ -5,21 +5,36 @@ use forge_core::ForgeError;
 use crate::commands::Context;
 
 #[derive(Debug, PartialEq)]
-enum Level {
+pub enum Level {
     Ok,
     Warn,
     Fail,
 }
 
-struct Check {
+impl Level {
+    /// Wire tag, shared by the human output, `--json` and the MCP tool.
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+pub struct Check {
     level: Level,
     label: String,
     detail: String,
 }
 
-/// Environment and configuration health report. Exits non-zero (via
-/// `ForgeError`) only when something is actually broken.
-pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
+/// Every environment/configuration check, in report order.
+///
+/// This is the one definition of forge's health: `forge doctor` renders it
+/// and the MCP `forge_doctor` tool serves the same values (via
+/// [`crate::commands::mcp_cmd::CliDiagnostics`]) — never by shelling out to
+/// the CLI.
+pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
     let mut checks: Vec<Check> = Vec::new();
 
     let root = ctx.project_root()?;
@@ -52,6 +67,20 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
             label: "merged config".into(),
             detail: e.to_string(),
         }),
+    }
+
+    // Independent of what is configured: an exported FORGE_TEST_MOCKS
+    // makes every mock selectable for the whole shell, long after whatever
+    // test run needed it. Say so once, always.
+    if forge_config::test_mocks_allowed() {
+        checks.push(Check {
+            level: Level::Warn,
+            label: "test mocks".into(),
+            detail: format!(
+                "{}=1 is set — test-only mock providers are selectable in this environment",
+                forge_config::TEST_MOCKS_ENV
+            ),
+        });
     }
 
     let forge_dir = root.join(".forge");
@@ -169,16 +198,44 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
 
     if let Ok(resolved) = &resolved {
         let config = &resolved.config;
-        // Model provider: mock/scripted are offline; anything else gets a
-        // reachability probe of its endpoint (warn, never fail).
-        let model_detail = match config.model.as_str() {
-            "mock-local" | "mock" => Some("mock-local (built-in mock, available offline)".into()),
-            "scripted-mock" => Some("scripted-mock (offline script)".into()),
-            _ => None,
+        // Model provider: a test-only mock is reported as whatever it
+        // actually is right now — usable under the gate, broken without it
+        // (every run would fail at provider construction, and "why does
+        // forge say mock response to:" is exactly the confusion the gate
+        // exists to prevent). Anything else gets a reachability probe of
+        // its endpoint (warn, never fail).
+        let mock_model = matches!(
+            config.model.as_str(),
+            "mock" | "mock-local" | "scripted-mock"
+        );
+        let model_detail = if mock_model {
+            Some(if forge_config::test_mocks_allowed() {
+                (
+                    Level::Warn,
+                    format!(
+                        "{} is a test-only mock, unlocked by {}",
+                        config.model,
+                        forge_config::TEST_MOCKS_ENV
+                    ),
+                )
+            } else {
+                (
+                    Level::Fail,
+                    format!(
+                        "{} is a test-only mock and will not load; pick a real model \
+                         (see the README's \"Pick your model\"), or set {}=1 if you \
+                         are running forge's own tests",
+                        config.model,
+                        forge_config::TEST_MOCKS_ENV
+                    ),
+                )
+            })
+        } else {
+            None
         };
         match model_detail {
-            Some(detail) => checks.push(Check {
-                level: Level::Ok,
+            Some((level, detail)) => checks.push(Check {
+                level,
                 label: "model provider".into(),
                 detail,
             }),
@@ -229,11 +286,12 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
                 });
             }
         }
-        checks.push(Check {
-            level: Level::Ok,
-            label: "decision router".into(),
-            detail: format!("{} ({})", config.router, router_note(&config.router)),
-        });
+        checks.push(mock_aware_check(
+            "decision router",
+            &config.router,
+            config.router == "mock",
+            router_note(&config.router),
+        ));
 
         checks.push(needle_check(config).await);
         checks.push(jev_check(config));
@@ -280,15 +338,12 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
                 }
             });
         }
-        checks.push(Check {
-            level: Level::Ok,
-            label: "execution provider".into(),
-            detail: format!(
-                "{} ({})",
-                config.execution,
-                execution_note(&config.execution)
-            ),
-        });
+        checks.push(mock_aware_check(
+            "execution provider",
+            &config.execution,
+            config.execution == "mock",
+            execution_note(&config.execution),
+        ));
         match forge_core::ApprovalPolicy::parse(&config.approval) {
             Ok(policy) => checks.push(Check {
                 level: Level::Ok,
@@ -303,40 +358,55 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
         }
     }
 
-    let mut failures = 0usize;
-    let mut report: Vec<serde_json::Value> = Vec::new();
-    for check in &checks {
-        let tag = match check.level {
-            Level::Ok => "ok",
-            Level::Warn => "warn",
-            Level::Fail => {
-                failures += 1;
-                "fail"
-            }
-        };
-        if ctx.global.json {
-            report.push(serde_json::json!({
-                "status": tag,
+    Ok(checks)
+}
+
+/// How many checks are outright broken (warnings do not count).
+pub fn failures(checks: &[Check]) -> usize {
+    checks.iter().filter(|c| c.level == Level::Fail).count()
+}
+
+/// The machine-readable report — exactly what `forge doctor --json` prints
+/// and what the MCP `forge_doctor` tool returns.
+pub fn report_json(checks: &[Check]) -> serde_json::Value {
+    serde_json::json!({
+        "healthy": failures(checks) == 0,
+        "checks": checks
+            .iter()
+            .map(|check| serde_json::json!({
+                "status": check.level.tag(),
                 "check": check.label,
                 "detail": check.detail,
-            }));
-        } else {
-            println!("[{tag:>4}] {}: {}", check.label, check.detail);
-        }
-    }
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
 
+/// Environment and configuration health report. Exits non-zero (via
+/// `ForgeError`) only when something is actually broken.
+pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
+    let checks = collect_checks(ctx).await?;
+    let failures = failures(&checks);
     let healthy = failures == 0;
+
     if ctx.global.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "healthy": healthy,
-                "checks": report,
-            }))
-            .map_err(|e| ForgeError::config(format!("serializing doctor report: {e}")))?
+            serde_json::to_string_pretty(&report_json(&checks))
+                .map_err(|e| ForgeError::config(format!("serializing doctor report: {e}")))?
         );
-    } else if healthy {
-        println!("doctor: healthy");
+    } else {
+        for check in &checks {
+            println!(
+                "[{:>4}] {}: {}",
+                check.level.tag(),
+                check.label,
+                check.detail
+            );
+        }
+        if healthy {
+            println!("doctor: healthy");
+        }
     }
 
     if healthy {
@@ -732,7 +802,7 @@ fn router_note(router: &str) -> &'static str {
     match router {
         "needle" => "embedded on-device Needle 3 decisions, available offline",
         "static" => "deterministic rules, available offline",
-        "mock" => "deterministic mock, available offline",
+        "mock" => "test-only mock router",
         "cheapest" => "lowest-cost capable candidate, available offline",
         "http" => "System One-compatible HTTP router (uses router_url)",
         "laya" => "Laya typed-questions router (uses router_url, default 127.0.0.1:8788)",
@@ -746,8 +816,46 @@ fn router_note(router: &str) -> &'static str {
 fn execution_note(execution: &str) -> &'static str {
     match execution {
         "native" => "local process execution, available",
-        "mock" => "recorded mock execution, available offline",
+        // Not "available offline": it reports commands as run and files as
+        // written while doing neither.
+        "mock" => "test-only mock execution; records operations instead of performing them",
         _ => "unrecognized execution provider",
+    }
+}
+
+/// A check for a config value that may name a test-only mock.
+///
+/// Mirrors the model-provider check: a configured mock is a **failing**
+/// check when the gate is closed (nothing will build, and the user has no
+/// idea why), a warning when it is open (it works, but it is not real), and
+/// an ordinary Ok line otherwise.
+fn mock_aware_check(label: &str, value: &str, is_mock: bool, note: &str) -> Check {
+    if !is_mock {
+        return Check {
+            level: Level::Ok,
+            label: label.into(),
+            detail: format!("{value} ({note})"),
+        };
+    }
+    if forge_config::test_mocks_allowed() {
+        Check {
+            level: Level::Warn,
+            label: label.into(),
+            detail: format!(
+                "{value} ({note}), unlocked by {}",
+                forge_config::TEST_MOCKS_ENV
+            ),
+        }
+    } else {
+        Check {
+            level: Level::Fail,
+            label: label.into(),
+            detail: format!(
+                "{value} is a test-only mock and will not load; \
+                 use a real one, or set {}=1 if you are running forge's own tests",
+                forge_config::TEST_MOCKS_ENV
+            ),
+        }
     }
 }
 

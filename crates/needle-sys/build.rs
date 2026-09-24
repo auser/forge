@@ -24,12 +24,22 @@
 //! `needle.h` *is* committed, as the contract of record for the hand-written
 //! declarations.
 //!
-//! A *missing* library is not an error here: `cargo check` and `cargo clippy`
-//! never invoke the linker, so they work fine without it, and that is what
-//! keeps `just verify` green on a fresh checkout. Only a build that actually
-//! links code calling the engine needs it, which is why the absence is a
-//! loud warning rather than a panic. A `NEEDLE_LIB_DIR` that is *set but
-//! wrong* is operator error and does panic.
+//! A *missing* library is not an error here, and — since 2026-09-24 — not a
+//! `cargo:warning` either. `needle-sys` is a workspace member, so it builds
+//! on every `cargo build`/`check` even when nothing links it and the `ffi`
+//! feature is off, which is the overwhelmingly common case; a build script
+//! cannot see downstream features, so a warning here fired at users who had
+//! no reason to care and read as a build *failure*. The absence is therefore
+//! a plain `println!` note (captured by cargo, shown only under `-vv`), and
+//! the one case that really is broken stays loud:
+//!
+//! * absent library, no `NEEDLE_LIB_DIR` → quiet note. `cargo check`/
+//!   `clippy` never link, so nothing is wrong yet. A build that *does* link
+//!   engine calls (`forge-needle` feature `ffi`) fails at link time with
+//!   undefined `_needle_*` symbols — see README's "Embedded Needle brain
+//!   (`ffi`)" section, which is the documented pointer for that failure.
+//! * `NEEDLE_LIB_DIR` set but wrong → `cargo:warning` *and* a panic.
+//!   Operator error, deserves to be impossible to miss.
 
 use std::path::{Path, PathBuf};
 
@@ -69,7 +79,11 @@ fn main() {
         Some(dir) => {
             let dir = PathBuf::from(dir);
             if static_lib(&dir, &target).is_none() {
-                panic!(
+                // The only loud path left. `cargo:warning` as well as the
+                // panic: a panic message inside a build script is easy to
+                // lose in a parallel build's output, and this one is always
+                // actionable — the operator asked for a specific directory.
+                let message = format!(
                     "{LIB_DIR_ENV} is set to {} but no {} is there.\n\
                      Fetch one for {target} from the Cactus Needle 3 release:\n  \
                      https://huggingface.co/Cactus-Compute/needle3/tree/main/<platform>\n\
@@ -77,6 +91,8 @@ fn main() {
                     dir.display(),
                     lib_file_name(&target),
                 );
+                println!("cargo:warning=needle-sys: {}", one_line(&message));
+                panic!("{message}");
             }
             Some(dir)
         }
@@ -85,15 +101,23 @@ fn main() {
 
     match &lib_dir {
         Some(dir) => emit_link_flags(dir, &target),
+        // Deliberately NOT `cargo:warning=` — see the module docs. This is
+        // a note for someone reading `cargo build -vv`, not a diagnostic
+        // for every user of a default build.
         None => println!(
-            "cargo:warning=needle-sys: no {} found. Set {LIB_DIR_ENV}, or place the engine in \
-             crates/needle-sys/vendor/{target}/. `cargo check`/`clippy` succeed without it, but \
-             linking anything that calls the engine (forge-needle feature `ffi`) will fail with \
-             undefined _needle_* symbols. Fetch it from \
+            "needle-sys: no {} for {target}; building without the engine. This is normal unless \
+             you enabled forge-needle's `ffi` feature — then set {LIB_DIR_ENV} or place the \
+             engine in crates/needle-sys/vendor/{target}/ (see README, \"Embedded Needle brain\"). \
              https://huggingface.co/Cactus-Compute/needle3 (Apache-2.0).",
             lib_file_name(&target),
         ),
     }
+}
+
+/// Collapse newlines: `cargo:warning=` is a single-line directive, so an
+/// embedded newline would truncate the message at the first break.
+fn one_line(message: &str) -> String {
+    message.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn env(key: &str) -> String {

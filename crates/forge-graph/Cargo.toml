@@ -14,4 +14,8 @@ sha2.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+# Only the tests need these: `query`'s blend takes a `dyn Embedder` the
+# caller built, so the crate itself stays model-free and async-runtime-free.
+async-trait.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

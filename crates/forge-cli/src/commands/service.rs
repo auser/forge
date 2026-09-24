@@ -11,6 +11,13 @@ use crate::commands::Context;
 
 /// Build the execution provider from configuration. The project root is
 /// used for file-op risk classification.
+///
+/// `mock` is a **test-only** provider and gated like the mock models and
+/// router (`forge_config::test_mocks`). It deserves the gate more than they
+/// do: `MockExecution` *reports* commands as run and files as written while
+/// doing neither, so a user who selected it would watch forge narrate work
+/// that never happened. Tests construct `MockExecution` directly, which is
+/// unaffected — the gate is on what configuration may select.
 pub fn build_execution(
     config: &forge_config::Config,
     project_root: &Path,
@@ -20,9 +27,12 @@ pub fn build_execution(
             ApprovalPolicy::parse(&config.approval)?,
             project_root,
         ))),
-        "mock" => Ok(Arc::new(MockExecution::new(project_root))),
+        "mock" => {
+            forge_config::ensure_test_mocks_allowed("execution = \"mock\"")?;
+            Ok(Arc::new(MockExecution::new(project_root)))
+        }
         other => Err(ForgeError::execution(format!(
-            "unknown execution provider {other:?} (expected native or mock)"
+            "unknown execution provider {other:?} (expected native)"
         ))),
     }
 }

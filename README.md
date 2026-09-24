@@ -7,14 +7,13 @@ pluggable execution, and both CLI and REST/SSE interfaces over one shared runtim
 
 No Node.js, database, or daemon is required. The default stack is an embedded
 Needle 3 decision router (on-device, no network calls) in front of a local
-oMLX coding model — no mock in the default path, no hosted account needed.
+oMLX coding model — nothing mocked, no hosted account needed.
 When needle declines or fails, forge can escalate to Jev (TypeSafe's hosted
 System One API, or a self-hosted OpenJev server) before falling all the way
 back to deterministic static routing — opt-in only when a Jev credential is
 configured (`router_escalate = "auto"`, the default, is a no-op without one)
 and always skipped under `--local-only`. Laya (open-source System One) and
-other HTTP-style routers remain available as alternates. Mock providers
-exist for tests and demos but are strictly opt-in (`model = "mock-local"`).
+other HTTP-style routers remain available as alternates.
 
 - **How it all fits together** — the decision plane (Needle → Jev/OpenJev →
   static), the generation plane (local → subscription → API-key cloud), the
@@ -23,8 +22,9 @@ exist for tests and demos but are strictly opt-in (`model = "mock-local"`).
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
 - Implementation plan: [`specs/implementation-plan.md`](specs/implementation-plan.md)
 - Roadmap and future directions: [`specs/roadmap.md`](specs/roadmap.md)
-- Needle/Jev embedded-brain design (next direction: on-device decisions,
-  cheapest-first routing, ACP/MCP editor integration):
+- Needle/Jev embedded-brain design (on-device decisions, cheapest-first
+  routing; MCP editor integration is [live](#mcp-server-editors-and-agent-harnesses),
+  ACP is next):
   [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md)
 - BDD features: [`tests/features/`](tests/features/)
 
@@ -125,11 +125,19 @@ forge --model deepseek-chat run "Explain this project"
 `forge init` reports the keys it found by name; built-in `[models]` entries
 exist for `deepseek-chat`, `kimi-k2.7-code`, `gpt-5`, and `claude-sonnet`.
 
-**Just evaluating?** No GPU, no accounts, no server — one flag:
+**Just evaluating?** A lot of forge needs no model at all. With zero setup:
 
 ```bash
-forge --model mock-local --router static run "Explain this project"
+forge init                         # builds the project graph
+forge graph context "auth flow"    # ranked files for a task
+forge graph map                    # what's in this repo
+forge skill list                   # discovered skills
+forge doctor                       # what's configured, what's missing
+forge mcp                          # serve those as tools to your editor
 ```
+
+Running an agent loop (`forge run`) does need a model — that is the
+ten-second menu above.
 
 ### Troubleshooting
 
@@ -285,6 +293,7 @@ curl -s -X POST http://127.0.0.1:7341/v1/runs/<run-id>/input \
 forge init                          Initialize a project (idempotent)
 forge run [--max-turns N] <prompt>  Run the multi-turn agent loop
 forge serve [--host --port]         Start the REST/SSE server
+forge mcp                           Serve MCP over stdio (editors, agents)
 forge resume <run-or-session-id>    Continue a completed run in its session
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
@@ -304,8 +313,8 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
---router <r>          override the router (static|mock|cheapest|http|laya|needle)
---execution <p>       override the execution provider (native|mock)
+--router <r>          override the router (needle|jev|laya|http|static|cheapest)
+--execution <p>       override the execution provider (native)
 --local-only          restrict to local providers
 --approval <mode>     auto | prompt | prompt-dangerous | deny
 --json                machine-readable JSON on stdout, nothing else on stdout
@@ -338,11 +347,10 @@ Key settings (all optional):
 
 | Key | Default | Env var | Meaning |
 |---|---|---|---|
-| `model` | `qwen3-coder` | `FORGE_MODEL` | Active model (`mock-local`/`scripted-mock` = opt-in offline mocks) |
-| `mock_script` | — | `FORGE_MOCK_SCRIPT` | JSON script path for `scripted-mock` (project-relative) |
+| `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `laya` \| `static` \| `cheapest` \| `mock` \| `http` \| `jev` |
+| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key. Same primary-only fallback rule as `router_url` — the escalation tier never uses it (see `jev_key_env`) |
 | `router_escalate` | `auto` | `FORGE_ROUTER_ESCALATE` | `auto` \| `off` — when `router = "needle"`, escalate to the Jev tier before the static fallback once a Jev credential is present (`auto`, the default) or never (`off`); no-op unless a credential exists and `--local-only` is off |
@@ -352,7 +360,7 @@ Key settings (all optional):
 | `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle/jev decisions escalate to the fallback |
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
-| `execution` | `native` | `FORGE_EXECUTION` | `native` \| `mock` |
+| `execution` | `native` | `FORGE_EXECUTION` | `native` |
 | `approval` | `prompt` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny` |
 | `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers |
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
@@ -434,12 +442,7 @@ These are the three pluggable seams (traits in `forge-core`).
 ### ModelProvider
 
 The default is `qwen3-coder` via the OpenAI-compatible endpoint at
-`model_base_url` (oMLX convention). `mock` (offline, deterministic) and
-`scripted-mock` (JSON-scripted replies incl. tool calls) exist for tests,
-demos, and CI — always explicitly requested. The mock's reply is exactly
-`mock response to: <prompt>`; set `FORGE_MOCK_VERBOSE=1` to have it also
-echo a 120-character snippet of the assembled system context (skill
-instructions, graph context) when you want that plumbing visible.
+`model_base_url` (oMLX convention).
 Capabilities (streaming, tools,
 structured output, vision, context size) are explicit per provider, never
 assumed; a provider without `tools` receives single-turn requests only.
@@ -466,7 +469,6 @@ Seven modes:
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `static` (deterministic rules),
-- `mock` (preset decision, for tests),
 - `cheapest` (lowest-cost candidate from the `[models]` cost table;
   tie-breaks by output cost then name),
 - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
@@ -587,7 +589,8 @@ runs locally with approval gating: `Risky` operations pause for approval under
 `approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
 ones (non-interactive stdin → typed "approval required" error, which the agent
 loop treats as a pause: answer via piped stdin lines, e.g.
-`echo y | forge run ...`). `auto` runs, `deny` blocks. `mock` records requests
+`echo y | forge run ...`). `auto` runs, `deny` blocks. The test-only `mock`
+*execution* provider records requests
 for tests. MVM/container/remote executors plug into the same trait later.
 
 ## Skills
@@ -715,6 +718,87 @@ The server tracks at most 1024 in-flight/recent runs in memory
 (`MAX_TRACKED_RUNS`); oldest terminal entries are evicted first and remain fully
 retrievable from the session store (the source of truth).
 
+## MCP server (editors and agent harnesses)
+
+One command wires forge into Claude Code:
+
+```bash
+claude mcp add forge -- forge mcp
+```
+
+That's it. Your agent can now search this project's graph, read its skills, and
+run forge tasks as tools.
+
+Any other MCP client wants the same two facts — command `forge`, argument `mcp`:
+
+```json
+{
+  "mcpServers": {
+    "forge": {
+      "command": "forge",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+(VS Code: `.vscode/mcp.json`. Cursor: `.cursor/mcp.json` or the global
+`~/.cursor/mcp.json`. Add `"args": ["--project", "/path/to/repo", "mcp"]` if the
+client does not launch the server in your repository.)
+
+### The tools
+
+```text
+forge_graph_context {query, limit?}     ranked files for a task (semantic blend
+                                        when needle weights + index exist)
+forge_graph_grep    {pattern, semantic?} symbol matches by regex or by meaning
+forge_graph_map     {}                  per-directory structure summary
+forge_skill_list    {}                  skill names + descriptions (metadata only)
+forge_skill_show    {name}              a skill's full instructions
+forge_doctor        {}                  the `forge doctor` checks as JSON
+forge_run           {prompt, max_turns?, timeout_ms?}
+                                        run the agent loop; returns
+                                        {run_id, status, text}
+forge_run_status    {run_id}            status + final text + recent events
+forge_run_input     {run_id, input}     answer a waiting run (approvals)
+forge_run_cancel    {run_id}            cancel a run
+```
+
+Results come back as one text item of compact JSON, mirrored in
+`structuredContent`. Failures a model can act on (unbuilt graph, unknown run,
+missing weights) are tool errors with the fix in the message, not protocol
+errors.
+
+### Approvals
+
+`forge mcp` is non-interactive by definition: stdin is the protocol channel, so
+nothing can prompt on it. Under `approval = "prompt"`, a risky operation parks
+the run instead — `forge_run` (or `forge_run_status`) reports
+`status: "waiting_for_approval"`, and the client approves with
+
+```json
+{ "name": "forge_run_input", "arguments": { "run_id": "...", "input": "y" } }
+```
+
+Anything other than `"y"` denies. `forge_run` waits `timeout_ms` (default
+120000) for a run to finish; if the run outlives that, it keeps going and you
+poll `forge_run_status`.
+
+### Notes
+
+* Same runtime as everything else: one `AgentService`, the same routing,
+  execution, approval policy and session recording. Runs started here appear in
+  `forge session list` and are redacted like any other.
+* Global flags work as usual (`--project`, `--model`, `--router`, `--local-only`,
+  `--approval`). There is no host/port: stdio only, so the trust boundary is the
+  process — same machine, same user.
+* stdout carries the protocol and nothing else; all logs go to stderr (`-v`,
+  `-vv`, `-vvv` are safe to add). `--json` is meaningless here.
+* Both MCP eras are served from one process: the `initialize` handshake
+  (revisions `2025-11-25` and earlier) and the current `2026-07-28` stateless
+  style with per-request `_meta` and `server/discover`. Framing is
+  newline-delimited JSON-RPC, per the stdio binding.
+
 ## Sessions and events
 
 Every run appends versioned events (`"v": 2`, with a monotonic per-run `seq`
@@ -804,6 +888,16 @@ cargo build --release -p forge-cli --features needle-ffi
 `just lint-ffi` — `cargo clippy` never links, so that needs no engine binary.
 The recipes above are what additionally *run* it.
 
+**If you enable `ffi` without fetching the engine**, the build gets all the way
+to linking and then fails with undefined symbols — `ld`/`lld` naming
+`_needle_init`, `_needle_decide`, `_needle_embed` and friends (`undefined
+symbol: needle_init` on Linux, `Undefined symbols for architecture arm64` on
+macOS). That is the *only* symptom, and the fix is the `curl` step above (or
+`NEEDLE_LIB_DIR`). A default build — no `ffi` — never links the engine and
+says nothing about it: `needle-sys` prints a note only under `cargo build -vv`,
+deliberately not a `cargo:warning`, because the crate compiles on every
+workspace build whether or not anything needs the engine.
+
 `just e2e` needs weights as well as the engine:
 
 ```bash
@@ -846,9 +940,10 @@ Layout:
 crates/
   forge-core        traits, event protocol, typed errors (no heavy deps)
   forge-config      config loading, precedence, provenance
-  forge-execution   native + mock execution providers
-  forge-providers   mock/scripted + OpenAI-compatible models; static, mock,
-                    cheapest, HTTP, and Laya routers
+  forge-execution   native execution (+ a test-only mock)
+  forge-providers   OpenAI-compatible/Anthropic models and the needle, jev,
+                    laya, http, static and cheapest routers
+                    (+ test-only mocks)
   forge-session     append-only JSONL store + secret redaction
   forge-skills      SKILL.md discovery, progressive disclosure
   forge-graph       deterministic incremental project graph
@@ -856,6 +951,8 @@ crates/
                     weights lifecycle, engine thread, needle router
   forge-runtime     AgentService — the one runtime shared by CLI and server
   forge-server      axum REST/SSE adapter
+  forge-mcp         Model Context Protocol (stdio) adapter: tool registry,
+                    schemas, dispatch
   forge-cli         clap command tree, tracing, the forge binary
   needle-sys        raw FFI declarations for libneedle + its link config
 tests/features/     Gherkin scenarios (executable via just bdd)
@@ -872,7 +969,15 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 22 features / 43 scenarios / 160 steps.
+  mock providers — fully offline. Currently 23 features / 44 scenarios / 165 steps.
+- Mocks are **test-only**. `model = "mock-local"`, `model = "scripted-mock"`,
+  `router = "mock"` and `execution = "mock"` are all refused by configuration
+  unless `FORGE_TEST_MOCKS=1` is
+  set, which every forge test harness does. They answer
+  `mock response to: <prompt>`, which is useful for asserting the agent loop
+  and actively misleading as a product — so users never see them offered.
+  (`FORGE_MOCK_VERBOSE=1` additionally makes the mock echo a snippet of the
+  assembled system context, when you want that plumbing visible in a test.)
 - Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
   `just verify` — they need a native engine and real weights. See [Embedded
   Needle brain (`ffi`)](#embedded-needle-brain-ffi).

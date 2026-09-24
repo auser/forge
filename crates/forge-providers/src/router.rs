@@ -631,8 +631,11 @@ fn build_router(
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
     match ROUTER_CTORS.iter().find(|(n, _)| *n == name) {
         Some((_, ctor)) => ctor(config, registry),
+        // `mock` is accepted (it is in ROUTER_CTORS) but deliberately not
+        // listed: it is test-only and refused without FORGE_TEST_MOCKS, so
+        // advertising it here would be pointing users at a dead end.
         None => Err(ForgeError::router(format!(
-            "unknown router {name:?} (expected static, mock, cheapest, http, laya, needle, or jev)"
+            "unknown router {name:?} (expected needle, jev, laya, http, static, or cheapest)"
         ))),
     }
 }
@@ -646,10 +649,14 @@ fn build_static(
     ))
 }
 
+/// The test-only mock router. Gated like the mock models: configuration may
+/// only select it under `FORGE_TEST_MOCKS=1` (see
+/// [`forge_config::test_mocks`]).
 fn build_mock(
     config: &Config,
     _registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    forge_config::ensure_test_mocks_allowed("router = \"mock\"")?;
     Ok(Arc::new(MockRouter::selecting(config.model.clone())))
 }
 

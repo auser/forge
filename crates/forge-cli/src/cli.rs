@@ -16,7 +16,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct GlobalOpts {
     /// Increase diagnostics verbosity (-v info, -vv debug, -vvv trace); diagnostics go to stderr.
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count, global = true)]
@@ -34,7 +34,12 @@ pub struct GlobalOpts {
     #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Override the configured router (static|mock|cheapest|http|laya|needle|jev).
+    /// Override the configured router (needle|jev|laya|http|static|cheapest).
+    // `mock` is deliberately absent from that list: it is a test-only
+    // router that `router_from_config` refuses unless FORGE_TEST_MOCKS=1
+    // (see `forge_config::test_mocks`). The flag still accepts it — the
+    // test harnesses pass it — it is just not advertised to users. A plain
+    // comment, not a doc comment, so clap cannot render it in `--help`.
     #[arg(long, global = true, value_name = "ROUTER")]
     pub router: Option<String>,
 
@@ -72,6 +77,10 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         max_turns: Option<u32>,
     },
+
+    /// Serve the Model Context Protocol over stdio (for editors and agent
+    /// harnesses). stdout carries the protocol; logs go to stderr.
+    Mcp,
 
     /// Start the REST/SSE server.
     Serve {

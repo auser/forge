@@ -377,16 +377,42 @@ impl AgentService {
         String,
         tokio::task::JoinHandle<Result<RunOutcome, ForgeError>>,
     ) {
-        let run_id = new_run_id();
-        let session_id = session_id.unwrap_or_else(new_session_id);
+        self.start_run_with_options(
+            prompt,
+            RunOptions {
+                session_id,
+                ..RunOptions::default()
+            },
+        )
+    }
+
+    /// [`start_run`](Self::start_run) with explicit [`RunOptions`] — the
+    /// MCP adapter needs a per-call turn budget, which the REST adapter
+    /// has no way to express. `options.resume_from` is ignored here:
+    /// resuming is [`resume`](Self::resume)'s job.
+    pub fn start_run_with_options(
+        self: &Arc<Self>,
+        prompt: impl Into<String>,
+        options: RunOptions,
+    ) -> (
+        String,
+        String,
+        tokio::task::JoinHandle<Result<RunOutcome, ForgeError>>,
+    ) {
+        let run_id = options.run_id.unwrap_or_else(new_run_id);
+        let session_id = options.session_id.unwrap_or_else(new_session_id);
         // Create the broadcast channel now so subscribers connecting right
-        // after the 202 response miss nothing.
+        // after the ids are handed out miss nothing.
         self.broadcaster(&run_id);
         let service = Arc::clone(self);
         let prompt = prompt.into();
         let (rid, sid) = (run_id.clone(), session_id.clone());
-        let handle =
-            tokio::spawn(async move { service.run_inner(&prompt, &rid, &sid, None, None).await });
+        let max_turns = options.max_turns;
+        let handle = tokio::spawn(async move {
+            service
+                .run_inner(&prompt, &rid, &sid, max_turns, None)
+                .await
+        });
         (run_id, session_id, handle)
     }
 

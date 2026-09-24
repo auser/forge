@@ -1,5 +1,11 @@
-//! Model providers (`MockModel`, scripted mock, OpenAI-compatible HTTP) and
-//! decision routers (static, mock, System One-compatible HTTP, fallback).
+//! Model providers (OpenAI-compatible HTTP, Anthropic, and test-only
+//! mocks) and decision routers (needle, jev, laya, http, static, cheapest,
+//! and a test-only mock).
+//!
+//! The mocks are gated: configuration can only select them when
+//! `FORGE_TEST_MOCKS=1` is set (see `forge_config::test_mocks`).
+//! Constructing them directly from Rust — which is what unit tests across
+//! the workspace do — is unaffected.
 
 mod anthropic;
 mod credentials;

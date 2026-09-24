@@ -1,19 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use forge_core::embed::Embedder;
-use forge_core::{ContextHit, ForgeError, ProjectGraph};
-use forge_graph::{EmbeddingIndex, LocalGraph};
+use forge_core::{ForgeError, ProjectGraph};
+use forge_graph::{EMBEDDINGS_REL_PATH, EmbeddingIndex, LocalGraph};
 use forge_needle::EngineEmbedder;
 
 use crate::cli::GraphCommand;
 use crate::commands::Context;
-
-/// Where the local semantic index lives, relative to the project root —
-/// alongside `graph.json` under the same `.forge/graph/` directory. Kept
-/// separate from `graph.json` itself: the structural graph is model-free by
-/// design (see the crate README), while this file only exists when a
-/// needle engine was available at build time.
-const EMBEDDINGS_REL_PATH: &str = ".forge/graph/embeddings.bin";
 
 /// Symbols are embedded in batches so a large first build doesn't hold one
 /// giant `Vec<String>` in flight against the engine at once.
@@ -239,23 +232,14 @@ fn grep(ctx: &Context, pattern: &str) -> Result<(), ForgeError> {
 /// either way (`forge init` to fetch weights, then `forge graph build`).
 async fn grep_semantic(ctx: &Context, query: &str) -> Result<(), ForgeError> {
     let graph = open_built(ctx)?;
-    let resolved = ctx.resolve_config()?;
-    let engine = forge_needle::engine_if_available(&resolved.config)
-        .await
-        .ok_or_else(|| {
-            ForgeError::graph("semantic search needs needle weights (run forge init)")
-        })?;
-    let embedder = EngineEmbedder::new(engine).await?;
-
-    let index_path = graph.root().join(EMBEDDINGS_REL_PATH);
-    let index = EmbeddingIndex::load(&index_path)
-        .filter(|idx| idx.matches_model(&embedder.model_id(), embedder.dimensions()))
-        .ok_or_else(|| {
-            ForgeError::graph("semantic index not built yet; run `forge graph build`")
-        })?;
-
-    let query_vector = embed_one(&embedder, query).await?;
-    let results = index.search(&query_vector, 20);
+    let embedder = context_embedder(ctx).await?;
+    let results = forge_graph::semantic_grep(
+        &graph,
+        embedder.as_ref().map(|e| e as &dyn Embedder),
+        query,
+        20,
+    )
+    .await?;
 
     if ctx.global.json {
         let out: Vec<serde_json::Value> = results
@@ -276,17 +260,6 @@ async fn grep_semantic(ctx: &Context, query: &str) -> Result<(), ForgeError> {
         }
     }
     Ok(())
-}
-
-/// Embed a single piece of text via an `Embedder`, unwrapping the
-/// one-vector-per-text contract.
-async fn embed_one(embedder: &EngineEmbedder, text: &str) -> Result<Vec<f32>, ForgeError> {
-    embedder
-        .embed(&[text.to_string()])
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| ForgeError::graph("embedder returned no vector for its input"))
 }
 
 fn callers(ctx: &Context, symbol: &str) -> Result<(), ForgeError> {
@@ -346,12 +319,16 @@ fn blast(ctx: &Context, path: &str) -> Result<(), ForgeError> {
 
 async fn context(ctx: &Context, query: &str) -> Result<(), ForgeError> {
     let graph = open_built(ctx)?;
-    // A wider lexical candidate pool than the final 10 shown, so a file the
-    // semantic side ranks highly but lexical search only weakly matched
-    // still has a rank score to blend with (rather than defaulting to 0).
-    let lexical = graph.context(query, 20);
-    let mut blended = semantic_blend(ctx, &graph, query, &lexical).await?;
-    blended.truncate(10);
+    // One ranking implementation for every adapter: `forge_graph_context`
+    // over MCP calls the same function with the same embedder seam.
+    let embedder = context_embedder(ctx).await?;
+    let blended = forge_graph::blended_context(
+        &graph,
+        embedder.as_ref().map(|e| e as &dyn Embedder),
+        query,
+        10,
+    )
+    .await?;
 
     if ctx.global.json {
         let out: Vec<serde_json::Value> = blended
@@ -380,108 +357,12 @@ async fn context(ctx: &Context, query: &str) -> Result<(), ForgeError> {
     Ok(())
 }
 
-/// One context result after blending, if applicable — `score` is always a
-/// float here (unlike `ContextHit::score`, a `u32`), so the blended and
-/// lexical-only paths share one output shape.
-struct ScoredHit {
-    path: String,
-    score: f64,
-    reasons: Vec<String>,
-}
-
-/// Blend lexical context hits with the semantic index when both a working
-/// needle engine and a matching embeddings index exist for this project;
-/// otherwise return `lexical` unchanged (still sorted/ranked exactly as
-/// `LocalGraph::context` produced it).
-///
-/// Blend formula: `final = 0.5 * lexical_rank_score + 0.5 * cosine`, where
-/// `lexical_rank_score = 1 / (1 + rank)` over `lexical`'s existing order
-/// (rank 0 = best lexical match) and `cosine` is the best (max) similarity
-/// among that path's symbols in the semantic index. Candidates are the
-/// union of `lexical`'s paths and whatever paths the semantic search
-/// surfaces — a file the semantic side considers a strong match still
-/// shows up even if lexical search missed it entirely (rank score 0 for
-/// that half), and vice versa.
-async fn semantic_blend(
-    ctx: &Context,
-    graph: &LocalGraph,
-    query: &str,
-    lexical: &[ContextHit],
-) -> Result<Vec<ScoredHit>, ForgeError> {
-    let unchanged = || {
-        lexical
-            .iter()
-            .map(|h| ScoredHit {
-                path: h.path.clone(),
-                score: h.score as f64,
-                reasons: h.reasons.clone(),
-            })
-            .collect::<Vec<_>>()
-    };
-
+/// The on-device embedder when one is genuinely usable, else `None`
+/// (which keeps ranking lexical). Absence is normal, never an error.
+async fn context_embedder(ctx: &Context) -> Result<Option<EngineEmbedder>, ForgeError> {
     let resolved = ctx.resolve_config()?;
     let Some(engine) = forge_needle::engine_if_available(&resolved.config).await else {
-        return Ok(unchanged());
+        return Ok(None);
     };
-    let embedder = EngineEmbedder::new(engine).await?;
-
-    let index_path = graph.root().join(EMBEDDINGS_REL_PATH);
-    let Some(index) = EmbeddingIndex::load(&index_path)
-        .filter(|idx| idx.matches_model(&embedder.model_id(), embedder.dimensions()))
-    else {
-        return Ok(unchanged());
-    };
-
-    let query_vector = embed_one(&embedder, query).await?;
-
-    // Best (max) cosine per path, from the top semantic matches.
-    let mut cosine_by_path: BTreeMap<String, f32> = BTreeMap::new();
-    for (key, score) in index.search(&query_vector, 50) {
-        if let Some((path, _symbol)) = key.rsplit_once("::") {
-            cosine_by_path
-                .entry(path.to_string())
-                .and_modify(|best| {
-                    if score > *best {
-                        *best = score;
-                    }
-                })
-                .or_insert(score);
-        }
-    }
-
-    let lexical_rank: BTreeMap<&str, usize> = lexical
-        .iter()
-        .enumerate()
-        .map(|(rank, h)| (h.path.as_str(), rank))
-        .collect();
-    let mut reasons_by_path: BTreeMap<String, Vec<String>> = lexical
-        .iter()
-        .map(|h| (h.path.clone(), h.reasons.clone()))
-        .collect();
-
-    let mut paths: BTreeSet<String> = lexical.iter().map(|h| h.path.clone()).collect();
-    paths.extend(cosine_by_path.keys().cloned());
-
-    let mut out: Vec<ScoredHit> = paths
-        .into_iter()
-        .map(|path| {
-            let rank_score = lexical_rank
-                .get(path.as_str())
-                .map(|rank| 1.0 / (1.0 + *rank as f64))
-                .unwrap_or(0.0);
-            let cosine = cosine_by_path.get(&path).copied().unwrap_or(0.0) as f64;
-            let reasons = reasons_by_path.remove(&path).unwrap_or_default();
-            ScoredHit {
-                score: 0.5 * rank_score + 0.5 * cosine,
-                path,
-                reasons,
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    Ok(out)
+    Ok(Some(EngineEmbedder::new(engine).await?))
 }

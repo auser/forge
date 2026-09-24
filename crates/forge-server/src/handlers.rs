@@ -82,7 +82,11 @@ pub async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
         "capabilities": active.capabilities(),
         "active": true,
     })];
-    if active.name() != "mock-local" {
+    // `mock-local` is a test-only provider (`forge_config::test_mocks`), so
+    // it is only advertised when the gate that would let a client actually
+    // select it is open. Otherwise this endpoint would offer a model that
+    // configuration refuses to build.
+    if active.name() != "mock-local" && forge_config::test_mocks_allowed() {
         models.push(serde_json::json!({
             "name": "mock-local",
             "capabilities": forge_core::ModelCapabilities {
@@ -93,7 +97,7 @@ pub async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
                 max_context: 32_768,
             },
             "active": false,
-            "note": "built-in offline mock",
+            "note": "test-only mock",
         }));
     }
     Json(serde_json::json!({ "models": models }))

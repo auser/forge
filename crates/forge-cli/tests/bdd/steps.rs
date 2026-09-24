@@ -1548,3 +1548,74 @@ fn jev_router_endpoint_unreachable(world: &mut BddWorld) {
     // convention `configured_router_unavailable` uses for http/laya above.
     world.set_config("jev_url", "\"http://127.0.0.1:9/systemone\"");
 }
+
+// ---------------------------------------------------------------------------
+// mcp.feature
+// ---------------------------------------------------------------------------
+
+#[when("an MCP client handshakes over stdio")]
+async fn mcp_client_handshakes(world: &mut BddWorld) {
+    world.start_mcp().await;
+}
+
+#[then("the tool list includes the forge graph, skill and run tools")]
+async fn mcp_tool_list_includes_the_surface(world: &mut BddWorld) {
+    let listed = world.mcp_request("tools/list", serde_json::json!({})).await;
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tools in {listed}"))
+        .clone();
+    world.mcp_tools = tools
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    for expected in [
+        "forge_graph_context",
+        "forge_graph_map",
+        "forge_skill_list",
+        "forge_run",
+        "forge_run_input",
+    ] {
+        assert!(
+            world.mcp_tools.iter().any(|name| name == expected),
+            "{expected} missing from {:?}",
+            world.mcp_tools
+        );
+    }
+}
+
+#[then(expr = "calling {string} over MCP returns the project structure")]
+async fn mcp_tool_call_returns_structure(world: &mut BddWorld, tool: String) {
+    let called = world
+        .mcp_request(
+            "tools/call",
+            serde_json::json!({ "name": tool, "arguments": {} }),
+        )
+        .await;
+    let text = called["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content in {called}"))
+        .to_string();
+    let payload: serde_json::Value =
+        serde_json::from_str(&text).expect("tool result text is compact JSON");
+    assert!(
+        !payload["directories"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no directories in {payload}"))
+            .is_empty(),
+        "the graph map should list at least one directory: {payload}"
+    );
+}
+
+#[then("nothing but JSON-RPC reached stdout")]
+fn mcp_stdout_is_pure_protocol(world: &mut BddWorld) {
+    assert!(
+        !world.mcp_lines.is_empty(),
+        "expected protocol traffic on stdout"
+    );
+    for line in &world.mcp_lines {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("non-JSON line on stdout: {e}: {line:?}"));
+        assert_eq!(value["jsonrpc"], "2.0", "not a JSON-RPC message: {line}");
+    }
+}
