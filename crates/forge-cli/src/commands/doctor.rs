@@ -237,6 +237,10 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
 
         checks.push(needle_check(config).await);
         checks.push(jev_check(config));
+        checks.extend(credential_env_checks(config));
+        if let Some(check) = legacy_router_check(config) {
+            checks.push(check);
+        }
 
         // Reachability of http/laya routers (warn, never fail).
         if matches!(config.router.as_str(), "http" | "laya") {
@@ -624,6 +628,106 @@ fn jev_check(config: &forge_config::Config) -> Check {
     }
 }
 
+/// Every credential env var the *effective* configuration actually names,
+/// paired with the config key that named it. Only roles that can really be
+/// contacted are included: the active model's `key_env` (or the global
+/// `model_key_env`), and `router_key_env` when an `http`/`laya` router uses
+/// it. Names only — no value ever leaves this function.
+///
+/// **One owner per root cause.** Anything in a jev role — `router = "jev"`
+/// (which also resolves `router_key_env`) and needle's escalation tier — is
+/// [`jev_check`]'s alone: it already reports that credential with the
+/// endpoint and the `--local-only`/escalation semantics attached, and a
+/// second warn about the same unset variable is exactly the noise this
+/// check exists to remove.
+fn named_credential_envs(config: &forge_config::Config) -> Vec<(&'static str, String)> {
+    let mut named: Vec<(&'static str, String)> = Vec::new();
+
+    // The active model's env var: the entry's `key_env` wins over the
+    // global `model_key_env`, exactly as `model_from_config` resolves it.
+    // Mocks never authenticate, so naming a var for them is meaningless.
+    if !matches!(
+        config.model.as_str(),
+        "mock" | "mock-local" | "scripted-mock"
+    ) {
+        let entry_key_env = config
+            .models
+            .get(&config.model)
+            .and_then(|e| e.key_env.clone());
+        match entry_key_env {
+            Some(name) => named.push(("[models] key_env", name)),
+            None => {
+                if let Some(name) = config.model_key_env.clone() {
+                    named.push(("model_key_env", name));
+                }
+            }
+        }
+    }
+
+    // `router = "jev"` deliberately absent: that role's credential (which
+    // may itself be `router_key_env`) belongs to `jev_check`.
+    if matches!(config.router.as_str(), "http" | "laya")
+        && let Some(name) = config.router_key_env.clone()
+    {
+        named.push(("router_key_env", name));
+    }
+    named
+}
+
+/// Config-vs-environment mismatch: a credential env var the configuration
+/// names but the environment does not provide. This is the exact shape of
+/// the reported first-run failure — `model_key_env = "OMLX_API_KEY"` with
+/// `OMLX_API_KEY` unset — where every individual check passed and nothing
+/// said which two edits would fix it. Warn, never Fail: an unauthenticated
+/// request may well succeed against a local server.
+fn credential_env_checks(config: &forge_config::Config) -> Vec<Check> {
+    named_credential_envs(config)
+        .into_iter()
+        .map(|(config_key, env_name)| {
+            let set = std::env::var(&env_name).is_ok_and(|v| !v.trim().is_empty());
+            if set {
+                Check {
+                    level: Level::Ok,
+                    label: "credential env".into(),
+                    detail: format!("{config_key} names {env_name} and it is set"),
+                }
+            } else {
+                // Both halves, for every key: a self-hosted endpoint can be
+                // keyless whether it serves models (oMLX with auth off) or
+                // routing decisions (a local laya adapter, a self-hosted
+                // OpenJev), so "delete the line" is a real fix in every
+                // case, not just for model credentials.
+                Check {
+                    level: Level::Warn,
+                    label: "credential env".into(),
+                    detail: format!(
+                        "{config_key} names {env_name} but it is not set — \
+                         export {env_name}=... or remove {config_key} if the \
+                         endpoint needs no key"
+                    ),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Settings that used to be right and now silently cost the user the
+/// built-in default. Config-only (no network): the `router endpoint` check
+/// above already probes reachability when it applies.
+fn legacy_router_check(config: &forge_config::Config) -> Option<Check> {
+    if config.router != "laya" {
+        return None;
+    }
+    Some(Check {
+        level: Level::Warn,
+        label: "legacy config".into(),
+        detail: "laya is no longer the default; the embedded needle brain is \
+                 (delete the router line to use it) — keep laya by running: \
+                 forge router serve"
+            .into(),
+    })
+}
+
 fn router_note(router: &str) -> &'static str {
     match router {
         "needle" => "embedded on-device Needle 3 decisions, available offline",
@@ -902,6 +1006,228 @@ mod tests {
             "escalation must never surface the generic router_url/router_key_env: {}",
             check.detail
         );
+    }
+
+    // --- credential env mismatches ---
+
+    /// The reported failure, verbatim shape: `model_key_env` names a var
+    /// the shell does not have. The message has to carry both fixes.
+    #[test]
+    #[serial]
+    fn credential_env_warns_when_model_key_env_is_unset() {
+        unsafe { std::env::remove_var("OMLX_API_KEY") };
+        let config = forge_config::Config {
+            model: "Qwen3-Coder-Next-4bit".to_string(),
+            model_key_env: Some("OMLX_API_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        let checks = credential_env_checks(&config);
+        assert_eq!(checks.len(), 1, "{:?}", checks[0].detail);
+        assert_eq!(checks[0].level, Level::Warn);
+        assert_eq!(
+            checks[0].detail,
+            "model_key_env names OMLX_API_KEY but it is not set — \
+             export OMLX_API_KEY=... or remove model_key_env if the endpoint needs no key"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn credential_env_is_ok_when_the_named_var_is_set() {
+        unsafe { std::env::set_var("OMLX_API_KEY", "dummy-value-for-test") };
+        let config = forge_config::Config {
+            model: "Qwen3-Coder-Next-4bit".to_string(),
+            model_key_env: Some("OMLX_API_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        let checks = credential_env_checks(&config);
+        unsafe { std::env::remove_var("OMLX_API_KEY") };
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::Ok);
+        assert!(
+            checks[0].detail.contains("it is set"),
+            "{}",
+            checks[0].detail
+        );
+        // Never the value, only the name.
+        assert!(!checks[0].detail.contains("dummy-value-for-test"));
+    }
+
+    /// An empty value is as broken as an unset one (`export FOO=` is a
+    /// common way to end up here) and must not read as healthy.
+    #[test]
+    #[serial]
+    fn credential_env_treats_empty_value_as_unset() {
+        unsafe { std::env::set_var("OMLX_API_KEY", "   ") };
+        let config = forge_config::Config {
+            model_key_env: Some("OMLX_API_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        let checks = credential_env_checks(&config);
+        unsafe { std::env::remove_var("OMLX_API_KEY") };
+        assert_eq!(checks[0].level, Level::Warn);
+    }
+
+    /// The active `[models]` entry's own `key_env` wins over the global
+    /// `model_key_env` — same resolution order `model_from_config` uses, so
+    /// doctor reports the var that will actually be read.
+    #[test]
+    #[serial]
+    fn credential_env_prefers_the_active_model_entrys_key_env() {
+        unsafe { std::env::remove_var("ENTRY_KEY") };
+        unsafe { std::env::remove_var("GLOBAL_KEY") };
+        let mut config = forge_config::Config {
+            model: "deepseek-chat".to_string(),
+            model_key_env: Some("GLOBAL_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        if let Some(entry) = config.models.get_mut("deepseek-chat") {
+            entry.key_env = Some("ENTRY_KEY".to_string());
+        }
+        let checks = credential_env_checks(&config);
+        assert_eq!(checks.len(), 1, "{:?}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("ENTRY_KEY"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(
+            !checks[0].detail.contains("GLOBAL_KEY"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    /// Only *active* roles are reported: a leftover `router_key_env` from
+    /// an http/laya setup names no credential the default needle stack will
+    /// ever read, so warning about it would be noise.
+    #[test]
+    #[serial]
+    fn credential_env_ignores_router_key_env_when_that_router_is_inactive() {
+        unsafe { std::env::remove_var("LEFTOVER_ROUTER_KEY") };
+        let config = forge_config::Config {
+            router: "needle".to_string(),
+            router_key_env: Some("LEFTOVER_ROUTER_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        assert!(credential_env_checks(&config).is_empty());
+
+        // ...and reports it once that router is the active one.
+        let config = forge_config::Config {
+            router: "laya".to_string(),
+            router_key_env: Some("LEFTOVER_ROUTER_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        let checks = credential_env_checks(&config);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::Warn);
+        // A self-hosted laya adapter can be keyless too, so the router key
+        // gets the same "or delete the line" alternative as a model key.
+        assert_eq!(
+            checks[0].detail,
+            "router_key_env names LEFTOVER_ROUTER_KEY but it is not set — \
+             export LEFTOVER_ROUTER_KEY=... or remove router_key_env if the endpoint needs no key"
+        );
+    }
+
+    /// One owner per root cause: `jev_check` reports jev's credential in
+    /// both roles (with endpoint and escalation semantics attached), so
+    /// `credential_env_checks` must stay out of it — otherwise one unset
+    /// variable produces two warns, which is the noise this batch fights.
+    #[test]
+    #[serial]
+    fn jev_credentials_are_reported_once_by_jev_check_only() {
+        unsafe { std::env::remove_var("MY_JEV_KEY") };
+
+        // Primary role: jev_check warns, and it is the *only* warn.
+        let primary = forge_config::Config {
+            router: "jev".to_string(),
+            jev_key_env: Some("MY_JEV_KEY".to_string()),
+            // A primary jev also resolves `router_key_env`; that is
+            // jev_check's business too, so it must not double up here.
+            router_key_env: Some("MY_JEV_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        let mut checks = vec![jev_check(&primary)];
+        checks.extend(credential_env_checks(&primary));
+        let warns: Vec<&Check> = checks
+            .iter()
+            .filter(|c| c.level == Level::Warn && c.detail.contains("MY_JEV_KEY"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one warn per root cause: {:?}",
+            checks.iter().map(|c| &c.detail).collect::<Vec<_>>()
+        );
+        assert_eq!(warns[0].label, "jev");
+
+        // Escalation role: jev_check reports it informationally (Ok), and
+        // credential_env_checks still adds nothing.
+        let escalating = forge_config::Config {
+            jev_key_env: Some("MY_JEV_KEY".to_string()),
+            ..forge_config::Config::default() // router = needle, escalate = auto
+        };
+        assert_eq!(jev_check(&escalating).level, Level::Ok);
+        assert!(
+            credential_env_checks(&escalating).is_empty(),
+            "jev's credential is jev_check's to report, in either role"
+        );
+    }
+
+    /// Mocks never authenticate: naming a credential var for them is not a
+    /// mismatch worth a warning.
+    #[test]
+    #[serial]
+    fn credential_env_skips_mock_models() {
+        unsafe { std::env::remove_var("OMLX_API_KEY") };
+        let config = forge_config::Config {
+            model: "mock-local".to_string(),
+            model_key_env: Some("OMLX_API_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        assert!(credential_env_checks(&config).is_empty());
+    }
+
+    // --- legacy router setting ---
+
+    #[test]
+    fn legacy_router_check_flags_configured_laya_with_both_fixes() {
+        let config = forge_config::Config {
+            router: "laya".to_string(),
+            ..forge_config::Config::default()
+        };
+        let check = legacy_router_check(&config).expect("laya is flagged");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("no longer the default"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("delete the router line"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("forge router serve"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn legacy_router_check_is_silent_for_every_current_router() {
+        for router in ["needle", "static", "cheapest", "mock", "http", "jev"] {
+            let config = forge_config::Config {
+                router: router.to_string(),
+                ..forge_config::Config::default()
+            };
+            assert!(
+                legacy_router_check(&config).is_none(),
+                "{router} must not be flagged as legacy"
+            );
+        }
     }
 
     #[test]

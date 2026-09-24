@@ -63,48 +63,133 @@ Release assets are built by CI for every `v*` tag (see
 
 ## Quickstart
 
-The default stack routes on-device: embedded Needle 3 → a real local model
-via oMLX — no mock anywhere in the default path, no separate router process
-to start.
-
-Prereqs: an OpenAI-compatible server running `qwen3-coder` at
-`http://127.0.0.1:8080/v1` (oMLX or compatible). After
-[installing](#installation) (or with `cargo build --release` and
-`./target/release/forge` in place of `forge`):
+### Three commands to a working agent
 
 ```bash
-cd /path/to/your/project
-forge init                     # creates .forge/, starter config, gitignore entry, builds graph, fetches Needle weights
-forge doctor                   # probes model + router endpoints and the embedded needle brain (weights, load, decision latency), warns if down
-forge run "Explain this project"
-forge serve                    # REST/SSE on http://127.0.0.1:7341
-curl http://127.0.0.1:7341/health
+curl -fsSL https://raw.githubusercontent.com/auser/forge/main/install.sh | bash   # 1. install
+cd /path/to/your/project && forge init                                            # 2. set up
+forge run "Explain this project"                                                  # 3. go
 ```
 
-No GPU, no accounts, just evaluating? The mock is one explicit flag away:
+What each does:
+
+1. **install** — one static binary into `~/.local/bin` (see
+   [Installation](#installation) for Cargo/local-checkout variants).
+2. **`forge init`** — writes `.forge/config.toml` (starter config: local
+   model + embedded on-device router), builds the project graph at
+   `.forge/graph/` (deterministic, no model calls), adds `.forge/` to
+   `.gitignore`, and on builds with the `needle-ffi` feature fetches +
+   checksum-verifies the ~35 MB brain weights into `~/.cache/forge/models/`.
+   Idempotent — safe to re-run any time.
+3. **`forge run "…"`** — the multi-turn agent loop against whatever model
+   you picked below.
+
+Then, any time something looks wrong: **`forge doctor`** — it probes the
+model endpoint, the router, the embedded brain, and every credential env
+var your config names, and tells you which line to change.
+
+### Pick your model (10 seconds)
+
+Exactly one of these, whichever you already have:
+
+**(a) A local server you already run** — Ollama, LM Studio, llama.cpp, oMLX:
+
+```toml
+# .forge/config.toml
+model = "qwen3-coder"                          # the name your server serves
+model_base_url = "http://127.0.0.1:8080/v1"    # include the /v1 prefix
+# model_key_env = "MY_API_KEY"   # ONLY if your server requires a key
+```
+
+Add `model_key_env` **only** if your server actually demands a key: it names
+an env var, never holds a key, and naming one that is unset is the single
+most common first-run failure.
+
+**(b) A subscription you already pay for** — Claude:
+
+```bash
+claude login      # once; forge picks up the stored token automatically
+forge --model claude-sonnet run "Explain this project"
+```
+
+Nothing to configure: the `claude-sonnet` entry ships built in, and
+`forge auth status` shows what was detected (never any values).
+
+**(c) An API key** — DeepSeek, Moonshot, OpenAI, …:
+
+```bash
+echo 'DEEPSEEK_API_KEY=sk-...' >> .env    # loaded at startup, redacted from logs
+forge --model deepseek-chat run "Explain this project"
+```
+
+`forge init` reports the keys it found by name; built-in `[models]` entries
+exist for `deepseek-chat`, `kimi-k2.7-code`, `gpt-5`, and `claude-sonnet`.
+
+**Just evaluating?** No GPU, no accounts, no server — one flag:
 
 ```bash
 forge --model mock-local --router static run "Explain this project"
 ```
 
-`forge init` fetches and verifies Needle's weights when `needle.autofetch`
-is on (the default) — a one-time ~35 MB download for `needle.variant = "full"`
-(the only variant with a hosted, pinned artifact today; `small`/`medium`
-report "no pinned weights artifact" and fall back to static routing),
-cached under `~/.cache/forge/models/`; re-running `init`
-re-verifies the checksum and skips the download if it already matches.
-Whenever weights aren't present (no network, `--local-only`, or a variant
-with nothing to fetch yet — see below), routing falls back to deterministic
-static routing (`fallback_used: true` in the events) and the run proceeds
-with the configured model; this is a fully supported, fully offline mode,
-not a degraded one. To point at a different endpoint or use an API
-key, override per project:
+### Troubleshooting
 
-```toml
-# .forge/config.toml
-model_base_url = "http://127.0.0.1:8080/v1"   # include the /v1 prefix
-model_key_env = "MY_API_KEY"   # name of the env var, never the key itself
+`forge doctor` is always the first move — it names the config line to change.
+`forge version` is the second, if the installed binary might be stale.
+
+**`no credential found for model …` then `401 Unauthorized: API key required`**
+
+```text
+WARN no credential found for model Qwen3-Coder-Next-4bit; tried env vars and CLI credential
+     stores (see `forge auth status`) — hint: set OMLX_API_KEY in your shell or .env, or
+     remove model_key_env if the endpoint needs no key
+error: model provider error: model endpoint http://127.0.0.1:8080/v1/chat/completions
+       returned 401 Unauthorized: {"error":{"message":"API key required",...}} — hint: set
+       OMLX_API_KEY in your shell or .env, or remove model_key_env if the endpoint needs no key
 ```
+
+Cause: your config names a key env var (`model_key_env`, or `key_env` on the
+active `[models]` entry) that is unset, so requests go out unauthenticated.
+Two fixes, pick the one that's true:
+
+```bash
+export OMLX_API_KEY=...                       # the server does want a key
+# or delete the `model_key_env` line          # the server wants none
+```
+
+**`primary router failed; using fallback … laya router endpoint … returned 500`**
+
+```text
+WARN primary router failed; using fallback error=router error: laya router endpoint
+     http://127.0.0.1:8788/decide returned 500 Internal Server Error — hint: laya is
+     no longer the default — delete the `router` line to use the embedded needle brain,
+     or run `forge router serve` to serve laya
+```
+
+Cause: `router = "laya"` is a legacy setting — the default is now the
+embedded needle brain, and nothing is serving the laya endpoint. The run
+still worked (the fallback is by design), but you're paying a failed request
+per decision. Two fixes:
+
+```bash
+# delete the `router = "laya"` line from .forge/config.toml   # use the built-in brain
+forge router serve                                            # or keep laya, and serve it
+```
+
+**`[models.x] has model_base_url, which does nothing inside a model entry`** —
+inside a `[models.<name>]` entry the fields are `base_url` and `key_env`; the
+`model_`-prefixed spellings are top-level keys only. Rename them.
+
+**Weights/brain notes.** `forge init` fetches and verifies Needle's weights
+when `needle.autofetch` is on (the default) and the build has the
+`needle-ffi` feature — a one-time ~35 MB download for `needle.variant =
+"full"` (the only variant with a hosted, pinned artifact today;
+`small`/`medium` report "no pinned weights artifact"), cached under
+`~/.cache/forge/models/`; re-running `init` re-verifies the checksum and
+skips the download if it already matches. Whenever weights aren't present
+(no network, `--local-only`, a prebuilt binary without `needle-ffi`, or a
+variant with nothing to fetch), routing falls back to deterministic static
+routing (`fallback_used: true` in the events) and the run proceeds with the
+configured model — a fully supported, fully offline mode, not a degraded one.
 
 ### Drop-in setup for existing projects
 
@@ -129,12 +214,15 @@ Forge ships ready-made config presets — copy one into `.forge/config.toml`
 (or `~/.config/forge/config.toml` for all projects) and you're done:
 
 ```bash
-cp configs/hybrid-laya.toml .forge/config.toml   # from the repo's examples/
+cp examples/configs/local-first.toml .forge/config.toml
 ```
 
-See [`examples/`](examples/) for `local-first`, `hybrid-laya`,
-`budget-hosted`, and `offline-eval` presets plus an `env.example` template
-for provider keys.
+See [`examples/configs/`](examples/configs/) for `local-first` (the default
+stack, made explicit), `hybrid-needle` (local first, hosted escalation),
+`budget-hosted`, `offline-eval`, and `hybrid-laya` (the Laya-adapter
+example) presets, plus an [`env.example`](examples/env.example) template for
+provider keys. A unit test parses every preset against the current config
+schema, so a preset never drifts out of date.
 
 ## Usage
 
@@ -275,7 +363,12 @@ Key settings (all optional):
 | `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~35 MB for `full`) |
 | `needle.weights_sha256` | — | `FORGE_NEEDLE_WEIGHTS_SHA256` | Operator override for the expected weights checksum (64 hex chars); empty → use the compiled-in pin. Pairs with `weights_path`/a custom base URL to run your own weights without recompiling |
 
-Unknown keys are tolerated. Inspect the resolved configuration:
+Unknown keys are tolerated, with one deliberate exception: inside a
+`[models.<name>]` entry, `model_base_url`/`model_key_env` are rejected by
+name (they are top-level keys; the in-entry fields are `base_url`/`key_env`).
+Tolerating them would mean an endpoint that silently never applies.
+
+Inspect the resolved configuration:
 
 ```bash
 forge config show            # merged effective config
@@ -343,7 +436,11 @@ These are the three pluggable seams (traits in `forge-core`).
 The default is `qwen3-coder` via the OpenAI-compatible endpoint at
 `model_base_url` (oMLX convention). `mock` (offline, deterministic) and
 `scripted-mock` (JSON-scripted replies incl. tool calls) exist for tests,
-demos, and CI — always explicitly requested. Capabilities (streaming, tools,
+demos, and CI — always explicitly requested. The mock's reply is exactly
+`mock response to: <prompt>`; set `FORGE_MOCK_VERBOSE=1` to have it also
+echo a 120-character snippet of the assembled system context (skill
+instructions, graph context) when you want that plumbing visible.
+Capabilities (streaming, tools,
 structured output, vision, context size) are explicit per provider, never
 assumed; a provider without `tools` receives single-turn requests only.
 
@@ -454,8 +551,11 @@ built-ins prefers the free local model unless it's capability-ineligible.
 ### Laya via the reference adapter
 
 Laya (open-source System One decision model) is a Python SDK with no official
-server. The easiest way to run it is built into Forge (the adapter script is
-embedded in the binary — no repo checkout needed):
+server. It is **not** the default any more — the embedded needle brain is —
+so `router = "laya"` always needs a process serving the endpoint, and
+`forge init`/`forge doctor` both flag the setting if they find it. The
+easiest way to run it is built into Forge (the adapter script is embedded in
+the binary — no repo checkout needed):
 
 ```bash
 pip install laya
@@ -772,7 +872,7 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 20 features / 38 scenarios / 141 steps.
+  mock providers — fully offline. Currently 22 features / 43 scenarios / 160 steps.
 - Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
   `just verify` — they need a native engine and real weights. See [Embedded
   Needle brain (`ffi`)](#embedded-needle-brain-ffi).

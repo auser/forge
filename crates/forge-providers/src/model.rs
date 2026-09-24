@@ -10,9 +10,20 @@ use serde::Serialize;
 
 use crate::scripted::ScriptedMockModel;
 
-/// Deterministic offline model. Echoes the last user message and records
-/// every request for assertions. Capabilities are configurable so tests
-/// can build restricted variants.
+/// Env var that turns the mock's system-context echo back on.
+const MOCK_VERBOSE_ENV: &str = "FORGE_MOCK_VERBOSE";
+
+/// Deterministic offline model. Replies `mock response to: <prompt>` and
+/// records every request for assertions. Capabilities are configurable so
+/// tests can build restricted variants.
+///
+/// The reply is deliberately clean: `forge --model mock-local run ...` is
+/// the zero-setup first impression, and echoing the assembled system
+/// context (skill instructions, graph context) into it made that output
+/// look like a leak. Set `FORGE_MOCK_VERBOSE=1` to append
+/// `(system context: <first 120 chars>)` when you need context plumbing
+/// visible in a reply; tests that own the provider should prefer
+/// [`MockModel::recorded`], which shows the whole request, untruncated.
 pub struct MockModel {
     name: String,
     capabilities: ModelCapabilities,
@@ -77,15 +88,19 @@ impl ModelProvider for MockModel {
             .find(|m| m.role == forge_core::Role::User)
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        // Echo a snippet of any system context (e.g. activated skill
-        // instructions) so context plumbing is observable in tests.
-        let system: String = request
-            .messages
-            .iter()
-            .filter(|m| m.role == forge_core::Role::System)
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Opt-in only (see the type docs): echoing the assembled system
+        // context turns the one zero-setup command into a wall of internals.
+        let system: String = if mock_verbose() {
+            request
+                .messages
+                .iter()
+                .filter(|m| m.role == forge_core::Role::System)
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
         self.requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -110,6 +125,15 @@ impl ModelProvider for MockModel {
     }
 }
 
+/// Whether the mock should append its system-context snippet. Anything but
+/// unset/empty/`0`/`false` counts as on.
+fn mock_verbose() -> bool {
+    match std::env::var(MOCK_VERBOSE_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false"),
+        Err(_) => false,
+    }
+}
+
 /// Enforce the capability contract: providers without `tools` must reject
 /// tool-bearing requests with a typed error.
 pub(crate) fn reject_tools_without_capability(
@@ -126,6 +150,33 @@ pub(crate) fn reject_tools_without_capability(
     Ok(())
 }
 
+/// The config field that named a credential env var, so the "remove it"
+/// half of a hint points at a line that actually exists in the user's file.
+pub(crate) const FIELD_MODEL_KEY_ENV: &str = "model_key_env";
+/// `[models.<name>] key_env` named it, not the top-level `model_key_env`.
+pub(crate) const FIELD_ENTRY_KEY_ENV: &str = "the model entry's key_env";
+
+/// The one-line fix for a credential problem, safe to print anywhere: it
+/// names the env var the configuration points at, never a value.
+///
+/// Both halves of the real-world failure need saying, because either can
+/// be the actual mistake: the config names `OMLX_API_KEY` and the shell
+/// doesn't have it (export it), or the endpoint never wanted a key at all
+/// and the setting is leftover (delete it). `config_field` is which line to
+/// delete — telling someone to remove `model_key_env` when their key came
+/// from a `[models]` entry sends them looking for a line that isn't there.
+pub(crate) fn credential_hint(key_env: Option<&str>, config_field: &str) -> String {
+    match key_env {
+        Some(name) => format!(
+            "hint: set {name} in your shell or .env, or remove {config_field} \
+             if the endpoint needs no key"
+        ),
+        None => "hint: no model_key_env is configured; set model_key_env = \"<ENV_VAR>\" \
+                 (and export that variable) if this endpoint requires a key"
+            .to_string(),
+    }
+}
+
 /// OpenAI-compatible chat-completions client (works with oMLX and other
 /// compatible servers). Holds a resolved credential (never logged); when
 /// none was found, requests go out unauthenticated with a one-time warn.
@@ -135,6 +186,11 @@ pub struct OpenAiCompatibleModel {
     model: String,
     credential: Option<crate::credentials::ResolvedCredential>,
     capabilities: ModelCapabilities,
+    /// Name of the env var the config expects the key in (never a value),
+    /// carried purely so credential warnings and 401s can name the fix.
+    key_env: Option<String>,
+    /// Which config field named `key_env` (see [`credential_hint`]).
+    key_env_field: &'static str,
 }
 
 impl OpenAiCompatibleModel {
@@ -155,7 +211,18 @@ impl OpenAiCompatibleModel {
             model: model.into(),
             credential,
             capabilities,
+            key_env: None,
+            key_env_field: FIELD_MODEL_KEY_ENV,
         })
+    }
+
+    /// Record the env var name the configuration expects the key in, and
+    /// which config field named it, so credential warnings and 401 errors
+    /// can spell out the fix. Names only — the value never travels here.
+    pub fn with_key_env(mut self, key_env: Option<String>, config_field: &'static str) -> Self {
+        self.key_env = key_env;
+        self.key_env_field = config_field;
+        self
     }
 }
 
@@ -278,11 +345,12 @@ impl ModelProvider for OpenAiCompatibleModel {
             Some(credential) => http = http.bearer_auth(&credential.secret),
             // No credential resolved: send unauthenticated but warn loudly
             // — this is the classic silent-401 cause. Sources only, never
-            // values.
+            // values, plus the exact fix.
             None => tracing::warn!(
                 "no credential resolved for model {}; requests will be sent \
-                 without authentication (see `forge auth status`)",
-                self.model
+                 without authentication (see `forge auth status`) — {}",
+                self.model,
+                credential_hint(self.key_env.as_deref(), self.key_env_field)
             ),
         }
 
@@ -302,8 +370,19 @@ impl ModelProvider for OpenAiCompatibleModel {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            // 401/403 from the model endpoint is the one failure whose fix
+            // is always a credential, so say which env var to set right
+            // here rather than making the user go find `forge auth status`.
+            let suffix = if matches!(status.as_u16(), 401 | 403) {
+                format!(
+                    " — {}",
+                    credential_hint(self.key_env.as_deref(), self.key_env_field)
+                )
+            } else {
+                String::new()
+            };
             return Err(ForgeError::provider(format!(
-                "model endpoint {url} returned {status}: {text}"
+                "model endpoint {url} returned {status}: {text}{suffix}"
             )));
         }
         let body: serde_json::Value = response
@@ -443,21 +522,26 @@ pub fn model_from_config(
             let hint = entry
                 .and_then(|e| e.provider.clone())
                 .or_else(|| infer_provider_hint(&base_url));
-            let key_env = entry
-                .and_then(|e| e.key_env.clone())
-                .or_else(|| config.model_key_env.clone());
+            // Which config line named the key env var, so credential hints
+            // can tell the user what to delete without sending them after a
+            // line that isn't in their file.
+            let (key_env, key_env_field) = match entry.and_then(|e| e.key_env.clone()) {
+                Some(name) => (Some(name), FIELD_ENTRY_KEY_ENV),
+                None => (config.model_key_env.clone(), FIELD_MODEL_KEY_ENV),
+            };
 
             if hint.as_deref() == Some("anthropic") {
-                let credential = crate::credentials::resolve_credential(
-                    key_env.as_deref(),
-                    Some("anthropic"),
-                )
-                .ok_or_else(|| {
-                    ForgeError::provider(format!(
-                        "no credential for anthropic model {name:?}; tried {key_env_display},                          CLAUDE_CODE_OAUTH_TOKEN, ~/.claude/.credentials.json                          (see `forge auth status`)",
-                        key_env_display = key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY")
-                    ))
-                })?;
+                let credential =
+                    crate::credentials::resolve_credential(key_env.as_deref(), Some("anthropic"))
+                        .ok_or_else(|| {
+                        ForgeError::provider(format!(
+                            "no credential for anthropic model {name:?}; tried {key_env_display}, \
+                         CLAUDE_CODE_OAUTH_TOKEN, ~/.claude/.credentials.json \
+                         (see `forge auth status`) — {hint}, or run `claude login`",
+                            key_env_display = key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY"),
+                            hint = credential_hint(key_env.as_deref(), key_env_field)
+                        ))
+                    })?;
                 let base = entry
                     .and_then(|e| e.base_url.clone())
                     .unwrap_or_else(|| base_url.clone());
@@ -475,16 +559,21 @@ pub fn model_from_config(
                 crate::credentials::resolve_credential(key_env.as_deref(), hint.as_deref());
             if credential.is_none() && key_env.is_some() {
                 tracing::warn!(
-                    "no credential found for model {name}; tried env vars and CLI                      credential stores (see `forge auth status`)"
+                    "no credential found for model {name}; tried env vars and CLI \
+                     credential stores (see `forge auth status`) — {}",
+                    credential_hint(key_env.as_deref(), key_env_field)
                 );
             }
-            Ok(Arc::new(OpenAiCompatibleModel::new(
-                base_url,
-                name,
-                credential,
-                capabilities,
-                Duration::from_secs(120),
-            )?))
+            Ok(Arc::new(
+                OpenAiCompatibleModel::new(
+                    base_url,
+                    name,
+                    credential,
+                    capabilities,
+                    Duration::from_secs(120),
+                )?
+                .with_key_env(key_env, key_env_field),
+            ))
         }
     }
 }
@@ -505,6 +594,7 @@ fn infer_provider_hint(base_url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use forge_core::Message;
+    use serial_test::serial;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -526,6 +616,68 @@ mod tests {
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
         assert_eq!(model.recorded().len(), 1);
         assert!(model.capabilities().tools);
+    }
+
+    /// The zero-setup first impression must stay clean: no assembled
+    /// system context (skill instructions, graph context) in the reply,
+    /// even when the request carries plenty of it. The request itself is
+    /// still fully inspectable via `recorded()`.
+    #[tokio::test]
+    #[serial]
+    async fn mock_model_reply_omits_system_context_by_default() {
+        // SAFETY: test-only env mutation, serialized against the other
+        // FORGE_MOCK_VERBOSE test via #[serial].
+        unsafe { std::env::remove_var(MOCK_VERBOSE_ENV) };
+        let model = MockModel::new();
+        let response = model
+            .complete(CompletionRequest::new(
+                "mock-local",
+                vec![
+                    Message::system("Active skill `find-skills` instructions: # Find Skills"),
+                    Message::user("Explain this project"),
+                ],
+            ))
+            .await
+            .expect("mock completes");
+
+        assert_eq!(response.content, "mock response to: Explain this project");
+        // The context still reached the provider — it just isn't echoed.
+        let recorded = model.recorded();
+        assert!(
+            recorded[0]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("find-skills")),
+            "the system context must still reach the model: {:?}",
+            recorded[0].messages
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mock_model_echoes_system_context_when_verbose_env_is_set() {
+        // SAFETY: test-only env mutation, serialized via #[serial].
+        unsafe { std::env::set_var(MOCK_VERBOSE_ENV, "1") };
+        let model = MockModel::new();
+        let response = model
+            .complete(CompletionRequest::new(
+                "mock-local",
+                vec![
+                    Message::system("skill instructions here"),
+                    Message::user("hi"),
+                ],
+            ))
+            .await
+            .expect("mock completes");
+        unsafe { std::env::remove_var(MOCK_VERBOSE_ENV) };
+
+        assert!(
+            response
+                .content
+                .contains("system context: skill instructions here"),
+            "content: {}",
+            response.content
+        );
     }
 
     #[tokio::test]
@@ -641,6 +793,186 @@ mod tests {
             }
             other => panic!("expected provider error, got {other:?}"),
         }
+    }
+
+    /// The real-world failure: a config naming `OMLX_API_KEY`, the var
+    /// unset, and a local server that wants a key. The 401 has to carry
+    /// both fixes, and never the key itself.
+    #[tokio::test]
+    async fn unauthorized_error_names_the_key_env_var_to_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"error":{"message":"API key required"}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let model = OpenAiCompatibleModel::new(
+            server.uri(),
+            "Qwen3-Coder-Next-4bit",
+            None,
+            ModelCapabilities::default(),
+            Duration::from_secs(5),
+        )
+        .expect("construct")
+        .with_key_env(Some("OMLX_API_KEY".to_string()), FIELD_MODEL_KEY_ENV);
+
+        let err = model
+            .complete(CompletionRequest::new("m", vec![Message::user("x")]))
+            .await
+            .expect_err("401 must fail");
+        let ForgeError::Provider(msg) = err else {
+            panic!("expected a provider error");
+        };
+        assert!(msg.contains("401"), "msg: {msg}");
+        assert!(msg.contains("OMLX_API_KEY"), "msg: {msg}");
+        assert!(msg.contains("remove model_key_env"), "msg: {msg}");
+    }
+
+    /// A 401 with no `model_key_env` configured at all is the other half:
+    /// the fix is to name one, so the hint says so.
+    #[tokio::test]
+    async fn unauthorized_error_without_key_env_says_how_to_configure_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .mount(&server)
+            .await;
+
+        let model = OpenAiCompatibleModel::new(
+            server.uri(),
+            "m",
+            None,
+            ModelCapabilities::default(),
+            Duration::from_secs(5),
+        )
+        .expect("construct");
+        let err = model
+            .complete(CompletionRequest::new("m", vec![Message::user("x")]))
+            .await
+            .expect_err("401 must fail");
+        let ForgeError::Provider(msg) = err else {
+            panic!("expected a provider error");
+        };
+        assert!(msg.contains("model_key_env"), "msg: {msg}");
+    }
+
+    /// Non-credential failures must not acquire a credential hint — a 500
+    /// is not fixed by exporting a key.
+    #[tokio::test]
+    async fn non_auth_http_error_carries_no_credential_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let model = OpenAiCompatibleModel::new(
+            server.uri(),
+            "m",
+            None,
+            ModelCapabilities::default(),
+            Duration::from_secs(5),
+        )
+        .expect("construct")
+        .with_key_env(Some("OMLX_API_KEY".to_string()), FIELD_MODEL_KEY_ENV);
+        let err = model
+            .complete(CompletionRequest::new("m", vec![Message::user("x")]))
+            .await
+            .expect_err("500 must fail");
+        let ForgeError::Provider(msg) = err else {
+            panic!("expected a provider error");
+        };
+        assert!(!msg.contains("hint:"), "msg: {msg}");
+    }
+
+    #[test]
+    fn credential_hint_names_the_env_var_and_both_fixes() {
+        let hint = credential_hint(Some("OMLX_API_KEY"), FIELD_MODEL_KEY_ENV);
+        assert!(hint.starts_with("hint: set OMLX_API_KEY"), "hint: {hint}");
+        assert!(hint.contains(".env"), "hint: {hint}");
+        assert!(hint.contains("remove model_key_env"), "hint: {hint}");
+
+        let hint = credential_hint(None, FIELD_MODEL_KEY_ENV);
+        assert!(
+            hint.contains("no model_key_env is configured"),
+            "hint: {hint}"
+        );
+    }
+
+    /// End-to-end for the reported failure: `model_from_config` must hand
+    /// the configured env var name to the client, or the 401 hint above
+    /// can never fire in a real run.
+    #[tokio::test]
+    async fn model_from_config_propagates_key_env_into_the_401_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"error":{"message":"API key required"}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            model: "Qwen3-Coder-Next-4bit".to_string(),
+            model_base_url: Some(server.uri()),
+            model_key_env: Some("OMLX_API_KEY".to_string()),
+            ..Config::default()
+        };
+        let model = model_from_config(&config, std::path::Path::new(".")).expect("builds");
+        let err = model
+            .complete(CompletionRequest::new(
+                "Qwen3-Coder-Next-4bit",
+                vec![Message::user("Explain this project")],
+            ))
+            .await
+            .expect_err("401 must fail");
+        let ForgeError::Provider(msg) = err else {
+            panic!("expected a provider error");
+        };
+        assert!(msg.contains("OMLX_API_KEY"), "msg: {msg}");
+        assert!(msg.contains("remove model_key_env"), "msg: {msg}");
+    }
+
+    /// When the var came from a `[models]` entry, the hint must not tell the
+    /// user to delete `model_key_env` — there is no such line in their file.
+    #[tokio::test]
+    async fn key_env_from_a_models_entry_points_at_the_entry_not_model_key_env() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .mount(&server)
+            .await;
+
+        let mut config = Config {
+            model: "local-thing".to_string(),
+            model_base_url: Some(server.uri()),
+            ..Config::default()
+        };
+        config.models.insert(
+            "local-thing".to_string(),
+            forge_config::ModelEntry {
+                key_env: Some("ENTRY_ONLY_KEY".to_string()),
+                ..Default::default()
+            },
+        );
+        let model = model_from_config(&config, std::path::Path::new(".")).expect("builds");
+        let err = model
+            .complete(CompletionRequest::new(
+                "local-thing",
+                vec![Message::user("x")],
+            ))
+            .await
+            .expect_err("401 must fail");
+        let ForgeError::Provider(msg) = err else {
+            panic!("expected a provider error");
+        };
+        assert!(msg.contains("ENTRY_ONLY_KEY"), "msg: {msg}");
+        assert!(msg.contains("the model entry's key_env"), "msg: {msg}");
+        assert!(!msg.contains("remove model_key_env"), "msg: {msg}");
     }
 
     #[test]

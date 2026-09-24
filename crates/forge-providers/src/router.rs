@@ -396,6 +396,15 @@ pub(crate) fn optimistic_caps() -> ModelCapabilities {
     }
 }
 
+/// Appended to every "laya is not answering" error. `router = "laya"` is a
+/// pre-needle setting, so an unreachable adapter almost always means the
+/// config predates the embedded brain rather than that the adapter crashed
+/// — and the fallback hides that, leaving only this warn to explain itself.
+/// Shape-of-response errors deliberately do *not* get this hint: those mean
+/// laya IS running.
+const LAYA_LEGACY_HINT: &str = "hint: laya is no longer the default — delete the `router` line to use the embedded \
+     needle brain, or run `forge router serve` to serve laya";
+
 /// Laya router: System One-compatible HTTP router specialized for Laya's
 /// typed-questions shape. POSTs
 /// `{"state": {"task", "required_capabilities"}, "questions": {"model":
@@ -516,15 +525,21 @@ impl DecisionRouter for LayaRouter {
         }
         let response = http.send().await.map_err(|e| {
             if e.is_timeout() {
-                ForgeError::router(format!("laya router request to {} timed out", self.url))
+                ForgeError::router(format!(
+                    "laya router request to {} timed out — {LAYA_LEGACY_HINT}",
+                    self.url
+                ))
             } else {
-                ForgeError::router(format!("laya router request to {} failed: {e}", self.url))
+                ForgeError::router(format!(
+                    "laya router request to {} failed: {e} — {LAYA_LEGACY_HINT}",
+                    self.url
+                ))
             }
         })?;
         let status = response.status();
         if !status.is_success() {
             return Err(ForgeError::router(format!(
-                "laya router endpoint {} returned {status}",
+                "laya router endpoint {} returned {status} — {LAYA_LEGACY_HINT}",
                 self.url
             )));
         }
@@ -1898,9 +1913,57 @@ mod tests {
         };
         let err = router.route(&request).await.expect_err("unknown choice");
         match err {
-            ForgeError::Router(msg) => assert!(msg.contains("ghost"), "got: {msg}"),
+            ForgeError::Router(msg) => {
+                assert!(msg.contains("ghost"), "got: {msg}");
+                // Laya answered, so this is not a "laya is not the default
+                // any more" situation — no legacy hint here.
+                assert!(!msg.contains("no longer the default"), "got: {msg}");
+            }
             other => panic!("expected router error, got {other:?}"),
         }
+    }
+
+    /// The reported failure's other half: the laya endpoint 500s (or is
+    /// simply not there), the fallback silently absorbs it, and the only
+    /// thing the user ever sees is this warn — so it has to say that laya
+    /// stopped being the default and name both ways forward.
+    #[tokio::test]
+    async fn laya_transport_errors_carry_the_legacy_default_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let router = LayaRouter::new(
+            Some(server.uri()),
+            None,
+            Duration::from_secs(5),
+            std::collections::HashMap::new(),
+        )
+        .expect("construct");
+        let request = RoutingRequest::new("x");
+        let err = router.route(&request).await.expect_err("500 fails");
+        let ForgeError::Router(msg) = err else {
+            panic!("expected a router error");
+        };
+        assert!(msg.contains("500"), "got: {msg}");
+        assert!(msg.contains("no longer the default"), "got: {msg}");
+        assert!(msg.contains("forge router serve"), "got: {msg}");
+
+        // Same hint when nothing is listening at all.
+        let dead = LayaRouter::new(
+            Some("http://127.0.0.1:9".to_string()),
+            None,
+            Duration::from_millis(200),
+            std::collections::HashMap::new(),
+        )
+        .expect("construct");
+        let err = dead.route(&request).await.expect_err("unreachable fails");
+        let ForgeError::Router(msg) = err else {
+            panic!("expected a router error");
+        };
+        assert!(msg.contains("no longer the default"), "got: {msg}");
     }
 
     #[tokio::test]

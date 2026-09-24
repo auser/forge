@@ -1,17 +1,19 @@
-# Fully local, free: oMLX + Laya. This is Forge's built-in default stack,
-# made explicit so you can tune it. Nothing leaves your machine.
+# Fully local, free: your own model server + the embedded Needle brain.
+# This is Forge's built-in default stack, made explicit so you can tune it.
+# Nothing leaves your machine — no router process, no accounts, no keys.
 
 model = "qwen3-coder"
-model_base_url = "http://127.0.0.1:8080/v1"
-router = "laya"               # open-source System One router (forge router serve)
-router_fallback = "static"    # static rules if Laya is not running
+model_base_url = "http://127.0.0.1:8080/v1"   # oMLX / Ollama / LM Studio / llama.cpp
+# model_key_env = "MY_API_KEY"  # ONLY if your local server requires a key
+router = "needle"             # on-device decisions, no network calls
+router_fallback = "static"    # deterministic rules when weights aren't loaded
 execution = "native"
 approval = "prompt"
 local_only = true
 
-# Add more local models here as you install them; Laya picks per task.
+# Add more local models here as you install them; the router picks per task.
 # [models.qwen3-coder-30b]
 # description = "larger local coder for hard tasks"
-# base_url = "http://127.0.0.1:8080/v1"
+# base_url = "http://127.0.0.1:8080/v1"   # NOT model_base_url — that's top-level only
 # cost_input_per_mtok = 0.0
 # cost_output_per_mtok = 0.0

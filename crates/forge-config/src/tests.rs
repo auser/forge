@@ -492,3 +492,77 @@ fn router_escalate_env_override_and_explain() {
     let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
     assert!(matches!(err, ForgeError::Config(_)));
 }
+
+/// A `[models.<name>]` entry that spells the endpoint/key fields with
+/// their *top-level* names parses as TOML and then silently does nothing —
+/// the entry has no endpoint, and every request lands on whatever the
+/// global `model_base_url` says. That's a UX trap, so validation rejects
+/// it and names the field that was meant.
+#[test]
+fn model_entry_with_top_level_key_names_is_rejected_by_name() {
+    for (wrong, right) in WRONG_MODEL_ENTRY_KEYS {
+        let c: Config = toml::from_str(&format!(
+            "[models.my-model]\n{wrong} = \"whatever\"\ncost_input_per_mtok = 0.0\n"
+        ))
+        .expect("parses as TOML");
+        let err = c
+            .validate()
+            .expect_err("wrong key name must be rejected")
+            .to_string();
+        assert!(err.contains("my-model"), "err: {err}");
+        assert!(err.contains(wrong), "err must name the wrong key: {err}");
+        assert!(err.contains(right), "err must name the right key: {err}");
+    }
+}
+
+#[test]
+fn model_entry_with_correct_key_names_validates() {
+    let c: Config = toml::from_str(
+        "[models.my-model]\nbase_url = \"http://127.0.0.1:8080/v1\"\nkey_env = \"MY_KEY\"\n",
+    )
+    .expect("parses");
+    c.validate().expect("correct field names are valid");
+    let entry = c.models.get("my-model").expect("entry");
+    assert_eq!(entry.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+    assert_eq!(entry.key_env.as_deref(), Some("MY_KEY"));
+    assert!(entry.extra.is_empty(), "extra: {:?}", entry.extra);
+}
+
+/// Every shipped preset in `examples/configs/` must deserialize into the
+/// current `Config` and pass `validate()`. Presets are the copy-paste
+/// starting point for new users, so a preset that no longer matches the
+/// config shape is a first-run failure waiting to happen.
+#[test]
+fn every_shipped_preset_parses_and_validates() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("configs");
+    let mut seen = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("examples/configs is readable") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        seen += 1;
+        let text = std::fs::read_to_string(&path).expect("read preset");
+        let config: Config = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} does not parse as Config: {e}", path.display()));
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("{} fails validation: {e}", path.display()));
+        // Needle-era default: only the preset that is explicitly about the
+        // Laya adapter may still set `router = "laya"`.
+        let is_laya_preset = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.contains("laya"));
+        assert!(
+            config.router != "laya" || is_laya_preset,
+            "{} sets router = \"laya\" but is not the laya preset",
+            path.display()
+        );
+    }
+    assert!(seen >= 4, "expected the shipped presets, found {seen}");
+}

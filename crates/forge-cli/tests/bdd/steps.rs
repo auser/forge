@@ -417,6 +417,13 @@ fn skill_description_shown(world: &mut BddWorld) {
 #[when("a task matches the skill")]
 async fn task_matches_skill(world: &mut BddWorld) {
     world.set_config("model", "\"mock-local\"");
+    // The mock's reply is clean by default (the plain `forge run` first
+    // impression must not be a wall of internals); this scenario is
+    // specifically about the instructions reaching the model, so it opts
+    // into the echo rather than asserting less.
+    world
+        .env
+        .insert("FORGE_MOCK_VERBOSE".to_string(), "1".to_string());
     world.run_forge(&["run", "please run the demo"]).await;
 }
 
@@ -443,6 +450,29 @@ fn instructions_activated_and_logged(world: &mut BddWorld) {
         .find(|e| e["type"] == "skill_activated")
         .unwrap_or_else(|| panic!("no skill_activated in session log: {log}"));
     assert_eq!(event["name"], "demo");
+}
+
+#[when("a task matches the skill with default mock output")]
+async fn task_matches_skill_default_output(world: &mut BddWorld) {
+    world.set_config("model", "\"mock-local\"");
+    world.run_forge(&["run", "please run the demo"]).await;
+}
+
+#[then("the reply is exactly the mock response to the prompt")]
+fn reply_is_exactly_the_mock_response(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    assert_eq!(
+        world.last_stdout.trim(),
+        "mock response to: please run the demo",
+        "the mock reply must not carry system context: {}",
+        world.last_stdout
+    );
+    // The skill still activated — it is only the *reply* that stays clean.
+    let log = world.session_log();
+    assert!(
+        log.contains("skill_activated"),
+        "skill must still activate: {log}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1404,23 @@ fn doctor_output_mentions(world: &mut BddWorld, needle: String) {
         "stdout: {}",
         world.last_stdout
     );
+}
+
+// ---------------------------------------------------------------------------
+// first-run.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a project config sets the router to {string}")]
+fn project_config_sets_router(world: &mut BddWorld, router: String) {
+    world.set_config("router", &format!("\"{router}\""));
+}
+
+#[given(expr = "a project config names the model key env var {string}")]
+fn project_config_names_model_key_env(world: &mut BddWorld, env_name: String) {
+    // Mocks never authenticate, so the mismatch check ignores them: name a
+    // real (unreachable) endpoint model instead.
+    world.set_config("model", "\"qwen3-coder\"");
+    world.set_config("model_key_env", &format!("\"{env_name}\""));
 }
 
 #[given("a fresh project directory")]

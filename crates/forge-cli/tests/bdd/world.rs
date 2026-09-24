@@ -40,6 +40,10 @@ pub const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_NEEDLE_BACKEND",
     "FORGE_NEEDLE_WEIGHTS_BASE_URL",
     "FORGE_NEEDLE_TEST_SHA256",
+    // The mock's system-context echo is opt-in (see `MockModel`'s docs);
+    // scrubbed so a developer's shell can neither switch it on for
+    // scenarios that assert clean output nor off for the one that needs it.
+    "FORGE_MOCK_VERBOSE",
 ];
 
 #[derive(Debug, Default, cucumber::World)]
