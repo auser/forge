@@ -362,6 +362,30 @@ impl LocalGraph {
         dirs.into_values().collect()
     }
 
+    /// `(key, content_hash, embedding_text)` for every indexed symbol, in
+    /// exactly the format the semantic index (`embed_index::EmbeddingIndex`)
+    /// expects: key `"<path>::<name>"` (so two symbols named alike in
+    /// different files get distinct, independently searchable keys) and
+    /// `content_hash` over the exact text that would be embedded, so a
+    /// symbol whose kind/name/path haven't changed is never needlessly
+    /// re-embedded. Pure string/hash work — this crate stays model-free;
+    /// `forge-cli`'s `graph build` is the one that calls an `Embedder` on
+    /// the returned text.
+    pub fn embedding_candidates(&self) -> Vec<(String, String, String)> {
+        self.state
+            .symbols
+            .iter()
+            .map(|s| {
+                let key = format!("{}::{}", s.file, s.name);
+                let text = format!("{} {} in {}", s.kind, s.name, s.file);
+                let mut hasher = Sha256::new();
+                hasher.update(text.as_bytes());
+                let hash = format!("{:x}", hasher.finalize());
+                (key, hash, text)
+            })
+            .collect()
+    }
+
     /// Symbols whose recorded call sites reference `symbol`.
     pub fn callers(&self, symbol: &str) -> Vec<&SymbolNode> {
         self.state

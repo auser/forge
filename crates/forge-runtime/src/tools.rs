@@ -114,6 +114,103 @@ fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing or invalid string argument {key:?}"))
 }
 
+/// Map a tool call onto a file operation: `None` when the tool is not a
+/// file op at all, `Some(Err)` when its arguments don't type-check. Shared
+/// by dispatch and [`minimum_dispatch_risk`] so the two can never disagree
+/// about what a call would do.
+fn file_op_for(call: &ToolCall) -> Option<Result<FileOp, String>> {
+    let args = &call.arguments;
+    let path_op = |make: fn(PathBuf) -> FileOp| match arg_str(args, "path") {
+        Ok(path) => Some(Ok(make(PathBuf::from(path)))),
+        Err(e) => Some(Err(e)),
+    };
+    match call.name.as_str() {
+        "read_file" => path_op(|path| FileOp::Read { path }),
+        "delete_file" => path_op(|path| FileOp::Delete { path }),
+        "write_file" => Some(match (arg_str(args, "path"), arg_str(args, "content")) {
+            (Ok(path), Ok(content)) => Ok(FileOp::Write {
+                path: PathBuf::from(path),
+                content,
+            }),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }),
+        "edit_file" => Some(
+            match (
+                arg_str(args, "path"),
+                arg_str(args, "old"),
+                arg_str(args, "new"),
+            ) {
+                (Ok(path), Ok(old), Ok(new)) => Ok(FileOp::Edit {
+                    path: PathBuf::from(path),
+                    old,
+                    new,
+                }),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+            },
+        ),
+        _ => None,
+    }
+}
+
+/// `run_command`'s risk: the model's hint can only raise the level, never
+/// lower it — a shell command is never below `Risky`.
+fn command_risk(args: &serde_json::Value) -> RiskLevel {
+    if arg_str(args, "risk")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("destructive")
+    {
+        RiskLevel::Destructive
+    } else {
+        RiskLevel::Risky
+    }
+}
+
+/// The lowest risk level dispatching `call` could possibly be classified
+/// at, or `None` for a call that cannot be dispatched at all (unknown tool,
+/// arguments that don't type-check). Answered without dispatching anything,
+/// so a caller can decide *whether* to dispatch — the seam the needle fast
+/// path uses to stay out of approval territory entirely.
+///
+/// The rules are not restated here: file ops are handed to the real
+/// [`FileOp::risk`], commands to the same [`command_risk`] clamp
+/// `dispatch_inner` applies, and the graph tools never reach an
+/// `ExecutionProvider` (so nothing can gate them). `FileOp::risk` needs a
+/// project root to tell `Risky` from `Destructive` — and, since it also
+/// gates `Read` against the escape check, to tell `Safe` from
+/// `Destructive` — which the tool layer does not know.
+///
+/// The sentinel root below is a single-component absolute path
+/// (`/forge-dispatch-risk-sentinel`) rather than an empty path. An empty
+/// path is not a safe stand-in here: `Path::starts_with` treats every path
+/// as starting with the empty path, so `path_escapes_root` can never
+/// observe an escape against it — an absolute path like `/etc/passwd`, or
+/// a relative walk-up like `../../secret`, would silently normalize back
+/// to "inside root" and this function would keep answering `Safe`. A
+/// non-empty sentinel does not have that problem: any absolute path other
+/// than one actually rooted at the sentinel fails `starts_with`, and any
+/// relative path with a net leading `..` (a walk-up past its own root)
+/// pops the sentinel's one component and fails too — which is exactly
+/// correct, because `..` from a project root by definition leaves that
+/// root **regardless of how deep the real root is**. The one remaining
+/// gap this can't close is under-reporting `Destructive` as `Risky` for a
+/// `Write`/`Edit` escape, which is exactly the "lowest possible risk"
+/// promise this function makes and is harmless here: gate 5 only checks
+/// for `Safe`, and neither `Risky` nor `Destructive` is `Safe`. Only
+/// `Some(RiskLevel::Safe)` is therefore a guarantee: it means no approval
+/// policy can gate this call (see `NativeExecution::check_approval`, which
+/// returns early for `Safe`).
+pub(crate) fn minimum_dispatch_risk(call: &ToolCall) -> Option<RiskLevel> {
+    const SENTINEL_ROOT: &str = "/forge-dispatch-risk-sentinel";
+    if let Some(op) = file_op_for(call) {
+        return Some(op.ok()?.risk(std::path::Path::new(SENTINEL_ROOT)));
+    }
+    match call.name.as_str() {
+        "run_command" => Some(command_risk(&call.arguments)),
+        "graph_context" | "graph_grep" => Some(RiskLevel::Safe),
+        _ => None,
+    }
+}
+
 fn arg_string_vec(args: &serde_json::Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(serde_json::Value::as_array)
@@ -159,41 +256,10 @@ impl ToolDispatcher {
         };
 
         // File operations.
-        let file_op = match call.name.as_str() {
-            "read_file" => match arg_str(args, "path") {
-                Ok(path) => Some(FileOp::Read {
-                    path: PathBuf::from(path),
-                }),
-                Err(e) => return invalid(e),
-            },
-            "write_file" => match (arg_str(args, "path"), arg_str(args, "content")) {
-                (Ok(path), Ok(content)) => Some(FileOp::Write {
-                    path: PathBuf::from(path),
-                    content,
-                }),
-                (Err(e), _) | (_, Err(e)) => return invalid(e),
-            },
-            "edit_file" => {
-                match (
-                    arg_str(args, "path"),
-                    arg_str(args, "old"),
-                    arg_str(args, "new"),
-                ) {
-                    (Ok(path), Ok(old), Ok(new)) => Some(FileOp::Edit {
-                        path: PathBuf::from(path),
-                        old,
-                        new,
-                    }),
-                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return invalid(e),
-                }
-            }
-            "delete_file" => match arg_str(args, "path") {
-                Ok(path) => Some(FileOp::Delete {
-                    path: PathBuf::from(path),
-                }),
-                Err(e) => return invalid(e),
-            },
-            _ => None,
+        let file_op = match file_op_for(call) {
+            Some(Ok(op)) => Some(op),
+            Some(Err(e)) => return invalid(e),
+            None => None,
         };
         if let Some(op) = file_op {
             let path = op.path().to_path_buf();
@@ -234,14 +300,7 @@ impl ToolDispatcher {
                     Ok(c) => c,
                     Err(e) => return invalid(e),
                 };
-                // Risk rule: the model's hint can only raise the level;
-                // run_command is never below Risky.
-                let hint = arg_str(args, "risk").unwrap_or_default();
-                let risk = if hint.eq_ignore_ascii_case("destructive") {
-                    RiskLevel::Destructive
-                } else {
-                    RiskLevel::Risky
-                };
+                let risk = command_risk(args);
                 let request = ExecRequest {
                     command: command.clone(),
                     args: arg_string_vec(args, "args"),
@@ -336,5 +395,38 @@ impl ToolDispatcher {
             }
             other => invalid(format!("unknown tool {other:?}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall::new("test-1", name, args)
+    }
+
+    #[test]
+    fn in_root_read_is_safe() {
+        let c = call("read_file", serde_json::json!({"path": "src/lib.rs"}));
+        assert_eq!(minimum_dispatch_risk(&c), Some(RiskLevel::Safe));
+    }
+
+    #[test]
+    fn relative_escaping_read_is_not_safe() {
+        // The tool layer has no project root, so `minimum_dispatch_risk`
+        // must classify an escaping read as non-`Safe` without one — this
+        // is gate 5 of the needle fast path (see `service.rs`), the one
+        // gate that keeps a read-only "optimization" from ever reaching
+        // `check_approval`'s Safe-always-runs fast path for a path outside
+        // the project.
+        let c = call("read_file", serde_json::json!({"path": "../../secret"}));
+        assert_ne!(minimum_dispatch_risk(&c), Some(RiskLevel::Safe));
+    }
+
+    #[test]
+    fn absolute_escaping_read_is_not_safe() {
+        let c = call("read_file", serde_json::json!({"path": "/etc/passwd"}));
+        assert_ne!(minimum_dispatch_risk(&c), Some(RiskLevel::Safe));
     }
 }

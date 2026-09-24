@@ -551,7 +551,13 @@ mod tests {
         let read = FileOp::Read {
             path: PathBuf::from("../outside.txt"),
         };
-        assert_eq!(read.risk(root), RiskLevel::Safe); // reads are safe
+        // An escaping read is gated exactly like an escaping write — see
+        // `FileOp::risk`'s doc comment for why `Read` is not exempt.
+        assert_eq!(read.risk(root), RiskLevel::Destructive);
+        let read_inside = FileOp::Read {
+            path: PathBuf::from("src/ok.rs"),
+        };
+        assert_eq!(read_inside.risk(root), RiskLevel::Safe);
         let write = FileOp::Write {
             path: PathBuf::from("../outside.txt"),
             content: "x".to_string(),
@@ -629,5 +635,23 @@ mod tests {
             .await
             .expect("read allowed under deny");
         assert_eq!(result.content.as_deref(), Some("data"));
+    }
+
+    #[tokio::test]
+    async fn deny_blocks_escaping_reads() {
+        // A read that escapes the project root is Destructive (see
+        // `FileOp::risk`), so `deny` must refuse it exactly like an
+        // escaping write — this is the fix for the gap where an escaping
+        // `Read` used to be classified `Safe` and every `ApprovalPolicy`,
+        // `Deny` included, let `Safe` operations run unconditionally.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exec = NativeExecution::new(ApprovalPolicy::Deny, tmp.path());
+        let err = exec
+            .file_op(FileOp::Read {
+                path: PathBuf::from("../outside-secret.txt"),
+            })
+            .await
+            .expect_err("denied");
+        assert!(err.to_string().contains("approval denied"));
     }
 }

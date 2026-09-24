@@ -5,7 +5,7 @@ use forge_core::{ForgeError, RunningProcess};
 
 use crate::commands::Context;
 use crate::commands::router_cmd::spawn_adapter;
-use crate::commands::service::{build_execution, build_service};
+use crate::commands::service::{build_execution, build_run_service};
 
 /// How long to wait for the adapter to preload its model and come up
 /// (Laya's checkpoint load is slow on busy machines).
@@ -17,7 +17,7 @@ const ADAPTER_READY_BUDGET: Duration = Duration::from_secs(300);
 /// adapter is auto-started as a managed child first (see
 /// [`maybe_autostart_laya`]).
 pub async fn run(ctx: &Context, host: Option<String>, port: Option<u16>) -> Result<(), ForgeError> {
-    let service = Arc::new(build_service(ctx)?);
+    let service = Arc::new(build_run_service(ctx).await?);
     let resolved = ctx.resolve_config()?;
     let host = host.unwrap_or_else(|| resolved.config.server_host.clone());
     let port = port.unwrap_or(resolved.config.server_port);

@@ -5,10 +5,12 @@ interactive coding agent core, provider-neutral model access, configurable decis
 routing, progressive-disclosure skills, a deterministic incremental project graph,
 pluggable execution, and both CLI and REST/SSE interfaces over one shared runtime.
 
-No Node.js, database, or daemon is required. The default stack is Laya
-(open-source System One decision routing) in front of a local oMLX coding model
-— no mock in the default path, no hosted account needed. Mock providers exist
-for tests and demos but are strictly opt-in (`model = "mock-local"`).
+No Node.js, database, or daemon is required. The default stack is an embedded
+Needle 3 decision router (on-device, no network calls) in front of a local
+oMLX coding model — no mock in the default path, no hosted account needed.
+Laya (open-source System One) and other HTTP-style routers remain available
+as alternates. Mock providers exist for tests and demos but are strictly
+opt-in (`model = "mock-local"`).
 
 - Project spec: [`specs/project.md`](specs/project.md)
 - Architecture decisions: [`specs/adrs/`](specs/adrs/) (start with `0001-core-architecture.md`)
@@ -54,19 +56,19 @@ Release assets are built by CI for every `v*` tag (see
 
 ## Quickstart
 
-The default stack routes Jev-style: Laya (open-source System One) → a real
-local model via oMLX — no mock anywhere in the default path.
+The default stack routes on-device: embedded Needle 3 → a real local model
+via oMLX — no mock anywhere in the default path, no separate router process
+to start.
 
 Prereqs: an OpenAI-compatible server running `qwen3-coder` at
-`http://127.0.0.1:8080/v1` (oMLX or compatible), and the Laya router
-(`pip install laya`). After [installing](#installation) (or with
-`cargo build --release` and `./target/release/forge` in place of `forge`):
+`http://127.0.0.1:8080/v1` (oMLX or compatible). After
+[installing](#installation) (or with `cargo build --release` and
+`./target/release/forge` in place of `forge`):
 
 ```bash
 cd /path/to/your/project
-forge router serve &           # Laya decision router on 127.0.0.1:8788
-forge init                     # creates .forge/, starter config, gitignore entry, builds graph
-forge doctor                   # probes model + router endpoints, warns if down
+forge init                     # creates .forge/, starter config, gitignore entry, builds graph, fetches Needle weights
+forge doctor                   # probes model + router endpoints and the embedded needle brain (weights, load, decision latency), warns if down
 forge run "Explain this project"
 forge serve                    # REST/SSE on http://127.0.0.1:7341
 curl http://127.0.0.1:7341/health
@@ -78,10 +80,18 @@ No GPU, no accounts, just evaluating? The mock is one explicit flag away:
 forge --model mock-local --router static run "Explain this project"
 ```
 
-Without Laya installed, routing still works: the decision falls back to
-deterministic static routing (`fallback_used: true` in the events) and the run
-proceeds with the configured model. To point at a different endpoint or use an
-API key, override per project:
+`forge init` fetches and verifies Needle's weights when `needle.autofetch`
+is on (the default) — a one-time ~35 MB download for `needle.variant = "full"`
+(the only variant with a hosted, pinned artifact today; `small`/`medium`
+report "no pinned weights artifact" and fall back to static routing),
+cached under `~/.cache/forge/models/`; re-running `init`
+re-verifies the checksum and skips the download if it already matches.
+Whenever weights aren't present (no network, `--local-only`, or a variant
+with nothing to fetch yet — see below), routing falls back to deterministic
+static routing (`fallback_used: true` in the events) and the run proceeds
+with the configured model; this is a fully supported, fully offline mode,
+not a degraded one. To point at a different endpoint or use an API
+key, override per project:
 
 ```toml
 # .forge/config.toml
@@ -95,20 +105,18 @@ model_key_env = "MY_API_KEY"   # name of the env var, never the key itself
 `.env.local` from the project root (shell env wins over `.env.local`, which
 wins over `.env`), and init reports what it found — e.g.
 `detected  DEEPSEEK_API_KEY → deepseek-chat routable` (key names only, values
-are never printed or written anywhere). With keys in place, the default Laya
-router plus the built-in `[models]` registry give you Jev-style model
-selection out of the box — no config file needed.
+are never printed or written anywhere). With keys in place, the default
+embedded Needle router plus the built-in `[models]` registry give you
+Jev-style model selection out of the box — no config file needed.
+
+```bash
+forge init     # loads .env/.env.local, detects known provider keys, builds the graph
+```
 
 Full environment precedence: **shell env** (incl. `FORGE_*` vars) →
 `.env.local` → `.env` → project config file → user config file → defaults;
 CLI flags beat everything. Values loaded from `.env` files are covered by
 session-log secret redaction just like shell-set keys.
-
-### Drop-in setup for existing projects
-
-```bash
-forge init     # loads .env/.env.local, detects known provider keys, builds the graph
-```
 
 Forge ships ready-made config presets — copy one into `.forge/config.toml`
 (or `~/.config/forge/config.toml` for all projects) and you're done:
@@ -130,6 +138,23 @@ forge run "add a hello function to main.rs"   # edits files via tools
 forge run --max-turns 10 "refactor the parser"
 forge run --json "summarize this repo" | jq .text
 ```
+
+Well-defined read-only requests skip the LLM entirely. All of these must
+hold: the run's model is tool-capable (a chat-only model's run stays a plain
+completion), the embedded Needle brain both picks a tool and fills its
+arguments with confidence at least `router_confidence_threshold`, the
+operation is **read-only** (`read_file`, `graph_context`, `graph_grep` —
+anything that could need approval is excluded by construction, so a fast
+path never prompts you), and a second on-device check finds the call
+non-destructive. Then Forge dispatches it directly — no model call at all,
+and the run records `router: "needle-dispatch"` with `turns: 0`.
+
+Everything else — writes, deletes, commands, prompts the brain declines or
+is unsure about, resumed runs — runs the full agent loop exactly as before.
+The fast path is purely an optimization: it dispatches through the same
+approval-gated execution provider as the loop, so it can never do something
+a normal run of the same configuration could not, and without a working
+brain (no `ffi` feature, weights missing) it simply never engages.
 
 Approval, when a tool call needs it (`approval = "prompt"`):
 
@@ -184,7 +209,7 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
---router <r>          override the router (static|mock|cheapest|http|laya)
+--router <r>          override the router (static|mock|cheapest|http|laya|needle)
 --execution <p>       override the execution provider (native|mock)
 --local-only          restrict to local providers
 --approval <mode>     auto | prompt | prompt-dangerous | deny
@@ -222,11 +247,11 @@ Key settings (all optional):
 | `mock_script` | — | `FORGE_MOCK_SCRIPT` | JSON script path for `scripted-mock` (project-relative) |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `laya` | `FORGE_ROUTER` | `laya` \| `static` \| `cheapest` \| `mock` \| `http` |
+| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `laya` \| `static` \| `cheapest` \| `mock` \| `http` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key |
-| `router_timeout_ms` | `5000` | — | HTTP router timeout |
-| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya decisions escalate to the fallback |
+| `router_timeout_ms` | `5000` | — | HTTP/needle router timeout |
+| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle decisions escalate to the fallback |
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` \| `mock` |
@@ -235,6 +260,10 @@ Key settings (all optional):
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
 | `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
+| `needle.variant` | `full` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small \| medium \| full); **only `full` has a downloadable artifact today** — Cactus-Compute publishes one 20-layer file, `needle build --layers N` slices smaller ones locally, so `small`/`medium` currently report "no pinned weights artifact" and fall back to static routing. `full` is the default precisely because it's the one that actually fetches; revisit once a smaller rung is hosted |
+| `needle.weights_path` | — | — | Weights override; empty → ~/.cache/forge/models/ |
+| `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~35 MB for `full`) |
+| `needle.weights_sha256` | — | `FORGE_NEEDLE_WEIGHTS_SHA256` | Operator override for the expected weights checksum (64 hex chars); empty → use the compiled-in pin. Pairs with `weights_path`/a custom base URL to run your own weights without recompiling |
 
 Unknown keys are tolerated. Inspect the resolved configuration:
 
@@ -299,30 +328,39 @@ assumed; a provider without `tools` receives single-turn requests only.
 ### DecisionRouter
 
 Chooses the model per task and records the decision with a confidence score.
-Five modes:
+Six modes:
 
+- `needle` (embedded on-device Needle 3 decision model, no network calls
+  once weights are on disk; **default**; `forge init` fetches/verifies
+  weights for `needle.variant = "full"`, the one variant Cactus-Compute
+  currently publishes as a standalone artifact; real inference needs a build
+  with the `needle-ffi` feature — see [Embedded Needle brain
+  (`ffi`)](#embedded-needle-brain-ffi) — and falls back to static without
+  it, or when weights are unavailable: unpinned variant, `--local-only`,
+  no network),
 - `laya` (open-source System One decision model via the reference adapter;
-  **default**; falls back to static when the adapter is down),
+  falls back to static when the adapter is down),
 - `static` (deterministic rules),
 - `mock` (preset decision, for tests),
 - `cheapest` (lowest-cost candidate from the `[models]` cost table;
   tie-breaks by output cost then name),
 - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
-  to `router_url`, bearer token from `router_key_env`),
-- `laya` (Laya typed-questions shape; defaults to
-  `http://127.0.0.1:8788/decide`, the reference adapter below).
+  to `router_url`, bearer token from `router_key_env`).
 
-`http`/`laya` decisions below `router_confidence_threshold` (default 0.7) are
-rejected and escalate through the fallback chain: any router is wrapped in a
-fallback (`router_fallback`, default `static`, may be `cheapest`), so an
-unreachable, timing-out, or unconfident router degrades to deterministic
-routing with `fallback_used: true`. TypeSafe Jev / Kev services work through
-the `http` backend — nothing is hard-coded.
+`http`/`laya`/`needle` decisions below `router_confidence_threshold` (default
+0.7) are rejected and escalate through the fallback chain: any router is
+wrapped in a fallback (`router_fallback`, default `static`, may be
+`cheapest`), so an unreachable, timing-out, unconfident, or (for `needle`)
+not-yet-loaded router degrades to deterministic routing with
+`fallback_used: true`. TypeSafe Jev / Kev services work through the `http`
+backend — nothing is hard-coded.
 
 ### Model registry with costs
 
-Three entries ship as built-in defaults (prices as of September 2026 — prices
-change; check provider pages):
+Five entries ship as built-in defaults (`qwen3-coder`, `deepseek-chat`,
+`claude-sonnet`, `gpt-5`, `kimi-k2.7-code`; prices as of September 2026 —
+prices change; check provider pages). A representative few, shown below
+(`claude-sonnet` is shown in [Authentication](#authentication) above):
 
 ```toml
 [models.qwen3-coder]      # local default, free
@@ -385,9 +423,12 @@ Forge never requires Python.
 
 All command/script execution AND file reads/writes/edits/deletes go through
 this trait (the runtime never spawns processes or touches files directly).
-Risk classification: reads are `Safe`, in-project writes/edits are `Risky`,
-deletes and out-of-project paths are `Destructive`. `native` runs locally with
-approval gating: `Risky` operations pause for approval under
+Risk classification: in-project reads are `Safe`; in-project writes/edits are
+`Risky`; deletes, and any operation (including a read) whose path escapes the
+project root, are `Destructive` — a read outside the project can exfiltrate a
+secret just as effectively as a write can overwrite one, so it gets the same
+gating rather than the free pass `Safe` gives every approval policy. `native`
+runs locally with approval gating: `Risky` operations pause for approval under
 `approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
 ones (non-interactive stdin → typed "approval required" error, which the agent
 loop treats as a pause: answer via piped stdin lines, e.g.
@@ -417,17 +458,57 @@ appended to the session log. `forge skill test <name>` runs the skill's
 — no model calls, no network — stored at `.forge/graph/graph.json` (git-ignored).
 It indexes files, directories, symbols, imports, tests, and basic call sites for
 Rust, Python, JS/TS, and Go (regex-based extraction). Rebuilds are incremental:
-only files whose mtime+hash changed are re-parsed.
+only files whose mtime+hash changed are re-parsed. The graph itself stays
+model-free by design — this never changes even when a needle engine is available.
 
 ```bash
 forge graph build              # build / incrementally refresh
 forge graph check              # fresh (exit 0) or stale (exit 1, lists changes)
 forge graph map                # per-directory structural summary
 forge graph grep <pattern>     # search symbols and imports
+forge graph grep --semantic <query>  # search a local semantic embedding index
 forge graph callers <symbol>   # who calls this symbol
 forge graph blast <path>       # direct + second-hop importers
 forge graph context <query>    # ranked files/symbols for agent context
 ```
+
+### Semantic index
+
+When a needle engine is genuinely available (weights loaded and answering, not
+just constructible — see `forge_needle::engine_if_available`), `forge graph
+build` additionally embeds every symbol locally and stores the vectors at
+`.forge/graph/embeddings.bin`. Embedding text is `"<kind> <name> in <path>"`;
+the index key is `"<path>::<name>"`, so two symbols with the same name in
+different files are both independently searchable. Rebuilds are incremental
+and content-hash keyed: only symbols whose embedded text actually changed are
+re-embedded, in batches of 32; symbols removed from the graph are dropped from
+the index too. An index built with a different model or embedding
+dimensionality is discarded and rebuilt wholesale rather than mixed with new
+vectors. Without a working needle engine, this step is skipped silently — the
+build still succeeds, and no `embeddings.bin` is touched.
+
+`embeddings.bin` is a single `serde_json` blob today (an 8-byte `FRGEMB01`
+magic prefix + one JSON object), parsed in full on every load. That is fine
+at the hash backend's 64 dimensions, but the real `ffi` backend embeds at
+3072 dimensions (see [Embedded Needle brain
+(`ffi`)](#embedded-needle-brain-ffi)); a project with ~1,000 embedded symbols
+would produce a ~45 MB index under that format. A raw little-endian-`f32`
+format bump is planned — safe to do later because the magic prefix makes a
+version change non-silent (mismatch → clean rebuild, never a misread) — see
+the spec's §8 amendment for the follow-up.
+
+`forge graph grep --semantic <query>` embeds the query and returns the top 20
+matches by cosine similarity (`score  path::symbol` lines); without a working
+engine it fails with `semantic search needs needle weights (run forge init)`
+(exit 1) rather than silently falling back to literal search. `forge graph
+context <query>` blends the two signals when both an engine and a matching
+index exist: `final = 0.5 * (1 / (1 + lexical_rank)) + 0.5 * cosine`; otherwise
+its output is exactly the lexical ranking as before. For `--json` consumers:
+`score` is always a float — a blended 0-1 value when a needle engine and
+matching index both exist, otherwise the raw lexical rank count — whereas the
+`POST /v1/project/context` server endpoint always returns the raw lexical
+count as an integer today (see [Server](#server); it has not been wired to
+the semantic blend yet).
 
 ## Server
 
@@ -467,6 +548,13 @@ GET  /v1/skills                discovered skill metadata
 GET  /v1/project/graph         graph stats + freshness
 POST /v1/project/context       {"query": "..."} → ranked context selection
 ```
+
+`POST /v1/project/context` is lexical-only today: it calls the same
+structural ranking as `forge graph context` but does not (yet) blend in
+the semantic index the way the CLI command does — see [Known
+limitations](#known-limitations-v03) and the `forge graph context`
+paragraph under [Semantic index](#semantic-index) for the score-shape
+difference this implies for `--json`/API consumers.
 
 The server tracks at most 1024 in-flight/recent runs in memory
 (`MAX_TRACKED_RUNS`); oldest terminal entries are evicted first and remain fully
@@ -509,6 +597,94 @@ just release   # release build
 just clean
 ```
 
+### Embedded Needle brain (`ffi`)
+
+`just verify` runs with default features, where the needle router has no
+inference engine and degrades to static routing. Real on-device inference is
+behind a feature flag because it needs a per-platform native engine that this
+repo does not carry:
+
+| crate | feature | effect |
+| --- | --- | --- |
+| `forge-needle` | `ffi` | `FfiBackend` over `libneedle` instead of `UnavailableBackend` |
+| `forge-needle` | `needle-e2e` | enables `tests/e2e.rs` (needs `ffi` + real weights) |
+| `forge-cli` | `needle-ffi` | builds the `forge` binary with the above |
+
+The engine ships per platform in the same Apache-2.0 Hugging Face repo as the
+weights, [`Cactus-Compute/needle3`](https://huggingface.co/Cactus-Compute/needle3).
+Fetch `libneedle.a` for your target once:
+
+```bash
+TRIPLE=$(rustc -vV | sed -n 's/^host: //p')      # e.g. aarch64-apple-darwin
+mkdir -p crates/needle-sys/vendor/$TRIPLE
+curl -L -o crates/needle-sys/vendor/$TRIPLE/libneedle.a \
+  https://huggingface.co/Cactus-Compute/needle3/resolve/main/macos-arm64/libneedle.a
+
+# Verify against the pinned checksum (macos-arm64; see the spec's §8 for
+# other platforms as they get verified) before trusting the download:
+echo "60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a  crates/needle-sys/vendor/$TRIPLE/libneedle.a" | shasum -a 256 -c -
+```
+
+Substitute the platform folder for your target (`macos-arm64`,
+`linux-x86_64`, `linux-arm64`, `linux-armv7`, `linux-riscv64`,
+`linux-mipsel`, `windows-x86_64`, `windows-arm64`, `android-arm64`, ...; the
+full list is in `crates/needle-sys/build.rs`). `NEEDLE_LIB_DIR=/path/to/dir`
+overrides the vendored location. `crates/needle-sys/vendor/` is gitignored;
+`needle.h` is committed as the contract of record — `needle-sys` hand-writes
+its six `extern "C"` declarations rather than generating them (no `bindgen`, so
+no libclang needed to build forge), and a unit test fails if the committed
+header ever stops matching those declarations.
+
+Then:
+
+```bash
+just verify-ffi   # clippy + unit tests with `ffi` on
+just e2e          # real-weights end-to-end suite (release build)
+
+# build the forge binary itself against the real engine
+cargo build --release -p forge-cli --features needle-ffi
+```
+
+`just verify` already type- and lint-checks the `ffi` code on every run via
+`just lint-ffi` — `cargo clippy` never links, so that needs no engine binary.
+The recipes above are what additionally *run* it.
+
+`just e2e` needs weights as well as the engine:
+
+```bash
+FORGE_NEEDLE_E2E_WEIGHTS=~/.cache/forge/models/needle3.cact just e2e
+```
+
+`forge init` puts that file there (35 MB, SHA-256 pinned). The suite asserts
+the engine loads, that `decide` picks `test-runner` for "run the tests" with
+calibrated confidence, that embeddings are 3072-dimensional, L2-normalised
+and deterministic, that `extract` pulls `{"city":"Paris"}` out of prose, that
+an unsupported request refuses instead of guessing, and that a warm route
+round-trip is not pathologically slow.
+
+On latency: a warm round-trip measures **~47 ms** in a release build on an
+idle macos-arm64 machine (~100 ms debug). The suite prints every sample
+against that reference but asserts only a loose 2 s ceiling, because
+wall-clock latency here tracks machine load far more than it tracks forge —
+the same bit-identical inference measured 47 ms idle and 1.3 s at load average
+347. Read the printed numbers for drift; the assertion exists to catch gross
+regressions (skipping `needle_init` per call once took a round-trip to 16.5 s).
+
+The "no network calls once weights are on disk" claim holds for this backend:
+`libneedle.a` has no network-capable symbols at all (`nm -u` shows only libc
+maths/memory/stdio, `mmap`, `pthread` and `sysctlbyname`). Needle's own README
+mentions engine telemetry, but that lives in its Python SDK and standalone CLI
+runner, neither of which forge uses.
+
+Two things worth knowing about the C API, because they shape the code:
+`libneedle` is **one process-global, non-thread-safe model that cannot be
+unloaded**, so `NeedleEngine` keeps it on a single dedicated thread and
+`FfiBackend` takes a process-wide claim (a second engine fails loudly instead
+of racing); and for `extract`, Needle takes its semantics from the record's
+name and description, so give extraction schemas a `title` (it becomes the
+tool name) or a meaningful `description` — a bare `{"type":"object",
+"properties":{...}}` is often declined rather than guessed at.
+
 Layout:
 
 ```text
@@ -521,9 +697,12 @@ crates/
   forge-session     append-only JSONL store + secret redaction
   forge-skills      SKILL.md discovery, progressive disclosure
   forge-graph       deterministic incremental project graph
+  forge-needle      embedded Needle brain: decide/embed/extract/tool-call,
+                    weights lifecycle, engine thread, needle router
   forge-runtime     AgentService — the one runtime shared by CLI and server
   forge-server      axum REST/SSE adapter
   forge-cli         clap command tree, tracing, the forge binary
+  needle-sys        raw FFI declarations for libneedle + its link config
 tests/features/     Gherkin scenarios (executable via just bdd)
 specs/              project spec, ADRs, implementation plan
 ```
@@ -538,7 +717,10 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 17 features / 28 scenarios / 108 steps.
+  mock providers — fully offline. Currently 20 features / 38 scenarios / 141 steps.
+- Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
+  `just verify` — they need a native engine and real weights. See [Embedded
+  Needle brain (`ffi`)](#embedded-needle-brain-ffi).
 
 ## Known limitations (v0.3)
 
@@ -549,6 +731,45 @@ go in `specs/adrs/`.
   terminal-first eviction); the session store persists across restarts.
 - Input delivery is in-process: `POST /v1/runs/:id/input` for a run owned by
   another process records the event but that loop does not consume it.
+- The needle direct-dispatch fast path is read-only by design (`read_file`,
+  `graph_context`, `graph_grep` only); writes, edits, deletes, and commands
+  always go through the full agent loop and its approval gating.
+- `forge init` builds the project graph's structure but never embeds it (no
+  model calls from `init`, ever); run `forge graph build` afterwards to
+  populate the semantic index once needle weights are available.
+- Needle extraction and fast-path tool-call quality depend on the weights
+  variant loaded; only `full` ships a downloadable artifact today, so
+  `small`/`medium` quality is untested until Cactus-Compute hosts them.
+- Jev-tier escalation (routing across a ladder of models by task difficulty,
+  with `extract()`-based argument repair in the agent loop) is not
+  implemented yet; it needs real-model quality data first and is deferred to
+  a later spec sub-project.
+- Default/prebuilt builds don't include the inference engine yet: the
+  `needle-ffi` feature is off by default and in release builds, so `forge
+  init` skips fetching needle weights entirely in such builds (there is no
+  backend to use them) and reports the skip rather than downloading ~35 MB
+  that would just sit unused. Build with `--features needle-ffi` (see
+  [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi)) to get real
+  fetch-on-init behavior.
+- `POST /v1/project/context` is lexical-only: the semantic blend that
+  `forge graph context`/`graph grep --semantic` apply (needle engine +
+  embedding index, when both exist) has not been ported to the server
+  handler yet. Follow-up: share one `semantic_blend` implementation between
+  the CLI and `forge-server` via `forge-runtime`.
+- `embeddings.bin`'s whole-file `serde_json` format has a known scale limit
+  for `ffi` builds: fine at the hash backend's 64 dimensions, but the real
+  engine embeds at 3072 dimensions, where a project with ~1,000 symbols
+  would produce a ~45 MB index parsed in full on every load. A raw
+  little-endian-`f32` format bump is planned; deferred for now because the
+  `FRGEMB01` magic prefix makes that change safe to land later (a version
+  bump triggers a clean rebuild, never a misread).
+- `forge model test` reports generation-plane (`ModelProvider`) health only;
+  it has no needle/decision-plane status yet (`forge doctor`'s needle probe
+  is the current way to check that). Skill selection
+  (`SkillRegistry::match_task`) is lexical word/substring matching, not the
+  pre-embedded, task-embedding-ranked selection the design describes —
+  both are deferred to the same follow-up as the semantic-blend sharing
+  above.
 
 ## Contributing
 

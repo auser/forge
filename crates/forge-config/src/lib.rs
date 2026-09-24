@@ -65,6 +65,47 @@ impl ModelEntry {
     }
 }
 
+/// `[needle]`: the embedded on-device Needle brain (weights variant, an
+/// optional override path, and whether `forge init` may fetch weights).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NeedleConfig {
+    /// Weights ladder: "small" (~8 MB), "medium", or "full" (default;
+    /// ~35 MB; currently the only variant with a hosted, pinned artifact —
+    /// see `forge-needle`'s `weights::VARIANTS`).
+    pub variant: String,
+    /// Override path to weights; empty means the default cache location
+    /// (`~/.cache/forge/models/`).
+    pub weights_path: String,
+    /// Whether `forge init` downloads and verifies weights automatically.
+    pub autofetch: bool,
+    /// Operator-supplied SHA-256 override for the expected weights
+    /// checksum; empty means use the compiled-in pin (`forge-needle`'s
+    /// `weights::VARIANTS` table). Compiled-in pins are the default trust
+    /// anchor — this lets an operator consciously supply their own weights
+    /// (paired with `weights_path`/a custom base URL) without recompiling
+    /// forge. Must be empty or exactly 64 hex characters.
+    pub weights_sha256: String,
+}
+
+/// Weights ladder values accepted by `[needle].variant`.
+const NEEDLE_VARIANTS: &[&str] = &["small", "medium", "full"];
+
+impl Default for NeedleConfig {
+    fn default() -> Self {
+        Self {
+            // "full" is the only variant with a hosted, pinned artifact
+            // today, so a fresh `forge init` actually fetches working
+            // weights out of the box. Revert to a smaller rung once Cactus
+            // hosts one (see the design spec's risks section).
+            variant: "full".to_string(),
+            weights_path: String::new(),
+            autofetch: true,
+            weights_sha256: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -96,6 +137,10 @@ pub struct Config {
     /// Named models with cost/capability metadata. Deep-merged by name
     /// across config files; not settable via env/CLI flags.
     pub models: BTreeMap<String, ModelEntry>,
+    /// The embedded on-device Needle brain: config for the default
+    /// `router = "needle"`. Weights resolution lands in a later phase;
+    /// until then, routing built on it degrades to `router_fallback`.
+    pub needle: NeedleConfig,
     /// Unknown keys are tolerated and preserved.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -103,10 +148,13 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        // Default stack: Laya (open-source System One router) → local oMLX
-        // model. Mock providers stay available but are opt-in
-        // (`model = "mock-local"`). Hosted models are only called when a
-        // router selects them or the user sets `model` explicitly.
+        // Default stack: embedded Needle 3 (on-device decision routing,
+        // static fallback when weights are unavailable) → local oMLX
+        // model. Laya (open-source System One) and other HTTP-style
+        // routers remain available as alternates. Mock providers stay
+        // available but are opt-in (`model = "mock-local"`). Hosted models
+        // are only called when a router selects them or the user sets
+        // `model` explicitly.
         let models = [
             ModelEntry {
                 description: Some("local coding model via oMLX (Qwen3-Coder)".to_string()),
@@ -191,7 +239,7 @@ impl Default for Config {
             model_base_url: Some("http://127.0.0.1:8080/v1".to_string()),
             model_key_env: None,
             mock_script: None,
-            router: "laya".to_string(),
+            router: "needle".to_string(),
             router_url: None,
             router_key_env: None,
             router_timeout_ms: 5_000,
@@ -213,6 +261,7 @@ impl Default for Config {
             ]
             .into_iter()
             .collect(),
+            needle: NeedleConfig::default(),
             extra: toml::Table::new(),
         }
     }
@@ -299,6 +348,9 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ),
     ("FORGE_ROUTER_FALLBACK", "router_fallback"),
     ("FORGE_ROUTER_AUTOSTART", "router_autostart"),
+    ("FORGE_NEEDLE_VARIANT", "needle.variant"),
+    ("FORGE_NEEDLE_AUTOFETCH", "needle.autofetch"),
+    ("FORGE_NEEDLE_WEIGHTS_SHA256", "needle.weights_sha256"),
 ];
 
 impl Config {
@@ -325,6 +377,27 @@ impl Config {
 
     pub fn project_config_path(project_root: &Path) -> PathBuf {
         project_root.join(".forge").join("config.toml")
+    }
+
+    /// Cross-field and enum-like validation that TOML deserialization alone
+    /// can't express. Called at the end of [`Config::load`] so every caller
+    /// gets it for free.
+    pub fn validate(&self) -> Result<(), ForgeError> {
+        if !NEEDLE_VARIANTS.contains(&self.needle.variant.as_str()) {
+            return Err(ForgeError::config(format!(
+                "needle.variant must be one of {} (got {:?})",
+                NEEDLE_VARIANTS.join(", "),
+                self.needle.variant
+            )));
+        }
+        let sha = &self.needle.weights_sha256;
+        if !sha.is_empty() && !(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err(ForgeError::config(format!(
+                "needle.weights_sha256 must be empty or 64 hex characters (got {:?})",
+                sha
+            )));
+        }
+        Ok(())
     }
 
     /// Load and merge all configuration layers in precedence order.
@@ -378,6 +451,7 @@ impl Config {
         let config: Config = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| ForgeError::config(format!("invalid configuration: {e}")))?;
+        config.validate()?;
 
         Ok(ResolvedConfig { config, sources })
     }
@@ -391,12 +465,19 @@ fn apply_layer(
 ) {
     for (key, value) in layer {
         // The models table merges by entry name: a later layer's entry
-        // replaces the same-named entry, other entries survive.
+        // replaces the same-named entry, other entries survive. This
+        // always takes the dedicated path for "models" (even on the very
+        // first layer, when `merged` doesn't have a "models" entry yet) so
+        // it never falls into the generic nested-section branch below,
+        // which would otherwise leak stale per-model dotted sources that
+        // are never refreshed once this branch takes over on later layers.
         if key == "models"
-            && let Some(toml::Value::Table(existing)) = merged.get("models")
             && let toml::Value::Table(new_entries) = &value
         {
-            let mut combined = existing.clone();
+            let mut combined = match merged.get("models") {
+                Some(toml::Value::Table(existing)) => existing.clone(),
+                _ => toml::Table::new(),
+            };
             for (name, entry) in new_entries {
                 combined.insert(name.clone(), entry.clone());
             }
@@ -408,6 +489,33 @@ fn apply_layer(
                 },
             );
             merged.insert(key, toml::Value::Table(combined));
+            continue;
+        }
+        // Generic one-level nested config sections (e.g. `[needle]`): merge
+        // field-by-field so a layer that sets only some fields doesn't wipe
+        // out the others, and record a dotted source per field this layer
+        // actually set (so `forge config explain needle.variant` works).
+        if let toml::Value::Table(new_table) = &value {
+            let merged_table = match merged.get(&key) {
+                Some(toml::Value::Table(existing)) => {
+                    let mut combined = existing.clone();
+                    for (subkey, subvalue) in new_table {
+                        combined.insert(subkey.clone(), subvalue.clone());
+                    }
+                    combined
+                }
+                _ => new_table.clone(),
+            };
+            for (subkey, subvalue) in new_table {
+                sources.insert(
+                    format!("{key}.{subkey}"),
+                    ConfigSource {
+                        value: subvalue.to_string(),
+                        origin,
+                    },
+                );
+            }
+            merged.insert(key, toml::Value::Table(merged_table));
             continue;
         }
         sources.insert(
@@ -440,7 +548,7 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
             continue;
         };
         let value = match *key {
-            "local_only" | "router_autostart" => {
+            "local_only" | "router_autostart" | "needle.autofetch" => {
                 toml::Value::Boolean(parse_env_bool(env_name, &raw)?)
             }
             "server_port" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
@@ -458,9 +566,28 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
             }
             _ => toml::Value::String(raw),
         };
-        table.insert((*key).to_string(), value);
+        insert_dotted(&mut table, key, value);
     }
     Ok(table)
+}
+
+/// Insert `value` into `table` at a possibly dotted key path (e.g.
+/// `needle.variant` creates/updates a `needle` sub-table with a `variant`
+/// entry), so `ENV_KEYS` can target nested config sections.
+fn insert_dotted(table: &mut toml::Table, key: &str, value: toml::Value) {
+    match key.split_once('.') {
+        Some((head, rest)) => {
+            let entry = table
+                .entry(head.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(sub) = entry {
+                insert_dotted(sub, rest, value);
+            }
+        }
+        None => {
+            table.insert(key.to_string(), value);
+        }
+    }
 }
 
 fn parse_env_bool(env_name: &str, raw: &str) -> Result<bool, ForgeError> {

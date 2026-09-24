@@ -35,6 +35,28 @@ fn scripted_service(
     )
 }
 
+/// A service wired to the deterministic `HashBackend` needle engine. The
+/// fast-path tests drive it with exact `"<tool>: <json-object>"` prompts —
+/// the one shape `HashBackend::tool_call` answers (everything else it
+/// declines, which is the fall-through path).
+fn needle_service(
+    root: &std::path::Path,
+    model: Arc<dyn forge_core::ModelProvider>,
+    execution: Arc<dyn forge_core::ExecutionProvider>,
+) -> AgentService {
+    AgentService::new(
+        model,
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        execution,
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions"))),
+        Config::default(),
+    )
+    .with_needle(Some(Arc::new(forge_needle::NeedleEngine::spawn(
+        forge_needle::HashBackend::new(),
+    ))))
+}
+
 fn text_reply(text: &str) -> ScriptedReply {
     ScriptedReply {
         text: Some(text.to_string()),
@@ -645,6 +667,261 @@ async fn graph_tools_work_and_report_unavailable() {
     );
     let outcome = service.run("query").await.expect("run");
     assert_eq!(outcome.text, "no graph, fine");
+}
+
+// --- needle direct-dispatch fast path ---
+
+fn has_needle_dispatch(outcome: &RunOutcome) -> bool {
+    outcome.events.iter().any(|e| {
+        matches!(&e.kind, EventKind::RoutingDecisionMade { router, .. } if router == "needle-dispatch")
+    })
+}
+
+#[tokio::test]
+async fn needle_fast_path_dispatches_exact_tool_prompt_without_the_model() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply(
+        "the model must never be called",
+    )]));
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("fn main() {}\n"));
+    let service = needle_service(tmp.path(), model.clone(), exec.clone());
+
+    let outcome = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("run");
+
+    // The tool output is the run's answer, produced without a model call.
+    assert_eq!(outcome.text, "fn main() {}\n");
+    assert_eq!(outcome.turns, 0, "no model turns");
+    assert_eq!(outcome.tool_calls, 1);
+    assert!(model.recorded().is_empty(), "model loop never ran");
+    assert_eq!(exec.recorded_file_ops().len(), 1, "the tool really ran");
+
+    assert!(has_needle_dispatch(&outcome), "{:?}", event_kinds(&outcome));
+    assert_eq!(
+        event_kinds(&outcome),
+        [
+            "run_started",
+            "routing_decision_made", // model routing
+            "routing_decision_made", // needle-dispatch
+            "tool_call_requested",
+            "tool_started",
+            "tool_completed",
+            "completed",
+        ]
+    );
+    assert!(
+        !event_kinds(&outcome).contains(&"turn_completed"),
+        "the model loop must not run"
+    );
+}
+
+#[tokio::test]
+async fn needle_fast_path_refuses_destructive_calls_and_falls_through() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("I will not")]));
+    let exec = Arc::new(MockExecution::new(tmp.path()));
+    let service = needle_service(tmp.path(), model.clone(), exec.clone());
+
+    let outcome = service
+        .run("run_command: {\"command\": \"rm\", \"args\": [\"-rf\", \"logs\"]}")
+        .await
+        .expect("run completes through the normal loop");
+
+    assert!(!has_needle_dispatch(&outcome), "guardrail must refuse");
+    assert_eq!(outcome.text, "I will not");
+    assert_eq!(model.recorded().len(), 1, "the full loop ran");
+    // No partial execution: the refused call never reached the provider.
+    assert!(exec.recorded().is_empty(), "no command executed");
+    assert!(exec.recorded_file_ops().is_empty(), "no file op");
+    assert_eq!(outcome.tool_calls, 0);
+}
+
+#[tokio::test]
+async fn needle_fast_path_absent_engine_changes_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("plain loop")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let outcome = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("run");
+
+    assert_eq!(outcome.text, "plain loop");
+    assert_eq!(outcome.turns, 1);
+    assert_eq!(
+        event_kinds(&outcome),
+        ["run_started", "routing_decision_made", "completed"]
+    );
+}
+
+#[tokio::test]
+async fn needle_fast_path_never_attempts_a_non_read_only_operation() {
+    // A write is at least `Risky`, so it could pause for approval — the
+    // fast path must therefore refuse it *before* the execution provider is
+    // touched at all. `MockExecution` never gates anything, so a recorded
+    // file op here would mean the fast path had attempted (and completed) a
+    // write whose approval the loop is supposed to own.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("loop handled it")]));
+    let exec = Arc::new(MockExecution::new(tmp.path()));
+    let service = needle_service(tmp.path(), model.clone(), exec.clone());
+
+    let outcome = service
+        .run("write_file: {\"path\": \"out.txt\", \"content\": \"x\"}")
+        .await
+        .expect("run completes through the normal loop");
+
+    assert!(!has_needle_dispatch(&outcome));
+    assert_eq!(outcome.text, "loop handled it");
+    assert!(
+        exec.recorded_file_ops().is_empty(),
+        "no execution attempt may be made for a gateable operation"
+    );
+
+    // Same prompt against a provider that does gate: still no write, and
+    // the loop — not the fast path — owns the approval decision.
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    let native = Arc::new(NativeExecution::new(
+        forge_core::ApprovalPolicy::Prompt,
+        tmp2.path(),
+    ));
+    let service = needle_service(
+        tmp2.path(),
+        Arc::new(ScriptedMockModel::new(vec![text_reply("loop handled it")])),
+        native,
+    );
+    let outcome = service
+        .run("write_file: {\"path\": \"out.txt\", \"content\": \"x\"}")
+        .await
+        .expect("run completes through the normal loop");
+    assert!(!has_needle_dispatch(&outcome));
+    assert!(!tmp2.path().join("out.txt").exists(), "no write happened");
+}
+
+#[tokio::test]
+async fn needle_fast_path_dispatches_safe_reads_under_prompt_approval() {
+    // The strictest interactive policy still fast-paths a read: `Safe`
+    // operations return from `check_approval` before the policy is
+    // consulted, so no prompt can originate here. (Tests have no terminal
+    // stdin, so an approval attempt would fail the run outright — passing
+    // proves none was made.)
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("notes.txt"), "read me\n").expect("write");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("never used")]));
+    let exec = Arc::new(NativeExecution::new(
+        forge_core::ApprovalPolicy::Prompt,
+        tmp.path(),
+    ));
+    let service = needle_service(tmp.path(), model.clone(), exec);
+
+    let outcome = service
+        .run("read_file: {\"path\": \"notes.txt\"}")
+        .await
+        .expect("read dispatches without approval");
+
+    assert!(has_needle_dispatch(&outcome));
+    assert_eq!(outcome.text, "read me\n");
+    assert!(model.recorded().is_empty(), "model never called");
+    assert!(
+        !event_kinds(&outcome).contains(&"approval_requested"),
+        "the fast path must never ask for approval"
+    );
+}
+
+#[tokio::test]
+async fn needle_fast_path_requires_a_tool_capable_model() {
+    // A chat-only provider's run is a plain completion with no tools at
+    // all; the fast path must not turn it into tool execution.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(
+        MockModel::new().with_capabilities(forge_core::ModelCapabilities {
+            streaming: true,
+            tools: false,
+            structured_output: false,
+            vision: false,
+            max_context: 8_192,
+        }),
+    );
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("secret"));
+    let service = needle_service(tmp.path(), model, exec.clone());
+
+    let outcome = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("run");
+
+    assert!(!has_needle_dispatch(&outcome));
+    assert!(
+        exec.recorded_file_ops().is_empty(),
+        "a chat-only model's run must execute no tools"
+    );
+    assert_eq!(outcome.turns, 1, "plain completion path");
+}
+
+#[tokio::test]
+async fn needle_fast_path_guardrail_refuses_destructive_wording_on_a_safe_tool() {
+    // The guardrail is a second, independent gate: this call is read-only
+    // (so the risk gate admits it), but its arguments read destructively,
+    // and the brain's verdict alone must stop it.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("loop answered")]));
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("contents"));
+    let service = needle_service(tmp.path(), model.clone(), exec.clone());
+
+    let outcome = service
+        .run("read_file: {\"path\": \"delete_me.txt\"}")
+        .await
+        .expect("run completes through the normal loop");
+
+    assert!(!has_needle_dispatch(&outcome), "guardrail must refuse");
+    assert!(exec.recorded_file_ops().is_empty(), "nothing was read");
+    assert_eq!(outcome.text, "loop answered");
+}
+
+#[tokio::test]
+async fn needle_fast_path_skips_resumed_runs() {
+    // A resume re-uses the original prompt; re-dispatching the same tool
+    // instead of continuing the conversation would be wrong.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("resumed answer")]));
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("contents"));
+    let service = needle_service(tmp.path(), model.clone(), exec.clone());
+
+    let first = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("first run");
+    assert!(has_needle_dispatch(&first), "first run fast-paths");
+
+    let resumed = service.resume(&first.run_id).await.expect("resume");
+    assert!(
+        !has_needle_dispatch(&resumed),
+        "resume goes through the loop"
+    );
+    assert_eq!(resumed.text, "resumed answer");
+    assert_eq!(exec.recorded_file_ops().len(), 1, "no second dispatch");
+}
+
+#[tokio::test]
+async fn needle_fast_path_declines_prompts_it_cannot_fill() {
+    // Prose (not "<tool>: <json>"): HashBackend declines, run is unchanged.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("prose answer")]));
+    let exec = Arc::new(MockExecution::new(tmp.path()));
+    let service = needle_service(tmp.path(), model.clone(), exec);
+
+    let outcome = service
+        .run("please read Cargo.toml for me")
+        .await
+        .expect("run");
+    assert!(!has_needle_dispatch(&outcome));
+    assert_eq!(outcome.text, "prose answer");
+    assert_eq!(outcome.turns, 1);
 }
 
 #[tokio::test]

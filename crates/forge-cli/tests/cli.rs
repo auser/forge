@@ -11,16 +11,39 @@ const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_LOCAL_ONLY",
     "FORGE_SERVER_HOST",
     "FORGE_SERVER_PORT",
+    // needle config/env knobs (see forge-config's ENV_KEYS and
+    // forge-needle's weights.rs/lib.rs): removed so a developer's shell
+    // can't perturb a supposedly-hermetic run (e.g. a real
+    // FORGE_NEEDLE_WEIGHTS_BASE_URL pointed at a personal mirror, or
+    // FORGE_NEEDLE_AUTOFETCH=true left set from other work).
+    "FORGE_NEEDLE_VARIANT",
+    "FORGE_NEEDLE_AUTOFETCH",
+    "FORGE_NEEDLE_WEIGHTS_SHA256",
+    "FORGE_NEEDLE_BACKEND",
+    "FORGE_NEEDLE_WEIGHTS_BASE_URL",
+    "FORGE_NEEDLE_TEST_SHA256",
 ];
 
-/// A `forge` invocation isolated from the developer's real user config and
-/// environment: XDG_CONFIG_HOME points at a temp dir, FORGE_* vars removed.
+/// A `forge` invocation isolated from the developer's real user
+/// config/environment/cache: `HOME` and `XDG_CONFIG_HOME` point at temp
+/// subdirs, FORGE_*/FORGE_NEEDLE_* vars are removed, and autofetch is
+/// forced off. Without this, `forge init` (which defaults to
+/// `router = "needle"` with `needle.autofetch = true`) would resolve
+/// `~/.cache/forge/models/` to the developer's *real* home directory and
+/// attempt a real fetch from Hugging Face on every test run touching init.
+/// This must hold independent of which cargo features are compiled in —
+/// the `needle-ffi` feature gate in `forge init` itself (see
+/// `commands::init::needle_weights_item`) already prevents the fetch in a
+/// default build, but hermeticity here must not depend on that; a
+/// `--features needle-ffi` test run must stay just as isolated.
 fn forge(tmp: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_forge"));
     for var in FORGE_ENV_VARS {
         cmd.env_remove(var);
     }
+    cmd.env("HOME", tmp.join("home"));
     cmd.env("XDG_CONFIG_HOME", tmp.join("xdg"));
+    cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
     cmd.env("NO_COLOR", "1");
     cmd
 }
@@ -133,6 +156,43 @@ fn init_is_idempotent() {
     assert!(project.join(".forge/config.toml").is_file());
 }
 
+/// `forge init` must never fetch the ~35 MB needle weights artifact in a
+/// build that has no inference engine to use it — this binary is compiled
+/// without the `needle-ffi` feature (the crate's `default = []`, and this
+/// integration suite builds with default features), so it should report
+/// the skip rather than silently succeeding after a real network fetch.
+#[test]
+fn init_skips_needle_weights_fetch_without_needle_ffi_feature() {
+    if cfg!(feature = "needle-ffi") {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .arg("init")
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(
+        stdout.contains("needle-ffi"),
+        "expected the feature-off skip message: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipped"),
+        "expected the feature-off skip message: {stdout}"
+    );
+    assert!(
+        !tmp.path().join("home/.cache/forge/models").exists(),
+        "init must not create/fetch into the weights cache dir without needle-ffi"
+    );
+}
+
 #[test]
 fn serve_serves_health_on_ephemeral_port() {
     use std::io::{Read, Write};
@@ -164,9 +224,16 @@ fn serve_serves_health_on_ephemeral_port() {
     let mut ok = false;
     for _ in 0..100 {
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-            stream
+            // A connection accepted before the server is really ready can
+            // already be reset here (EINVAL/ECONNRESET on macOS); that is a
+            // retry, not a test failure.
+            if stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .expect("timeout");
+                .is_err()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
             let attempt = stream
                 .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 .and_then(|()| stream.read_to_string(&mut body).map(|_| ()));
@@ -410,6 +477,122 @@ fn graph_build_check_map_and_stale_detection() {
     let stdout = String::from_utf8_lossy(&check.stdout);
     assert!(stdout.contains("stale"), "check: {stdout}");
     assert!(stdout.contains("modified"), "check: {stdout}");
+}
+
+#[test]
+fn graph_semantic_grep_needs_needle_weights_without_an_engine() {
+    // Default build (no `needle-ffi` feature, no FORGE_NEEDLE_BACKEND hook):
+    // `engine_if_available` must report unavailable, and `graph grep
+    // --semantic` must fail loudly rather than silently returning nothing.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join("src")).expect("mkdir");
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write");
+
+    let build = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "build"])
+        .output()
+        .expect("run");
+    assert!(build.status.success());
+
+    let grep = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "grep", "--semantic", "main"])
+        .output()
+        .expect("run");
+    assert!(!grep.status.success());
+    let stderr = String::from_utf8_lossy(&grep.stderr);
+    assert!(
+        stderr.contains("semantic search needs needle weights (run forge init)"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn graph_build_embeds_symbols_and_semantic_grep_ranks_by_meaning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join("src")).expect("mkdir");
+    std::fs::write(
+        project.join("src/parser.rs"),
+        "pub fn parse_document(input: &str) -> usize {\n    input.len()\n}\n",
+    )
+    .expect("write");
+    std::fs::write(
+        project.join("src/color.rs"),
+        "pub fn mix_paint_colors() -> u8 {\n    42\n}\n",
+    )
+    .expect("write");
+
+    // First build: FORGE_NEEDLE_BACKEND=hash gives a real, working
+    // (deterministic) engine, so the build must embed every symbol and
+    // write the semantic index.
+    let build = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "graph", "build"])
+        .output()
+        .expect("run");
+    assert!(build.status.success(), "{build:?}");
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    let first: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    let first_embedded = first["embedded"].as_u64().expect("embedded count");
+    assert!(first_embedded >= 2, "expected >=2 embedded, got {first}");
+
+    let index_path = project.join(".forge/graph/embeddings.bin");
+    assert!(
+        index_path.is_file(),
+        "embeddings.bin must exist after build"
+    );
+
+    // `graph grep --semantic` over a needle-shaped query: the hash
+    // backend's deterministic trigram embeddings mean a query sharing
+    // trigrams with "parse_document" (via the embedded text "function
+    // parse_document in src/parser.rs") scores higher than the unrelated
+    // "mix_paint_colors" symbol.
+    let grep = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "grep", "--semantic", "parse document"])
+        .output()
+        .expect("run");
+    assert!(grep.status.success(), "{grep:?}");
+    let grep_stdout = String::from_utf8_lossy(&grep.stdout);
+    let parse_line = grep_stdout
+        .lines()
+        .position(|l| l.contains("src/parser.rs::parse_document"))
+        .unwrap_or_else(|| panic!("parse_document missing from: {grep_stdout}"));
+    let color_line = grep_stdout
+        .lines()
+        .position(|l| l.contains("src/color.rs::mix_paint_colors"))
+        .unwrap_or_else(|| panic!("mix_paint_colors missing from: {grep_stdout}"));
+    assert!(
+        parse_line < color_line,
+        "expected parse_document ranked above mix_paint_colors: {grep_stdout}"
+    );
+
+    // Second build with no source changes: every symbol's content hash is
+    // unchanged, so nothing should be re-embedded.
+    let rebuild = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "graph", "build"])
+        .output()
+        .expect("run");
+    assert!(rebuild.status.success());
+    let rebuild_stdout = String::from_utf8_lossy(&rebuild.stdout);
+    let second: serde_json::Value = serde_json::from_str(rebuild_stdout.trim()).expect("json");
+    assert_eq!(
+        second["embedded"].as_u64(),
+        Some(0),
+        "no-op rebuild must re-embed nothing: {second}"
+    );
 }
 
 #[test]
@@ -849,11 +1032,26 @@ fn serve_laya_autostart() {
             "server did not start; log: {}",
             std::fs::read_to_string(&log_path).unwrap_or_default()
         );
-        // The adapter was autostarted and answers liveness.
-        let adapter = http_get(adapter_port, "/").expect("adapter responds");
+        // The adapter was autostarted and answers liveness. The server's own
+        // /health going green does not imply the adapter has bound its port
+        // yet — it is a separate process the server only spawns — so poll for
+        // it instead of sampling once. (Sampling once passed when this test
+        // ran alone and failed under a loaded parallel test run.)
+        let adapter_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut adapter = None;
+        while std::time::Instant::now() < adapter_deadline {
+            if let Some(body) = http_get(adapter_port, "/")
+                && body.contains("\"status\": \"ok\"")
+            {
+                adapter = Some(body);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         assert!(
-            adapter.contains("\"status\": \"ok\""),
-            "adapter liveness: {adapter}"
+            adapter.is_some(),
+            "adapter did not answer liveness on port {adapter_port}; log: {}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
         );
         // The server itself works end to end.
         let run = {
@@ -898,4 +1096,69 @@ fn serve_laya_autostart() {
         }
         assert!(gone, "adapter still listening on {adapter_port}");
     }
+}
+
+#[test]
+fn run_fast_paths_a_tool_prompt_through_the_needle_brain() {
+    // End-to-end proof that `forge run` wires the brain into AgentService:
+    // with FORGE_NEEDLE_BACKEND=hash the deterministic engine fills a
+    // `read_file` call for an exact "<tool>: <json>" prompt, so the run is
+    // answered by the tool itself and the model is never called.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    std::fs::write(project.join("hello.txt"), "hello from disk\n").expect("write");
+    let prompt = "read_file: {\"path\": \"hello.txt\"}";
+    let args = [
+        "--model",
+        "mock-local",
+        "--router",
+        "static",
+        "--json",
+        "run",
+        prompt,
+    ];
+    let routers = |outcome: &serde_json::Value| -> Vec<String> {
+        outcome["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter_map(|e| e["router"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let fast = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(args)
+        .output()
+        .expect("run");
+    assert!(fast.status.success(), "{fast:?}");
+    let outcome: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&fast.stdout).trim()).expect("run json");
+    assert_eq!(outcome["text"], "hello from disk\n");
+    assert_eq!(outcome["turns"], 0, "no model turn: {outcome}");
+    assert!(
+        routers(&outcome).iter().any(|r| r == "needle-dispatch"),
+        "routers: {:?}",
+        routers(&outcome)
+    );
+
+    // Without an available engine the very same prompt runs the model loop.
+    let normal = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(args)
+        .output()
+        .expect("run");
+    assert!(normal.status.success(), "{normal:?}");
+    let outcome: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&normal.stdout).trim()).expect("run json");
+    assert_eq!(outcome["turns"], 1, "plain loop: {outcome}");
+    assert!(
+        !routers(&outcome).iter().any(|r| r == "needle-dispatch"),
+        "routers: {:?}",
+        routers(&outcome)
+    );
 }

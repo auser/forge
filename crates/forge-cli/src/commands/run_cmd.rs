@@ -5,7 +5,7 @@ use forge_core::ForgeError;
 use forge_runtime::RunOptions;
 
 use crate::commands::Context;
-use crate::commands::service::build_service;
+use crate::commands::service::build_run_service;
 
 /// `forge run <prompt...>` — run the agent loop, print the final text.
 ///
@@ -19,7 +19,7 @@ pub async fn run(
     max_turns: Option<u32>,
 ) -> Result<(), ForgeError> {
     let prompt = prompt.join(" ");
-    let service = Arc::new(build_service(ctx)?);
+    let service = Arc::new(build_run_service(ctx).await?);
 
     let run_id = forge_session::new_run_id();
     let feeder = spawn_stdin_feeder(&service, &run_id);

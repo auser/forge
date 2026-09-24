@@ -6,11 +6,13 @@ members = [
     "crates/forge-core",
     "crates/forge-execution",
     "crates/forge-graph",
+    "crates/forge-needle",
     "crates/forge-providers",
     "crates/forge-runtime",
     "crates/forge-server",
     "crates/forge-session",
     "crates/forge-skills",
+    "crates/needle-sys",
 ]
 
 [workspace.package]
@@ -23,11 +25,13 @@ forge-core = { path = "crates/forge-core" }
 forge-config = { path = "crates/forge-config" }
 forge-execution = { path = "crates/forge-execution" }
 forge-graph = { path = "crates/forge-graph" }
+forge-needle = { path = "crates/forge-needle" }
 forge-providers = { path = "crates/forge-providers" }
 forge-runtime = { path = "crates/forge-runtime" }
 forge-server = { path = "crates/forge-server" }
 forge-session = { path = "crates/forge-session" }
 forge-skills = { path = "crates/forge-skills" }
+needle-sys = { path = "crates/needle-sys" }
 
 async-trait = "0.1"
 axum = "0.8"

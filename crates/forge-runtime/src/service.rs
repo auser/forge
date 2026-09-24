@@ -7,14 +7,15 @@ use forge_config::Config;
 use forge_core::{
     CompletionRequest, DecisionRouter, Event, EventKind, ExecutionProvider, ForgeError, Message,
     ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, SessionStore, Skill, SkillMeta,
-    SkillRegistry, ToolResult,
+    SkillRegistry, ToolCall, ToolResult,
 };
+use forge_needle::NeedleEngine;
 use forge_session::{JsonlSessionStore, new_run_id, new_session_id};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::{ToolDispatcher, ToolOutcome, tool_definitions};
+use crate::tools::{ToolDispatcher, ToolOutcome, minimum_dispatch_risk, tool_definitions};
 
 /// Skill registry for runtimes without skills (tests).
 pub struct NullSkillRegistry;
@@ -32,6 +33,32 @@ impl SkillRegistry for NullSkillRegistry {
 /// Factory resolving a model provider for a routed model name.
 pub type ModelFactory =
     Arc<dyn Fn(&str) -> Result<Arc<dyn ModelProvider>, ForgeError> + Send + Sync>;
+
+/// Router name recorded for a run answered by the direct-dispatch fast
+/// path instead of the model loop.
+const NEEDLE_DISPATCH: &str = "needle-dispatch";
+
+/// The two `decide` options of the fast-path guardrail. Order matters:
+/// only `GUARD_SAFE` (index 0) lets a call through, and `HashBackend`
+/// breaks ties in favour of the first option.
+///
+/// The phrasing is deliberate. `HashBackend` scores an option by how many
+/// of its tokens appear in the question (see `hash_backend.rs`), so the
+/// question shares exactly one token — "operation" — with *both* options:
+/// a benign call therefore ties 1–1 and the safe option wins on order,
+/// while any destructive word in the tool name or arguments ("rm",
+/// "delete", …) lifts the risky option to 2 and the call is refused. A
+/// real backend reads the same two strings as plain English.
+const GUARD_SAFE: &str = "safe operation";
+const GUARD_RISKY: &str =
+    "destructive operation: delete, remove, rm, rmdir, overwrite, truncate, drop, format, kill";
+
+/// A tool call the brain picked, already executed, ready to be reported.
+struct FastPathDispatch {
+    call: ToolCall,
+    outcome: ToolOutcome,
+    confidence: f64,
+}
 
 /// Result of a completed run.
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +130,9 @@ pub struct AgentService {
     /// Resolves a provider for the routed model name; defaults to the
     /// single configured model for every selection.
     model_factory: Option<ModelFactory>,
+    /// On-device brain for the direct-dispatch fast path. `None` (the
+    /// default) means every run goes through the model loop.
+    needle: Option<Arc<NeedleEngine>>,
     broadcasters: Mutex<HashMap<String, broadcast::Sender<Event>>>,
     inputs: Mutex<HashMap<String, InputState>>,
     cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
@@ -126,6 +156,7 @@ impl AgentService {
             config,
             graph: None,
             model_factory: None,
+            needle: None,
             broadcasters: Mutex::new(HashMap::new()),
             inputs: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
@@ -143,6 +174,16 @@ impl AgentService {
     /// configured model serves every selection.
     pub fn with_model_factory(mut self, factory: ModelFactory) -> Self {
         self.model_factory = Some(factory);
+        self
+    }
+
+    /// Attach the on-device Needle brain, enabling the direct-dispatch
+    /// fast path (see [`AgentService::needle_fast_path`]). Callers pass the
+    /// engine only when it is genuinely usable — `forge_needle::engine_if_available`
+    /// is the seam that decides that. `None` keeps the plain model loop
+    /// exactly as it is, so a build without a brain behaves identically.
+    pub fn with_needle(mut self, engine: Option<Arc<NeedleEngine>>) -> Self {
+        self.needle = engine;
         self
     }
 
@@ -349,6 +390,141 @@ impl AgentService {
         (run_id, session_id, handle)
     }
 
+    /// Try to answer a prompt with one local tool call instead of the
+    /// model loop: the brain picks the tool *and* fills its arguments, a
+    /// second brain call vets the result, and the call is dispatched
+    /// through [`ToolDispatcher`] — the same path the loop uses, so
+    /// `ExecutionProvider` approval gating applies unchanged.
+    ///
+    /// Every gate must hold, and any failure returns `None` to mean "run
+    /// normally": this is an optimization, never a behaviour change.
+    ///  1. a brain is attached and the run isn't cancelled;
+    ///  2. `tool_call` produced a call within `router_timeout_ms`, from the
+    ///     same tool list the model would have been offered (the caller
+    ///     only calls this when that list is non-empty, i.e. when the
+    ///     resolved model is tool-capable — a chat-only provider gets the
+    ///     plain-completion path and the fast path must not widen that);
+    ///  3. its confidence is at least `router_confidence_threshold`;
+    ///  4. its arguments parse as a JSON *object* (what the dispatcher
+    ///     reads arguments out of);
+    ///  5. the call is *read-only*: `minimum_dispatch_risk` says
+    ///     `RiskLevel::Safe`, the one classification no approval policy can
+    ///     gate;
+    ///  6. the guardrail `decide` answers `GUARD_SAFE`, confidently and in
+    ///     time;
+    ///  7. the dispatch itself succeeded.
+    ///
+    /// Both brain calls are bounded by `router_timeout_ms`: a slow or hung
+    /// engine costs a run that budget once and then behaves as if no brain
+    /// were attached — it can never hang a run.
+    ///
+    /// Gate 5 is the load-bearing safety gate: **no approval prompt can
+    /// ever originate from the fast path**, under any `approval` policy.
+    /// Without it, `check_approval` would run *inside* the fast path —
+    /// blocking on stdin on a terminal before any event exists, and turning
+    /// a user's "n" into a plain error that the fast path would silently
+    /// swallow, letting the loop request the very same tool and prompt a
+    /// second time. Restricting dispatch to reads removes that whole class:
+    /// `Safe` operations return from `check_approval` before the policy is
+    /// even consulted. Anything else — writes, edits, deletes, commands —
+    /// falls through *before* the execution provider is touched at all.
+    ///
+    /// Nothing is emitted from here, so a decline leaves no trace and no
+    /// side effect for the loop to contradict. The cost is that a
+    /// dispatched call's `tool_*` events are written just after the work
+    /// rather than just before it, for the few milliseconds one local
+    /// read takes.
+    async fn needle_fast_path(
+        &self,
+        prompt: &str,
+        run_id: &str,
+        tools: &[forge_core::ToolDefinition],
+    ) -> Option<FastPathDispatch> {
+        let engine = self.needle.as_ref()?;
+        if self.cancel_requested(run_id) {
+            // Let the loop's own checkpoint report the cancellation.
+            return None;
+        }
+        let budget = Duration::from_millis(self.config.router_timeout_ms);
+        let tools_json = serde_json::to_string(tools).ok()?;
+
+        let call =
+            match tokio::time::timeout(budget, engine.tool_call(prompt.to_string(), tools_json))
+                .await
+            {
+                Ok(Ok(Some(call))) => call,
+                Ok(Ok(None)) => return None,
+                Ok(Err(e)) => {
+                    tracing::debug!(run_id, error = %e, "needle fast path unavailable");
+                    return None;
+                }
+                Err(_) => {
+                    tracing::debug!(run_id, "needle fast path timed out picking a tool");
+                    return None;
+                }
+            };
+        if call.confidence < self.config.router_confidence_threshold {
+            return None;
+        }
+        let arguments = match serde_json::from_str::<serde_json::Value>(&call.arguments_json) {
+            Ok(value) if value.is_object() => value,
+            _ => return None,
+        };
+
+        let tool_call = ToolCall::new(format!("{NEEDLE_DISPATCH}-1"), &call.name, arguments);
+        if minimum_dispatch_risk(&tool_call) != Some(RiskLevel::Safe) {
+            tracing::debug!(
+                run_id,
+                tool = %tool_call.name,
+                "needle fast path skipped: not a read-only operation"
+            );
+            return None;
+        }
+
+        let question = format!(
+            "Classify this tool operation: {} with arguments {}",
+            call.name, call.arguments_json
+        );
+        let options = vec![GUARD_SAFE.to_string(), GUARD_RISKY.to_string()];
+        let verdict = match tokio::time::timeout(budget, engine.decide(question, options)).await {
+            Ok(Ok(verdict)) => verdict,
+            _ => return None,
+        };
+        if verdict.choice != GUARD_SAFE
+            || verdict.confidence < self.config.router_confidence_threshold
+        {
+            tracing::debug!(
+                run_id,
+                tool = %call.name,
+                choice = %verdict.choice,
+                confidence = verdict.confidence,
+                "needle fast path declined by the guardrail"
+            );
+            return None;
+        }
+
+        let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
+        match dispatcher.dispatch(&tool_call).await {
+            Ok(outcome) if !outcome.result.is_error => Some(FastPathDispatch {
+                call: tool_call,
+                outcome,
+                confidence: call.confidence,
+            }),
+            // A tool error means the operation did not complete, so the loop
+            // is where it belongs: a model may recover from it. (An
+            // `ApprovalRequired` cannot reach here — gate 5 admits only
+            // `Safe` operations — but it is handled the same way for free.)
+            _ => {
+                tracing::debug!(
+                    run_id,
+                    tool = %tool_call.name,
+                    "needle fast path handed the call back to the agent loop"
+                );
+                None
+            }
+        }
+    }
+
     async fn run_inner(
         &self,
         prompt: &str,
@@ -509,6 +685,108 @@ impl AgentService {
         } else {
             Vec::new()
         };
+
+        // Fast path: the on-device brain answers a well-defined prompt with
+        // one local tool call, before the model is called. Only for a fresh
+        // prompt — a resume continues a conversation, so re-running the
+        // original prompt's tool would be wrong — and only when the run
+        // actually has tools, i.e. the resolved provider is tool-capable:
+        // a chat-only model's run is a plain completion and the fast path
+        // must not turn it into tool execution. All other gates and the
+        // dispatch itself live in `needle_fast_path`; `None` means "run
+        // normally", and nothing has been emitted or executed by then.
+        if resume_from.is_none()
+            && !tools.is_empty()
+            && let Some(fast) = self.needle_fast_path(prompt, &run_id, &tools).await
+        {
+            tracing::info!(
+                run_id,
+                tool = %fast.call.name,
+                confidence = fast.confidence,
+                "needle dispatched a tool call directly (no model call)"
+            );
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::RoutingDecisionMade {
+                        router: NEEDLE_DISPATCH.to_string(),
+                        selected_model: "none".to_string(),
+                        confidence: fast.confidence,
+                        fallback_used: false,
+                        reason: format!(
+                            "needle filled and dispatched `{}` on device; no model call",
+                            fast.call.name
+                        ),
+                    },
+                ),
+            )?;
+            let args_summary: String = fast.call.arguments.to_string().chars().take(120).collect();
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::ToolCallRequested {
+                        tool: fast.call.name.clone(),
+                        args_summary,
+                    },
+                ),
+            )?;
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::ToolStarted {
+                        name: fast.call.name.clone(),
+                    },
+                ),
+            )?;
+            if let Some(path) = &fast.outcome.file_changed {
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(
+                        &run_id,
+                        &session_id,
+                        EventKind::FileChanged { path: path.clone() },
+                    ),
+                )?;
+            }
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::ToolCompleted {
+                        name: fast.call.name.clone(),
+                        success: true,
+                    },
+                ),
+            )?;
+            let text = fast.outcome.result.content;
+            let summary: String = text.chars().take(80).collect();
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(&run_id, &session_id, EventKind::Completed { summary }),
+            )?;
+            return Ok(RunOutcome {
+                run_id,
+                session_id,
+                text,
+                // No model turn ran; the one tool call is the whole run.
+                turns: 0,
+                tool_calls: tool_call_count + 1,
+                events: collected,
+            });
+        }
 
         if tools.is_empty() {
             // Single-turn path: providers without tool support behave

@@ -1,0 +1,34 @@
+[package]
+name = "forge-needle"
+description = "Embedded on-device AI backend for Forge: decide/embed/extract/tool-call behind a swappable engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Real libneedle backend. Off by default because it needs a per-platform
+# `libneedle.a` that is not in the repo — see crates/needle-sys/build.rs for
+# where to fetch it and README's Development section for the commands.
+ffi = ["dep:needle-sys"]
+# End-to-end tests against real weights (tests/e2e.rs). Requires `ffi` and
+# FORGE_NEEDLE_E2E_WEIGHTS; see README.
+needle-e2e = []
+
+[dependencies]
+async-trait.workspace = true
+forge-config.workspace = true
+forge-core.workspace = true
+needle-sys = { workspace = true, optional = true }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tracing.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tempfile.workspace = true
+wiremock.workspace = true

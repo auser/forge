@@ -1,17 +1,17 @@
 use std::path::{Path, PathBuf};
 
 use forge_core::{ForgeError, find_project_root};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::commands::Context;
 
 const STARTER_CONFIG: &str = "\
 # Forge project configuration.
-# Defaults: local oMLX model + Laya (open-source System One) router.
+# Defaults: local oMLX model + embedded Needle 3 decision router.
 # Precedence: user config -> this file -> FORGE_* env -> CLI flags.
 # See `forge config explain <key>`.
 model = \"qwen3-coder\"        # served by oMLX at model_base_url
-router = \"laya\"              # open-source Jev; falls back to static when down
+router = \"needle\"            # on-device decisions; falls back to static when unavailable
 execution = \"native\"
 approval = \"prompt\"
 ";
@@ -103,9 +103,136 @@ pub fn run(ctx: &Context) -> Result<(), ForgeError> {
 
     items.push(update_gitignore(&root)?);
     items.push(build_graph(&root)?);
+
+    let resolved = ctx.resolve_config()?;
+    items.push(needle_weights_item(&root, &resolved.config));
+
     items.extend(detect_environment(&root));
 
     report(&root, &items, ctx.global.json)
+}
+
+/// `forge init`'s weights step: fetch/verify `[needle]` weights when the
+/// resolved config actually wants them — `needle.autofetch` on, not
+/// `--local-only`, and `router = "needle"` so a fetch wouldn't be wasted on
+/// a router that never runs. Never fails `forge init`: every outcome
+/// (including "no pinned artifact for this variant" and network failure)
+/// degrades to an informational item, matching the design's guarantee that
+/// forge stays fully functional on static routing without weights.
+///
+/// Feature-gated first: the `needle-ffi` feature (off by default and in
+/// release builds — see `forge-cli/Cargo.toml`) is what actually lets
+/// anything *use* fetched weights (`FfiBackend` vs. `UnavailableBackend`).
+/// Without it, fetching the ~35 MB `full` artifact would only ever sit on
+/// disk unused, so this skips the fetch entirely rather than downloading
+/// bytes no build here can act on — regardless of `local_only`/`autofetch`,
+/// since the more fundamental reason to skip is "this binary has no
+/// inference backend to feed", not the config.
+fn needle_weights_item(root: &Path, config: &forge_config::Config) -> InitItem {
+    if !cfg!(feature = "needle-ffi") {
+        return InitItem {
+            status: ItemStatus::Detected,
+            path: root.to_path_buf(),
+            note: Some(
+                "needle weights: skipped (this build has no embedded inference backend; \
+                 build with --features needle-ffi); routing falls back to static"
+                    .to_string(),
+            ),
+        };
+    }
+    if config.local_only {
+        return InitItem {
+            status: ItemStatus::Detected,
+            path: root.to_path_buf(),
+            note: Some(
+                "needle weights: skipped (--local-only); routing falls back to static until weights exist"
+                    .to_string(),
+            ),
+        };
+    }
+    if !config.needle.autofetch || config.router != "needle" {
+        return InitItem {
+            status: ItemStatus::Detected,
+            path: root.to_path_buf(),
+            note: Some(
+                "needle weights: autofetch disabled (needle.autofetch = false or router != \"needle\")"
+                    .to_string(),
+            ),
+        };
+    }
+
+    let needle = config.needle.clone();
+    match run_async(async move { forge_needle::ensure_weights(&needle).await }) {
+        Ok(Ok(forge_needle::WeightsStatus::Present(path))) => InitItem {
+            status: ItemStatus::Unchanged,
+            path,
+            note: Some("needle weights present (verified)".to_string()),
+        },
+        Ok(Ok(forge_needle::WeightsStatus::Fetched(path))) => InitItem {
+            status: ItemStatus::Created,
+            path,
+            note: Some(format!(
+                "fetched needle weights (variant: {})",
+                config.needle.variant
+            )),
+        },
+        Ok(Ok(forge_needle::WeightsStatus::Missing { path, reason })) => {
+            warn!(reason = %reason, "needle weights unavailable; static routing continues");
+            InitItem {
+                status: ItemStatus::Detected,
+                path,
+                note: Some(format!(
+                    "needle weights unavailable: {reason} (static routing continues)"
+                )),
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "needle weights fetch returned an error");
+            InitItem {
+                status: ItemStatus::Detected,
+                path: root.to_path_buf(),
+                note: Some(format!(
+                    "needle weights: error resolving weights ({e}); static routing continues"
+                )),
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "could not run the needle weights fetch");
+            InitItem {
+                status: ItemStatus::Detected,
+                path: root.to_path_buf(),
+                note: Some(format!(
+                    "needle weights: could not run fetch ({e}); static routing continues"
+                )),
+            }
+        }
+    }
+}
+
+/// Bridge a sync call site (`forge init`'s `run()` is sync — see the
+/// `Command::Init => init::run(&ctx)` line in `commands::dispatch`, called
+/// without `.await`) into `forge-needle`'s async weights I/O. Runs the
+/// future on a dedicated OS thread with its own single-purpose Tokio
+/// runtime: `forge-cli`'s top-level `runtime.block_on(dispatch(cli))`
+/// already drives this call from inside a multi-thread Tokio runtime, and
+/// nesting `Handle::block_on` there would deadlock/panic; a fresh thread
+/// sidesteps that regardless of whether a runtime happens to be running
+/// already (e.g. a plain unit test calling this directly would have none).
+fn run_async<F, T>(fut: F) -> Result<T, ForgeError>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("forge-init-async".to_string())
+        .spawn(move || {
+            tokio::runtime::Runtime::new()
+                .map(|rt| rt.block_on(fut))
+                .map_err(|e| ForgeError::config(format!("starting async runtime: {e}")))
+        })
+        .map_err(|e| ForgeError::config(format!("spawning async thread: {e}")))?
+        .join()
+        .map_err(|_| ForgeError::config("async thread panicked"))?
 }
 
 /// Drop-in conveniences: report `.env`/`.env.local` files (loaded at
@@ -238,4 +365,46 @@ fn report(root: &Path, items: &[InitItem], json: bool) -> Result<(), ForgeError>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the fix that made this path feature-aware: a
+    /// default build (no `needle-ffi` — this is exactly how `cargo test`
+    /// compiles this crate; see `forge-cli/Cargo.toml`'s `default = []`)
+    /// must skip the fetch entirely rather than downloading ~35 MB it has
+    /// no backend to use, and must say so. Guarded with `cfg!` rather than
+    /// `#[cfg(not(feature = "needle-ffi"))]` so `cargo test --features
+    /// needle-ffi` still compiles this test (it just returns early instead
+    /// of asserting the wrong branch).
+    #[test]
+    fn needle_weights_item_skips_fetch_without_needle_ffi_feature() {
+        if cfg!(feature = "needle-ffi") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let weights_path = dir.path().join("cache").join("w.cact");
+        let mut config = forge_config::Config::default();
+        // Would autofetch if anything tried: proves the skip happens
+        // regardless of config, not because autofetch/local_only already
+        // said no.
+        config.needle.autofetch = true;
+        config.needle.weights_path = weights_path.display().to_string();
+        config.router = "needle".to_string();
+        config.local_only = false;
+
+        let item = needle_weights_item(dir.path(), &config);
+
+        let note = item.note.expect("note present");
+        assert!(note.contains("skipped"), "note: {note}");
+        assert!(note.contains("needle-ffi"), "note: {note}");
+        assert!(
+            !weights_path.exists(),
+            "no fetch should have happened, but a file exists at {}",
+            weights_path.display()
+        );
+    }
 }

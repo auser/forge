@@ -4,6 +4,7 @@ use forge_core::ForgeError;
 
 use crate::commands::Context;
 
+#[derive(Debug, PartialEq)]
 enum Level {
     Ok,
     Warn,
@@ -234,6 +235,8 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
             detail: format!("{} ({})", config.router, router_note(&config.router)),
         });
 
+        checks.push(needle_check(config).await);
+
         // Reachability of http/laya routers (warn, never fail).
         if matches!(config.router.as_str(), "http" | "laya") {
             let url = config
@@ -366,8 +369,189 @@ fn check_config_file(checks: &mut Vec<Check>, label: &str, path: &Path) {
     }
 }
 
+/// Probe the embedded Needle brain: only meaningful when `router = "needle"`
+/// (else purely informational). Never returns `Level::Fail` — a broken or
+/// missing brain degrades to the configured static fallback, so forge stays
+/// usable either way; this check exists to surface *why* it degraded.
+///
+/// Filesystem/checksum only: this never fetches weights over the network
+/// (that's `forge init`'s job), so `forge doctor` stays fast and offline.
+async fn needle_check(config: &forge_config::Config) -> Check {
+    const LABEL: &str = "needle brain";
+
+    if config.router != "needle" {
+        return Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: "not the active router".into(),
+        };
+    }
+
+    let using_hash_backend = std::env::var("FORGE_NEEDLE_BACKEND").as_deref() == Ok("hash");
+    // Set once this function's own checksum step confirms weights are
+    // present and verified on disk — used below to give an honest message
+    // when `engine_from_config` still fails with a weights-missing-shaped
+    // error (today it always does: no `ffi` backend exists yet, so it
+    // always spawns `UnavailableBackend`, whose `load()` always reports
+    // `WeightsMissing` regardless of what's actually on disk). Without this
+    // flag the probe would print a `forge init` hint that's actively wrong
+    // — the weights *are* fetched and verified; the binary just can't load
+    // them yet.
+    let mut weights_verified = false;
+
+    if !using_hash_backend {
+        let path = match forge_needle::weights_path(&config.needle) {
+            Ok(path) => path,
+            Err(e) => {
+                // Typically an unpinned variant (e.g. "small"/"medium") —
+                // name the situation rather than pretending it's fixable
+                // with `forge init`.
+                return Check {
+                    level: Level::Warn,
+                    label: LABEL.into(),
+                    detail: format!("{e} (falling back to {} routing)", config.router_fallback),
+                };
+            }
+        };
+        if !path.is_file() {
+            return Check {
+                level: Level::Warn,
+                label: LABEL.into(),
+                detail: format!(
+                    "weights missing at {}; run `forge init` to fetch them",
+                    path.display()
+                ),
+            };
+        }
+        let expected_sha256 = if !config.needle.weights_sha256.trim().is_empty() {
+            config.needle.weights_sha256.clone()
+        } else {
+            match forge_needle::spec_for(&config.needle.variant) {
+                Ok(spec) => spec.sha256.to_string(),
+                Err(e) => {
+                    return Check {
+                        level: Level::Warn,
+                        label: LABEL.into(),
+                        detail: e.to_string(),
+                    };
+                }
+            }
+        };
+        match forge_needle::verify(&path, &expected_sha256) {
+            Ok(true) => weights_verified = true,
+            Ok(false) => {
+                return Check {
+                    level: Level::Warn,
+                    label: LABEL.into(),
+                    detail: format!(
+                        "weights at {} failed checksum verification; run `forge init` to refetch them",
+                        path.display()
+                    ),
+                };
+            }
+            Err(e) => {
+                return Check {
+                    level: Level::Warn,
+                    label: LABEL.into(),
+                    detail: format!(
+                        "could not verify weights at {}: {e}; run `forge init`",
+                        path.display()
+                    ),
+                };
+            }
+        }
+    }
+
+    let engine_result = if using_hash_backend {
+        Ok(forge_needle::NeedleEngine::spawn(
+            forge_needle::HashBackend::new(),
+        ))
+    } else {
+        forge_needle::engine_from_config(&config.needle)
+    };
+    let engine = match engine_result {
+        Ok(engine) => engine,
+        Err(e) => {
+            return Check {
+                level: Level::Warn,
+                label: LABEL.into(),
+                detail: format!("engine unavailable: {e}"),
+            };
+        }
+    };
+
+    let timeout = std::time::Duration::from_millis(config.router_timeout_ms);
+    let started = std::time::Instant::now();
+    // The probe has to be a task that genuinely maps to one of the options.
+    // Needle refuses to guess by design: asked to choose "ok" for a "doctor
+    // smoke test" it declines — correctly — and the probe then reports a
+    // healthy brain as broken. So ask something real (this mirrors the
+    // options a routing decision actually sees) and only check that a
+    // decision came back at all, not which one.
+    let decide_result = tokio::time::timeout(
+        timeout,
+        engine.decide(
+            "run the project's test suite".to_string(),
+            vec!["test-runner".to_string(), "chat-model".to_string()],
+        ),
+    )
+    .await;
+    let elapsed_ms = started.elapsed().as_millis();
+
+    match decide_result {
+        Ok(Ok(_decision)) => match engine.info().await {
+            Ok((model_id, _dims)) => Check {
+                level: Level::Ok,
+                label: LABEL.into(),
+                detail: format!("ok (model {model_id}, decide {elapsed_ms} ms)"),
+            },
+            Err(e) => Check {
+                level: Level::Warn,
+                label: LABEL.into(),
+                detail: format!("decide succeeded but model info failed: {e}"),
+            },
+        },
+        Ok(Err(e)) if weights_verified && is_weights_missing_shaped(&e) => Check {
+            // This function's own checksum check above just confirmed the
+            // weights ARE present and verified — a `forge init` hint here
+            // would be actively wrong. What's actually true: this binary was
+            // built without the `ffi` inference backend, so
+            // `engine_from_config` yields `UnavailableBackend`, which cannot
+            // load any weights, verified or not.
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!(
+                "weights present and verified, but this binary was built without the embedded \
+                 inference backend (rebuild with `--features needle-ffi`); falls back to {} routing",
+                config.router_fallback
+            ),
+        },
+        Ok(Err(e)) => Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!("decide failed: {e}"),
+        },
+        Err(_) => Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!("decide timed out after {} ms", timeout.as_millis()),
+        },
+    }
+}
+
+/// `NeedleEngine::decide`'s error is a stringly-typed `ForgeError::Router`
+/// by the time it reaches doctor — the engine layer collapses
+/// `BackendError` into a message rather than preserving the variant. This
+/// matches on the exact wording `BackendError::WeightsMissing`'s `Display`
+/// impl produces (`forge-needle/src/backend.rs`) so `needle_check` can tell
+/// "no ffi backend built in" apart from a genuine inference failure.
+fn is_weights_missing_shaped(err: &ForgeError) -> bool {
+    err.to_string().contains("weights missing at")
+}
+
 fn router_note(router: &str) -> &'static str {
     match router {
+        "needle" => "embedded on-device Needle 3 decisions, available offline",
         "static" => "deterministic rules, available offline",
         "mock" => "deterministic mock, available offline",
         "cheapest" => "lowest-cost capable candidate, available offline",
@@ -382,5 +566,116 @@ fn execution_note(execution: &str) -> &'static str {
         "native" => "local process execution, available",
         "mock" => "recorded mock execution, available offline",
         _ => "unrecognized execution provider",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use super::*;
+
+    #[tokio::test]
+    #[serial]
+    async fn needle_check_when_router_is_not_needle_is_ok_and_informational() {
+        let config = forge_config::Config {
+            router: "static".to_string(),
+            ..forge_config::Config::default()
+        };
+        let check = needle_check(&config).await;
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("not the active router"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn needle_check_reports_missing_weights_as_warn_not_fail() {
+        let mut config = forge_config::Config::default();
+        config.needle.weights_path = "/nonexistent/needle.bin".to_string();
+        let check = needle_check(&config).await;
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("forge init"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn needle_check_gives_honest_message_when_weights_verified_but_no_ffi_backend() {
+        // Weights genuinely present and checksum-verified on disk, but
+        // `engine_from_config` still can't load them (no `ffi` backend
+        // built into this binary until Task 8). The probe must not blame
+        // this on missing weights or suggest `forge init` — that would be
+        // actively wrong, since the checksum step just succeeded.
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("weights.bin");
+        let bytes = b"arbitrary-bytes-standing-in-for-real-needle-weights";
+        std::fs::write(&path, bytes).expect("write fake weights");
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+
+        let config = forge_config::Config {
+            needle: forge_config::NeedleConfig {
+                variant: "full".to_string(),
+                weights_path: path.display().to_string(),
+                autofetch: true,
+                // Operator-supplied override bypasses the pinned-spec
+                // checksum lookup entirely, so an arbitrary payload can
+                // verify cleanly.
+                weights_sha256: sha256,
+            },
+            ..forge_config::Config::default()
+        };
+
+        let check = needle_check(&config).await;
+
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            !check.detail.contains("forge init"),
+            "must not suggest `forge init` once weights are already verified: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("without the embedded inference backend"),
+            "detail: {}",
+            check.detail
+        );
+        // The message has to tell the operator how to fix it, which is a
+        // rebuild with the feature — not a refetch.
+        assert!(
+            check.detail.contains("needle-ffi"),
+            "should name the feature that turns the backend on: {}",
+            check.detail
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn needle_check_warns_for_unpinned_variant_without_panicking() {
+        // "medium" is config-valid but has no pinned artifact yet (see
+        // forge-needle's weights module doc) — must degrade to Warn, never
+        // panic or Fail.
+        let mut config = forge_config::Config::default();
+        config.needle.variant = "medium".to_string();
+        let check = needle_check(&config).await;
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("medium"), "detail: {}", check.detail);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn needle_check_with_hash_backend_reports_ok_and_latency() {
+        // SAFETY: test-only env mutation, serialized via #[serial] against
+        // any other test touching FORGE_NEEDLE_BACKEND in this crate.
+        unsafe {
+            std::env::set_var("FORGE_NEEDLE_BACKEND", "hash");
+        }
+        let check = needle_check(&forge_config::Config::default()).await;
+        unsafe {
+            std::env::remove_var("FORGE_NEEDLE_BACKEND");
+        }
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("ms")); // measured decide() latency
     }
 }

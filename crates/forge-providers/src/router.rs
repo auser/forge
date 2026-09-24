@@ -541,8 +541,10 @@ impl DecisionRouter for ThresholdRouter {
 }
 
 /// Build a router by name. `static`, `mock`, `cheapest` are local;
-/// `http`/`laya` are HTTP. Laya defaults to `127.0.0.1:8788` when
-/// `router_url` is unset.
+/// `http`/`laya` are HTTP; `needle` is the embedded on-device Needle 3
+/// decision router (env `FORGE_NEEDLE_BACKEND=hash` selects the
+/// deterministic test/BDD backend instead of the real weights-backed
+/// engine). Laya defaults to `127.0.0.1:8788` when `router_url` is unset.
 fn build_router(
     name: &str,
     config: &Config,
@@ -592,24 +594,32 @@ fn build_router(
                 criteria,
             )?))
         }
+        "needle" => {
+            let engine = forge_needle::select_engine(&config.needle)?;
+            Ok(Arc::new(forge_needle::NeedleRouter::new(
+                engine,
+                registry.to_vec(),
+                Duration::from_millis(config.router_timeout_ms),
+            )))
+        }
         other => Err(ForgeError::router(format!(
-            "unknown router {other:?} (expected static, mock, cheapest, http, or laya)"
+            "unknown router {other:?} (expected static, mock, cheapest, http, laya, or needle)"
         ))),
     }
 }
 
 /// Build the decision router from configuration: `static`, `mock`,
-/// `cheapest`, `http`, or `laya`. HTTP-class routers are gated by
-/// `router_confidence_threshold`; when the primary differs from
-/// `router_fallback` it is wrapped in a `FallbackRouter` so failures and
-/// low-confidence decisions degrade to the fallback instead of failing
+/// `cheapest`, `http`, `laya`, or `needle`. HTTP-class routers and `needle`
+/// are gated by `router_confidence_threshold`; when the primary differs
+/// from `router_fallback` it is wrapped in a `FallbackRouter` so failures
+/// and low-confidence decisions degrade to the fallback instead of failing
 /// the run.
 pub fn router_from_config(
     config: &Config,
     registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
     let mut primary = build_router(&config.router, config, registry)?;
-    if matches!(config.router.as_str(), "http" | "laya") {
+    if matches!(config.router.as_str(), "http" | "laya" | "needle") {
         primary = Arc::new(ThresholdRouter::new(
             primary,
             config.router_confidence_threshold,
@@ -624,6 +634,7 @@ pub fn router_from_config(
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -829,10 +840,10 @@ mod tests {
     }
 
     #[test]
-    fn router_from_config_builds_laya_chain_by_default() {
-        // Default router is laya (threshold-gated, static fallback).
+    fn router_from_config_builds_needle_chain_by_default() {
+        // Default router is needle (threshold-gated, static fallback).
         let config = Config::default();
-        assert_eq!(config.router, "laya");
+        assert_eq!(config.router, "needle");
         assert_eq!(config.router_fallback, "static");
         let router = router_from_config(&config, &[]).expect("default chain builds");
         drop(router);
@@ -845,6 +856,17 @@ mod tests {
             ..Config::default()
         };
         let router = router_from_config(&config, &[]).expect("static builds");
+        drop(router);
+    }
+
+    #[test]
+    fn router_from_config_builds_laya_explicitly() {
+        // Laya is no longer the default but stays available and buildable.
+        let config = Config {
+            router: "laya".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("laya builds");
         drop(router);
     }
 
@@ -867,6 +889,48 @@ mod tests {
             ..Config::default()
         };
         assert!(router_from_config(&config, &[]).is_err());
+    }
+
+    // --- needle ---
+
+    #[tokio::test]
+    #[serial]
+    async fn needle_router_from_config_falls_back_to_static_without_weights() {
+        let config = Config {
+            router: "needle".to_string(),
+            router_fallback: "static".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[("qwen3-coder".to_string(), caps(true))])
+            .expect("builds");
+        let d = router
+            .route(&RoutingRequest::new("explain this"))
+            .await
+            .expect("fallback routes");
+        assert!(d.fallback_used);
+        assert_eq!(d.router_name, "static");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn needle_router_with_hash_backend_routes_directly() {
+        // Env-driven backend selection; #[serial] guards env mutation
+        // against the test above, which also builds a "needle" router and
+        // would otherwise race on FORGE_NEEDLE_BACKEND.
+        unsafe { std::env::set_var("FORGE_NEEDLE_BACKEND", "hash") };
+        let config = Config {
+            router: "needle".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[("qwen3-coder".to_string(), caps(true))])
+            .expect("builds");
+        let d = router
+            .route(&RoutingRequest::new("qwen3 coder please"))
+            .await
+            .expect("routes");
+        unsafe { std::env::remove_var("FORGE_NEEDLE_BACKEND") };
+        assert_eq!(d.router_name, "needle");
+        assert!(!d.fallback_used);
     }
 
     // --- cheapest ---

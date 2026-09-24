@@ -47,13 +47,14 @@ fn defaults_when_nothing_set() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
 
-    // Default stack: local oMLX model + Laya router (mocks are opt-in).
+    // Default stack: local oMLX model + embedded Needle router (mocks are
+    // opt-in).
     assert_eq!(resolved.config.model, "qwen3-coder");
     assert_eq!(
         resolved.config.model_base_url.as_deref(),
         Some("http://127.0.0.1:8080/v1")
     );
-    assert_eq!(resolved.config.router, "laya");
+    assert_eq!(resolved.config.router, "needle");
     assert_eq!(resolved.config.router_timeout_ms, 5_000);
     assert_eq!(resolved.config.execution, "native");
     assert_eq!(resolved.config.approval, "prompt");
@@ -107,7 +108,7 @@ fn project_file_overrides_user_file_and_defaults() {
     // Untouched key stays default.
     assert_eq!(
         resolved.explain("router"),
-        Some(("\"laya\"".to_string(), Origin::Default))
+        Some(("\"needle\"".to_string(), Origin::Default))
     );
 }
 
@@ -265,6 +266,152 @@ fn models_table_deep_merges_by_name() {
         resolved.explain("models").map(|(_, o)| o),
         Some(Origin::ProjectFile)
     );
+}
+
+/// Regression test: the generic nested-section merge added for `[needle]`
+/// must never leak stale per-model dotted sources for `[models]`, which has
+/// its own dedicated name-keyed merge path. Before the fix, a project-file
+/// override of a built-in model landed correctly in `resolved.config` but
+/// `explain("models.qwen3-coder")` still reported the stale default value
+/// with `Origin::Default`, because the generic branch (mis-)handled the
+/// very first (defaults) layer for "models" before the dedicated branch
+/// ever got a chance to run.
+#[test]
+#[serial]
+fn models_override_does_not_leak_stale_dotted_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let xdg = tmp.path().join("xdg");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    let _guard = EnvGuard::isolated(&xdg);
+
+    write_project_config(
+        &project,
+        "[models.qwen3-coder]\ncost_input_per_mtok = 999.0\n",
+    );
+
+    let resolved = Config::load(Some(&project), &CliOverrides::default()).expect("load");
+    // The override is correctly applied to the resolved config...
+    assert_eq!(
+        resolved.config.models["qwen3-coder"].cost_input_per_mtok,
+        999.0
+    );
+    // ...and per-model dotted keys are never exposed via explain (models
+    // only ever gets the aggregate "models" source), so there is no stale
+    // default value to leak.
+    assert_eq!(resolved.explain("models.qwen3-coder"), None);
+    assert_eq!(
+        resolved.explain("models").map(|(_, o)| o),
+        Some(Origin::ProjectFile)
+    );
+}
+
+#[test]
+fn needle_defaults() {
+    let c = Config::default();
+    // "full" is the only variant with a hosted, pinned artifact today, so
+    // a fresh `forge init` actually fetches working weights out of the
+    // box. See the design spec's risks section for reverting this once
+    // Cactus hosts a smaller rung.
+    assert_eq!(c.needle.variant, "full");
+    assert_eq!(c.needle.weights_path, "");
+    assert!(c.needle.autofetch);
+    assert_eq!(c.needle.weights_sha256, "");
+}
+
+#[test]
+fn needle_section_parses_and_validates() {
+    let c: Config =
+        toml::from_str("[needle]\nvariant = \"small\"\nautofetch = false").expect("parses");
+    assert_eq!(c.needle.variant, "small");
+    assert!(!c.needle.autofetch);
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn needle_invalid_variant_names_valid_values() {
+    let c: Config = toml::from_str("[needle]\nvariant = \"tiny\"").expect("parses");
+    let err = c
+        .validate()
+        .expect_err("invalid variant rejected")
+        .to_string();
+    assert!(err.contains("tiny") && err.contains("small") && err.contains("full"));
+}
+
+#[test]
+fn needle_weights_sha256_parses_and_validates() {
+    // Empty (the default) and a well-formed 64-char hex string both pass.
+    let empty: Config = toml::from_str("[needle]\nvariant = \"full\"").expect("parses");
+    assert!(empty.validate().is_ok());
+
+    let good: Config = toml::from_str(&format!(
+        "[needle]\nvariant = \"full\"\nweights_sha256 = \"{}\"",
+        "a".repeat(64)
+    ))
+    .expect("parses");
+    assert_eq!(good.needle.weights_sha256, "a".repeat(64));
+    assert!(good.validate().is_ok());
+
+    // Wrong length and non-hex characters are both rejected, and the
+    // error names the offending field.
+    let too_short: Config = toml::from_str("[needle]\nweights_sha256 = \"abcd\"").expect("parses");
+    let err = too_short
+        .validate()
+        .expect_err("short hash rejected")
+        .to_string();
+    assert!(err.contains("weights_sha256"), "err: {err}");
+
+    let not_hex: Config = toml::from_str(&format!(
+        "[needle]\nweights_sha256 = \"{}\"",
+        "z".repeat(64)
+    ))
+    .expect("parses");
+    let err = not_hex
+        .validate()
+        .expect_err("non-hex rejected")
+        .to_string();
+    assert!(err.contains("weights_sha256"), "err: {err}");
+}
+
+#[test]
+#[serial]
+fn needle_env_overrides_and_explain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.needle.variant, "full");
+    assert_eq!(
+        resolved.explain("needle.variant"),
+        Some(("\"full\"".to_string(), Origin::Default))
+    );
+    assert_eq!(
+        resolved.explain("needle.autofetch"),
+        Some(("true".to_string(), Origin::Default))
+    );
+
+    unsafe {
+        std::env::set_var("FORGE_NEEDLE_VARIANT", "small");
+        std::env::set_var("FORGE_NEEDLE_AUTOFETCH", "false");
+    }
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.needle.variant, "small");
+    assert!(!resolved.config.needle.autofetch);
+    // weights_path untouched by env should still resolve to its default,
+    // even though only two of three needle fields were overridden.
+    assert_eq!(resolved.config.needle.weights_path, "");
+    assert_eq!(
+        resolved.explain("needle.variant"),
+        Some(("\"small\"".to_string(), Origin::Environment))
+    );
+    assert_eq!(
+        resolved.explain("needle.autofetch"),
+        Some(("false".to_string(), Origin::Environment))
+    );
+
+    unsafe { std::env::set_var("FORGE_NEEDLE_VARIANT", "bogus") };
+    let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
+    assert!(matches!(err, ForgeError::Config(_)));
 }
 
 #[test]

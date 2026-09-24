@@ -34,7 +34,7 @@ pub struct GlobalOpts {
     #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Override the configured router.
+    /// Override the configured router (static|mock|cheapest|http|laya|needle).
     #[arg(long, global = true, value_name = "ROUTER")]
     pub router: Option<String>,
 
@@ -165,6 +165,10 @@ pub enum GraphCommand {
     Grep {
         #[arg(value_name = "PATTERN")]
         pattern: String,
+        /// Search the local semantic embedding index instead of literal
+        /// text/regex matching (requires needle weights; see `forge init`).
+        #[arg(long)]
+        semantic: bool,
     },
     /// Find callers of a symbol.
     Callers {

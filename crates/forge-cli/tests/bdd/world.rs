@@ -21,6 +21,16 @@ pub const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_MAX_TURNS",
     "FORGE_SERVER_HOST",
     "FORGE_SERVER_PORT",
+    // needle config/env knobs (see forge-config's ENV_KEYS and
+    // forge-needle's weights.rs/lib.rs): removed so a developer's shell
+    // can't perturb a supposedly-hermetic scenario run. `FORGE_NEEDLE_AUTOFETCH`
+    // is set back to `"false"` explicitly below, after this removal runs.
+    "FORGE_NEEDLE_VARIANT",
+    "FORGE_NEEDLE_AUTOFETCH",
+    "FORGE_NEEDLE_WEIGHTS_SHA256",
+    "FORGE_NEEDLE_BACKEND",
+    "FORGE_NEEDLE_WEIGHTS_BASE_URL",
+    "FORGE_NEEDLE_TEST_SHA256",
 ];
 
 #[derive(Debug, Default, cucumber::World)]
@@ -83,13 +93,24 @@ impl BddWorld {
         cmd.arg("--project")
             .arg(&root)
             .args(args)
-            .stdin(Stdio::null())
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("NO_COLOR", "1");
+            .stdin(Stdio::null());
+        // Remove first, then set defaults: FORGE_NEEDLE_AUTOFETCH is one of
+        // FORGE_ENV_VARS now, so setting it before removing would have the
+        // removal undo it.
         for var in FORGE_ENV_VARS {
             cmd.env_remove(var);
         }
+        cmd.env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("NO_COLOR", "1")
+            // Hermetic default: BDD never depends on the network.
+            // `needle.variant` now defaults to "full" (the only variant
+            // with a hosted, pinned artifact), so an un-overridden `forge
+            // init` would otherwise download ~35 MB from Hugging Face on
+            // every scenario run. A scenario that wants to exercise real
+            // autofetch can still opt in via `world.env`, which is applied
+            // after this and wins.
+            .env("FORGE_NEEDLE_AUTOFETCH", "false");
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
