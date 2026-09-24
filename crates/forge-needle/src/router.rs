@@ -126,6 +126,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_decision_times_out_and_says_so() {
+        // The `timeout` arm of `route` had no coverage: a backend slower
+        // than `router_timeout_ms` must produce an Err naming the timeout
+        // (which `FallbackRouter` then degrades to static rules) rather
+        // than blocking the request for as long as inference takes.
+        use crate::engine::tests::SlowBackend;
+        use std::sync::atomic::AtomicUsize;
+
+        let slow = NeedleRouter::new(
+            Arc::new(NeedleEngine::spawn(SlowBackend {
+                decide_calls: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::from_millis(500),
+            })),
+            vec![("qwen3-coder".to_string(), caps(true))],
+            Duration::from_millis(10),
+        );
+
+        let started = std::time::Instant::now();
+        let err = slow
+            .route(&RoutingRequest::new("anything"))
+            .await
+            .expect_err("a decision slower than the timeout must error");
+        assert!(
+            err.to_string().contains("timed out"),
+            "error should name the timeout: {err}"
+        );
+        // It must return at the timeout, not after the full inference.
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "route returned after {:?}, so it waited for the backend instead of timing out",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn empty_candidates_is_an_error_not_a_guess() {
         let empty = NeedleRouter::new(
             Arc::new(NeedleEngine::spawn(HashBackend::new())),

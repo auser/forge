@@ -297,6 +297,51 @@ adds `router_name: "needle"` and confidence — no schema change.
   currently only fetches weights at runtime (autofetch), not the engine.
   The `NEEDLE_LIB_DIR`/vendored/download-at-build resolution order still
   keeps forge shippable under any outcome there.
+
+  **Amendment (Task 8, engine acquired and verified 2026-09-23).** The
+  engine is real, obtained, and now the basis of `FfiBackend`:
+
+  - **Source.** `https://huggingface.co/Cactus-Compute/needle3` ships a
+    folder per platform, each holding `libneedle.a` + `needle.h` (native
+    runners `needle`/`needle.exe` too, which forge does not use):
+    `macos-arm64`, `linux-{x86_64,arm64,armv7,riscv64,mipsel}`,
+    `windows-{x86_64,arm64}`, `android-{arm64,armv7,riscv64}`,
+    `ios-arm64`, `ios-sim-arm64`, `tvos-arm64`, `watchos-arm64`, `wasm`,
+    `wasm-component`. Discovered via the HF API `siblings` listing after
+    `cactus-compute/needle` (the Apache-2.0 Python SDK repo, PyPI package
+    `cactus-needle` 3.0.1) documented a C API and a `needle build
+    --platform <folder>` fetch path. Engine version per the SDK's
+    `ENGINE_VERSIONS[3]`: `3.0.2`.
+  - **License: Apache-2.0, same repo, redistributable.** Confirmed for the
+    *library* as well as the weights — the HF repo-root `LICENSE` covers
+    every platform folder, and the SDK repo is independently Apache-2.0
+    (`pyproject.toml` `license = { text = "Apache-2.0" }`, GitHub
+    `license.spdx_id: Apache-2.0`). Vendoring is therefore *permitted*; the
+    repo still does not commit `libneedle.a` (1.1 MB × 17 targets, and
+    nothing in `just verify` needs it) but `needle.h` — the API contract —
+    is committed so `cargo check` works on machines that never link it.
+  - **Pinned artifacts** (macos-arm64, verified by `shasum -a 256`):
+    `libneedle.a` = `60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a`
+    (1 158 184 bytes); `needle.h` =
+    `3aa713942528d944598458cecb4a262f2cc49349bec63355f91df0b159964e55`
+    (1 187 bytes, committed at `crates/needle-sys/needle.h`).
+  - **It is C++ behind an `extern "C"` facade.** `nm` shows libc++ symbols
+    plus `__cxa_*`/`__gxx_personality_v0`, so `build.rs` links the C++
+    runtime (`c++` on Apple/FreeBSD, `stdc++` on Linux, `c++_static` +
+    `c++abi` on Android, nothing extra on MSVC).
+  - **The offline guarantee holds: `libneedle.a` cannot make network
+    calls.** Needle's README warns that "telemetry is turned on in the
+    binary" by default, which would contradict forge's "no network calls
+    once weights are on disk" claim for the `needle` router. It does not
+    apply to us: that telemetry is in the Python SDK
+    (`needle/_telemetry.py`) and the standalone `needle` CLI runner, not in
+    the static library forge links. `nm -u libneedle.a` shows **zero**
+    network-capable undefined symbols — no `socket`, `connect`,
+    `getaddrinfo`, `gethostby*`, DNS, TLS/SSL, HTTP or curl. The complete
+    external surface is libc maths/memory/stdio (`fopen`/`fread`/`fwrite`/
+    `remove` — expected, `needle_init` takes an optional tool-index path)
+    plus `mmap`/`munmap`, `pthread_create`, `getrusage` and
+    `sysctlbyname`. No `NEEDLE_TELEMETRY=0` workaround is required.
 - **Artifact layout differs from the original plan: only one variant is
   a downloadable file.** The design assumed three separately-hosted
   weight variants (`small`/`medium`/`full`). In reality Cactus-Compute
@@ -327,6 +372,75 @@ adds `router_name: "needle"` and confidence — no schema change.
   the trust anchor.
 - **C API stability**: Needle 3 shipped 2026-09-18; pin an exact
   library + weights version, verify by checksum.
+
+  **Amendment (Task 8): the C API is six functions, and smaller than the
+  plan assumed.** `needle.h` declares only `needle_load`, `needle_init`,
+  `needle_complete`, `needle_embed`, `needle_reset`, `needle_last_error`.
+  There is no `decide`, no `extract` and no separate tool-call entry point:
+  `needle_complete` is the single generation primitive, and the *tool
+  surface installed by `needle_init` decides what it means*. So
+  `FfiBackend` maps three trait methods onto it — `decide` installs one
+  no-argument tool per option (the selected tool is the choice), `extract`
+  installs the caller's JSON Schema as one record tool, `tool_call` passes
+  the caller's tools JSON through — while `embed` uses `needle_embed`
+  directly. The `NeedleBackend` trait did not change.
+
+  Behaviours measured against the real library that the header does *not*
+  state, each of which the wrapper now defends against:
+
+  - **`needle_init` does not validate its tools JSON.** `"{not json"`
+    returns success (10), as does `"[]"` (7). Malformed tool surfaces are
+    therefore silent; `FfiBackend` parses every JSON string with
+    `serde_json` before handing it over, and builds JSON with `serde_json`
+    rather than string formatting.
+  - **`needle_complete` truncates silently.** With a 64-byte buffer it
+    wrote 63 bytes + NUL and still returned success. It does respect
+    `out_capacity` (verified by placing the buffer against an
+    `mprotect(PROT_NONE)` guard page — no fault), so this is a correctness
+    not a safety problem: the wrapper uses a 256 KiB buffer and reports a
+    full buffer as a typed truncation error.
+  - **The return value of `needle_complete` is a token count, not a byte
+    count.** The NUL terminator is the only length signal.
+  - **`needle_load` copies the archive.** Verified by revoking the source
+    pages with `mprotect(PROT_NONE)` after loading and continuing to infer
+    successfully, so the weights `Vec` is dropped immediately rather than
+    leaked for the process lifetime.
+  - **Names round-trip verbatim.** The engine snake-cases tool names
+    internally (its `reasoning` shows `qwen3_coder`) but echoes the
+    original in `function_calls[].name` — `qwen3-coder` and
+    `openai/gpt-5.1-mini` both come back exactly as given. No sanitisation
+    or name-mapping table is needed; options are matched by string
+    equality.
+  - **`needle_embed`** reports 3072 dimensions for `needle3.cact`, is
+    L2-normalised, needs `needle_load` but not `needle_init`, is
+    independent of conversation state, and rejects an undersized output
+    buffer with `-1` rather than overflowing.
+  - **`needle_last_error`** points at `""` (not null) when nothing failed,
+    and is invalidated by the next call, so it is copied out immediately.
+  - **`needle_init` per call is a performance *win*, not a cost.** It
+    tokenizes and caches the static prefix. Caching it and skipping it for
+    an unchanged tool surface — the obvious optimisation — made a warm
+    route round-trip ~30x *worse* (0.5 s → 16.5 s). `FfiBackend::run`
+    therefore resets and re-inits on every call, with a comment saying so.
+
+- **Process-global, non-thread-safe, cannot unload.** The header's first
+  sentence, and the strongest constraint on the design. `NeedleEngine`
+  already serialises everything onto one dedicated thread, which satisfies
+  it for a single engine; `FfiBackend::load` additionally takes a
+  process-wide claim so a *second* engine in the same process fails with a
+  typed error instead of racing through shared C state, and records which
+  archive was bound so a request for different weights fails loudly rather
+  than being silently answered by the first ones. It also means the
+  real-weights e2e suite has to be a single sequential test function —
+  parallel test threads would otherwise collide.
+
+- **Latency is real but noisy.** Warm route round-trip on an idle
+  macos-arm64 machine: ~47 ms in a release build, ~100 ms in a debug
+  build; first inference after load ~5.7 s (paging in the archive).
+  Identical deterministic inferences measured anywhere from 93 ms to 20 s
+  on a machine busy compiling Rust, so the e2e perf assertion takes the
+  minimum of five samples and the README points at release builds for any
+  real measurement.
 - **Quality bar**: Needle's routing/guardrail accuracy on forge's
   decision phrasing must be validated during implementation; the
   confidence threshold and static fallback bound the blast radius of

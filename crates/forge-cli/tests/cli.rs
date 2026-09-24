@@ -849,11 +849,26 @@ fn serve_laya_autostart() {
             "server did not start; log: {}",
             std::fs::read_to_string(&log_path).unwrap_or_default()
         );
-        // The adapter was autostarted and answers liveness.
-        let adapter = http_get(adapter_port, "/").expect("adapter responds");
+        // The adapter was autostarted and answers liveness. The server's own
+        // /health going green does not imply the adapter has bound its port
+        // yet — it is a separate process the server only spawns — so poll for
+        // it instead of sampling once. (Sampling once passed when this test
+        // ran alone and failed under a loaded parallel test run.)
+        let adapter_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut adapter = None;
+        while std::time::Instant::now() < adapter_deadline {
+            if let Some(body) = http_get(adapter_port, "/")
+                && body.contains("\"status\": \"ok\"")
+            {
+                adapter = Some(body);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         assert!(
-            adapter.contains("\"status\": \"ok\""),
-            "adapter liveness: {adapter}"
+            adapter.is_some(),
+            "adapter did not answer liveness on port {adapter_port}; log: {}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
         );
         // The server itself works end to end.
         let run = {

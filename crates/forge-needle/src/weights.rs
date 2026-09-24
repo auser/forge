@@ -329,7 +329,12 @@ mod tests {
         format!("{:x}", Sha256::digest(bytes))
     }
 
+    // `#[serial]`: this asserts the *default* resolve URL, so it must not run
+    // while one of the `ensure_weights` tests below has `BASE_URL_ENV`
+    // pointed at its wiremock server. (Without this it fails intermittently
+    // depending on test scheduling.)
     #[test]
+    #[serial]
     fn spec_for_full_returns_the_pinned_artifact() {
         let spec = spec_for("full").expect("full is pinned");
         assert_eq!(spec.variant, "full");

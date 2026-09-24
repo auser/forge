@@ -316,9 +316,11 @@ Six modes:
 - `needle` (embedded on-device Needle 3 decision model, no network calls
   once weights are on disk; **default**; `forge init` fetches/verifies
   weights for `needle.variant = "full"`, the one variant Cactus-Compute
-  currently publishes as a standalone artifact; falls back to static when
-  weights are unavailable — unpinned variant, `--local-only`, no network,
-  or the FFI inference backend itself, which lands in a later phase),
+  currently publishes as a standalone artifact; real inference needs a build
+  with the `needle-ffi` feature — see [Embedded Needle brain
+  (`ffi`)](#embedded-needle-brain-ffi) — and falls back to static without
+  it, or when weights are unavailable: unpinned variant, `--local-only`,
+  no network),
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `static` (deterministic rules),
@@ -526,6 +528,75 @@ just release   # release build
 just clean
 ```
 
+### Embedded Needle brain (`ffi`)
+
+`just verify` runs with default features, where the needle router has no
+inference engine and degrades to static routing. Real on-device inference is
+behind a feature flag because it needs a per-platform native engine that this
+repo does not carry:
+
+| crate | feature | effect |
+| --- | --- | --- |
+| `forge-needle` | `ffi` | `FfiBackend` over `libneedle` instead of `UnavailableBackend` |
+| `forge-needle` | `needle-e2e` | enables `tests/e2e.rs` (needs `ffi` + real weights) |
+| `forge-cli` | `needle-ffi` | builds the `forge` binary with the above |
+
+The engine ships per platform in the same Apache-2.0 Hugging Face repo as the
+weights, [`Cactus-Compute/needle3`](https://huggingface.co/Cactus-Compute/needle3).
+Fetch `libneedle.a` for your target once:
+
+```bash
+TRIPLE=$(rustc -vV | sed -n 's/^host: //p')      # e.g. aarch64-apple-darwin
+mkdir -p crates/needle-sys/vendor/$TRIPLE
+curl -L -o crates/needle-sys/vendor/$TRIPLE/libneedle.a \
+  https://huggingface.co/Cactus-Compute/needle3/resolve/main/macos-arm64/libneedle.a
+```
+
+Substitute the platform folder for your target (`macos-arm64`,
+`linux-x86_64`, `linux-arm64`, `linux-armv7`, `linux-riscv64`,
+`linux-mipsel`, `windows-x86_64`, `windows-arm64`, `android-arm64`, ...; the
+full list is in `crates/needle-sys/build.rs`). `NEEDLE_LIB_DIR=/path/to/dir`
+overrides the vendored location. `crates/needle-sys/vendor/` is gitignored;
+`needle.h` is committed, because it is the API contract and `cargo check`
+needs it on machines that will never link the engine.
+
+Then:
+
+```bash
+just verify-ffi   # clippy + unit tests with `ffi` on
+just e2e          # real-weights end-to-end suite (release build)
+forge_bin() { cargo build --release -p forge-cli --features needle-ffi; }
+```
+
+`just e2e` needs weights as well as the engine:
+
+```bash
+FORGE_NEEDLE_E2E_WEIGHTS=~/.cache/forge/models/needle3.cact just e2e
+```
+
+`forge init` puts that file there (35 MB, SHA-256 pinned). The suite asserts
+the engine loads, that `decide` picks `test-runner` for "run the tests" with
+calibrated confidence, that embeddings are 3072-dimensional, L2-normalised
+and deterministic, that `extract` pulls `{"city":"Paris"}` out of prose, that
+an unsupported request refuses instead of guessing, and that a warm route
+round-trip stays under 500 ms (measured ~47 ms release / ~100 ms debug on an
+idle macos-arm64 machine).
+
+The "no network calls once weights are on disk" claim holds for this backend:
+`libneedle.a` has no network-capable symbols at all (`nm -u` shows only libc
+maths/memory/stdio, `mmap`, `pthread` and `sysctlbyname`). Needle's own README
+mentions engine telemetry, but that lives in its Python SDK and standalone CLI
+runner, neither of which forge uses.
+
+Two things worth knowing about the C API, because they shape the code:
+`libneedle` is **one process-global, non-thread-safe model that cannot be
+unloaded**, so `NeedleEngine` keeps it on a single dedicated thread and
+`FfiBackend` takes a process-wide claim (a second engine fails loudly instead
+of racing); and for `extract`, Needle takes its semantics from the record's
+name and description, so give extraction schemas a `title` (it becomes the
+tool name) or a meaningful `description` — a bare `{"type":"object",
+"properties":{...}}` is often declined rather than guessed at.
+
 Layout:
 
 ```text
@@ -538,9 +609,12 @@ crates/
   forge-session     append-only JSONL store + secret redaction
   forge-skills      SKILL.md discovery, progressive disclosure
   forge-graph       deterministic incremental project graph
+  forge-needle      embedded Needle brain: decide/embed/extract/tool-call,
+                    weights lifecycle, engine thread, needle router
   forge-runtime     AgentService — the one runtime shared by CLI and server
   forge-server      axum REST/SSE adapter
   forge-cli         clap command tree, tracing, the forge binary
+  needle-sys        raw bindgen FFI to libneedle (built only with `ffi`)
 tests/features/     Gherkin scenarios (executable via just bdd)
 specs/              project spec, ADRs, implementation plan
 ```
@@ -556,6 +630,9 @@ go in `specs/adrs/`.
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
   mock providers — fully offline. Currently 17 features / 28 scenarios / 108 steps.
+- Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
+  `just verify` — they need a native engine and real weights. See [Embedded
+  Needle brain (`ffi`)](#embedded-needle-brain-ffi).
 
 ## Known limitations (v0.3)
 

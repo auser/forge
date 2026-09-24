@@ -7,12 +7,19 @@ license.workspace = true
 
 [features]
 default = []
-ffi = []           # real libneedle backend, wired in Task 8
+# Real libneedle backend. Off by default because it needs a per-platform
+# `libneedle.a` that is not in the repo — see crates/needle-sys/build.rs for
+# where to fetch it and README's Development section for the commands.
+ffi = ["dep:needle-sys"]
+# End-to-end tests against real weights (tests/e2e.rs). Requires `ffi` and
+# FORGE_NEEDLE_E2E_WEIGHTS; see README.
+needle-e2e = []
 
 [dependencies]
 async-trait.workspace = true
 forge-config.workspace = true
 forge-core.workspace = true
+needle-sys = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

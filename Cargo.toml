@@ -12,6 +12,7 @@ members = [
     "crates/forge-server",
     "crates/forge-session",
     "crates/forge-skills",
+    "crates/needle-sys",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ forge-runtime = { path = "crates/forge-runtime" }
 forge-server = { path = "crates/forge-server" }
 forge-session = { path = "crates/forge-session" }
 forge-skills = { path = "crates/forge-skills" }
+needle-sys = { path = "crates/needle-sys" }
 
 async-trait = "0.1"
 axum = "0.8"

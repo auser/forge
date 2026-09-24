@@ -15,6 +15,14 @@ name = "bdd"
 path = "tests/bdd/main.rs"
 harness = false
 
+[features]
+default = []
+# Build the `forge` binary against the real libneedle engine. Off by default:
+# it needs a per-platform `libneedle.a` that is not vendored in the repo (see
+# crates/needle-sys/build.rs). Without it forge still routes — the needle
+# router reports weights/engine unavailable and falls back to static rules.
+needle-ffi = ["forge-needle/ffi"]
+
 [dependencies]
 forge-config.workspace = true
 forge-core.workspace = true

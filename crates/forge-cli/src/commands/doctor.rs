@@ -482,9 +482,18 @@ async fn needle_check(config: &forge_config::Config) -> Check {
 
     let timeout = std::time::Duration::from_millis(config.router_timeout_ms);
     let started = std::time::Instant::now();
+    // The probe has to be a task that genuinely maps to one of the options.
+    // Needle refuses to guess by design: asked to choose "ok" for a "doctor
+    // smoke test" it declines — correctly — and the probe then reports a
+    // healthy brain as broken. So ask something real (this mirrors the
+    // options a routing decision actually sees) and only check that a
+    // decision came back at all, not which one.
     let decide_result = tokio::time::timeout(
         timeout,
-        engine.decide("doctor smoke test".to_string(), vec!["ok".to_string()]),
+        engine.decide(
+            "run the project's test suite".to_string(),
+            vec!["test-runner".to_string(), "chat-model".to_string()],
+        ),
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();
@@ -505,14 +514,15 @@ async fn needle_check(config: &forge_config::Config) -> Check {
         Ok(Err(e)) if weights_verified && is_weights_missing_shaped(&e) => Check {
             // This function's own checksum check above just confirmed the
             // weights ARE present and verified — a `forge init` hint here
-            // would be actively wrong. What's actually true: no `ffi`
-            // backend is built into this binary yet (Task 8), so
-            // `engine_from_config` always yields a stub that can't load
-            // any weights, verified or not.
+            // would be actively wrong. What's actually true: this binary was
+            // built without the `ffi` inference backend, so
+            // `engine_from_config` yields `UnavailableBackend`, which cannot
+            // load any weights, verified or not.
             level: Level::Warn,
             label: LABEL.into(),
             detail: format!(
-                "weights present and verified, but the embedded inference backend is not built into this binary yet; falls back to {} routing",
+                "weights present and verified, but this binary was built without the embedded \
+                 inference backend (rebuild with `--features needle-ffi`); falls back to {} routing",
                 config.router_fallback
             ),
         },
@@ -625,8 +635,17 @@ mod tests {
             check.detail
         );
         assert!(
-            check.detail.contains("not built into this binary"),
+            check
+                .detail
+                .contains("without the embedded inference backend"),
             "detail: {}",
+            check.detail
+        );
+        // The message has to tell the operator how to fix it, which is a
+        // rebuild with the feature — not a refetch.
+        assert!(
+            check.detail.contains("needle-ffi"),
+            "should name the feature that turns the backend on: {}",
             check.detail
         );
     }

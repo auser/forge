@@ -1,11 +1,15 @@
 pub mod backend;
 pub mod engine;
+#[cfg(feature = "ffi")]
+pub mod ffi_backend;
 pub mod hash_backend;
 pub mod router;
 pub mod weights;
 
 pub use backend::{BackendError, Decision, NeedleBackend, NeedleToolCall};
 pub use engine::{EngineEmbedder, NeedleEngine};
+#[cfg(feature = "ffi")]
+pub use ffi_backend::FfiBackend;
 pub use hash_backend::HashBackend;
 pub use router::NeedleRouter;
 pub use weights::{WeightsSpec, WeightsStatus, ensure_weights, spec_for, verify, weights_path};
@@ -14,14 +18,23 @@ pub use weights::{WeightsSpec, WeightsStatus, ensure_weights, spec_for, verify, 
 /// `needle.variant` should live (`weights::weights_path`), then pick a
 /// backend.
 ///
-/// With the `ffi` feature enabled (Task 8's real libneedle backend) and a
-/// verified weights file already on disk, this would load `FfiBackend`;
-/// until then — and always without `ffi` — it spawns `UnavailableBackend`
-/// with the real resolved path, so `BackendError::WeightsMissing` names
-/// exactly where `forge init` should have put the weights. Any resolution
-/// failure (e.g. an unpinned variant with no cached override) degrades to
-/// the same `UnavailableBackend` with a best-effort path rather than
-/// erroring `engine_from_config` itself — routing built on it still falls
+/// With the `ffi` feature enabled this spawns the real [`FfiBackend`] over
+/// `libneedle`; without it — the default — it spawns `UnavailableBackend`, so
+/// `BackendError::WeightsMissing` names exactly where `forge init` should have
+/// put the weights and the `FallbackRouter` wrapping the needle router
+/// degrades to static rules. Forge is fully functional either way; the FFI
+/// backend is an upgrade, not a requirement.
+///
+/// Note what this deliberately does *not* do: it never checks whether the
+/// weights exist here. `FfiBackend::load()` reports a missing file as
+/// `WeightsMissing`, which the engine retries on every job, so weights that
+/// appear after the process started (a concurrent `forge init`) start working
+/// without a restart. A one-shot existence check at construction would
+/// instead pin the process to "unavailable" for its whole life.
+///
+/// Any path-resolution failure (e.g. an unpinned variant with no cached
+/// override) degrades to `UnavailableBackend` with a best-effort path rather
+/// than erroring `engine_from_config` itself — routing built on it still falls
 /// back to the configured fallback router instead of guessing.
 pub fn engine_from_config(
     needle: &forge_config::NeedleConfig,
@@ -30,13 +43,7 @@ pub fn engine_from_config(
 
     #[cfg(feature = "ffi")]
     {
-        // Task 8 seam: once `FfiBackend` exists, this arm becomes
-        //   if path.is_file() && weights::verify(&path, spec.sha256)? {
-        //       Ok(NeedleEngine::spawn(backend::FfiBackend::load(&path)?))
-        //   } else { ...UnavailableBackend as below }
-        // `ffi` has no backend yet, so behavior is identical to the
-        // `not(ffi)` arm below.
-        Ok(NeedleEngine::spawn(backend::UnavailableBackend::new(path)))
+        Ok(NeedleEngine::spawn(ffi_backend::FfiBackend::new(path)))
     }
     #[cfg(not(feature = "ffi"))]
     {
