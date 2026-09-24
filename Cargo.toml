@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/forge-acp",
     "crates/forge-cli",
     "crates/forge-config",
     "crates/forge-core",
@@ -22,6 +23,7 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
+forge-acp = { path = "crates/forge-acp" }
 forge-core = { path = "crates/forge-core" }
 forge-config = { path = "crates/forge-config" }
 forge-execution = { path = "crates/forge-execution" }

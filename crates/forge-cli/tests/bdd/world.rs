@@ -67,6 +67,18 @@ pub struct BddWorld {
     pub mcp_lines: Vec<String>,
     /// Tool names from the last `tools/list`.
     pub mcp_tools: Vec<String>,
+    /// Spawned `forge acp` child process and its protocol pipes.
+    pub acp: Option<AcpChild>,
+    /// Every line `forge acp` wrote to stdout (the protocol channel).
+    pub acp_lines: Vec<String>,
+    /// The `update` object of every `session/update` notification, in order.
+    pub acp_updates: Vec<serde_json::Value>,
+    /// The ACP session created by `start_acp`.
+    pub acp_session: String,
+    /// `stopReason` from the last `session/prompt` response.
+    pub acp_stop_reason: String,
+    /// How many `session/request_permission` requests the agent made.
+    pub acp_permissions: usize,
     pub base_url: String,
     /// Wiremock server standing in for a System One-compatible router.
     pub router_mock: Option<wiremock::MockServer>,
@@ -91,6 +103,15 @@ pub struct BddWorld {
 /// A running `forge mcp` with its stdio pipes and JSON-RPC id counter.
 #[derive(Debug)]
 pub struct McpChild {
+    pub child: tokio::process::Child,
+    pub stdin: tokio::process::ChildStdin,
+    pub stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+    pub next_id: u64,
+}
+
+/// A running `forge acp` with its stdio pipes and JSON-RPC id counter.
+#[derive(Debug)]
+pub struct AcpChild {
     pub child: tokio::process::Child,
     pub stdin: tokio::process::ChildStdin,
     pub stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
@@ -332,6 +353,178 @@ impl BddWorld {
         }
     }
 
+    /// Spawn `forge acp`, complete the ACP handshake and open a session
+    /// rooted at the scenario project.
+    ///
+    /// stdio is the protocol channel here, so stdin/stdout are pipes.
+    pub async fn start_acp(&mut self) {
+        use tokio::io::BufReader;
+
+        self.flush_config();
+        let root = self.project();
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&xdg).expect("xdg");
+
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_forge"));
+        cmd.arg("--project")
+            .arg(&root)
+            .arg("acp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("NO_COLOR", "1");
+        for var in FORGE_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
+        cmd.env("FORGE_TEST_MOCKS", "1");
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+
+        let mut child = cmd.spawn().expect("spawn forge acp");
+        let stdin = child.stdin.take().expect("acp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("acp stdout"));
+        self.acp = Some(AcpChild {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        });
+
+        let init = self
+            .acp_request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": { "name": "forge-bdd", "version": "1.0.0" },
+                }),
+            )
+            .await;
+        assert_eq!(
+            init["result"]["agentInfo"]["name"], "forge",
+            "unexpected initialize result: {init}"
+        );
+
+        let created = self
+            .acp_request(
+                "session/new",
+                serde_json::json!({ "cwd": root, "mcpServers": [] }),
+            )
+            .await;
+        self.acp_session = created["result"]["sessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no sessionId in {created}"))
+            .to_string();
+    }
+
+    /// Send a prompt and drive the turn to its response.
+    pub async fn acp_prompt(&mut self, text: &str) {
+        let session_id = self.acp_session.clone();
+        let response = self
+            .acp_request(
+                "session/prompt",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": text }],
+                }),
+            )
+            .await;
+        self.acp_stop_reason = response["result"]["stopReason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no stopReason in {response}"))
+            .to_string();
+    }
+
+    /// Send a request and read until its response arrives, handling what
+    /// interleaves: `session/update` notifications are collected, and
+    /// `session/request_permission` requests are approved (the scenario
+    /// plays a user who says yes).
+    pub async fn acp_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let id = {
+            let acp = self.acp.as_mut().expect("forge acp running");
+            let id = acp.next_id;
+            acp.next_id += 1;
+            id
+        };
+        self.acp_send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await;
+
+        loop {
+            let message = self.acp_read().await;
+            if message["id"] == serde_json::json!(id) && message.get("method").is_none() {
+                return message;
+            }
+            match message["method"].as_str() {
+                Some("session/update") => {
+                    self.acp_updates.push(message["params"]["update"].clone())
+                }
+                Some("session/request_permission") => self.acp_approve(&message).await,
+                other => panic!("unexpected message from forge acp: {other:?}: {message}"),
+            }
+        }
+    }
+
+    async fn acp_approve(&mut self, message: &serde_json::Value) {
+        self.acp_permissions += 1;
+        let options = message["params"]["options"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no options in {message}"));
+        let allow = options
+            .iter()
+            .find(|o| o["kind"] == "allow_once")
+            .unwrap_or_else(|| panic!("no allow_once option in {message}"));
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": message["id"].clone(),
+            "result": { "outcome": { "outcome": "selected", "optionId": allow["optionId"] } },
+        });
+        self.acp_send(response).await;
+    }
+
+    async fn acp_send(&mut self, message: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+        let line = serde_json::to_string(&message).expect("serialize");
+        let acp = self.acp.as_mut().expect("forge acp running");
+        acp.stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write to acp stdin");
+        acp.stdin.flush().await.expect("flush acp stdin");
+    }
+
+    async fn acp_read(&mut self) -> serde_json::Value {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        {
+            let acp = self.acp.as_mut().expect("forge acp running");
+            let read = acp
+                .stdout
+                .read_line(&mut line)
+                .await
+                .expect("read acp stdout");
+            assert!(read > 0, "forge acp closed stdout unexpectedly");
+        }
+        let line = line.trim_end().to_string();
+        self.acp_lines.push(line.clone());
+        serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("non-JSON on acp stdout: {e}: {line:?}"))
+    }
+
     /// Set/replace a config key line (TOML `key = value`); flushed to
     /// `.forge/config.toml` by `flush_config`.
     pub fn set_config(&mut self, key: &str, value: &str) {
@@ -385,6 +578,9 @@ impl Drop for BddWorld {
         }
         if let Some(mut mcp) = self.mcp.take() {
             let _ = mcp.child.start_kill();
+        }
+        if let Some(mut acp) = self.acp.take() {
+            let _ = acp.child.start_kill();
         }
     }
 }

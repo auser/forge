@@ -1,3 +1,4 @@
+pub mod acp_cmd;
 pub mod auth_cmd;
 pub mod config_cmd;
 pub mod doctor;
@@ -99,5 +100,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
         Command::Skill { command } => skill_cmd::run(&ctx, command).await,
         Command::Serve { host, port } => serve_cmd::run(&ctx, host, port).await,
         Command::Mcp => mcp_cmd::run(&ctx).await,
+        Command::Acp => acp_cmd::run(&ctx).await,
     }
 }

@@ -76,6 +76,11 @@ Each sub-project gets its own spec → plan → implementation cycle:
    OpenJev-compatibility notes.
 3. **`forge acp`** — Agent Client Protocol adapter over stdio (Zed,
    JetBrains, neovim, other ACP clients get forge as an in-editor agent).
+   **Implemented** — stdio adapter in `crates/forge-acp` over the shared
+   `AgentService`, speaking ACP protocol version 1; see the §8 amendment
+   for the verified schema version, the SDK decision (we carry the v1
+   wire subset rather than depend on the official crate) and the two
+   recorded follow-ups.
 4. **`forge mcp`** — MCP server exposing graph search, skills, and runs
    as tools (VS Code, Cursor, Claude Code, other harnesses).
    **Implemented** — stdio adapter in `crates/forge-mcp` over the shared
@@ -700,3 +705,74 @@ adds `router_name: "needle"` and confidence — no schema change.
   `start_run_with_options` so the adapter can honour a per-call
   `max_turns`; `start_run` delegates to it, so the REST adapter is
   unchanged.
+
+  **Amendment (`forge acp` shipped 2026-09-24).** §2 item 3 is
+  implemented, in `crates/forge-acp` + `crates/forge-cli/src/commands/acp_cmd.rs`.
+  Four things are worth recording:
+
+  - **Protocol version: 1, and it is stable.** Unlike MCP, ACP did *not*
+    move out from under the brief. Verified against the authoritative
+    schema source (`agent-client-protocol-schema` **1.9.1**, which the
+    SDK pins with `=`): `ProtocolVersion` is a single integer "only
+    bumped for breaking changes", `V1` is `LATEST`, and `V2` exists only
+    behind an `unstable_protocol_v2` feature as a draft. Framing is
+    newline-delimited JSON-RPC 2.0 over stdio. The method names, the
+    `session/update` nesting (`{sessionId, update:{sessionUpdate, …}}`),
+    the `ToolKind`/`ToolCallStatus` vocabularies, the five stop reasons,
+    and the `outcome`-tagged permission outcomes are all as the brief
+    assumed. Docs: `agentclientprotocol.com/protocol/{overview,
+    initialization,session-setup,prompt-turn,tool-calls}`.
+
+  - **SDK: rejected on cost, not capability — the opposite call to MCP's.**
+    `agent-client-protocol` 2.2.0 (2026-09-18, the ACP org's official Rust
+    SDK) builds fine on our toolchain and does cover the agent side. It
+    also adds **52** new transitive crates to this workspace, measured by
+    resolving it alone and diffing against `Cargo.lock` — against
+    `rmcp`'s 13 — including a second async reactor (`async-io`,
+    `async-process`, `async-signal`, `polling`, `blocking`) beside tokio,
+    two more datetime libraries (`jiff`, `time`) beside chrono, `defmt`
+    (an embedded logging framework), and the
+    `darling`/`strum`/`serde_with`/`derive_more` proc-macro trees. The
+    2.x surface is a framework (roles, components, proxy chains, protocol
+    routers, MCP-over-ACP) moving fast (1.0 → 2.2 in three months), where
+    what this adapter needs is one stdio loop and a dozen message types.
+    So `forge-acp::protocol` carries the v1 subset, transcribed
+    field-by-field from the schema crate's source rather than from prose,
+    and the SDK stays the documented escape hatch behind the same module
+    boundary. The brief's premise that forge-mcp already ships a
+    hand-rolled JSON-RPC stdio loop to share turned out to be false —
+    `rmcp` owns all of that — so there was nothing to factor out and no
+    shared plumbing module was created.
+
+  - **Two seams, mirroring MCP's `Diagnostics`.** An ACP client picks the
+    project root *per session* (`session/new`'s `cwd`), so the runtime
+    cannot be built once at startup: `forge-acp` declares a
+    `ServiceFactory` and `forge-cli` implements it by overriding
+    `--project`, which keeps every session on the same
+    `build_run_service` path (needle seam, config discovery, provider
+    resolution) as every other subcommand. And the **ACP session id *is*
+    the forge session id**, so an editor-driven turn is inspectable with
+    `forge session show <id>` and continuable with `forge resume <id>` —
+    asserted by a test, because it is the kind of property that silently
+    stops being true.
+
+  - **Approval is the same parked-run mechanism, answered differently.**
+    stdin is the protocol channel, so the loop cannot prompt; a risky
+    operation under `approval = "prompt"` parks on `ApprovalRequested`,
+    which becomes a `session/request_permission` request naming the tool
+    call already on the client's screen, and the chosen option maps back
+    to `send_input("y"/"n")`. Only "once" options are offered:
+    forge's gate is per-operation with nowhere to persist a standing
+    decision, so `allow_always` would be a lie. A client that cancels
+    instead of answering (`{"outcome":"cancelled"}`) is treated as a
+    denial *and* still unblocks the run — a parked run that nobody
+    answers is the one failure mode that hangs a turn.
+
+  **Recorded follow-ups** (deliberately not in v1, both advertised
+  honestly in `initialize`): an **editor-filesystem bridge** — v1 ignores
+  the client's `fs`/`terminal` capabilities and executes through forge's
+  own `ExecutionProvider` in the project root, so unsaved editor buffers
+  are invisible and edits land on disk; and **token streaming** — the
+  agent loop produces final text rather than a token stream, so the
+  answer is one `agent_message_chunk` rather than a faked stream. Tool
+  calls *are* streamed live.

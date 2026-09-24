@@ -1619,3 +1619,80 @@ fn mcp_stdout_is_pure_protocol(world: &mut BddWorld) {
         assert_eq!(value["jsonrpc"], "2.0", "not a JSON-RPC message: {line}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// acp.feature
+// ---------------------------------------------------------------------------
+
+#[when("an ACP client starts a session over stdio")]
+async fn acp_client_starts_a_session(world: &mut BddWorld) {
+    world.start_acp().await;
+    assert!(
+        !world.acp_session.is_empty(),
+        "session/new should have returned a session id"
+    );
+}
+
+#[when(expr = "the ACP client prompts {string}")]
+async fn acp_client_prompts(world: &mut BddWorld, prompt: String) {
+    world.acp_prompt(&prompt).await;
+}
+
+#[then("the ACP client was asked for permission in the editor")]
+fn acp_client_was_asked_for_permission(world: &mut BddWorld) {
+    // The distinctive ACP affordance: because stdio is the protocol
+    // channel the loop cannot prompt on the terminal, so the risky write
+    // becomes a `session/request_permission` the editor renders itself.
+    assert_eq!(
+        world.acp_permissions, 1,
+        "expected exactly one session/request_permission"
+    );
+}
+
+#[then(expr = "the ACP turn ends with stop reason {string}")]
+fn acp_turn_ends_with_stop_reason(world: &mut BddWorld, expected: String) {
+    assert_eq!(world.acp_stop_reason, expected);
+}
+
+#[then("the ACP client saw the tool call and the agent's final message")]
+fn acp_client_saw_tool_call_and_message(world: &mut BddWorld) {
+    let kinds: Vec<&str> = world
+        .acp_updates
+        .iter()
+        .filter_map(|u| u["sessionUpdate"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"tool_call"),
+        "expected a tool_call update, saw {kinds:?}"
+    );
+    assert!(
+        world
+            .acp_updates
+            .iter()
+            .any(|u| u["sessionUpdate"] == "tool_call_update" && u["status"] == "completed"),
+        "expected the tool call to reach completed, saw {:?}",
+        world.acp_updates
+    );
+    assert!(
+        world
+            .acp_updates
+            .iter()
+            .any(|u| u["sessionUpdate"] == "agent_message_chunk"
+                && u["content"]["text"] == "all done"),
+        "expected the final text as an agent_message_chunk, saw {:?}",
+        world.acp_updates
+    );
+}
+
+#[then("nothing but JSON-RPC reached the ACP stdout")]
+fn acp_stdout_is_pure_protocol(world: &mut BddWorld) {
+    assert!(
+        !world.acp_lines.is_empty(),
+        "expected protocol traffic on stdout"
+    );
+    for line in &world.acp_lines {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("non-JSON line on stdout: {e}: {line:?}"));
+        assert_eq!(value["jsonrpc"], "2.0", "not a JSON-RPC message: {line}");
+    }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "forge-acp"
+description = "Agent Client Protocol (stdio) adapter exposing the shared Forge agent runtime as an in-editor agent"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-config.workspace = true
+forge-core.workspace = true
+forge-runtime.workspace = true
+forge-session.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `io-std` on top of the workspace features: this adapter owns stdin and
+# stdout directly (the workspace default set has no reason to).
+tokio = { workspace = true, features = ["io-std"] }
+tracing.workspace = true
+
+[dev-dependencies]
+forge-execution.workspace = true
+forge-providers.workspace = true
+forge-skills.workspace = true
+tempfile.workspace = true
