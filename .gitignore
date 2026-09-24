@@ -1,5 +1,6 @@
 /target/
 /.forge/
+/.claude/
 # Per-platform libneedle engine binaries (feature `ffi`). Apache-2.0 and
 # redistributable, but a 1.1 MB blob per target that `cargo check`/`just
 # verify` never need — fetch on demand, see crates/needle-sys/build.rs.
