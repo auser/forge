@@ -132,8 +132,10 @@ pub struct Config {
     pub model: String,
     pub model_base_url: Option<String>,
     pub model_key_env: Option<String>,
-    /// Path to a JSON script for `model = "scripted-mock"` (relative to
-    /// the project root).
+    /// **Test-only.** Path to a JSON script for `model = "scripted-mock"`
+    /// (relative to the project root). Inert for every other model, and
+    /// `scripted-mock` itself is refused unless `FORGE_TEST_MOCKS=1` — see
+    /// [`test_mocks`].
     pub mock_script: Option<String>,
     pub router: String,
     pub router_url: Option<String>,
@@ -189,10 +191,10 @@ impl Default for Config {
         // Default stack: embedded Needle 3 (on-device decision routing,
         // static fallback when weights are unavailable) → local oMLX
         // model. Laya (open-source System One) and other HTTP-style
-        // routers remain available as alternates. Mock providers stay
-        // available but are opt-in (`model = "mock-local"`). Hosted models
-        // are only called when a router selects them or the user sets
-        // `model` explicitly.
+        // routers remain available as alternates. The mock providers are
+        // test-only and refused unless `FORGE_TEST_MOCKS=1` (see
+        // `test_mocks`). Hosted models are only called when a router
+        // selects them or the user sets `model` explicitly.
         let models = [
             ModelEntry {
                 description: Some("local coding model via oMLX (Qwen3-Coder)".to_string()),

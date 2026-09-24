@@ -1303,3 +1303,210 @@ fn model_list_does_not_advertise_mocks_without_the_test_env() {
         "the gate being open should surface it, labelled: {stdout}"
     );
 }
+
+/// Read `forge --json doctor`'s check list for a project.
+fn doctor_checks(tmp: &Path, project: &Path, mocks: bool) -> Vec<serde_json::Value> {
+    let mut cmd = if mocks {
+        forge(tmp)
+    } else {
+        forge_without_mocks(tmp)
+    };
+    let output = cmd
+        .args(["--project"])
+        .arg(project)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("doctor --json is JSON");
+    report["checks"].as_array().expect("checks array").clone()
+}
+
+fn check_named<'a>(checks: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+    checks
+        .iter()
+        .find(|c| c["check"] == name)
+        .unwrap_or_else(|| panic!("no {name:?} check in {checks:#?}"))
+}
+
+/// The mock *execution* provider is the worst of the mocks to leak: it
+/// reports commands as run and files as written while doing neither. It
+/// must be refused exactly like the mock model, and doctor must say so.
+#[test]
+fn the_mock_execution_provider_is_refused_without_the_test_env() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "execution = \"mock\"\nrouter = \"static\"\n",
+    )
+    .expect("write config");
+
+    let output = forge_without_mocks(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "hello"])
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "a mock execution provider must not run without the gate"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("execution = \"mock\""), "stderr: {stderr}");
+    assert!(stderr.contains("FORGE_TEST_MOCKS=1"), "stderr: {stderr}");
+
+    // `forge skill test` reads the same config key by its own path; it must
+    // not be a way around the gate.
+    let output = forge_without_mocks(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["skill", "test", "anything"])
+        .output()
+        .expect("skill test");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("FORGE_TEST_MOCKS=1"),
+        "skill test must honour the gate too: {stderr}"
+    );
+
+    let checks = doctor_checks(tmp.path(), &project, false);
+    let execution = check_named(&checks, "execution provider");
+    assert_eq!(execution["status"], "fail", "{execution}");
+    assert!(
+        execution["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("test-only mock"),
+        "{execution}"
+    );
+    assert!(
+        !execution["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("available offline"),
+        "a mock that pretends to run commands is not \"available\": {execution}"
+    );
+}
+
+/// Doctor must not bless a configured mock router that `router_from_config`
+/// would refuse.
+#[test]
+fn doctor_fails_the_router_check_for_a_configured_mock_router() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "router = \"mock\"\nmodel = \"qwen3-coder\"\n",
+    )
+    .expect("write config");
+
+    let checks = doctor_checks(tmp.path(), &project, false);
+    let router = check_named(&checks, "decision router");
+    assert_eq!(router["status"], "fail", "{router}");
+    assert!(
+        router["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("test-only mock"),
+        "{router}"
+    );
+
+    // With the gate open it is usable, but still not "fine": a warning.
+    let checks = doctor_checks(tmp.path(), &project, true);
+    let router = check_named(&checks, "decision router");
+    assert_eq!(router["status"], "warn", "{router}");
+}
+
+/// An exported FORGE_TEST_MOCKS outlives the test run that needed it, so
+/// doctor reports it whatever the configuration says.
+#[test]
+fn doctor_warns_whenever_the_mock_gate_is_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    // Deliberately a fully real configuration: the warning is about the
+    // environment, not about what is configured.
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"qwen3-coder\"\nrouter = \"static\"\nexecution = \"native\"\n",
+    )
+    .expect("write config");
+
+    let checks = doctor_checks(tmp.path(), &project, true);
+    let gate = check_named(&checks, "test mocks");
+    assert_eq!(gate["status"], "warn", "{gate}");
+    assert!(
+        gate["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("FORGE_TEST_MOCKS=1 is set"),
+        "{gate}"
+    );
+
+    // And it says nothing at all when the gate is closed.
+    let checks = doctor_checks(tmp.path(), &project, false);
+    assert!(
+        !checks.iter().any(|c| c["check"] == "test mocks"),
+        "no gate line without the env: {checks:#?}"
+    );
+}
+
+/// Unknown-name errors must not advertise the test-only mocks as options.
+#[test]
+fn unknown_provider_errors_do_not_advertise_mocks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "router = \"nonsense\"\n",
+    )
+    .expect("write config");
+    let output = forge_without_mocks(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "hello"])
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown router"), "stderr: {stderr}");
+    assert!(!stderr.contains("mock"), "stderr advertises mock: {stderr}");
+
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "execution = \"nonsense\"\n",
+    )
+    .expect("write config");
+    let output = forge_without_mocks(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "hello"])
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown execution provider"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("mock"), "stderr advertises mock: {stderr}");
+}
+
+/// `--help` must not offer the test-only router either.
+#[test]
+fn help_does_not_advertise_the_mock_router() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = forge_without_mocks(tmp.path())
+        .arg("--help")
+        .output()
+        .expect("help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--router"), "help: {stdout}");
+    assert!(
+        !stdout.contains("mock"),
+        "help must not advertise mocks: {stdout}"
+    );
+}

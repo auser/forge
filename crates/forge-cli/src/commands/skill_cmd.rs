@@ -118,7 +118,11 @@ async fn test(ctx: &Context, name: &str) -> Result<(), ForgeError> {
     let root = ctx.project_root()?;
 
     // Keep a handle to the mock so we can report what would have run.
+    // Gated exactly like `build_execution`'s `mock` arm (which the other
+    // branch goes through): this reads the same config key, so it must not
+    // become a way around the gate.
     let mock = if resolved.config.execution == "mock" {
+        forge_config::ensure_test_mocks_allowed("execution = \"mock\"")?;
         Some(MockExecution::new(&root))
     } else {
         None

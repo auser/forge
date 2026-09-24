@@ -314,7 +314,7 @@ Global flags:
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
 --router <r>          override the router (needle|jev|laya|http|static|cheapest)
---execution <p>       override the execution provider (native|mock)
+--execution <p>       override the execution provider (native)
 --local-only          restrict to local providers
 --approval <mode>     auto | prompt | prompt-dangerous | deny
 --json                machine-readable JSON on stdout, nothing else on stdout
@@ -360,7 +360,7 @@ Key settings (all optional):
 | `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle/jev decisions escalate to the fallback |
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
-| `execution` | `native` | `FORGE_EXECUTION` | `native` \| `mock` |
+| `execution` | `native` | `FORGE_EXECUTION` | `native` |
 | `approval` | `prompt` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny` |
 | `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers |
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
@@ -589,7 +589,7 @@ runs locally with approval gating: `Risky` operations pause for approval under
 `approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
 ones (non-interactive stdin → typed "approval required" error, which the agent
 loop treats as a pause: answer via piped stdin lines, e.g.
-`echo y | forge run ...`). `auto` runs, `deny` blocks. The `mock`
+`echo y | forge run ...`). `auto` runs, `deny` blocks. The test-only `mock`
 *execution* provider records requests
 for tests. MVM/container/remote executors plug into the same trait later.
 
@@ -940,10 +940,10 @@ Layout:
 crates/
   forge-core        traits, event protocol, typed errors (no heavy deps)
   forge-config      config loading, precedence, provenance
-  forge-execution   native + mock execution providers
-  forge-providers   OpenAI-compatible/Anthropic models (+ test-only mocks);
-                    needle, jev, laya, http, static, cheapest,
-                    cheapest, HTTP, and Laya routers
+  forge-execution   native execution (+ a test-only mock)
+  forge-providers   OpenAI-compatible/Anthropic models and the needle, jev,
+                    laya, http, static and cheapest routers
+                    (+ test-only mocks)
   forge-session     append-only JSONL store + secret redaction
   forge-skills      SKILL.md discovery, progressive disclosure
   forge-graph       deterministic incremental project graph
@@ -951,6 +951,8 @@ crates/
                     weights lifecycle, engine thread, needle router
   forge-runtime     AgentService — the one runtime shared by CLI and server
   forge-server      axum REST/SSE adapter
+  forge-mcp         Model Context Protocol (stdio) adapter: tool registry,
+                    schemas, dispatch
   forge-cli         clap command tree, tracing, the forge binary
   needle-sys        raw FFI declarations for libneedle + its link config
 tests/features/     Gherkin scenarios (executable via just bdd)
@@ -968,8 +970,9 @@ go in `specs/adrs/`.
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
   mock providers — fully offline. Currently 23 features / 44 scenarios / 165 steps.
-- Mocks are **test-only**. `model = "mock-local"`, `model = "scripted-mock"` and
-  `router = "mock"` are refused by configuration unless `FORGE_TEST_MOCKS=1` is
+- Mocks are **test-only**. `model = "mock-local"`, `model = "scripted-mock"`,
+  `router = "mock"` and `execution = "mock"` are all refused by configuration
+  unless `FORGE_TEST_MOCKS=1` is
   set, which every forge test harness does. They answer
   `mock response to: <prompt>`, which is useful for asserting the agent loop
   and actively misleading as a product — so users never see them offered.

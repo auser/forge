@@ -496,29 +496,43 @@ fn an_approval_pause_is_answered_with_run_input() {
     let mut client = McpClient::spawn(tmp.path(), &project);
     client.initialize();
 
-    // Short budget: the run parks on approval and will never finish on
-    // its own, so waiting the full default would just stall the test.
+    // A generous budget on purpose: a parked run is blocked inside the
+    // loop and will never finish by itself, so `forge_run` has to report
+    // the pause the moment it happens rather than sitting out the timeout.
+    // A regression to "wait, then guess" takes 30 s and fails on elapsed —
+    // the previous version of this test hid that behind a 1.5 s budget and
+    // a polling loop.
+    let started_at = std::time::Instant::now();
     let run = client.call_tool(
         "forge_run",
-        serde_json::json!({ "prompt": "write the notes", "timeout_ms": 1500 }),
+        serde_json::json!({ "prompt": "write the notes", "timeout_ms": 30000 }),
     );
     let started = McpClient::tool_json(&run);
+    let elapsed = started_at.elapsed();
     let run_id = started["run_id"].as_str().expect("run id").to_string();
 
-    // Poll until the run reports itself parked.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let status = client.call_tool("forge_run_status", serde_json::json!({ "run_id": run_id }));
-        let json = McpClient::tool_json(&status);
-        if json["status"] == "waiting_for_approval" {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "run never parked for approval: {json}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    assert_eq!(
+        started["status"], "waiting_for_approval",
+        "forge_run must report the pause itself: {started}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "the pause should be reported promptly, took {elapsed:?}"
+    );
+    assert!(
+        started["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("forge_run_input"),
+        "the client must be told how to answer: {started}"
+    );
+
+    // forge_run_status agrees with what forge_run reported.
+    let status = client.call_tool("forge_run_status", serde_json::json!({ "run_id": run_id }));
+    assert_eq!(
+        McpClient::tool_json(&status)["status"],
+        "waiting_for_approval"
+    );
 
     let delivered = client.call_tool(
         "forge_run_input",

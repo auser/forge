@@ -69,6 +69,20 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
         }),
     }
 
+    // Independent of what is configured: an exported FORGE_TEST_MOCKS
+    // makes every mock selectable for the whole shell, long after whatever
+    // test run needed it. Say so once, always.
+    if forge_config::test_mocks_allowed() {
+        checks.push(Check {
+            level: Level::Warn,
+            label: "test mocks".into(),
+            detail: format!(
+                "{}=1 is set — test-only mock providers are selectable in this environment",
+                forge_config::TEST_MOCKS_ENV
+            ),
+        });
+    }
+
     let forge_dir = root.join(".forge");
     if forge_dir.is_dir() {
         let mut missing = Vec::new();
@@ -272,11 +286,12 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                 });
             }
         }
-        checks.push(Check {
-            level: Level::Ok,
-            label: "decision router".into(),
-            detail: format!("{} ({})", config.router, router_note(&config.router)),
-        });
+        checks.push(mock_aware_check(
+            "decision router",
+            &config.router,
+            config.router == "mock",
+            router_note(&config.router),
+        ));
 
         checks.push(needle_check(config).await);
         checks.push(jev_check(config));
@@ -323,15 +338,12 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                 }
             });
         }
-        checks.push(Check {
-            level: Level::Ok,
-            label: "execution provider".into(),
-            detail: format!(
-                "{} ({})",
-                config.execution,
-                execution_note(&config.execution)
-            ),
-        });
+        checks.push(mock_aware_check(
+            "execution provider",
+            &config.execution,
+            config.execution == "mock",
+            execution_note(&config.execution),
+        ));
         match forge_core::ApprovalPolicy::parse(&config.approval) {
             Ok(policy) => checks.push(Check {
                 level: Level::Ok,
@@ -790,7 +802,7 @@ fn router_note(router: &str) -> &'static str {
     match router {
         "needle" => "embedded on-device Needle 3 decisions, available offline",
         "static" => "deterministic rules, available offline",
-        "mock" => "deterministic mock, available offline",
+        "mock" => "test-only mock router",
         "cheapest" => "lowest-cost capable candidate, available offline",
         "http" => "System One-compatible HTTP router (uses router_url)",
         "laya" => "Laya typed-questions router (uses router_url, default 127.0.0.1:8788)",
@@ -804,8 +816,46 @@ fn router_note(router: &str) -> &'static str {
 fn execution_note(execution: &str) -> &'static str {
     match execution {
         "native" => "local process execution, available",
-        "mock" => "recorded mock execution, available offline",
+        // Not "available offline": it reports commands as run and files as
+        // written while doing neither.
+        "mock" => "test-only mock execution; records operations instead of performing them",
         _ => "unrecognized execution provider",
+    }
+}
+
+/// A check for a config value that may name a test-only mock.
+///
+/// Mirrors the model-provider check: a configured mock is a **failing**
+/// check when the gate is closed (nothing will build, and the user has no
+/// idea why), a warning when it is open (it works, but it is not real), and
+/// an ordinary Ok line otherwise.
+fn mock_aware_check(label: &str, value: &str, is_mock: bool, note: &str) -> Check {
+    if !is_mock {
+        return Check {
+            level: Level::Ok,
+            label: label.into(),
+            detail: format!("{value} ({note})"),
+        };
+    }
+    if forge_config::test_mocks_allowed() {
+        Check {
+            level: Level::Warn,
+            label: label.into(),
+            detail: format!(
+                "{value} ({note}), unlocked by {}",
+                forge_config::TEST_MOCKS_ENV
+            ),
+        }
+    } else {
+        Check {
+            level: Level::Fail,
+            label: label.into(),
+            detail: format!(
+                "{value} is a test-only mock and will not load; \
+                 use a real one, or set {}=1 if you are running forge's own tests",
+                forge_config::TEST_MOCKS_ENV
+            ),
+        }
     }
 }
 

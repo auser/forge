@@ -501,7 +501,18 @@ async fn a_timed_out_run_keeps_going_and_is_pollable() {
         .as_str()
         .expect("run id")
         .to_string();
-    assert_eq!(outcome.value["status"], "running");
+    // Derived from the event log rather than hardcoded, and carrying what
+    // the client needs to follow up.
+    assert_eq!(outcome.value["status"], "running", "{:?}", outcome.value);
+    assert!(outcome.value["session_id"].as_str().is_some());
+    assert!(
+        outcome.value["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("forge_run_status"),
+        "{:?}",
+        outcome.value
+    );
 
     // The monitor settles it shortly after; polling must converge.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -605,4 +616,121 @@ async fn run_input_refuses_a_run_another_process_already_finished() {
         .expect("input");
     assert!(outcome.is_error);
     assert_eq!(outcome.value["code"], "run_finished", "{:?}", outcome.value);
+}
+
+/// A tool host whose agent loop actually parks: a scripted model that asks
+/// to write a file, and `NativeExecution` under `approval = "prompt"`.
+/// Tests run with a non-terminal stdin, so the write pauses the run with
+/// `ApprovalRequired` instead of prompting.
+fn approval_fixture() -> (tempfile::TempDir, ForgeTools) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    project(tmp.path());
+    build_graph(tmp.path());
+
+    let script = vec![
+        forge_providers::ScriptedReply {
+            text: None,
+            tool_calls: vec![forge_core::ToolCall {
+                id: "call_1".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "notes.txt", "content": "scripted" }),
+            }],
+        },
+        forge_providers::ScriptedReply {
+            text: Some("all done".to_string()),
+            tool_calls: Vec::new(),
+        },
+    ];
+    let service = Arc::new(AgentService::new(
+        Arc::new(forge_providers::ScriptedMockModel::new(script)),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(forge_execution::NativeExecution::new(
+            forge_core::ApprovalPolicy::Prompt,
+            tmp.path(),
+        )),
+        Arc::new(FsSkillRegistry::with_roots(vec![], None)),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    ));
+    let tools = ForgeTools::new(service, tmp.path());
+    (tmp, tools)
+}
+
+/// The regression this exists for: a parked run is blocked *inside* the
+/// loop, so nothing will ever complete it. `forge_run` must say
+/// `waiting_for_approval` as soon as the request is emitted — not sit out
+/// the whole timeout and then guess "running".
+#[tokio::test]
+async fn run_reports_waiting_for_approval_without_waiting_out_the_timeout() {
+    let (tmp, tools) = approval_fixture();
+
+    // A budget far longer than the test may take: if the approval arm did
+    // not fire, this would block for 30 s and the elapsed assertion below
+    // would fail rather than the test hanging forever.
+    let started = std::time::Instant::now();
+    let outcome = tools
+        .call(
+            "forge_run",
+            &json!({ "prompt": "write the notes", "timeout_ms": 30_000 }),
+        )
+        .await
+        .expect("run");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome.value["status"], "waiting_for_approval",
+        "{:?}",
+        outcome.value
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "should return as soon as the approval lands, took {elapsed:?}"
+    );
+    assert!(
+        outcome.value["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("forge_run_input"),
+        "the client must be told how to answer: {:?}",
+        outcome.value
+    );
+    assert!(outcome.value["session_id"].as_str().is_some());
+    assert!(
+        !tmp.path().join("notes.txt").exists(),
+        "the write must not have happened yet"
+    );
+
+    // And the run is answerable: approving completes it.
+    let run_id = outcome.value["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let delivered = tools
+        .call(
+            "forge_run_input",
+            &json!({ "run_id": run_id, "input": "y" }),
+        )
+        .await
+        .expect("input");
+    assert!(!delivered.is_error, "{:?}", delivered.value);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = tools
+            .call("forge_run_status", &json!({ "run_id": run_id }))
+            .await
+            .expect("status");
+        if status.value["status"] == "completed" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "approved run never completed: {:?}",
+            status.value
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(tmp.path().join("notes.txt").is_file());
 }

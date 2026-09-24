@@ -22,12 +22,14 @@ use forge_needle::EngineEmbedder;
 use forge_runtime::{AgentService, RunOptions};
 use forge_session::new_run_id;
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 use crate::runs::{Final, RunRegistry};
 
-/// Default synchronous budget for `forge_run` before it returns
-/// `status: "running"` and leaves the run going. Matches the brief and
-/// sits comfortably inside typical MCP client request timeouts.
+/// Default synchronous budget for `forge_run` before it reports the run's
+/// current status and leaves it going. Sits comfortably inside typical MCP
+/// client request timeouts. A run that parks for approval returns
+/// immediately rather than waiting this out.
 const DEFAULT_RUN_TIMEOUT_MS: u64 = 120_000;
 
 /// Upper bound a caller may request. Beyond this an MCP client's own
@@ -163,7 +165,7 @@ fn run_schema() -> Value {
                 "minimum": 1,
                 "maximum": MAX_RUN_TIMEOUT_MS,
                 "default": DEFAULT_RUN_TIMEOUT_MS,
-                "description": "How long to wait synchronously. On timeout the run keeps going and status is \"running\"; poll forge_run_status."
+                "description": "How long to wait synchronously. Returns sooner if the run needs an approval decision. If the budget runs out the run keeps going — poll forge_run_status with the returned run_id."
             }
         },
         "required": ["prompt"],
@@ -541,9 +543,18 @@ impl ForgeTools {
             Err(outcome) => return outcome,
         };
 
+        // Generate the run id here so we can subscribe to its event stream
+        // *before* the run task exists. `subscribe` creates the broadcast
+        // channel on demand, so there is no window in which an early event
+        // — an approval request from a fast first tool call — could be
+        // emitted before anyone is listening.
+        let run_id = new_run_id();
+        let mut events = self.service.subscribe(&run_id);
+
         let (run_id, session_id, handle) = self.service.start_run_with_options(
             prompt,
             RunOptions {
+                run_id: Some(run_id),
                 max_turns,
                 ..RunOptions::default()
             },
@@ -562,17 +573,61 @@ impl ForgeTools {
             let _ = finished_tx.send(());
         });
 
-        match tokio::time::timeout(Duration::from_millis(timeout_ms), finished_rx).await {
-            Ok(_) => self.settled_or_running(&run_id, &session_id),
-            Err(_) => ToolOutcome::ok(json!({
-                "run_id": run_id,
-                "session_id": session_id,
-                "status": "running",
-                "note": format!(
-                    "still running after {timeout_ms} ms; the run continues — poll forge_run_status with this run_id"
-                ),
-            })),
+        // Three ways this call can end. The approval arm is the load-bearing
+        // one: a run parked on an approval request is *blocked* inside the
+        // loop, so it will never finish on its own — waiting out the full
+        // timeout before saying so would strand the client for two minutes
+        // on a run that needs one word from it.
+        tokio::select! {
+            biased;
+            _ = finished_rx => self.settled_or_running(&run_id, &session_id),
+            () = wait_for_approval_request(&mut events) => {
+                self.paused_or_current(&run_id, &session_id)
+            }
+            () = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
+                // Never hardcode "running": by now the run may have parked
+                // for approval (with the event missed), failed, or finished
+                // between the timer firing and this line. The event log is
+                // the authority.
+                let mut outcome = self.status_value(&run_id);
+                if let Some(obj) = outcome.value.as_object_mut() {
+                    obj.insert("session_id".to_string(), Value::String(session_id.clone()));
+                    obj.insert(
+                        "note".to_string(),
+                        Value::String(format!(
+                            "still going after {timeout_ms} ms; the run continues — \
+                             poll forge_run_status with this run_id"
+                        )),
+                    );
+                }
+                outcome
+            }
         }
+    }
+
+    /// Report a run that just emitted an approval request. Reads the event
+    /// log rather than asserting the status, so a run that raced past the
+    /// pause (approval auto-granted, or answered by another client between
+    /// the event and this call) is still described accurately.
+    fn paused_or_current(&self, run_id: &str, session_id: &str) -> ToolOutcome {
+        let mut outcome = self.status_value(run_id);
+        if let Some(obj) = outcome.value.as_object_mut() {
+            obj.insert(
+                "session_id".to_string(),
+                Value::String(session_id.to_string()),
+            );
+            if obj.get("status").and_then(Value::as_str) == Some("waiting_for_approval") {
+                obj.insert(
+                    "note".to_string(),
+                    Value::String(
+                        "the run is waiting for permission to perform a risky operation — \
+                         answer it with forge_run_input (\"y\" approves, anything else denies)"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+        outcome
     }
 
     /// Render a run that the monitor has (or should have) settled.
@@ -714,6 +769,25 @@ fn final_label(state: &Final) -> &'static str {
         Final::Completed(_) => "completed",
         Final::Failed(_) => "failed",
         Final::Cancelled => "cancelled",
+    }
+}
+
+/// Resolve as soon as the run emits an approval request.
+///
+/// A `Lagged` receiver has missed events but is still live, so it keeps
+/// watching; `Closed` means no further events can arrive, which the caller
+/// handles by reading the event log. Every arm therefore ends in a state
+/// the caller can describe truthfully.
+async fn wait_for_approval_request(events: &mut broadcast::Receiver<Event>) {
+    loop {
+        match events.recv().await {
+            Ok(event) if matches!(event.kind, EventKind::ApprovalRequested { .. }) => return,
+            Ok(_) => continue,
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::debug!(missed, "event stream lagged while watching for approvals");
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
     }
 }
 
