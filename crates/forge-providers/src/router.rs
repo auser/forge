@@ -646,10 +646,14 @@ fn build_static(
     ))
 }
 
+/// The test-only mock router. Gated like the mock models: configuration may
+/// only select it under `FORGE_TEST_MOCKS=1` (see
+/// [`forge_config::test_mocks`]).
 fn build_mock(
     config: &Config,
     _registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    forge_config::ensure_test_mocks_allowed("router = \"mock\"")?;
     Ok(Arc::new(MockRouter::selecting(config.model.clone())))
 }
 

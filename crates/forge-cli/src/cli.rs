@@ -34,7 +34,12 @@ pub struct GlobalOpts {
     #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Override the configured router (static|mock|cheapest|http|laya|needle|jev).
+    /// Override the configured router (needle|jev|laya|http|static|cheapest).
+    // `mock` is deliberately absent from that list: it is a test-only
+    // router that `router_from_config` refuses unless FORGE_TEST_MOCKS=1
+    // (see `forge_config::test_mocks`). The flag still accepts it — the
+    // test harnesses pass it — it is just not advertised to users. A plain
+    // comment, not a doc comment, so clap cannot render it in `--help`.
     #[arg(long, global = true, value_name = "ROUTER")]
     pub router: Option<String>,
 

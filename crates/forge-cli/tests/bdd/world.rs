@@ -40,6 +40,10 @@ pub const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_NEEDLE_BACKEND",
     "FORGE_NEEDLE_WEIGHTS_BASE_URL",
     "FORGE_NEEDLE_TEST_SHA256",
+    // Mock providers are test-only and gated (see forge-providers'
+    // `test_mocks`). Scrubbed then set back to "1" below, so a scenario
+    // runs with mocks unlocked no matter what the developer's shell says.
+    "FORGE_TEST_MOCKS",
     // The mock's system-context echo is opt-in (see `MockModel`'s docs);
     // scrubbed so a developer's shell can neither switch it on for
     // scenarios that assert clean output nor off for the one that needs it.
@@ -138,7 +142,10 @@ impl BddWorld {
             // every scenario run. A scenario that wants to exercise real
             // autofetch can still opt in via `world.env`, which is applied
             // after this and wins.
-            .env("FORGE_NEEDLE_AUTOFETCH", "false");
+            .env("FORGE_NEEDLE_AUTOFETCH", "false")
+            // Scenarios drive the agent loop with mock/scripted models,
+            // which configuration refuses to resolve without this.
+            .env("FORGE_TEST_MOCKS", "1");
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
@@ -177,6 +184,7 @@ impl BddWorld {
         for var in FORGE_ENV_VARS {
             cmd.env_remove(var);
         }
+        cmd.env("FORGE_TEST_MOCKS", "1");
         let child = cmd.spawn().expect("spawn forge serve");
         self.server = Some(child);
         self.base_url = format!("http://127.0.0.1:{port}");
@@ -225,6 +233,7 @@ impl BddWorld {
             cmd.env_remove(var);
         }
         cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
+        cmd.env("FORGE_TEST_MOCKS", "1");
         for (key, value) in &self.env {
             cmd.env(key, value);
         }

@@ -66,8 +66,16 @@ fn list(ctx: &Context) -> Result<(), ForgeError> {
             caps.vision,
             caps.max_context
         );
-        if resolved.config.model != "mock-local" && resolved.config.model != "mock" {
-            println!("mock-local (built-in, available offline)");
+        // `mock-local` is a test-only provider (forge-providers'
+        // `test_mocks`): advertising it as an available model is how users
+        // ended up running forge against something that answers
+        // "mock response to: …". Listed only when the gate is open, and
+        // labelled for what it is.
+        if forge_config::test_mocks_allowed()
+            && resolved.config.model != "mock-local"
+            && resolved.config.model != "mock"
+        {
+            println!("mock-local (test-only mock, available offline)");
         }
         for (name, entry) in resolved.config.model_entries() {
             let desc = entry.description.as_deref().unwrap_or("");

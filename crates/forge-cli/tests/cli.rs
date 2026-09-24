@@ -22,6 +22,10 @@ const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_NEEDLE_BACKEND",
     "FORGE_NEEDLE_WEIGHTS_BASE_URL",
     "FORGE_NEEDLE_TEST_SHA256",
+    // Mock providers are test-only and refused by configuration unless this
+    // is set; scrubbed here and set back below, so the value is this
+    // harness's, never the developer's shell's.
+    "FORGE_TEST_MOCKS",
 ];
 
 /// A `forge` invocation isolated from the developer's real user
@@ -44,6 +48,9 @@ fn forge(tmp: &Path) -> Command {
     cmd.env("HOME", tmp.join("home"));
     cmd.env("XDG_CONFIG_HOME", tmp.join("xdg"));
     cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
+    // These tests configure `model = "mock-local"` / `"scripted-mock"`,
+    // which `model_from_config` refuses without the explicit opt-in.
+    cmd.env("FORGE_TEST_MOCKS", "1");
     cmd.env("NO_COLOR", "1");
     cmd
 }
@@ -1160,5 +1167,139 @@ fn run_fast_paths_a_tool_prompt_through_the_needle_brain() {
         !routers(&outcome).iter().any(|r| r == "needle-dispatch"),
         "routers: {:?}",
         routers(&outcome)
+    );
+}
+
+/// A `forge` invocation that is *not* allowed to use mocks: same hermetic
+/// environment as [`forge`], minus the `FORGE_TEST_MOCKS` unlock. This is
+/// what a user's shell looks like.
+fn forge_without_mocks(tmp: &Path) -> Command {
+    let mut cmd = forge(tmp);
+    cmd.env_remove("FORGE_TEST_MOCKS");
+    cmd
+}
+
+/// The user-facing half of the mock gate: a config that selects a mock is
+/// refused, by name, with the fix in the message — and `forge doctor` says
+/// so instead of reporting a healthy setup.
+#[test]
+fn a_mock_model_is_refused_without_the_test_env() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"mock-local\"\nrouter = \"static\"\n",
+    )
+    .expect("write config");
+
+    let output = forge_without_mocks(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "hello"])
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "a mock model must not run without the gate; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("test-only"), "stderr: {stderr}");
+    assert!(stderr.contains("FORGE_TEST_MOCKS=1"), "stderr: {stderr}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("mock response to"),
+        "no mock output may reach stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // Doctor turns the same situation into an actionable failing check.
+    let doctor = forge_without_mocks(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let report: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor --json is JSON");
+    let model_check = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["check"] == "model provider")
+        .expect("a model provider check")
+        .clone();
+    assert_eq!(model_check["status"], "fail", "check: {model_check}");
+    assert!(
+        model_check["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("test-only mock"),
+        "check: {model_check}"
+    );
+    assert_eq!(report["healthy"], false);
+}
+
+/// The mock *router* is gated too, and refused just as clearly.
+#[test]
+fn the_mock_router_is_refused_without_the_test_env() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(project.join(".forge/config.toml"), "router = \"mock\"\n")
+        .expect("write config");
+
+    let output = forge_without_mocks(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "hello"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success(), "the mock router must be refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("router = \"mock\""), "stderr: {stderr}");
+    assert!(stderr.contains("FORGE_TEST_MOCKS=1"), "stderr: {stderr}");
+}
+
+/// `forge model list` must not offer a provider the user cannot select.
+#[test]
+fn model_list_does_not_advertise_mocks_without_the_test_env() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"qwen3-coder\"\nmodel_base_url = \"http://127.0.0.1:8080/v1\"\n",
+    )
+    .expect("write config");
+
+    let output = forge_without_mocks(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["model", "list"])
+        .output()
+        .expect("model list");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("mock"),
+        "model list must not mention mocks: {stdout}"
+    );
+
+    // With the gate open it is listed, and labelled for what it is.
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["model", "list"])
+        .output()
+        .expect("model list");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("mock-local (test-only mock"),
+        "the gate being open should surface it, labelled: {stdout}"
     );
 }

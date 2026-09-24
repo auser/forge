@@ -444,9 +444,9 @@ impl ModelProvider for OpenAiCompatibleModel {
 }
 
 /// Build the active model provider from configuration. `mock`/`mock-local`
-/// selects the offline mock; `scripted-mock` loads a scripted mock from the
-/// `mock_script` JSON file (resolved against `project_root` when relative);
-/// anything else produces an OpenAI-compatible client with tools explicitly
+/// and `scripted-mock` select the **test-only** mocks and are refused
+/// unless `FORGE_TEST_MOCKS=1` (see [`forge_config::test_mocks`]); anything else
+/// produces an OpenAI-compatible client with tools explicitly
 /// enabled (the OpenAI tools schema is supported by oMLX-class servers).
 /// When no `model_base_url` is configured, the client points at a
 /// guaranteed-unroutable loopback address so construction succeeds and the
@@ -457,8 +457,15 @@ pub fn model_from_config(
     project_root: &std::path::Path,
 ) -> Result<Arc<dyn ModelProvider>, ForgeError> {
     match config.model.as_str() {
-        "mock" | "mock-local" => Ok(Arc::new(MockModel::new())),
+        // Mocks are test-only; see `test_mocks`. The gate lives here
+        // because this is the single place a *configured* model name
+        // becomes a provider.
+        "mock" | "mock-local" => {
+            forge_config::ensure_test_mocks_allowed(&format!("model = {:?}", config.model))?;
+            Ok(Arc::new(MockModel::new()))
+        }
         "scripted-mock" => {
+            forge_config::ensure_test_mocks_allowed("model = \"scripted-mock\"")?;
             let script = config.mock_script.as_deref().ok_or_else(|| {
                 ForgeError::config(
                     "model = \"scripted-mock\" requires mock_script (path to a JSON script)",
@@ -976,13 +983,43 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn model_from_config_mock_is_explicit() {
+        let _allowed = forge_config::test_mocks::MocksAllowed::new();
         let config = Config {
             model: "mock-local".to_string(),
             ..Config::default()
         };
         let model = model_from_config(&config, std::path::Path::new(".")).expect("mock builds");
         assert_eq!(model.name(), "mock-local");
+    }
+
+    /// The user-facing contract: no configuration can hand someone a mock
+    /// without the explicit opt-in.
+    #[test]
+    #[serial_test::serial]
+    fn every_mock_model_name_is_refused_without_the_test_env() {
+        let previous = std::env::var(forge_config::TEST_MOCKS_ENV).ok();
+        unsafe { std::env::remove_var(forge_config::TEST_MOCKS_ENV) };
+
+        for name in ["mock", "mock-local", "scripted-mock"] {
+            let config = Config {
+                model: name.to_string(),
+                mock_script: Some("script.json".to_string()),
+                ..Config::default()
+            };
+            let err = model_from_config(&config, std::path::Path::new("."))
+                .err()
+                .unwrap_or_else(|| panic!("{name} must not resolve without the gate"));
+            let message = err.to_string();
+            assert!(matches!(err, ForgeError::Config(_)), "{name}: {message}");
+            assert!(message.contains("test-only"), "{name}: {message}");
+            assert!(message.contains("FORGE_TEST_MOCKS=1"), "{name}: {message}");
+        }
+
+        if let Some(v) = previous {
+            unsafe { std::env::set_var(forge_config::TEST_MOCKS_ENV, v) };
+        }
     }
 
     #[tokio::test]
@@ -1085,7 +1122,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn scripted_mock_loads_from_config_via_model_from_config() {
+        let _allowed = forge_config::test_mocks::MocksAllowed::new();
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             tmp.path().join("script.json"),

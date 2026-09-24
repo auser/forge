@@ -34,6 +34,8 @@ const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_NEEDLE_WEIGHTS_BASE_URL",
     "FORGE_NEEDLE_TEST_SHA256",
     "FORGE_MOCK_VERBOSE",
+    // Test-only mocks are gated; scrubbed then set by `forge()` below.
+    "FORGE_TEST_MOCKS",
 ];
 
 /// The current MCP revision, used for the modern (per-request metadata)
@@ -53,6 +55,8 @@ fn forge(tmp: &Path, project: &Path) -> Command {
     cmd.env("HOME", tmp.join("home"));
     cmd.env("XDG_CONFIG_HOME", tmp.join("xdg"));
     cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
+    // The scaffolded project uses `model = "scripted-mock"`.
+    cmd.env("FORGE_TEST_MOCKS", "1");
     cmd.env("NO_COLOR", "1");
     cmd
 }

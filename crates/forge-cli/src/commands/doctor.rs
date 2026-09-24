@@ -184,16 +184,44 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
 
     if let Ok(resolved) = &resolved {
         let config = &resolved.config;
-        // Model provider: mock/scripted are offline; anything else gets a
-        // reachability probe of its endpoint (warn, never fail).
-        let model_detail = match config.model.as_str() {
-            "mock-local" | "mock" => Some("mock-local (built-in mock, available offline)".into()),
-            "scripted-mock" => Some("scripted-mock (offline script)".into()),
-            _ => None,
+        // Model provider: a test-only mock is reported as whatever it
+        // actually is right now — usable under the gate, broken without it
+        // (every run would fail at provider construction, and "why does
+        // forge say mock response to:" is exactly the confusion the gate
+        // exists to prevent). Anything else gets a reachability probe of
+        // its endpoint (warn, never fail).
+        let mock_model = matches!(
+            config.model.as_str(),
+            "mock" | "mock-local" | "scripted-mock"
+        );
+        let model_detail = if mock_model {
+            Some(if forge_config::test_mocks_allowed() {
+                (
+                    Level::Warn,
+                    format!(
+                        "{} is a test-only mock, unlocked by {}",
+                        config.model,
+                        forge_config::TEST_MOCKS_ENV
+                    ),
+                )
+            } else {
+                (
+                    Level::Fail,
+                    format!(
+                        "{} is a test-only mock and will not load; pick a real model \
+                         (see the README's \"Pick your model\"), or set {}=1 if you \
+                         are running forge's own tests",
+                        config.model,
+                        forge_config::TEST_MOCKS_ENV
+                    ),
+                )
+            })
+        } else {
+            None
         };
         match model_detail {
-            Some(detail) => checks.push(Check {
-                level: Level::Ok,
+            Some((level, detail)) => checks.push(Check {
+                level,
                 label: "model provider".into(),
                 detail,
             }),

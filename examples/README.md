@@ -26,8 +26,13 @@ built-in defaults. Check where any value comes from with
 | [`configs/local-first.toml`](configs/local-first.toml) | **Recommended.** You have a GPU/Apple Silicon and want fully local, free inference | a local model server (oMLX/Ollama/LM Studio/llama.cpp) |
 | [`configs/hybrid-needle.toml`](configs/hybrid-needle.toml) | Local model for easy tasks, hosted models when the on-device brain says the task is hard | a local model server; hosted keys optional |
 | [`configs/budget-hosted.toml`](configs/budget-hosted.toml) | No local GPU; always route to the cheapest capable hosted model | A provider API key in `.env` |
-| [`configs/offline-eval.toml`](configs/offline-eval.toml) | Trying Forge with zero dependencies, CI, demos | nothing |
 | [`configs/hybrid-laya.toml`](configs/hybrid-laya.toml) | You specifically want the Laya adapter doing the routing instead of the embedded brain | `pip install laya` + `forge router serve` |
+
+No preset for "just trying it out": forge's project graph, skills, doctor and
+MCP tools need no model and no config at all — `forge init` then `forge graph
+context "..."`. Only the agent loop (`forge run`) needs a model, so pick one of
+the presets above. (Forge's own test suites drive a mock model, but mocks are
+test-only: configuration refuses them unless `FORGE_TEST_MOCKS=1`.)
 
 `router = "laya"` is a legacy setting: the built-in default is now the
 embedded needle brain. Only `hybrid-laya.toml` sets it, and only because

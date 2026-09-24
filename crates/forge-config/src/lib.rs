@@ -13,6 +13,10 @@ use std::path::{Path, PathBuf};
 use forge_core::ForgeError;
 use serde::{Deserialize, Serialize};
 
+pub mod test_mocks;
+
+pub use test_mocks::{TEST_MOCKS_ENV, ensure_test_mocks_allowed, test_mocks_allowed};
+
 /// A `[models.<name>]` entry: cost metadata, optional endpoint, and
 /// capability overrides. Cost is USD per million tokens; unset costs mean
 /// free (0.0). Entries without any capability override are treated as

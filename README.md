@@ -7,14 +7,13 @@ pluggable execution, and both CLI and REST/SSE interfaces over one shared runtim
 
 No Node.js, database, or daemon is required. The default stack is an embedded
 Needle 3 decision router (on-device, no network calls) in front of a local
-oMLX coding model — no mock in the default path, no hosted account needed.
+oMLX coding model — nothing mocked, no hosted account needed.
 When needle declines or fails, forge can escalate to Jev (TypeSafe's hosted
 System One API, or a self-hosted OpenJev server) before falling all the way
 back to deterministic static routing — opt-in only when a Jev credential is
 configured (`router_escalate = "auto"`, the default, is a no-op without one)
 and always skipped under `--local-only`. Laya (open-source System One) and
-other HTTP-style routers remain available as alternates. Mock providers
-exist for tests and demos but are strictly opt-in (`model = "mock-local"`).
+other HTTP-style routers remain available as alternates.
 
 - **How it all fits together** — the decision plane (Needle → Jev/OpenJev →
   static), the generation plane (local → subscription → API-key cloud), the
@@ -126,11 +125,19 @@ forge --model deepseek-chat run "Explain this project"
 `forge init` reports the keys it found by name; built-in `[models]` entries
 exist for `deepseek-chat`, `kimi-k2.7-code`, `gpt-5`, and `claude-sonnet`.
 
-**Just evaluating?** No GPU, no accounts, no server — one flag:
+**Just evaluating?** A lot of forge needs no model at all. With zero setup:
 
 ```bash
-forge --model mock-local --router static run "Explain this project"
+forge init                         # builds the project graph
+forge graph context "auth flow"    # ranked files for a task
+forge graph map                    # what's in this repo
+forge skill list                   # discovered skills
+forge doctor                       # what's configured, what's missing
+forge mcp                          # serve those as tools to your editor
 ```
+
+Running an agent loop (`forge run`) does need a model — that is the
+ten-second menu above.
 
 ### Troubleshooting
 
@@ -306,7 +313,7 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
---router <r>          override the router (static|mock|cheapest|http|laya|needle)
+--router <r>          override the router (needle|jev|laya|http|static|cheapest)
 --execution <p>       override the execution provider (native|mock)
 --local-only          restrict to local providers
 --approval <mode>     auto | prompt | prompt-dangerous | deny
@@ -340,11 +347,10 @@ Key settings (all optional):
 
 | Key | Default | Env var | Meaning |
 |---|---|---|---|
-| `model` | `qwen3-coder` | `FORGE_MODEL` | Active model (`mock-local`/`scripted-mock` = opt-in offline mocks) |
-| `mock_script` | — | `FORGE_MOCK_SCRIPT` | JSON script path for `scripted-mock` (project-relative) |
+| `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `laya` \| `static` \| `cheapest` \| `mock` \| `http` \| `jev` |
+| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key. Same primary-only fallback rule as `router_url` — the escalation tier never uses it (see `jev_key_env`) |
 | `router_escalate` | `auto` | `FORGE_ROUTER_ESCALATE` | `auto` \| `off` — when `router = "needle"`, escalate to the Jev tier before the static fallback once a Jev credential is present (`auto`, the default) or never (`off`); no-op unless a credential exists and `--local-only` is off |
@@ -436,12 +442,7 @@ These are the three pluggable seams (traits in `forge-core`).
 ### ModelProvider
 
 The default is `qwen3-coder` via the OpenAI-compatible endpoint at
-`model_base_url` (oMLX convention). `mock` (offline, deterministic) and
-`scripted-mock` (JSON-scripted replies incl. tool calls) exist for tests,
-demos, and CI — always explicitly requested. The mock's reply is exactly
-`mock response to: <prompt>`; set `FORGE_MOCK_VERBOSE=1` to have it also
-echo a 120-character snippet of the assembled system context (skill
-instructions, graph context) when you want that plumbing visible.
+`model_base_url` (oMLX convention).
 Capabilities (streaming, tools,
 structured output, vision, context size) are explicit per provider, never
 assumed; a provider without `tools` receives single-turn requests only.
@@ -468,7 +469,6 @@ Seven modes:
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `static` (deterministic rules),
-- `mock` (preset decision, for tests),
 - `cheapest` (lowest-cost candidate from the `[models]` cost table;
   tie-breaks by output cost then name),
 - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
@@ -589,7 +589,8 @@ runs locally with approval gating: `Risky` operations pause for approval under
 `approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
 ones (non-interactive stdin → typed "approval required" error, which the agent
 loop treats as a pause: answer via piped stdin lines, e.g.
-`echo y | forge run ...`). `auto` runs, `deny` blocks. `mock` records requests
+`echo y | forge run ...`). `auto` runs, `deny` blocks. The `mock`
+*execution* provider records requests
 for tests. MVM/container/remote executors plug into the same trait later.
 
 ## Skills
@@ -940,7 +941,8 @@ crates/
   forge-core        traits, event protocol, typed errors (no heavy deps)
   forge-config      config loading, precedence, provenance
   forge-execution   native + mock execution providers
-  forge-providers   mock/scripted + OpenAI-compatible models; static, mock,
+  forge-providers   OpenAI-compatible/Anthropic models (+ test-only mocks);
+                    needle, jev, laya, http, static, cheapest,
                     cheapest, HTTP, and Laya routers
   forge-session     append-only JSONL store + secret redaction
   forge-skills      SKILL.md discovery, progressive disclosure
@@ -965,7 +967,14 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 22 features / 43 scenarios / 160 steps.
+  mock providers — fully offline. Currently 23 features / 44 scenarios / 165 steps.
+- Mocks are **test-only**. `model = "mock-local"`, `model = "scripted-mock"` and
+  `router = "mock"` are refused by configuration unless `FORGE_TEST_MOCKS=1` is
+  set, which every forge test harness does. They answer
+  `mock response to: <prompt>`, which is useful for asserting the agent loop
+  and actively misleading as a product — so users never see them offered.
+  (`FORGE_MOCK_VERBOSE=1` additionally makes the mock echo a snippet of the
+  assembled system context, when you want that plumbing visible in a test.)
 - Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
   `just verify` — they need a native engine and real weights. See [Embedded
   Needle brain (`ffi`)](#embedded-needle-brain-ffi).
