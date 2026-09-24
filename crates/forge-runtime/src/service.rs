@@ -15,7 +15,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::{ToolDispatcher, ToolOutcome, tool_definitions};
+use crate::tools::{ToolDispatcher, ToolOutcome, minimum_dispatch_risk, tool_definitions};
 
 /// Skill registry for runtimes without skills (tests).
 pub struct NullSkillRegistry;
@@ -399,35 +399,54 @@ impl AgentService {
     /// Every gate must hold, and any failure returns `None` to mean "run
     /// normally": this is an optimization, never a behaviour change.
     ///  1. a brain is attached and the run isn't cancelled;
-    ///  2. `tool_call` produced a call within `router_timeout_ms`;
+    ///  2. `tool_call` produced a call within `router_timeout_ms`, from the
+    ///     same tool list the model would have been offered (the caller
+    ///     only calls this when that list is non-empty, i.e. when the
+    ///     resolved model is tool-capable — a chat-only provider gets the
+    ///     plain-completion path and the fast path must not widen that);
     ///  3. its confidence is at least `router_confidence_threshold`;
     ///  4. its arguments parse as a JSON *object* (what the dispatcher
     ///     reads arguments out of);
-    ///  5. the guardrail `decide` answers `GUARD_SAFE`, confidently and in
+    ///  5. the call is *read-only*: `minimum_dispatch_risk` says
+    ///     `RiskLevel::Safe`, the one classification no approval policy can
+    ///     gate;
+    ///  6. the guardrail `decide` answers `GUARD_SAFE`, confidently and in
     ///     time;
-    ///  6. the dispatch itself succeeded without needing approval.
+    ///  7. the dispatch itself succeeded.
     ///
     /// Both brain calls are bounded by `router_timeout_ms`: a slow or hung
     /// engine costs a run that budget once and then behaves as if no brain
     /// were attached — it can never hang a run.
     ///
-    /// Gate 6 is why nothing is emitted from here: the dispatch is
-    /// attempted *before* any event is recorded, so a call that turns out
-    /// to need approval (`ForgeError::ApprovalRequired`, which the provider
-    /// returns before touching anything) or that fails outright leaves no
-    /// trace and no side effect, and the loop handles it properly — with
-    /// the interactive approval pause the fast path deliberately has no
-    /// business running. The cost is that the fast path's `tool_*` events
-    /// are written just after the work rather than just before it, for the
-    /// few milliseconds one local tool call takes.
-    async fn needle_fast_path(&self, prompt: &str, run_id: &str) -> Option<FastPathDispatch> {
+    /// Gate 5 is the load-bearing safety gate: **no approval prompt can
+    /// ever originate from the fast path**, under any `approval` policy.
+    /// Without it, `check_approval` would run *inside* the fast path —
+    /// blocking on stdin on a terminal before any event exists, and turning
+    /// a user's "n" into a plain error that the fast path would silently
+    /// swallow, letting the loop request the very same tool and prompt a
+    /// second time. Restricting dispatch to reads removes that whole class:
+    /// `Safe` operations return from `check_approval` before the policy is
+    /// even consulted. Anything else — writes, edits, deletes, commands —
+    /// falls through *before* the execution provider is touched at all.
+    ///
+    /// Nothing is emitted from here, so a decline leaves no trace and no
+    /// side effect for the loop to contradict. The cost is that a
+    /// dispatched call's `tool_*` events are written just after the work
+    /// rather than just before it, for the few milliseconds one local
+    /// read takes.
+    async fn needle_fast_path(
+        &self,
+        prompt: &str,
+        run_id: &str,
+        tools: &[forge_core::ToolDefinition],
+    ) -> Option<FastPathDispatch> {
         let engine = self.needle.as_ref()?;
         if self.cancel_requested(run_id) {
             // Let the loop's own checkpoint report the cancellation.
             return None;
         }
         let budget = Duration::from_millis(self.config.router_timeout_ms);
-        let tools_json = serde_json::to_string(&tool_definitions()).ok()?;
+        let tools_json = serde_json::to_string(tools).ok()?;
 
         let call =
             match tokio::time::timeout(budget, engine.tool_call(prompt.to_string(), tools_json))
@@ -452,6 +471,16 @@ impl AgentService {
             _ => return None,
         };
 
+        let tool_call = ToolCall::new(format!("{NEEDLE_DISPATCH}-1"), &call.name, arguments);
+        if minimum_dispatch_risk(&tool_call) != Some(RiskLevel::Safe) {
+            tracing::debug!(
+                run_id,
+                tool = %tool_call.name,
+                "needle fast path skipped: not a read-only operation"
+            );
+            return None;
+        }
+
         let question = format!(
             "Classify this tool operation: {} with arguments {}",
             call.name, call.arguments_json
@@ -474,7 +503,6 @@ impl AgentService {
             return None;
         }
 
-        let tool_call = ToolCall::new(format!("{NEEDLE_DISPATCH}-1"), &call.name, arguments);
         let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
         match dispatcher.dispatch(&tool_call).await {
             Ok(outcome) if !outcome.result.is_error => Some(FastPathDispatch {
@@ -482,11 +510,10 @@ impl AgentService {
                 outcome,
                 confidence: call.confidence,
             }),
-            // An approval pause arrives before the provider touches
-            // anything, and a tool error means the operation did not
-            // complete — in both cases the loop is where this belongs: it
-            // can pause for a real approval, or feed the error to a model
-            // that may recover from it.
+            // A tool error means the operation did not complete, so the loop
+            // is where it belongs: a model may recover from it. (An
+            // `ApprovalRequired` cannot reach here — gate 5 admits only
+            // `Safe` operations — but it is handled the same way for free.)
             _ => {
                 tracing::debug!(
                     run_id,
@@ -642,14 +669,35 @@ impl AgentService {
         }
         messages.push(Message::user(prompt));
 
+        // Resolve the provider for the routed model (defaults to the
+        // configured one).
+        let model = match &self.model_factory {
+            Some(factory) => match factory(&decision.selected_model) {
+                Ok(provider) => provider,
+                Err(e) => return Err(fail(&mut collected, e)),
+            },
+            None => self.model.clone(),
+        };
+        tracing::debug!(model = %model.name(), "model resolved for run");
+
+        let tools = if model.capabilities().tools {
+            tool_definitions()
+        } else {
+            Vec::new()
+        };
+
         // Fast path: the on-device brain answers a well-defined prompt with
-        // one local tool call, before any model is contacted. Only for a
-        // fresh prompt — a resume continues a conversation, so re-running
-        // the original prompt's tool would be wrong. All gates and the
+        // one local tool call, before the model is called. Only for a fresh
+        // prompt — a resume continues a conversation, so re-running the
+        // original prompt's tool would be wrong — and only when the run
+        // actually has tools, i.e. the resolved provider is tool-capable:
+        // a chat-only model's run is a plain completion and the fast path
+        // must not turn it into tool execution. All other gates and the
         // dispatch itself live in `needle_fast_path`; `None` means "run
         // normally", and nothing has been emitted or executed by then.
         if resume_from.is_none()
-            && let Some(fast) = self.needle_fast_path(prompt, &run_id).await
+            && !tools.is_empty()
+            && let Some(fast) = self.needle_fast_path(prompt, &run_id, &tools).await
         {
             tracing::info!(
                 run_id,
@@ -739,23 +787,6 @@ impl AgentService {
                 events: collected,
             });
         }
-
-        // Resolve the provider for the routed model (defaults to the
-        // configured one).
-        let model = match &self.model_factory {
-            Some(factory) => match factory(&decision.selected_model) {
-                Ok(provider) => provider,
-                Err(e) => return Err(fail(&mut collected, e)),
-            },
-            None => self.model.clone(),
-        };
-        tracing::debug!(model = %model.name(), "model resolved for run");
-
-        let tools = if model.capabilities().tools {
-            tool_definitions()
-        } else {
-            Vec::new()
-        };
 
         if tools.is_empty() {
             // Single-turn path: providers without tool support behave

@@ -41,7 +41,7 @@ fn scripted_service(
 /// declines, which is the fall-through path).
 fn needle_service(
     root: &std::path::Path,
-    model: Arc<ScriptedMockModel>,
+    model: Arc<dyn forge_core::ModelProvider>,
     execution: Arc<dyn forge_core::ExecutionProvider>,
 ) -> AgentService {
     AgentService::new(
@@ -760,16 +760,16 @@ async fn needle_fast_path_absent_engine_changes_nothing() {
 }
 
 #[tokio::test]
-async fn needle_fast_path_leaves_approval_gated_calls_to_the_loop() {
-    // Native execution under `prompt`: the write needs approval, which the
-    // fast path never asks for — it declines and the loop takes over.
+async fn needle_fast_path_never_attempts_a_non_read_only_operation() {
+    // A write is at least `Risky`, so it could pause for approval — the
+    // fast path must therefore refuse it *before* the execution provider is
+    // touched at all. `MockExecution` never gates anything, so a recorded
+    // file op here would mean the fast path had attempted (and completed) a
+    // write whose approval the loop is supposed to own.
     let tmp = tempfile::tempdir().expect("tempdir");
     let model = Arc::new(ScriptedMockModel::new(vec![text_reply("loop handled it")]));
-    let exec = Arc::new(NativeExecution::new(
-        forge_core::ApprovalPolicy::Prompt,
-        tmp.path(),
-    ));
-    let service = needle_service(tmp.path(), model.clone(), exec);
+    let exec = Arc::new(MockExecution::new(tmp.path()));
+    let service = needle_service(tmp.path(), model.clone(), exec.clone());
 
     let outcome = service
         .run("write_file: {\"path\": \"out.txt\", \"content\": \"x\"}")
@@ -779,9 +779,108 @@ async fn needle_fast_path_leaves_approval_gated_calls_to_the_loop() {
     assert!(!has_needle_dispatch(&outcome));
     assert_eq!(outcome.text, "loop handled it");
     assert!(
-        !tmp.path().join("out.txt").exists(),
-        "no write may happen on a declined fast path"
+        exec.recorded_file_ops().is_empty(),
+        "no execution attempt may be made for a gateable operation"
     );
+
+    // Same prompt against a provider that does gate: still no write, and
+    // the loop — not the fast path — owns the approval decision.
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    let native = Arc::new(NativeExecution::new(
+        forge_core::ApprovalPolicy::Prompt,
+        tmp2.path(),
+    ));
+    let service = needle_service(
+        tmp2.path(),
+        Arc::new(ScriptedMockModel::new(vec![text_reply("loop handled it")])),
+        native,
+    );
+    let outcome = service
+        .run("write_file: {\"path\": \"out.txt\", \"content\": \"x\"}")
+        .await
+        .expect("run completes through the normal loop");
+    assert!(!has_needle_dispatch(&outcome));
+    assert!(!tmp2.path().join("out.txt").exists(), "no write happened");
+}
+
+#[tokio::test]
+async fn needle_fast_path_dispatches_safe_reads_under_prompt_approval() {
+    // The strictest interactive policy still fast-paths a read: `Safe`
+    // operations return from `check_approval` before the policy is
+    // consulted, so no prompt can originate here. (Tests have no terminal
+    // stdin, so an approval attempt would fail the run outright — passing
+    // proves none was made.)
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("notes.txt"), "read me\n").expect("write");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("never used")]));
+    let exec = Arc::new(NativeExecution::new(
+        forge_core::ApprovalPolicy::Prompt,
+        tmp.path(),
+    ));
+    let service = needle_service(tmp.path(), model.clone(), exec);
+
+    let outcome = service
+        .run("read_file: {\"path\": \"notes.txt\"}")
+        .await
+        .expect("read dispatches without approval");
+
+    assert!(has_needle_dispatch(&outcome));
+    assert_eq!(outcome.text, "read me\n");
+    assert!(model.recorded().is_empty(), "model never called");
+    assert!(
+        !event_kinds(&outcome).contains(&"approval_requested"),
+        "the fast path must never ask for approval"
+    );
+}
+
+#[tokio::test]
+async fn needle_fast_path_requires_a_tool_capable_model() {
+    // A chat-only provider's run is a plain completion with no tools at
+    // all; the fast path must not turn it into tool execution.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(
+        MockModel::new().with_capabilities(forge_core::ModelCapabilities {
+            streaming: true,
+            tools: false,
+            structured_output: false,
+            vision: false,
+            max_context: 8_192,
+        }),
+    );
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("secret"));
+    let service = needle_service(tmp.path(), model, exec.clone());
+
+    let outcome = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("run");
+
+    assert!(!has_needle_dispatch(&outcome));
+    assert!(
+        exec.recorded_file_ops().is_empty(),
+        "a chat-only model's run must execute no tools"
+    );
+    assert_eq!(outcome.turns, 1, "plain completion path");
+}
+
+#[tokio::test]
+async fn needle_fast_path_guardrail_refuses_destructive_wording_on_a_safe_tool() {
+    // The guardrail is a second, independent gate: this call is read-only
+    // (so the risk gate admits it), but its arguments read destructively,
+    // and the brain's verdict alone must stop it.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("loop answered")]));
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("contents"));
+    let service = needle_service(tmp.path(), model.clone(), exec.clone());
+
+    let outcome = service
+        .run("read_file: {\"path\": \"delete_me.txt\"}")
+        .await
+        .expect("run completes through the normal loop");
+
+    assert!(!has_needle_dispatch(&outcome), "guardrail must refuse");
+    assert!(exec.recorded_file_ops().is_empty(), "nothing was read");
+    assert_eq!(outcome.text, "loop answered");
 }
 
 #[tokio::test]

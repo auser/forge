@@ -597,7 +597,7 @@ fn build_router(
         "needle" => {
             let engine = forge_needle::select_engine(&config.needle)?;
             Ok(Arc::new(forge_needle::NeedleRouter::new(
-                Arc::new(engine),
+                engine,
                 registry.to_vec(),
                 Duration::from_millis(config.router_timeout_ms),
             )))

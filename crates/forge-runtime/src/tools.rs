@@ -114,6 +114,86 @@ fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing or invalid string argument {key:?}"))
 }
 
+/// Map a tool call onto a file operation: `None` when the tool is not a
+/// file op at all, `Some(Err)` when its arguments don't type-check. Shared
+/// by dispatch and [`minimum_dispatch_risk`] so the two can never disagree
+/// about what a call would do.
+fn file_op_for(call: &ToolCall) -> Option<Result<FileOp, String>> {
+    let args = &call.arguments;
+    let path_op = |make: fn(PathBuf) -> FileOp| match arg_str(args, "path") {
+        Ok(path) => Some(Ok(make(PathBuf::from(path)))),
+        Err(e) => Some(Err(e)),
+    };
+    match call.name.as_str() {
+        "read_file" => path_op(|path| FileOp::Read { path }),
+        "delete_file" => path_op(|path| FileOp::Delete { path }),
+        "write_file" => Some(match (arg_str(args, "path"), arg_str(args, "content")) {
+            (Ok(path), Ok(content)) => Ok(FileOp::Write {
+                path: PathBuf::from(path),
+                content,
+            }),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }),
+        "edit_file" => Some(
+            match (
+                arg_str(args, "path"),
+                arg_str(args, "old"),
+                arg_str(args, "new"),
+            ) {
+                (Ok(path), Ok(old), Ok(new)) => Ok(FileOp::Edit {
+                    path: PathBuf::from(path),
+                    old,
+                    new,
+                }),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+            },
+        ),
+        _ => None,
+    }
+}
+
+/// `run_command`'s risk: the model's hint can only raise the level, never
+/// lower it — a shell command is never below `Risky`.
+fn command_risk(args: &serde_json::Value) -> RiskLevel {
+    if arg_str(args, "risk")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("destructive")
+    {
+        RiskLevel::Destructive
+    } else {
+        RiskLevel::Risky
+    }
+}
+
+/// The lowest risk level dispatching `call` could possibly be classified
+/// at, or `None` for a call that cannot be dispatched at all (unknown tool,
+/// arguments that don't type-check). Answered without dispatching anything,
+/// so a caller can decide *whether* to dispatch — the seam the needle fast
+/// path uses to stay out of approval territory entirely.
+///
+/// The rules are not restated here: file ops are handed to the real
+/// [`FileOp::risk`], commands to the same [`command_risk`] clamp
+/// `dispatch_inner` applies, and the graph tools never reach an
+/// `ExecutionProvider` (so nothing can gate them). `FileOp::risk` needs a
+/// project root to tell `Risky` from `Destructive`, which the tool layer
+/// does not know; the sentinel root below is sound for this contract
+/// because `Safe` is the one answer that cannot depend on the root (reads
+/// return it before any path is examined) and because under-reporting
+/// `Destructive` as `Risky` is exactly the "lowest possible" promise. Only
+/// `Some(RiskLevel::Safe)` is therefore a guarantee: it means no approval
+/// policy can gate this call (see `NativeExecution::check_approval`, which
+/// returns early for `Safe`).
+pub(crate) fn minimum_dispatch_risk(call: &ToolCall) -> Option<RiskLevel> {
+    if let Some(op) = file_op_for(call) {
+        return Some(op.ok()?.risk(std::path::Path::new("")));
+    }
+    match call.name.as_str() {
+        "run_command" => Some(command_risk(&call.arguments)),
+        "graph_context" | "graph_grep" => Some(RiskLevel::Safe),
+        _ => None,
+    }
+}
+
 fn arg_string_vec(args: &serde_json::Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(serde_json::Value::as_array)
@@ -159,41 +239,10 @@ impl ToolDispatcher {
         };
 
         // File operations.
-        let file_op = match call.name.as_str() {
-            "read_file" => match arg_str(args, "path") {
-                Ok(path) => Some(FileOp::Read {
-                    path: PathBuf::from(path),
-                }),
-                Err(e) => return invalid(e),
-            },
-            "write_file" => match (arg_str(args, "path"), arg_str(args, "content")) {
-                (Ok(path), Ok(content)) => Some(FileOp::Write {
-                    path: PathBuf::from(path),
-                    content,
-                }),
-                (Err(e), _) | (_, Err(e)) => return invalid(e),
-            },
-            "edit_file" => {
-                match (
-                    arg_str(args, "path"),
-                    arg_str(args, "old"),
-                    arg_str(args, "new"),
-                ) {
-                    (Ok(path), Ok(old), Ok(new)) => Some(FileOp::Edit {
-                        path: PathBuf::from(path),
-                        old,
-                        new,
-                    }),
-                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return invalid(e),
-                }
-            }
-            "delete_file" => match arg_str(args, "path") {
-                Ok(path) => Some(FileOp::Delete {
-                    path: PathBuf::from(path),
-                }),
-                Err(e) => return invalid(e),
-            },
-            _ => None,
+        let file_op = match file_op_for(call) {
+            Some(Ok(op)) => Some(op),
+            Some(Err(e)) => return invalid(e),
+            None => None,
         };
         if let Some(op) = file_op {
             let path = op.path().to_path_buf();
@@ -234,14 +283,7 @@ impl ToolDispatcher {
                     Ok(c) => c,
                     Err(e) => return invalid(e),
                 };
-                // Risk rule: the model's hint can only raise the level;
-                // run_command is never below Risky.
-                let hint = arg_str(args, "risk").unwrap_or_default();
-                let risk = if hint.eq_ignore_ascii_case("destructive") {
-                    RiskLevel::Destructive
-                } else {
-                    RiskLevel::Risky
-                };
+                let risk = command_risk(args);
                 let request = ExecRequest {
                     command: command.clone(),
                     args: arg_string_vec(args, "args"),
