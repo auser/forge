@@ -94,7 +94,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
                 router_cmd::serve(&ctx, host, port).await
             }
         },
-        Command::Graph { command } => graph_cmd::run(&ctx, command),
+        Command::Graph { command } => graph_cmd::run(&ctx, command).await,
         Command::Skill { command } => skill_cmd::run(&ctx, command).await,
         Command::Serve { host, port } => serve_cmd::run(&ctx, host, port).await,
     }

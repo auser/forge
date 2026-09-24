@@ -162,6 +162,33 @@ fn callers_blast_grep_map_context() {
 }
 
 #[test]
+fn embedding_candidates_key_and_text_format_disambiguate_same_named_symbols() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(tmp.path(), "src/a.rs", "pub fn run() {}\n");
+    write(tmp.path(), "src/b.rs", "pub fn run() {}\n");
+
+    let mut graph = LocalGraph::open(tmp.path()).expect("open");
+    graph.build().expect("build");
+
+    let candidates = graph.embedding_candidates();
+    let a = candidates
+        .iter()
+        .find(|(key, _, _)| key == "src/a.rs::run")
+        .expect("src/a.rs::run present");
+    let b = candidates
+        .iter()
+        .find(|(key, _, _)| key == "src/b.rs::run")
+        .expect("src/b.rs::run present");
+
+    assert_eq!(a.2, "function run in src/a.rs");
+    assert_eq!(b.2, "function run in src/b.rs");
+    // Same symbol name, different files: distinct keys, distinct hashes
+    // (the embedded text differs by path).
+    assert_ne!(a.0, b.0);
+    assert_ne!(a.1, b.1);
+}
+
+#[test]
 fn skips_common_directories() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fixture(tmp.path());

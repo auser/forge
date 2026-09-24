@@ -165,6 +165,10 @@ pub enum GraphCommand {
     Grep {
         #[arg(value_name = "PATTERN")]
         pattern: String,
+        /// Search the local semantic embedding index instead of literal
+        /// text/regex matching (requires needle weights; see `forge init`).
+        #[arg(long)]
+        semantic: bool,
     },
     /// Find callers of a symbol.
     Callers {

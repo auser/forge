@@ -436,17 +436,42 @@ appended to the session log. `forge skill test <name>` runs the skill's
 — no model calls, no network — stored at `.forge/graph/graph.json` (git-ignored).
 It indexes files, directories, symbols, imports, tests, and basic call sites for
 Rust, Python, JS/TS, and Go (regex-based extraction). Rebuilds are incremental:
-only files whose mtime+hash changed are re-parsed.
+only files whose mtime+hash changed are re-parsed. The graph itself stays
+model-free by design — this never changes even when a needle engine is available.
 
 ```bash
 forge graph build              # build / incrementally refresh
 forge graph check              # fresh (exit 0) or stale (exit 1, lists changes)
 forge graph map                # per-directory structural summary
 forge graph grep <pattern>     # search symbols and imports
+forge graph grep --semantic <query>  # search a local semantic embedding index
 forge graph callers <symbol>   # who calls this symbol
 forge graph blast <path>       # direct + second-hop importers
 forge graph context <query>    # ranked files/symbols for agent context
 ```
+
+### Semantic index
+
+When a needle engine is genuinely available (weights loaded and answering, not
+just constructible — see `forge_needle::engine_if_available`), `forge graph
+build` additionally embeds every symbol locally and stores the vectors at
+`.forge/graph/embeddings.bin`. Embedding text is `"<kind> <name> in <path>"`;
+the index key is `"<path>::<name>"`, so two symbols with the same name in
+different files are both independently searchable. Rebuilds are incremental
+and content-hash keyed: only symbols whose embedded text actually changed are
+re-embedded, in batches of 32; symbols removed from the graph are dropped from
+the index too. An index built with a different model or embedding
+dimensionality is discarded and rebuilt wholesale rather than mixed with new
+vectors. Without a working needle engine, this step is skipped silently — the
+build still succeeds, and no `embeddings.bin` is touched.
+
+`forge graph grep --semantic <query>` embeds the query and returns the top 20
+matches by cosine similarity (`score  path::symbol` lines); without a working
+engine it fails with `semantic search needs needle weights (run forge init)`
+(exit 1) rather than silently falling back to literal search. `forge graph
+context <query>` blends the two signals when both an engine and a matching
+index exist: `final = 0.5 * (1 / (1 + lexical_rank)) + 0.5 * cosine`; otherwise
+its output is exactly the lexical ranking as before.
 
 ## Server
 

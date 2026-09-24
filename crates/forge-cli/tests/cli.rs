@@ -413,6 +413,122 @@ fn graph_build_check_map_and_stale_detection() {
 }
 
 #[test]
+fn graph_semantic_grep_needs_needle_weights_without_an_engine() {
+    // Default build (no `needle-ffi` feature, no FORGE_NEEDLE_BACKEND hook):
+    // `engine_if_available` must report unavailable, and `graph grep
+    // --semantic` must fail loudly rather than silently returning nothing.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join("src")).expect("mkdir");
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write");
+
+    let build = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "build"])
+        .output()
+        .expect("run");
+    assert!(build.status.success());
+
+    let grep = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "grep", "--semantic", "main"])
+        .output()
+        .expect("run");
+    assert!(!grep.status.success());
+    let stderr = String::from_utf8_lossy(&grep.stderr);
+    assert!(
+        stderr.contains("semantic search needs needle weights (run forge init)"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn graph_build_embeds_symbols_and_semantic_grep_ranks_by_meaning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join("src")).expect("mkdir");
+    std::fs::write(
+        project.join("src/parser.rs"),
+        "pub fn parse_document(input: &str) -> usize {\n    input.len()\n}\n",
+    )
+    .expect("write");
+    std::fs::write(
+        project.join("src/color.rs"),
+        "pub fn mix_paint_colors() -> u8 {\n    42\n}\n",
+    )
+    .expect("write");
+
+    // First build: FORGE_NEEDLE_BACKEND=hash gives a real, working
+    // (deterministic) engine, so the build must embed every symbol and
+    // write the semantic index.
+    let build = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "graph", "build"])
+        .output()
+        .expect("run");
+    assert!(build.status.success(), "{build:?}");
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    let first: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    let first_embedded = first["embedded"].as_u64().expect("embedded count");
+    assert!(first_embedded >= 2, "expected >=2 embedded, got {first}");
+
+    let index_path = project.join(".forge/graph/embeddings.bin");
+    assert!(
+        index_path.is_file(),
+        "embeddings.bin must exist after build"
+    );
+
+    // `graph grep --semantic` over a needle-shaped query: the hash
+    // backend's deterministic trigram embeddings mean a query sharing
+    // trigrams with "parse_document" (via the embedded text "function
+    // parse_document in src/parser.rs") scores higher than the unrelated
+    // "mix_paint_colors" symbol.
+    let grep = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "grep", "--semantic", "parse document"])
+        .output()
+        .expect("run");
+    assert!(grep.status.success(), "{grep:?}");
+    let grep_stdout = String::from_utf8_lossy(&grep.stdout);
+    let parse_line = grep_stdout
+        .lines()
+        .position(|l| l.contains("src/parser.rs::parse_document"))
+        .unwrap_or_else(|| panic!("parse_document missing from: {grep_stdout}"));
+    let color_line = grep_stdout
+        .lines()
+        .position(|l| l.contains("src/color.rs::mix_paint_colors"))
+        .unwrap_or_else(|| panic!("mix_paint_colors missing from: {grep_stdout}"));
+    assert!(
+        parse_line < color_line,
+        "expected parse_document ranked above mix_paint_colors: {grep_stdout}"
+    );
+
+    // Second build with no source changes: every symbol's content hash is
+    // unchanged, so nothing should be re-embedded.
+    let rebuild = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "graph", "build"])
+        .output()
+        .expect("run");
+    assert!(rebuild.status.success());
+    let rebuild_stdout = String::from_utf8_lossy(&rebuild.stdout);
+    let second: serde_json::Value = serde_json::from_str(rebuild_stdout.trim()).expect("json");
+    assert_eq!(
+        second["embedded"].as_u64(),
+        Some(0),
+        "no-op rebuild must re-embed nothing: {second}"
+    );
+}
+
+#[test]
 fn skill_list_show_test_and_activation_logging() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = tmp.path().join("proj");

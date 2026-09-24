@@ -595,10 +595,7 @@ fn build_router(
             )?))
         }
         "needle" => {
-            let engine = match std::env::var("FORGE_NEEDLE_BACKEND").as_deref() {
-                Ok("hash") => forge_needle::NeedleEngine::spawn(forge_needle::HashBackend::new()),
-                _ => forge_needle::engine_from_config(&config.needle)?,
-            };
+            let engine = forge_needle::select_engine(&config.needle)?;
             Ok(Arc::new(forge_needle::NeedleRouter::new(
                 Arc::new(engine),
                 registry.to_vec(),

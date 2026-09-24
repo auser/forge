@@ -6,6 +6,8 @@ pub mod hash_backend;
 pub mod router;
 pub mod weights;
 
+use std::sync::Arc;
+
 pub use backend::{BackendError, Decision, NeedleBackend, NeedleToolCall};
 pub use engine::{EngineEmbedder, NeedleEngine};
 #[cfg(feature = "ffi")]
@@ -48,5 +50,50 @@ pub fn engine_from_config(
     #[cfg(not(feature = "ffi"))]
     {
         Ok(NeedleEngine::spawn(backend::UnavailableBackend::new(path)))
+    }
+}
+
+/// Select a Needle engine per `[needle]` config: env `FORGE_NEEDLE_BACKEND=hash`
+/// picks the deterministic test/BDD `HashBackend`; otherwise
+/// `engine_from_config` resolves the real backend (`FfiBackend` under the
+/// `ffi` feature, `UnavailableBackend` without it). This is exactly
+/// `build_router`'s "needle" arm in forge-providers, factored out here so
+/// that router construction and any other caller needing "the configured
+/// needle engine" (like `forge graph build`'s embedding step, via
+/// `engine_if_available` below) share one place that knows the selection
+/// rule instead of duplicating the `match`.
+pub fn select_engine(
+    needle: &forge_config::NeedleConfig,
+) -> Result<NeedleEngine, forge_core::error::ForgeError> {
+    match std::env::var("FORGE_NEEDLE_BACKEND").as_deref() {
+        Ok("hash") => Ok(NeedleEngine::spawn(HashBackend::new())),
+        _ => engine_from_config(needle),
+    }
+}
+
+/// Construct a Needle engine and confirm it can actually answer — for
+/// callers that need a real, working brain rather than merely one that
+/// spawned successfully.
+///
+/// `select_engine`/`engine_from_config` always succeed even when the
+/// resolved backend is `UnavailableBackend` (no `ffi` feature built, or
+/// weights not yet fetched): construction is pure and never touches the
+/// filesystem, so nothing there can fail. But `UnavailableBackend::load()`
+/// always errors, and the engine's job loop (see `engine.rs`) runs `load()`
+/// before answering *any* job — including a bare `info()` — so a cheap,
+/// near-instant `info()` call under a short timeout is a reliable proxy for
+/// "is this brain actually usable," without adding a separate
+/// is-available accessor that every `NeedleBackend` impl would have to
+/// implement honestly (and that `FfiBackend` couldn't answer without
+/// attempting the load anyway). This is the seam this module exposes for
+/// that check; `build_router` deliberately does *not* use it, since a
+/// router is expected to construct even when unavailable and degrade at
+/// request time via `FallbackRouter`/`ThresholdRouter` instead.
+pub async fn engine_if_available(config: &forge_config::Config) -> Option<Arc<NeedleEngine>> {
+    let engine = select_engine(&config.needle).ok()?;
+    let timeout = std::time::Duration::from_millis(config.router_timeout_ms);
+    match tokio::time::timeout(timeout, engine.info()).await {
+        Ok(Ok(_)) => Some(Arc::new(engine)),
+        _ => None,
     }
 }
