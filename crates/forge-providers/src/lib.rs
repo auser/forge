@@ -10,6 +10,7 @@
 mod anthropic;
 mod credentials;
 mod jev;
+mod local_only;
 mod model;
 mod router;
 mod scripted;
@@ -20,7 +21,8 @@ pub use credentials::{
     resolve_credential,
 };
 pub use jev::JevRouter;
-pub use model::{MockModel, OpenAiCompatibleModel, model_from_config};
+pub use local_only::endpoint_is_local;
+pub use model::{MockModel, OpenAiCompatibleModel, model_endpoint, model_from_config};
 pub use router::{
     CheapestRouter, FallbackRouter, HttpRouter, LayaRouter, MockRouter, StaticRouter,
     ThresholdRouter, filter_candidates, jev_credential_present, resolved_jev_key_env,

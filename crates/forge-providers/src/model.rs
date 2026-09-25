@@ -8,6 +8,7 @@ use forge_core::{
 };
 use serde::Serialize;
 
+use crate::local_only::ModelEndpoint;
 use crate::scripted::ScriptedMockModel;
 
 /// Env var that turns the mock's system-context echo back on.
@@ -155,6 +156,21 @@ pub(crate) fn reject_tools_without_capability(
 pub(crate) const FIELD_MODEL_KEY_ENV: &str = "model_key_env";
 /// `[models.<name>] key_env` named it, not the top-level `model_key_env`.
 pub(crate) const FIELD_ENTRY_KEY_ENV: &str = "the model entry's key_env";
+/// Same idea for the endpoint: which line set the URL a `local_only`
+/// refusal is complaining about.
+pub(crate) const FIELD_MODEL_BASE_URL: &str = "model_base_url";
+/// `[models.<name>] base_url` set it, not the top-level `model_base_url`.
+pub(crate) const FIELD_ENTRY_BASE_URL: &str = "the model entry's base_url";
+
+/// The built-in `model_base_url`. An entry's own URL loses to the global
+/// one only when the global was *changed* from this default.
+const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+/// Stand-in when nothing configured an endpoint: a guaranteed-unroutable
+/// loopback address, so construction succeeds (routing decisions are still
+/// recorded) and the failure surfaces as a typed provider error at request
+/// time. Loopback by design — an unconfigured model must not become a
+/// `local_only` refusal, it is simply not wired up yet.
+const UNCONFIGURED_BASE_URL: &str = "http://127.0.0.1:9";
 
 /// The one-line fix for a credential problem, safe to print anywhere: it
 /// names the env var the configuration points at, never a value.
@@ -443,6 +459,42 @@ impl ModelProvider for OpenAiCompatibleModel {
     }
 }
 
+/// Whether a model name selects one of the test-only mocks, which have no
+/// endpoint at all (see [`model_from_config`]'s gate).
+fn is_mock_model(name: &str) -> bool {
+    matches!(name, "mock" | "mock-local" | "scripted-mock")
+}
+
+/// Resolve the endpoint for `model` exactly as [`model_from_config`] does,
+/// paired with the config field that produced it. `None` means nothing
+/// configured one.
+///
+/// A `[models.<name>]` entry resolves the endpoint; an explicitly changed
+/// global `model_base_url` (different from the built-in default) wins over
+/// the entry's URL so env/CLI/file overrides always work.
+fn resolve_endpoint(config: &Config, model: &str) -> Option<ModelEndpoint> {
+    let entry_url = config.models.get(model).and_then(|e| e.base_url.clone());
+    match (entry_url, &config.model_base_url) {
+        (Some(_), Some(global)) if global != DEFAULT_MODEL_BASE_URL => {
+            Some(ModelEndpoint::new(global, FIELD_MODEL_BASE_URL))
+        }
+        (Some(entry_url), _) => Some(ModelEndpoint::new(entry_url, FIELD_ENTRY_BASE_URL)),
+        (None, Some(global)) => Some(ModelEndpoint::new(global, FIELD_MODEL_BASE_URL)),
+        (None, None) => None,
+    }
+}
+
+/// The endpoint the active model's provider will actually be pointed at, so
+/// `forge doctor` can probe and report the same URL the run will dial
+/// instead of re-deriving it and drifting. `None` when the configured model
+/// is a test-only mock (no endpoint) or nothing configured one.
+pub fn model_endpoint(config: &Config) -> Option<String> {
+    if is_mock_model(&config.model) {
+        return None;
+    }
+    resolve_endpoint(config, &config.model).map(|endpoint| endpoint.url)
+}
+
 /// Build the active model provider from configuration. `mock`/`mock-local`
 /// and `scripted-mock` select the **test-only** mocks and are refused
 /// unless `FORGE_TEST_MOCKS=1` (see [`forge_config::test_mocks`]); anything else
@@ -452,6 +504,16 @@ impl ModelProvider for OpenAiCompatibleModel {
 /// guaranteed-unroutable loopback address so construction succeeds and the
 /// failure surfaces as a typed provider error at request time — after
 /// routing decisions have been recorded.
+///
+/// This is also where `local_only` is enforced: it is the single place a
+/// configured model name becomes a provider, so a refusal here is a refusal
+/// everywhere — including the per-decision model factory that resolves a
+/// *routed* model name through this same function. See [`crate::local_only`]
+/// for the definition of "local". The mock branches are reached first and
+/// are unaffected: a mock has no endpoint, and `mock-local` is as local as
+/// software gets — the two gates constrain different things (`local_only`,
+/// where requests go; `FORGE_TEST_MOCKS`, whether a fake provider may be
+/// selected at all), and neither can grant what the other refuses.
 pub fn model_from_config(
     config: &Config,
     project_root: &std::path::Path,
@@ -480,23 +542,22 @@ pub fn model_from_config(
             Ok(Arc::new(ScriptedMockModel::from_path(&path)?))
         }
         name => {
-            // A `[models.<name>]` entry resolves the endpoint and can
-            // override capabilities; an explicitly changed global
-            // model_base_url (different from the built-in default) wins
-            // over the entry's URL so env/CLI/file overrides always work.
-            const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+            // Endpoint first, and `local_only` immediately after it: the
+            // check must run before credential resolution, or a refused
+            // remote model would complain about a missing API key instead of
+            // about the setting that actually stopped it.
             let entry = config.models.get(name);
-            let entry_url = entry.and_then(|e| e.base_url.clone());
-            let base_url = match (entry_url, &config.model_base_url) {
-                (Some(_), Some(global)) if global != DEFAULT_MODEL_BASE_URL => global.clone(),
-                (Some(entry_url), _) => entry_url,
-                (None, Some(global)) => global.clone(),
-                (None, None) => {
+            let base_url = match resolve_endpoint(config, name) {
+                Some(endpoint) => {
+                    endpoint.ensure_local_only_allows(name, config.local_only)?;
+                    endpoint.url
+                }
+                None => {
                     tracing::warn!(
                         model = name,
                         "no model_base_url configured; requests will fail"
                     );
-                    "http://127.0.0.1:9".to_string()
+                    UNCONFIGURED_BASE_URL.to_string()
                 }
             };
             let mut capabilities = ModelCapabilities {
@@ -549,11 +610,14 @@ pub fn model_from_config(
                             hint = credential_hint(key_env.as_deref(), key_env_field)
                         ))
                     })?;
-                let base = entry
-                    .and_then(|e| e.base_url.clone())
-                    .unwrap_or_else(|| base_url.clone());
+                // The endpoint resolved above, not `entry.base_url` again:
+                // one resolution means `local_only` cannot be bypassed by an
+                // entry URL the check never saw, and an explicitly changed
+                // global `model_base_url` overrides this family like any
+                // other (e.g. pointing `claude-sonnet` at a local
+                // Anthropic-compatible proxy).
                 return Ok(Arc::new(crate::anthropic::AnthropicModel::new(
-                    Some(base),
+                    Some(base_url),
                     name,
                     credential,
                     capabilities,
@@ -1221,6 +1285,200 @@ mod tests {
                 .keys()
                 .any(|k| k.as_str().eq_ignore_ascii_case("authorization")),
             "no Authorization header must be sent"
+        );
+    }
+
+    // --- local_only (see `crate::local_only` for where the line is drawn) ---
+
+    fn local_only_config(model: &str, base_url: &str) -> Config {
+        Config {
+            model: model.to_string(),
+            model_base_url: Some(base_url.to_string()),
+            local_only: true,
+            ..Config::default()
+        }
+    }
+
+    /// The README's promise, at the one place a configured model becomes a
+    /// provider: no client is built for an off-device endpoint, and the
+    /// refusal says which model, which URL, and both ways forward.
+    #[test]
+    fn local_only_refuses_a_remote_model_endpoint() {
+        let config = local_only_config("gpt-5", "https://api.openai.com/v1");
+        let err = model_from_config(&config, std::path::Path::new("."))
+            .err()
+            .expect("a remote endpoint must be refused under local_only");
+        let ForgeError::Config(message) = err else {
+            panic!("local_only refusals are config errors, not provider errors");
+        };
+        assert!(message.contains("gpt-5"), "{message}");
+        assert!(message.contains("https://api.openai.com/v1"), "{message}");
+        assert!(message.contains("model_base_url"), "{message}");
+        assert!(message.contains("unset local_only"), "{message}");
+    }
+
+    #[test]
+    fn local_only_allows_a_loopback_model_endpoint() {
+        let config = local_only_config("qwen-local", "http://127.0.0.1:8080/v1");
+        let model = model_from_config(&config, std::path::Path::new(".")).expect("loopback builds");
+        assert_eq!(model.name(), "qwen-local");
+
+        let config = local_only_config("qwen-local", "http://localhost:8080/v1");
+        assert!(model_from_config(&config, std::path::Path::new(".")).is_ok());
+    }
+
+    /// The judgment call, pinned: a private-range LAN address is off-device,
+    /// so `local_only` refuses it. Flip this test only by flipping the
+    /// documented decision in `crate::local_only::endpoint_is_local`.
+    #[test]
+    fn local_only_refuses_a_private_range_lan_endpoint() {
+        for url in [
+            "http://192.168.1.50:8080/v1",
+            "http://10.0.0.5:8080/v1",
+            "http://gpu-box.local:8080/v1",
+        ] {
+            let config = local_only_config("lan-model", url);
+            let err = model_from_config(&config, std::path::Path::new("."))
+                .err()
+                .unwrap_or_else(|| panic!("{url} is off-device and must be refused"));
+            assert!(err.to_string().contains(url), "{err}");
+        }
+    }
+
+    #[test]
+    fn local_only_disabled_refuses_nothing() {
+        let config = Config {
+            model: "gpt-5".to_string(),
+            model_base_url: Some("https://api.openai.com/v1".to_string()),
+            ..Config::default()
+        };
+        assert!(model_from_config(&config, std::path::Path::new(".")).is_ok());
+    }
+
+    /// The `anthropic` family is remote by construction in every shipped
+    /// configuration (the built-in entry carries `https://api.anthropic.com`),
+    /// and the same endpoint check catches it — before credential
+    /// resolution, so the error names the setting that actually stopped it
+    /// rather than sending the user after an API key.
+    #[test]
+    fn local_only_refuses_the_anthropic_family() {
+        let config = Config {
+            model: "claude-sonnet".to_string(),
+            local_only: true,
+            ..Config::default()
+        };
+        let err = model_from_config(&config, std::path::Path::new("."))
+            .err()
+            .expect("an anthropic model must be refused under local_only");
+        let message = err.to_string();
+        assert!(matches!(err, ForgeError::Config(_)), "{message}");
+        assert!(message.contains("claude-sonnet"), "{message}");
+        assert!(message.contains("https://api.anthropic.com"), "{message}");
+        assert!(
+            !message.contains("credential"),
+            "must not blame credentials: {message}"
+        );
+    }
+
+    /// Entry-supplied URLs get the entry named, so the hint points at a line
+    /// that exists in the user's file (same rule as `credential_hint`).
+    #[test]
+    fn local_only_refusal_names_the_entry_that_carried_the_url() {
+        let mut config = Config {
+            model: "hosted-thing".to_string(),
+            local_only: true,
+            ..Config::default()
+        };
+        config.models.insert(
+            "hosted-thing".to_string(),
+            forge_config::ModelEntry {
+                base_url: Some("https://hosted.example.com/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        let err = model_from_config(&config, std::path::Path::new("."))
+            .err()
+            .expect("refused");
+        let message = err.to_string();
+        assert!(message.contains("the model entry's base_url"), "{message}");
+        assert!(!message.contains("point model_base_url"), "{message}");
+    }
+
+    /// `mock-local` is, by nature, local: the two gates constrain different
+    /// things and must not contradict each other. The mock branch is also
+    /// reached before any endpoint exists, so ordering can't bite.
+    #[test]
+    #[serial_test::serial]
+    fn local_only_still_allows_the_test_only_mocks() {
+        let _allowed = forge_config::test_mocks::MocksAllowed::new();
+        let config = Config {
+            model: "mock-local".to_string(),
+            model_base_url: Some("https://api.openai.com/v1".to_string()),
+            local_only: true,
+            ..Config::default()
+        };
+        let model = model_from_config(&config, std::path::Path::new(".")).expect("mock builds");
+        assert_eq!(model.name(), "mock-local");
+    }
+
+    /// An unconfigured endpoint is not a `local_only` violation: the
+    /// placeholder is loopback, so the failure stays a request-time
+    /// transport error rather than becoming a confidentiality error.
+    #[test]
+    fn local_only_tolerates_a_model_with_no_endpoint_configured() {
+        let config = Config {
+            model: "nowhere".to_string(),
+            model_base_url: None,
+            local_only: true,
+            ..Config::default()
+        };
+        assert!(model_from_config(&config, std::path::Path::new(".")).is_ok());
+    }
+
+    /// The regression test that pins the README's claim: with
+    /// `local_only = true`, **no** model reachable from configuration can end
+    /// up with a non-local endpoint. Every built-in `[models]` entry is
+    /// resolved the way a routed model name would be (the per-decision model
+    /// factory calls this same function), and each one either builds with a
+    /// local endpoint or is refused.
+    #[test]
+    fn local_only_leaves_no_configured_model_with_a_remote_endpoint() {
+        let base = Config {
+            local_only: true,
+            ..Config::default()
+        };
+        let names: Vec<String> = base
+            .model_entries()
+            .keys()
+            .cloned()
+            .chain(std::iter::once(base.model.clone()))
+            .collect();
+        assert!(names.len() > 3, "expected the built-in registry: {names:?}");
+
+        let mut refused = 0;
+        for name in names {
+            let config = Config {
+                model: name.clone(),
+                ..base.clone()
+            };
+            let endpoint = model_endpoint(&config);
+            let local = endpoint
+                .as_deref()
+                .is_none_or(crate::local_only::endpoint_is_local);
+            match model_from_config(&config, std::path::Path::new(".")) {
+                Ok(_) => assert!(
+                    local,
+                    "{name} built a provider for non-local endpoint {endpoint:?} under local_only"
+                ),
+                Err(e) => {
+                    assert!(!local, "{name} was refused despite a local endpoint: {e}");
+                    refused += 1;
+                }
+            }
+        }
+        assert!(
+            refused >= 3,
+            "the built-in hosted entries must be refused under local_only"
         );
     }
 

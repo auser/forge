@@ -629,6 +629,18 @@ fn build_router(
     config: &Config,
     registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    // The backstop for every role a router name can appear in. The primary
+    // role degrades before reaching here (see
+    // [`RouterStackBuilder::resolve_primary`]); a `router_fallback` — or any
+    // future role — pointed at a remote decision service is a genuine config
+    // error, because there is nothing left to degrade to.
+    if let Some(reason) = local_only_block(name, config) {
+        return Err(ForgeError::router(format!(
+            "router = {name:?} {reason}, but local_only is set; hint: use \
+             router = \"needle\" or \"static\", point the router at a local \
+             endpoint, or unset local_only / FORGE_LOCAL_ONLY"
+        )));
+    }
     match ROUTER_CTORS.iter().find(|(n, _)| *n == name) {
         Some((_, ctor)) => ctor(config, registry),
         // `mock` is accepted (it is in ROUTER_CTORS) but deliberately not
@@ -799,6 +811,59 @@ fn build_jev(
     ))
 }
 
+/// Why `local_only` will not let this router class run, phrased to slot
+/// into "router = \"x\" {reason}" — or `None` when it may.
+///
+/// A decision router is handed the user's task text, so a remote one is a
+/// disclosure just like a remote model endpoint; the two planes share
+/// [`crate::endpoint_is_local`] so "local" means one thing.
+///
+/// `static`, `cheapest`, `needle` and the test-only `mock` never leave the
+/// process, so they are always allowed.
+///
+/// `http`/`laya` are judged on their **endpoint**, not their name, because
+/// their endpoint is very often local: `LayaRouter::DEFAULT_URL` is
+/// `http://127.0.0.1:8788/decide`, the adapter `forge serve` auto-starts.
+/// Blanket-pruning them would break a setup that sends nothing off the
+/// machine, which is over-blocking, not enforcement.
+///
+/// `jev` is pruned unconditionally, even when `jev_url` names a loopback
+/// self-hosted OpenJev. Its escalation-tier design shipped that promise
+/// ("`--local-only` prunes the tier entirely"), `forge doctor` reports it,
+/// and relaxing a shipped confidentiality promise is not this function's
+/// job. The asymmetry is deliberate and documented in the README.
+fn local_only_block(name: &str, config: &Config) -> Option<String> {
+    if !config.local_only {
+        return None;
+    }
+    match name {
+        "jev" => Some("requires network access".to_string()),
+        "http" | "laya" => {
+            let url = router_endpoint(name, config)?;
+            (!crate::endpoint_is_local(&url)).then(|| {
+                format!("would send routing requests to {url}, which is not a local endpoint")
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The endpoint an `http`/`laya` router will dial, resolved exactly as its
+/// constructor does. `None` for `http` with no `router_url` — `build_http`
+/// already errors on that, and a router that cannot be built cannot leak.
+fn router_endpoint(name: &str, config: &Config) -> Option<String> {
+    match name {
+        "http" => config.router_url.clone(),
+        "laya" => Some(
+            config
+                .router_url
+                .clone()
+                .unwrap_or_else(|| LayaRouter::DEFAULT_URL.to_string()),
+        ),
+        _ => None,
+    }
+}
+
 /// Builds the full decision-router stack from configuration. Each step is
 /// a small, independently testable method; [`router_from_config`] is a
 /// thin public shim over [`RouterStackBuilder::build`] so callers see no
@@ -816,26 +881,24 @@ impl<'a> RouterStackBuilder<'a> {
     /// The effective primary router name and its freshly-built instance
     /// (unwrapped — no threshold gate yet, see [`Self::threshold_wrap`]).
     ///
-    /// **`--local-only` and `jev`**: neither `http` nor `laya` are today
-    /// pruned from the stack under `local_only` (a discrepancy from this
-    /// crate's design docs, which describe local-only as hard-blocking all
-    /// network routers — recorded, not silently fixed here, since fixing it
-    /// is outside this change's scope). `jev` is a new, narrower guarantee:
-    /// since the design brief for the escalation tier explicitly requires
-    /// local-only to prune it in both roles, `router = "jev"` under
-    /// `local_only` degrades to `static` (with a warning) rather than
-    /// erroring the whole build — the same "prefer a working, less-capable
-    /// router over refusing to run" philosophy `needle`'s no-weights
-    /// fallback already uses. The escalation role is pruned the same way,
-    /// in [`Self::escalation_tier`].
+    /// **`local_only`**: a primary router that `local_only` refuses (see
+    /// [`local_only_block`] — `jev` always, `http`/`laya` when their
+    /// endpoint is off-device) degrades to `static` with a warning rather
+    /// than erroring the whole build: the same "prefer a working,
+    /// less-capable router over refusing to run" philosophy `needle`'s
+    /// no-weights fallback already uses. The escalation role is pruned the
+    /// same way, in [`Self::escalation_tier`]; every other role hard-errors
+    /// in [`build_router`], which has nothing left to degrade to.
     fn resolve_primary(&self) -> Result<(String, Arc<dyn DecisionRouter>), ForgeError> {
-        let name = if self.config.router == "jev" && self.config.local_only {
-            tracing::warn!(
-                "router = \"jev\" requires network access; --local-only forces static routing instead"
-            );
-            "static".to_string()
-        } else {
-            self.config.router.clone()
+        let configured = &self.config.router;
+        let name = match local_only_block(configured, self.config) {
+            Some(reason) => {
+                tracing::warn!(
+                    "router = {configured:?} {reason}; --local-only forces static routing instead"
+                );
+                "static".to_string()
+            }
+            None => configured.clone(),
         };
         let router = build_router(&name, self.config, self.registry)?;
         Ok((name, router))
@@ -1477,6 +1540,146 @@ mod tests {
 
         assert_eq!(decision.router_name, "static");
         assert!(!decision.fallback_used);
+    }
+
+    /// `http` is the other half of the promise: a remote decision endpoint
+    /// receives the user's task text, so `local_only` degrades it to static
+    /// exactly the way it degrades jev.
+    #[tokio::test]
+    async fn router_from_config_remote_http_primary_under_local_only_falls_back_to_static() {
+        let config = Config {
+            router: "http".to_string(),
+            router_url: Some("https://router.example.com/route".to_string()),
+            local_only: true,
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("x"))
+            .await
+            .expect("routes");
+        assert_eq!(decision.router_name, "static");
+        assert!(!decision.fallback_used);
+    }
+
+    /// ...but a *local* laya adapter — the one `forge serve` auto-starts on
+    /// `127.0.0.1:8788` — sends nothing off the machine, so `local_only`
+    /// leaves it alone. Over-blocking it would be a different bug.
+    #[tokio::test]
+    async fn router_from_config_loopback_laya_survives_local_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(laya_body("mock-local", 0.95)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            router: "laya".to_string(),
+            router_url: Some(server.uri()),
+            local_only: true,
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("builds");
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["mock-local".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.router_name, "laya");
+        assert_eq!(decision.selected_model, "mock-local");
+    }
+
+    /// A remote laya endpoint gets the same treatment as a remote http one.
+    #[tokio::test]
+    async fn router_from_config_remote_laya_under_local_only_falls_back_to_static() {
+        let config = Config {
+            router: "laya".to_string(),
+            router_url: Some("https://laya.example.com/decide".to_string()),
+            local_only: true,
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router = router_from_config(&config, &[]).expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("x"))
+            .await
+            .expect("routes");
+        assert_eq!(decision.router_name, "static");
+    }
+
+    /// The roles a degrade cannot rescue hard-error instead: there is no
+    /// fallback behind `router_fallback`, so a remote one under `local_only`
+    /// is a config error rather than a silent network call.
+    #[test]
+    fn remote_router_as_the_fallback_is_refused_under_local_only() {
+        let config = Config {
+            router: "static".to_string(),
+            router_fallback: "http".to_string(),
+            router_url: Some("https://router.example.com/route".to_string()),
+            local_only: true,
+            ..Config::default()
+        };
+        let err = router_from_config(&config, &[])
+            .err()
+            .expect("a remote fallback router must be refused");
+        let message = err.to_string();
+        assert!(matches!(err, ForgeError::Router(_)), "{message}");
+        assert!(message.contains("local_only"), "{message}");
+        assert!(
+            message.contains("https://router.example.com/route"),
+            "{message}"
+        );
+    }
+
+    /// The predicate behind all of the above, exercised directly.
+    #[test]
+    fn local_only_block_judges_http_and_laya_by_endpoint_and_jev_by_name() {
+        let remote = Config {
+            local_only: true,
+            router_url: Some("https://router.example.com/route".to_string()),
+            ..Config::default()
+        };
+        assert!(local_only_block("http", &remote).is_some());
+        assert!(local_only_block("laya", &remote).is_some());
+        assert!(local_only_block("jev", &remote).is_some());
+        for local in ["static", "cheapest", "needle", "mock"] {
+            assert!(
+                local_only_block(local, &remote).is_none(),
+                "{local} never leaves the process"
+            );
+        }
+
+        // Loopback endpoints (and laya's loopback default) are allowed;
+        // `http` without a URL cannot be built at all, so it is not blocked
+        // here.
+        let loopback = Config {
+            local_only: true,
+            router_url: Some("http://127.0.0.1:8788/decide".to_string()),
+            ..Config::default()
+        };
+        assert!(local_only_block("http", &loopback).is_none());
+        assert!(local_only_block("laya", &loopback).is_none());
+        assert!(local_only_block("jev", &loopback).is_some());
+
+        let laya_default = Config {
+            local_only: true,
+            ..Config::default()
+        };
+        assert!(local_only_block("laya", &laya_default).is_none());
+        assert!(local_only_block("http", &laya_default).is_none());
+
+        // Nothing is blocked when the setting is off.
+        let off = Config {
+            router_url: Some("https://router.example.com/route".to_string()),
+            ..Config::default()
+        };
+        for name in ["http", "laya", "jev"] {
+            assert!(local_only_block(name, &off).is_none(), "{name}");
+        }
     }
 
     #[tokio::test]

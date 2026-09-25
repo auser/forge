@@ -1610,6 +1610,47 @@ fn output_lists_at_least_one_symbol(world: &mut BddWorld) {
 }
 
 // ---------------------------------------------------------------------------
+// local_only.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a project config points the model at {string}")]
+fn project_config_points_the_model_at(world: &mut BddWorld, url: String) {
+    world.set_config("model", "\"remote-model\"");
+    world.set_config("model_base_url", &format!("\"{url}\""));
+}
+
+#[given("a project config enables local_only")]
+fn project_config_enables_local_only(world: &mut BddWorld) {
+    world.set_config("local_only", "true");
+}
+
+#[when(expr = "I run forge with prompt {string} and --local-only")]
+async fn run_forge_with_prompt_local_only(world: &mut BddWorld, prompt: String) {
+    world.run_forge(&["--local-only", "run", &prompt]).await;
+}
+
+#[then(expr = "the command fails mentioning {string}")]
+fn the_command_fails_mentioning(world: &mut BddWorld, text: String) {
+    assert_ne!(
+        world.last_code,
+        Some(0),
+        "expected a failure; stdout: {}",
+        world.last_stdout
+    );
+    failure_mentions(world, text);
+}
+
+#[then(expr = "the failure mentions {string}")]
+fn failure_mentions(world: &mut BddWorld, text: String) {
+    assert!(
+        world.last_stderr.contains(&text) || world.last_stdout.contains(&text),
+        "expected {text:?}; stderr: {}; stdout: {}",
+        world.last_stderr,
+        world.last_stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
 // jev_escalation.feature
 // ---------------------------------------------------------------------------
 
