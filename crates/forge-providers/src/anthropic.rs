@@ -12,6 +12,7 @@ use forge_core::{
 use serde::Serialize;
 
 use crate::credentials::{CredentialKind, ResolvedCredential};
+use crate::local_only::EgressPolicy;
 use crate::model::reject_tools_without_capability;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -29,6 +30,8 @@ pub struct AnthropicModel {
 }
 
 impl AnthropicModel {
+    /// `egress` decides how far this client may travel, redirects included
+    /// (see [`EgressPolicy`]).
     pub fn new(
         base_url: Option<String>,
         model: impl Into<String>,
@@ -36,10 +39,10 @@ impl AnthropicModel {
         capabilities: ModelCapabilities,
         max_output_tokens: Option<u32>,
         timeout: Duration,
+        egress: EgressPolicy,
     ) -> Result<Self, ForgeError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
+        let client = egress
+            .client(timeout)
             .map_err(|e| ForgeError::provider(format!("building HTTP client: {e}")))?;
         Ok(Self {
             client,
@@ -205,7 +208,12 @@ impl ModelProvider for AnthropicModel {
                     "cannot reach Anthropic endpoint at {url} (connection refused)"
                 ))
             } else {
-                ForgeError::provider(format!("anthropic request to {url} failed: {e}"))
+                // Source chain included: a `local_only` redirect refusal
+                // explains itself here (see `local_only::error_detail`).
+                ForgeError::provider(format!(
+                    "anthropic request to {url} failed: {}",
+                    crate::local_only::error_detail(&e)
+                ))
             }
         })?;
 
@@ -309,6 +317,7 @@ mod tests {
             },
             None,
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct")
     }

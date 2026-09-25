@@ -90,11 +90,13 @@ subscription you logged into with `claude login`, and `~/.codex/auth.json`
 when it holds an API key. See [Authentication](#authentication) for the full
 order and the caveats (OAuth-only Codex subscriptions are not usable yet).
 
-`--local-only` is narrower than its name suggests today, and worth stating
-plainly: it prunes the Jev tier from the decision plane in both roles, and
-`forge init` skips the weights fetch under it. It does **not** currently prune
-the `http`/`laya` routers, nor a hosted model you configured explicitly — a
-recorded discrepancy against the design docs rather than a fixed behaviour.
+`--local-only` means what it says: forge refuses to build a model provider
+whose endpoint is off this machine (including one a router picked), prunes the
+Jev tier in both roles, degrades an off-device `http`/`laya` router to static,
+and skips the weights fetch. It is not a sandbox — tools and hooks you run are
+still your own. [What `--local-only`
+restricts](#what---local-only-restricts) has the exact line between "local"
+and "remote".
 
 ## Where it runs
 
@@ -447,7 +449,8 @@ Global flags:
 --model <m>           override the configured model
 --router <r>          override the router (needle|jev|laya|http|static|cheapest)
 --execution <p>       override the execution provider (native)
---local-only          restrict to local providers
+--local-only          refuse any provider or router endpoint that is not on
+                      this machine (see "What --local-only restricts")
 --approval <mode>     auto | prompt | prompt-dangerous | deny
 --json                machine-readable JSON on stdout, nothing else on stdout
 --no-color            disable ANSI colors
@@ -480,7 +483,7 @@ Key settings (all optional):
 | Key | Default | Env var | Meaning |
 |---|---|---|---|
 | `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
-| `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.) |
+| `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.). **Setting this overrides *every* model's endpoint**, including hosted `[models]` entries like `claude-sonnet` and `gpt-5` — setting it to the default value still counts as setting it. Per-model endpoints belong in `[models.<name>] base_url`. Combinations that cannot work are refused at startup, naming both settings: an `anthropic`-family model whose endpoint ends in `/v1` (the client appends `/v1/messages`, so it would 404), or an entry whose `provider` contradicts the endpoint (`provider = "anthropic"` pointed at `api.openai.com`) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
 | `router` | `needle` | `FORGE_ROUTER` | `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
@@ -494,7 +497,7 @@ Key settings (all optional):
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` |
 | `approval` | `prompt` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny` |
-| `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers |
+| `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers — a model whose endpoint is not local is refused at construction, and network decision routers are pruned. See [What `--local-only` restricts](#what---local-only-restricts) |
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
 | `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
@@ -515,6 +518,69 @@ forge config show            # merged effective config
 forge config path            # config file locations and which exist
 forge config explain model   # winning value + source, e.g. model = "cli-model" (source: cli-flag)
 ```
+
+### What `--local-only` restricts
+
+`local_only = true` (`FORGE_LOCAL_ONLY=1`, `--local-only`) is enforced where
+a configured endpoint becomes an HTTP client, not merely where routing
+decisions are made:
+
+- **Model providers.** A model whose resolved endpoint is not local is
+  refused at construction with a typed config error naming the model, the
+  URL and the config line that set it — including a model a *router* picked,
+  since routed names resolve through the same code. So the hosted `[models]`
+  entries (`claude-sonnet`, `gpt-5`, `deepseek-chat`, `kimi-k2.7-code`) simply
+  cannot be used while it is on, unless you point one at a local endpoint.
+- **Every redirect hop.** Checking the configured URL alone would not be
+  worth much: an approved loopback endpoint that answers `307` with a
+  `Location` elsewhere would otherwise make forge re-POST your prompt, body
+  intact, to a host nothing ever checked. Under `local_only` every hop is
+  re-checked and a non-local one is refused, naming the host it declined.
+  Loopback-to-loopback redirects still work, and a local endpoint redirecting
+  in a circle stops after 10 hops exactly as it does with the setting off.
+- **Decision routers.** `router = "jev"` degrades to `static`, and the Jev
+  escalation tier behind `needle` is pruned — in both roles, unconditionally,
+  since a decision router is handed your task text. `http` and `laya` degrade
+  to `static` too **when their endpoint is off-device**; a loopback laya
+  adapter (its default, `http://127.0.0.1:8788/decide`, the one `forge serve`
+  auto-starts) keeps working, because it sends nothing off the machine. A
+  `router_fallback` pointed off-device degrades the same way rather than
+  failing the command.
+- **`forge init`** skips the Needle weights download, and `forge serve` does
+  not probe or auto-start an adapter at an off-device address.
+
+"Local" means **this machine**: loopback (`127.0.0.0/8`, `::1`, and the
+IPv4-mapped form `::ffff:127.0.0.1`), the unspecified addresses `0.0.0.0` and
+`::`, the exact name `localhost`, or a hostless `unix:`/`file:` socket path.
+Deliberately *not* local: private-range LAN addresses (`10/8`, `172.16/12`,
+`192.168/16`, `169.254/16`), mDNS `*.local` names, subdomains of `localhost`,
+a `file://host/…` URL that carries an authority, and anything that does not
+parse as a URL with a host. A LAN address is off-device — another host,
+another administrator, usually a plaintext wire — and `local_only` is read as
+"my code stays on my machine", so the stricter reading is the honest one. To
+use the GPU box down the hall, leave `local_only` off.
+
+What it does **not** do:
+
+- **It is not a sandbox.** Tools, hooks, MCP servers and build commands that
+  *you* run can still reach the network; `local_only` governs where forge
+  itself sends your code.
+- **It does not filter routing candidates.** A router may still *select* a
+  hosted `[models]` entry; the provider then refuses and that run fails with
+  a typed config error. Loud, not leaky — but it is a failed run, and until
+  candidate pruning lands, `model = "<a local model>"` plus
+  `router = "static"` is the configuration that never hits it.
+- **It trusts `localhost` by name.** Forge does not resolve it, so a modified
+  `/etc/hosts`, `HOSTALIASES`, or NSS resolver module can point it off-device
+  unnoticed. Accepting the name is a usability call (editing those needs
+  root); use `127.0.0.1` if you need the guarantee to survive a hostile
+  resolver.
+- **It cannot see through a local proxy.** If the loopback server you point
+  at forwards upstream, that is outside forge's control.
+
+`forge doctor` reports the setting, and its `model provider` line fails —
+with the same wording the run would fail with — when your configured model
+contradicts it.
 
 ## Authentication
 
@@ -637,7 +703,11 @@ Setting `router = "jev"` directly makes Jev the primary router (still
 threshold-gated, still falling back to `router_fallback`) instead of an
 escalation tier behind needle. Either way, `--local-only` prunes Jev
 entirely — as primary, it degrades to static with a warning instead of
-erroring the build; as an escalation tier, it's simply never wired in. Jev
+erroring the build; as an escalation tier, it's simply never wired in. That
+holds even for a loopback self-hosted OpenJev: the promise shipped
+unconditional, and `local_only` is not where a confidentiality promise gets
+relaxed. An `http`/`laya` router, by contrast, is judged on its endpoint —
+see [What `--local-only` restricts](#what---local-only-restricts). Jev
 and Kev-family services also work through the plain `http` backend if
 you'd rather speak the flat contract yourself — nothing is hard-coded.
 
@@ -1342,7 +1412,7 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 23 features / 44 scenarios / 165 steps.
+  mock providers — fully offline. Currently 25 features / 49 scenarios / 193 steps.
 - Mocks are **test-only**. `model = "mock-local"`, `model = "scripted-mock"`,
   `router = "mock"` and `execution = "mock"` are all refused by configuration
   unless `FORGE_TEST_MOCKS=1` is
@@ -1383,6 +1453,22 @@ go in `specs/adrs/`.
   unredacted. Treat `.forge/sessions/` as sensitive: it is already covered by
   the repo's own `.gitignore` for `.forge/`, but back-ups, bug reports and
   pasted logs are not.
+- `local_only` restricts forge's own egress, not the process: it refuses
+  non-local model endpoints (and redirect hops) at provider construction and
+  prunes off-device decision routers, but tools, hooks and MCP servers you run
+  are not sandboxed, `localhost` is trusted by name without resolving it, and
+  a local proxy that forwards upstream is outside forge's control. It also
+  does not *filter* candidates — a router that selects a hosted `[models]`
+  entry under `local_only` fails that run with a typed config error rather
+  than quietly picking something else, which is the loud-but-correct behavior
+  until candidate pruning lands. See [What `--local-only`
+  restricts](#what---local-only-restricts).
+- A global `model_base_url` overrides hosted `[models]` entries too, verbatim.
+  The two combinations that provably cannot work are refused at startup with
+  both settings named — an `anthropic`-family model on a `/v1` endpoint, and a
+  `provider` the endpoint contradicts — but forge cannot tell in general
+  whether a URL speaks the wire protocol a family expects. Use
+  `[models.<name>] base_url` to redirect one model rather than all of them.
 - The needle direct-dispatch fast path is read-only by design (`read_file`,
   `graph_context`, `graph_grep` only); writes, edits, deletes, and commands
   always go through the full agent loop and its approval gating.

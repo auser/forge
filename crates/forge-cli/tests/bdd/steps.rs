@@ -1610,6 +1610,95 @@ fn output_lists_at_least_one_symbol(world: &mut BddWorld) {
 }
 
 // ---------------------------------------------------------------------------
+// local_only.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a project config points the model at {string}")]
+fn project_config_points_the_model_at(world: &mut BddWorld, url: String) {
+    world.set_config("model", "\"remote-model\"");
+    world.set_config("model_base_url", &format!("\"{url}\""));
+}
+
+#[given("a project config enables local_only")]
+fn project_config_enables_local_only(world: &mut BddWorld) {
+    world.set_config("local_only", "true");
+}
+
+#[when(expr = "I run forge with prompt {string} and --local-only")]
+async fn run_forge_with_prompt_local_only(world: &mut BddWorld, prompt: String) {
+    world.run_forge(&["--local-only", "run", &prompt]).await;
+}
+
+/// A loopback endpoint `local_only` approves, which answers `307` with a
+/// `Location` at a second server addressed by a name the locality predicate
+/// calls remote (`api.localhost`, a `*.localhost` subdomain) — the hermetic
+/// stand-in for "somewhere else", since a test cannot reach a real off-device
+/// host. Without the per-hop check, reqwest re-POSTs the prompt there.
+#[given("a local model endpoint that redirects to another authority")]
+async fn local_endpoint_redirecting_elsewhere(world: &mut BddWorld) {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{ "message": { "content": "exfiltrated" } }]
+        })))
+        .mount(&elsewhere)
+        .await;
+    let target = format!(
+        "http://api.localhost:{}/chat/completions",
+        elsewhere.address().port()
+    );
+
+    let approved = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", target.as_str()))
+        .mount(&approved)
+        .await;
+
+    world.set_config("model", "\"redirecting-model\"");
+    world.set_config("model_base_url", &format!("\"{}\"", approved.uri()));
+    world.router_mock = Some(approved);
+    world.chat_mock = Some(elsewhere);
+}
+
+#[then("the redirect target never received the prompt")]
+async fn redirect_target_received_nothing(world: &mut BddWorld) {
+    let elsewhere = world
+        .chat_mock
+        .as_ref()
+        .expect("the redirect target server");
+    let received = elsewhere.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "the prompt reached the redirect target: {} request(s)",
+        received.len()
+    );
+}
+
+#[then(expr = "the command fails mentioning {string}")]
+fn the_command_fails_mentioning(world: &mut BddWorld, text: String) {
+    assert_ne!(
+        world.last_code,
+        Some(0),
+        "expected a failure; stdout: {}",
+        world.last_stdout
+    );
+    failure_mentions(world, text);
+}
+
+#[then(expr = "the failure mentions {string}")]
+fn failure_mentions(world: &mut BddWorld, text: String) {
+    assert!(
+        world.last_stderr.contains(&text) || world.last_stdout.contains(&text),
+        "expected {text:?}; stderr: {}; stdout: {}",
+        world.last_stderr,
+        world.last_stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
 // jev_escalation.feature
 // ---------------------------------------------------------------------------
 

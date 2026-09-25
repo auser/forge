@@ -116,7 +116,9 @@ service speaking the Jev wire protocol:
 
 Escalation is **opt-in by credential**: `router_escalate = "auto"` (the
 default) does nothing until the key env var is set, and `--local-only`
-prunes the tier entirely. `JevRouter` never fabricates a decision — any
+prunes the tier entirely (unconditionally, even for a loopback OpenJev;
+`http`/`laya` are pruned by endpoint instead — see the generation plane's
+`local_only` note). `JevRouter` never fabricates a decision — any
 error, timeout, or unknown choice is an `Err` that falls through.
 
 ### Tier 3: static rules
@@ -167,6 +169,32 @@ Capabilities are declared, never assumed: `Capability::satisfied_by` filters
 candidates before any router sees them, so a vision task never routes to a
 text-only model and a tool-needing loop never selects a provider without
 tool support.
+
+**`local_only` is enforced here, at provider construction.**
+`model_from_config` is the one place a configured (or *routed*) model name
+becomes a client, so it is the one place the restriction can actually hold:
+with `local_only` set, an endpoint that is not on this machine — loopback,
+`localhost`, or a hostless `unix:`/`file:` socket path; deliberately not
+private-range LAN addresses — yields a typed `ForgeError::Config` naming the
+model, the URL and the config field that set it, and no client is built.
+
+Checking the configured string is necessary but not sufficient, so an
+`EgressPolicy` travels with every HTTP client forge builds: under
+`local_only` its redirect policy re-checks each hop, because reqwest's
+default (`Policy::limited(10)`) has no host restriction and a `307` from an
+approved loopback endpoint would otherwise re-POST the prompt verbatim to an
+authority nothing inspected. A custom policy replaces that default whole, so
+it re-imposes the 10-hop bound too: locality alone would follow a loopback
+server that redirects to itself until the request timed out.
+
+Provider construction also refuses combinations that cannot work at all — an
+`anthropic`-family model whose endpoint already ends in `/v1` (the client
+appends `/v1/messages`), or an entry whose declared `provider` the endpoint
+contradicts — naming both settings rather than building a client whose only
+symptom is a 404. The decision plane uses the same
+`endpoint_is_local` predicate to prune off-device routers, so "local" has one
+definition (`forge_providers::local_only`) and `forge doctor` reports it
+rather than restating it.
 
 ## The direct-dispatch fast path
 
@@ -361,7 +389,7 @@ adapters classify a run's ending by.
 | Jev unreachable / no key     | static routing, recorded, run proceeds              |
 | Local model server down      | typed error with doctor-style hint                  |
 | Cloud credential absent      | cloud candidates simply don't exist                 |
-| `--local-only`               | every network tier pruned at construction           |
+| `--local-only`               | off-device routers degrade, non-local providers refused |
 | Engine panic / hung call     | contained; timeout-bounded; degrade to fallback     |
 
 `forge doctor` reports each layer's actual state (weights, backend presence,

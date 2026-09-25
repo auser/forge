@@ -112,6 +112,65 @@ fn project_file_overrides_user_file_and_defaults() {
     );
 }
 
+/// `ExplicitKeys` must answer "did a real layer set this?" — not "does this
+/// differ from the default?". Setting a value *to* the default is a choice,
+/// and code that guessed by comparison silently discarded it (which is how
+/// `model_base_url = "http://127.0.0.1:8080/v1"` became the one local
+/// endpoint a user could not select).
+#[test]
+#[serial]
+fn explicit_keys_record_who_set_a_value_not_whether_it_differs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let xdg = tmp.path().join("xdg");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir project");
+    let _guard = EnvGuard::isolated(&xdg);
+
+    // Exactly the compiled-in default value, set by hand.
+    write_project_config(
+        &project,
+        "model_base_url = \"http://127.0.0.1:8080/v1\"\n[models.mine]\nbase_url = \"http://127.0.0.1:9001/v1\"\n",
+    );
+    let resolved = Config::load(Some(&project), &CliOverrides::default()).expect("load");
+
+    assert_eq!(
+        resolved.config.model_base_url.as_deref(),
+        Some("http://127.0.0.1:8080/v1")
+    );
+    assert!(
+        resolved.config.explicit.contains(keys::MODEL_BASE_URL),
+        "a value equal to the default is still explicitly set: {:?}",
+        resolved.config.explicit.iter().collect::<Vec<_>>()
+    );
+    // A user-written entry and a compiled-in one are distinguishable.
+    assert!(
+        resolved
+            .config
+            .explicit
+            .contains(&keys::model_entry("mine"))
+    );
+    assert!(
+        !resolved
+            .config
+            .explicit
+            .contains(&keys::model_entry("claude-sonnet"))
+    );
+    // Untouched keys are not explicit.
+    assert!(!resolved.config.explicit.contains("router"));
+}
+
+/// A `Config` built in code carries no explicit keys, and `with_explicit` is
+/// how such a caller declares them.
+#[test]
+fn a_hand_built_config_has_no_explicit_keys_until_it_says_so() {
+    let plain = Config::default();
+    assert!(!plain.explicit.contains(keys::MODEL_BASE_URL));
+
+    let declared = Config::default().with_explicit([keys::MODEL_BASE_URL]);
+    assert!(declared.explicit.contains(keys::MODEL_BASE_URL));
+    assert!(!declared.explicit.contains("router"));
+}
+
 #[test]
 #[serial]
 fn env_overrides_files() {
@@ -296,14 +355,39 @@ fn models_override_does_not_leak_stale_dotted_source() {
         resolved.config.models["qwen3-coder"].cost_input_per_mtok,
         999.0
     );
-    // ...and per-model dotted keys are never exposed via explain (models
-    // only ever gets the aggregate "models" source), so there is no stale
-    // default value to leak.
-    assert_eq!(resolved.explain("models.qwen3-coder"), None);
+    // ...and the per-model dotted key reports the layer that actually won,
+    // never a stale `Origin::Default` from the defaults layer. (The dotted
+    // key used to be absent entirely; it exists now because
+    // `ExplicitKeys` must be able to tell a user-written
+    // `[models.<name>]` from a compiled-in one. The regression this test
+    // was written for — a stale *default* origin surviving an override —
+    // is what the origin assertion below pins.)
+    assert_eq!(
+        resolved.explain("models.qwen3-coder").map(|(_, o)| o),
+        Some(Origin::ProjectFile)
+    );
+    // The recorded value is the entry, not a placeholder: this key is
+    // reachable from `forge config explain models.<name>`, and it also makes
+    // the stale-*value* half of this regression assertable again.
+    let (value, _) = resolved
+        .explain("models.qwen3-coder")
+        .expect("the dotted key is recorded");
+    assert!(
+        value.contains("999"),
+        "explain must show the value: {value}"
+    );
     assert_eq!(
         resolved.explain("models").map(|(_, o)| o),
         Some(Origin::ProjectFile)
     );
+    // An entry nobody overrode still comes from the defaults, so the two
+    // are distinguishable — the whole point of recording them.
+    assert_eq!(
+        resolved.explain("models.claude-sonnet").map(|(_, o)| o),
+        Some(Origin::Default)
+    );
+    assert!(resolved.config.explicit.contains("models.qwen3-coder"));
+    assert!(!resolved.config.explicit.contains("models.claude-sonnet"));
 }
 
 #[test]

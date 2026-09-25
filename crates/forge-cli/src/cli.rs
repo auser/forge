@@ -47,7 +47,8 @@ pub struct GlobalOpts {
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub execution: Option<String>,
 
-    /// Restrict to local providers only.
+    /// Refuse any model or router endpoint that is not on this machine
+    /// (loopback, localhost, or a socket path).
     #[arg(long, global = true)]
     pub local_only: bool,
 
