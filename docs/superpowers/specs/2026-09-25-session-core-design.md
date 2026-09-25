@@ -156,12 +156,12 @@ pub struct Session {
     config: Config,
     history: Vec<Message>,
 
-    /// Shared, queued. `None` when this build has no engine
+    /// Handle to the *shared* engine (§20). Warmth is a property of the engine,
+    /// not of this session: the tool surface is installed into the engine, so a
+    /// second conversation against the same runtime must not pay the ~8 s
+    /// install again. `EngineHandle::None` when this build has no engine
     /// (`forge_needle::HAS_EMBEDDED_BACKEND == false`).
-    engine: Option<Arc<NeedleEngine>>,
-    /// Whether the engine's tool surface has been installed. Session-scoped, so
-    /// the ~8 s cold install is paid once per conversation rather than per turn.
-    warmed: Arc<AtomicBool>,
+    engine: EngineHandle,
 
     /// The decision plane (§13). Never optional: absence is `NullPlane`, and an
     /// on-device `NeedlePlane` needs no credential and no network.
@@ -171,7 +171,10 @@ pub struct Session {
     payloads: StatePayloadBuilder,
 
     gate: Gate,
-    log: DecisionLog,
+    /// Handle to the *shared* log (§20). Records carry this session's id, so one
+    /// log spans every surface — which is what §15's calibration needs in order
+    /// to converge in reasonable time.
+    log: DecisionLogHandle,
     /// Session-scoped memo, keyed by a hash of (prompt, ordered tool set): an
     /// identical request reuses its decision instead of re-deciding.
     memo: HashMap<u64, DecisionOutcome>,
@@ -199,10 +202,26 @@ impl AgentService {
 }
 ```
 
-All three surfaces hold a `Session` and call `turn`. That is the whole point of
-the extraction: the warm engine, the gate, the memo and the log acquire an owner
-whose lifetime matches a conversation, instead of being process-global or
-rebuilt per request.
+Every surface holds a `Session` and calls `turn`. That is the point of the
+extraction: the gate, the memo, the context budget and the conversation itself
+acquire an owner whose lifetime matches a conversation, instead of being
+process-global or rebuilt per request.
+
+**What the session does *not* own.** An earlier draft of this section put the
+warm engine and the decision log on `Session`, and that was wrong in two ways
+that §20 makes obvious:
+
+- The tool surface is installed **into the engine**, so warmth is the engine's
+  property. Session-scoped warmth would charge the ~8 s install again for every
+  new conversation against the same runtime — the exact cost this design exists
+  to pay once.
+- §15's calibration needs **one log across every surface**. A per-session log
+  fragments the labelled examples across terminal, editor and server, and none
+  of the fragments accumulates enough to fit a threshold from.
+
+Both are therefore runtime-scoped and reached through handles. §4's record
+schema already carries a `session` field, so session-tagged rows in one shared
+log is the shape it was always designed for.
 
 **Scope guard.** This extraction lifts the turn loop into `Session` and leaves
 the loop's internals — tool dispatch, session storage, skills, graph context —
@@ -968,6 +987,32 @@ One decision log across every surface, which is what §15's calibration needs to
 converge in reasonable time. One warm engine, so the second editor window costs
 nothing. One graph watcher (§17) amortised across clients. And one place for
 sidecars to live, so a tinyjev process is started once rather than per editor.
+
+## §21 Delivery phases
+
+This document is 20 sections and describes considerably more than one
+implementation plan's worth of work. It is split into phases that each ship
+something usable, and each gets its own plan.
+
+| Phase | Contents | Why here |
+|---|---|---|
+| **A1** | `Session` extraction, dispatch-before-routing, engine and log ownership (§2, §20's runtime split), the decision log (§4) | Smallest shippable improvement — and it begins collecting the data every later phase is designed against |
+| **A2** | `DecisionPlane` trait and impls (§13), risk taxonomy and gate (§3), approval contract (§18) | Designed against A1's real numbers rather than a published benchmark |
+| **A3** | Egress tiers (§11), graph signatures and summaries, ignore rules and freshness (§17) | Different crate, its own testing story; nothing in B/C/E depends on it |
+| **A4** | Daemon, sidecar supervision, bootstrap and update (§20, §14, §16) | Lifecycle. B, C and E all attach to this |
+| **A5** | Context budget (§12), earned autonomy (§15), spend ceiling (§19) | Needs A1's log to have accumulated real traffic |
+
+**A1 is deliberately first because it is the measurement.** Two assumptions in
+this document are unvalidated: the decline-retry's hit rate, and the behaviour of
+any remote decision plane, which has never executed in this project. A1 ships the
+decision log, which measures the decline rate on real work — so A2 is specified
+from observed numbers instead of from `jev-gateway`'s, whose own conclusion was
+*measure on your own work*.
+
+Streaming (sub-project F) is **not** deferred behind all of these. It is
+independent of the decision plane and blocks both the REPL (B) and editor
+integration (E), so it runs in parallel from A2 onward. A surface that cannot
+stream is a worse terminal, and the editors are the goal.
 
 ## Sources
 
