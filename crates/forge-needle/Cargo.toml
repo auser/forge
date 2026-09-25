@@ -8,9 +8,16 @@ license.workspace = true
 [features]
 default = []
 # Real libneedle backend. Off by default because it needs a per-platform
-# `libneedle.a` that is not in the repo — see crates/needle-sys/build.rs for
-# where to fetch it and README's Development section for the commands.
-ffi = ["dep:needle-sys"]
+# `libneedle.a` that is not in the repo, and that Cactus-Compute does not
+# publish for every target forge supports (no Intel macOS engine exists) —
+# see crates/needle-sys/build.rs for the resolution order and README's
+# "Embedded Needle brain" for the commands.
+#
+# `needle-sys/fetch` is what makes this one command rather than a manual
+# `curl`: with `ffi` on, needle-sys downloads and checksum-verifies the pinned
+# engine for the targets forge has verified. It is enabled from here and
+# nowhere else, so a default build never reaches for the network.
+ffi = ["dep:needle-sys", "needle-sys/fetch"]
 # End-to-end tests against real weights (tests/e2e.rs). Requires `ffi` and
 # FORGE_NEEDLE_E2E_WEIGHTS; see README.
 needle-e2e = []

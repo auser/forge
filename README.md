@@ -1,19 +1,110 @@
 # Forge
 
-Forge is a lightweight, single-binary Rust agentic coding harness. It combines a fast
-interactive coding agent core, provider-neutral model access, configurable decision
-routing, progressive-disclosure skills, a deterministic incremental project graph,
-pluggable execution, and both CLI and REST/SSE interfaces over one shared runtime.
+Forge is a single-binary Rust coding agent that separates **deciding** from
+**generating**. The fast, cheap, typed decisions — which model should handle
+this task, which tool to call and with what arguments, whether that call is
+safe to run — are made by a small calibrated decision model running
+on-device; a general language model is asked only for the work that actually
+needs one. No Node.js, no database, no daemon: one binary, one config file,
+and whatever model endpoints you already have.
 
-No Node.js, database, or daemon is required. The default stack is an embedded
-Needle 3 decision router (on-device, no network calls) in front of a local
-oMLX coding model — nothing mocked, no hosted account needed.
-When needle declines or fails, forge can escalate to Jev (TypeSafe's hosted
-System One API, or a self-hosted OpenJev server) before falling all the way
-back to deterministic static routing — opt-in only when a Jev credential is
-configured (`router_escalate = "auto"`, the default, is a no-op without one)
-and always skipped under `--local-only`. Laya (open-source System One) and
-other HTTP-style routers remain available as alternates.
+Splitting the two is the whole point. A chat model asked to choose is slow,
+expensive, and unaccountable about its own uncertainty; a decision model
+returns a typed choice with a confidence score in milliseconds, for free,
+without leaving the machine.
+
+## The decision plane: Needle 3, then Jev, then rules
+
+Every routing and guardrail question forge asks is a System One decision — a
+choice from a fixed set, with a confidence, never generated prose. Three tiers
+answer, cheapest first:
+
+1. **Needle 3, on-device.** The default (`router = "needle"`): an embedded
+   decision model from [Cactus Compute](https://huggingface.co/Cactus-Compute/needle3)
+   (Apache-2.0, ~35 MB of weights) running inside the forge process, with no
+   network calls once its weights are on disk. Free, and fast enough to be
+   invisible — the end-to-end suite's reference for a warm route round-trip is
+   ~47 ms in a release build on an idle macos-arm64 machine. Needle is also
+   what *fills* tool calls: name and arguments, against the same tool schemas
+   the language model would have been handed.
+2. **Jev**, when the on-device brain is unsure. TypeSafe's hosted System One
+   API, or a self-hosted [OpenJev](https://github.com/razorback16/openjev)
+   speaking the same wire protocol. It is consulted only when needle declines,
+   errors, or lands below `router_confidence_threshold` **and** a Jev
+   credential (`TYPESAFE_API_KEY`, or `jev_key_env`) is actually present and
+   `--local-only` is off. With no credential, `router_escalate = "auto"` — the
+   default — is a no-op and nothing leaves the machine.
+3. **Deterministic static rules**, as the floor that cannot fail. They need no
+   model, no weights, and no network. So an absent, unloaded, unreachable or
+   unconfident brain degrades to rules (`fallback_used: true` in the event log)
+   and the run continues. Laya and any other System One-compatible HTTP router
+   remain available as alternates.
+
+What this buys is two things you can point at:
+
+**Faster answers.** A well-defined read-only request is answered with *no LLM
+call at all*. Needle picks the tool and fills its arguments, a second
+on-device check confirms the call is non-destructive, and forge dispatches it
+directly through the normal approval-gated execution path — the run records
+`router: "needle-dispatch"` with `turns: 0`. The exact gates are in
+[Usage](#usage); the path is read-only by construction, so it can never
+prompt you and can never do something a normal run could not.
+
+**Better choices.** Which model runs, and whether a tool call is safe, are
+decided by a model calibrated to emit a choice plus a confidence — not by a
+chat model guessing in prose. Anything under the threshold is rejected and
+escalated rather than acted on.
+
+(Skill activation is still lexical matching over skill names and
+descriptions, not a needle decision. See [Skills](#skills).)
+
+**Whether you actually have a brain depends on the build.** Real on-device
+inference needs the native engine, which sits behind the `needle-ffi` cargo
+feature: the prebuilt release binaries for `aarch64-apple-darwin` and
+`aarch64-unknown-linux-gnu` are built with it (so the installed default on those
+platforms is a working brain), while a plain `cargo build`, Intel macOS, x86_64
+Linux and Windows get a statically-routing binary.
+That is a supported configuration and fully usable, not a degraded one: you
+get deterministic static routing instead of the on-device model, and you give
+up the direct-dispatch fast path and the local semantic index
+(`graph grep --semantic`) — the agent loop, tools, approvals and sessions are
+unchanged. `forge doctor` tells you which you have on its
+`needle engine` / `needle brain` lines, and names the one command that
+changes it. Details: [Installation](#installation) and [Embedded Needle brain
+(`ffi`)](#embedded-needle-brain-ffi).
+
+## The generation plane: local first, cloud when it is earned
+
+Generation goes to any OpenAI-compatible server you already run — oMLX,
+llama.cpp, Ollama, LM Studio — and that is the default out of the box
+(`qwen3-coder` at `http://127.0.0.1:8080/v1`). Cloud models sit in the
+candidate registry but are **never called implicitly**: one runs only when the
+decision plane selects it or you name it with `--model`, and only when a
+credential for it actually exists.
+
+Those credentials are taken from where they already live: API-key environment
+variables, including ones loaded from `.env`/`.env.local` (`DEEPSEEK_API_KEY`,
+`MOONSHOT_API_KEY`/`KIMI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`), and
+the CLI credential stores — `~/.claude/.credentials.json` for a Claude
+subscription you logged into with `claude login`, and `~/.codex/auth.json`
+when it holds an API key. See [Authentication](#authentication) for the full
+order and the caveats (OAuth-only Codex subscriptions are not usable yet).
+
+`--local-only` is narrower than its name suggests today, and worth stating
+plainly: it prunes the Jev tier from the decision plane in both roles, and
+`forge init` skips the weights fetch under it. It does **not** currently prune
+the `http`/`laya` routers, nor a hosted model you configured explicitly — a
+recorded discrepancy against the design docs rather than a fixed behaviour.
+
+## Where it runs
+
+One shared runtime, four front ends: the `forge` CLI, a REST/SSE server
+(`forge serve`), an MCP tool server (`forge mcp` — Claude Code, VS Code,
+Cursor), and a native in-editor agent over the Agent Client Protocol
+(`forge acp` — Zed). Same routing, same approval policy, same session log,
+whichever one you use.
+
+## Where to read more
 
 - **How it all fits together** — the decision plane (Needle → Jev/OpenJev →
   static), the generation plane (local → subscription → API-key cloud), the
@@ -61,7 +152,26 @@ on your `PATH`, and respects `NO_COLOR` and non-interactive terminals.
 Release assets are built by CI for every `v*` tag (see
 `.github/workflows/release.yml`).
 
+**The embedded brain comes with it** on `aarch64-apple-darwin` and
+`aarch64-unknown-linux-gnu` — the two platforms whose on-device engine forge has
+both checksum-verified *and* link-verified. Release assets for those targets are
+built with `needle-ffi`, CI asserts each one really has the engine before
+publishing, and the `cargo install` fallback adds the feature too (retrying
+without it if the engine cannot be fetched, so a bad network never costs you the
+install). Intel macOS, x86_64 Linux and Windows get a statically-routing binary,
+because no linkable engine exists for them yet (see [Embedded Needle brain
+(`ffi`)](#embedded-needle-brain-ffi) for exactly why each); `forge doctor` says
+which one you have on its `needle engine` line.
+
+Brain-enabled assets need nothing extra installed to run — the C++ runtime is
+linked statically on Linux and ships with the OS on macOS, so they depend on
+exactly what a brain-less build does. Full detail:
+[Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi).
+
 ## Quickstart
+
+Both planes have working defaults, so setting forge up is picking a
+generation model and nothing else.
 
 ### Three commands to a working agent
 
@@ -78,9 +188,12 @@ What each does:
 2. **`forge init`** — writes `.forge/config.toml` (starter config: local
    model + embedded on-device router), builds the project graph at
    `.forge/graph/` (deterministic, no model calls), adds `.forge/` to
-   `.gitignore`, and on builds with the `needle-ffi` feature fetches +
+   `.gitignore`, and — on a build that has the inference backend, which the
+   release binaries for macOS arm64 and Linux arm64 do — fetches +
    checksum-verifies the ~35 MB brain weights into `~/.cache/forge/models/`.
-   Idempotent — safe to re-run any time.
+   On a build without the backend it skips that fetch (nothing could use the
+   weights) and prints the one command that gets you one. Idempotent — safe
+   to re-run any time.
 3. **`forge run "…"`** — the multi-turn agent loop against whatever model
    you picked below.
 
@@ -195,10 +308,24 @@ when `needle.autofetch` is on (the default) and the build has the
 `small`/`medium` report "no pinned weights artifact"), cached under
 `~/.cache/forge/models/`; re-running `init` re-verifies the checksum and
 skips the download if it already matches. Whenever weights aren't present
-(no network, `--local-only`, a prebuilt binary without `needle-ffi`, or a
+(no network, `--local-only`, a build without `needle-ffi`, or a
 variant with nothing to fetch), routing falls back to deterministic static
 routing (`fallback_used: true` in the events) and the run proceeds with the
 configured model — a fully supported, fully offline mode, not a degraded one.
+
+**Which of those it is, forge tells you in one place.** `forge doctor` reports
+the brain as a line-pair — the backend and the weights on the first line, the
+verdict and the single command that changes it on the second:
+
+```text
+[warn] needle engine: backend not in this build (`needle-ffi` off); weights not fetched (…) — nothing here could use them
+[warn] needle brain: inactive — falling back to static routing; install a build with the brain: `cargo install …`
+```
+
+A build *with* a backend and no weights says `run \`forge init\`` instead,
+because there that is the fix. The two never both fire: the remedy always
+matches the precondition that actually failed, so `forge init`, a failed route
+and `forge doctor` cannot send you around in a circle.
 
 ### Drop-in setup for existing projects
 
@@ -271,9 +398,10 @@ Interrupt and continue:
 
 ```bash
 forge cancel <run-id>        # works from another terminal while a run is live
-forge resume <run-id>        # continues the completed run in its session
+forge resume <run-id>        # continues the run, replaying its conversation
 forge session list           # what happened, per session
 forge session show <id>      # full event history (JSONL, one event per line)
+forge session fork <id>      # branch the conversation into a new session
 ```
 
 Drive it over HTTP:
@@ -300,6 +428,7 @@ forge acp                           Serve ACP over stdio (forge as the agent
 forge resume <run-or-session-id>    Continue a completed run in its session
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
+forge session fork <id> [--at X]    Branch a session into a new one
 forge graph build|check|map|grep|callers|blast|context
 forge skill list|show|test
 forge router serve [--host --port]  Run the local Laya decision-router adapter
@@ -870,24 +999,123 @@ growing set of other editors, speak natively.
 
 ## Sessions and events
 
-Every run appends versioned events (`"v": 2`, with a monotonic per-run `seq`
+Every run appends versioned events (`"v": 3`, with a monotonic per-run `seq`
 assigned by the session store on append) to
 `.forge/sessions/<session_id>.jsonl` — one JSON object per line, append-only.
-v1 logs (no `seq`, f32 confidence) remain readable. Event kinds: `run_started`,
-`routing_decision_made`, `skill_activated`, `tool_call_requested`,
-`tool_started`, `tool_completed`, `file_changed`, `approval_requested`,
-`approval_decided`, `turn_completed`, `input_received`, `note` (v1 compat),
-`error`, `cancelled`, `completed`. Events carry run/session IDs, provider,
-model, routing confidence, and fallback flags. Secret-looking values (API-key
-patterns, `Bearer` tokens, values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*`
-env vars) are redacted to `[REDACTED]` before anything is written.
+v1 logs (no `seq`, f32 confidence) and v2 logs remain readable.
+
+The log carries two streams, deliberately separated:
+
+* **Observability** — short, human- and editor-facing:
+  `run_started`, `routing_decision_made`, `skill_activated`,
+  `tool_call_requested`, `tool_started`, `tool_completed`, `file_changed`,
+  `approval_requested`, `approval_decided`, `turn_completed`,
+  `input_received`, `note` (v1 compat), `error`, `cancelled`, `completed`.
+* **Replay** (v3) — the model conversation, verbatim, so it can be
+  reconstructed later: `assistant_message` (one per model response: its text
+  and the tool calls it requested), `tool_result` (each tool's output as the
+  model saw it, capped at 64 KiB with an explicit truncation marker), and
+  `session_forked` (fork provenance).
+
+Events carry run/session IDs, provider, model, routing confidence, and
+fallback flags. Secret-looking values (API-key patterns, `Bearer` tokens,
+values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env vars) are redacted to
+`[REDACTED]` before anything is written — replay payloads included.
 
 ```bash
 forge session list        # sessions with event counts
-forge session show <id>   # full event history
-forge resume <id>         # continue a completed run (new run, same session,
-                          # seeded with the original prompt + prior outcome)
+forge session show <id>   # full event history, numbered for --at
+forge session fork <id>   # branch: a new session holding a copy of this
+                          # session's history (--at cuts it short)
+forge resume <id>         # continue a completed run: a new run in the same
+                          # session, with the session's whole conversation
+                          # replayed as the model's history
 ```
+
+### Forking a session
+
+```bash
+forge session fork <session-id>             # branch from the whole history
+forge session fork <session-id> --at 12     # 1-based log position
+forge session fork <session-id> --at <run>  # after a particular run
+```
+
+A fork is a **prefix copy**: the new session file holds the source's lines
+verbatim (original `v`, `seq` and timestamps included) plus one
+`session_forked` marker. The source is never touched, and the fork is a
+normal session afterwards — resumable, cancellable, forkable again — with no
+reference back to its parent. The price is disk, paid once per fork; the
+gain is that no session can be broken by anything happening to another.
+
+* `--at` inside a run **snaps forward** to that run's end (`forge session
+  show` numbers its output with the positions `--at` takes). A half-run prefix
+  would replay as an assistant tool call with no result, which is not a state
+  any model should be handed.
+* Copying means a run id can exist in two sessions. `forge resume <run-id>`
+  then resolves to the older session (the source); name the fork's *session*
+  id to continue the fork.
+
+### Attaching to a run
+
+`AgentService` exposes the runtime primitives an interactive front end needs
+(no CLI surface yet — Phase B):
+
+* `attach(run_id)` — a run's events so far **and** the ones still to come,
+  in one call. The live subscription is taken before the stored backlog is
+  read and the overlap is removed by `seq`, so joining late loses nothing and
+  sees nothing twice. A finished run attaches to its backlog alone.
+* `list_runs()` — every live run (`running` / `waiting_for_approval`) plus
+  the 20 most recent finished ones, newest activity first.
+* `RunState` (in `forge-core`) is the typed discriminant the ACP and MCP
+  adapters classify by, instead of matching error text:
+  `running`, `waiting_for_approval`, `completed`, `cancelled`,
+  `awaiting_approval` (the loop stopped because a risky operation needed an
+  answer that could not arrive), `failed`.
+
+Per-run tracking (input channels, broadcast senders, cancellation tokens) is
+now pruned when a run reaches a terminal state, so a long-lived `forge
+serve` / `forge mcp` / `forge acp` no longer grows by three map entries per
+run. `send_input` to a finished run is a typed error rather than a silently
+recreated channel; `attach` still serves that run's whole history from the
+session store.
+
+### A session is a conversation
+
+**Anything that names an existing session continues it.** The session's
+conversation is rebuilt from the event log — every prior run's prompts,
+assistant messages, tool calls and tool results, in order — and becomes the
+model's history for the new run. That covers:
+
+* `forge resume <id>` — replays up to the run being resumed and appends a
+  continuation instruction (there is no new prompt to send).
+* A **new prompt in an existing session** — `POST /v1/runs` with a
+  `session_id`, `forge_run` with a `session_id`, and every ACP turn after the
+  first (an editor session *is* a forge session) — replays the history and
+  the prompt is the next turn.
+
+A fresh session starts with nothing, so plain `forge run` is unaffected.
+
+How reconstruction behaves at the edges:
+
+* Runs recorded before v3 have no verbatim payloads, so their turns replay
+  from the truncated `completed` summary. It still works; the log line says
+  `degraded=true`.
+* A run that died between asking for a tool and getting its result (cancelled,
+  dispatch failed, approval unanswered) leaves a call with no answer. Replay
+  answers it with `[forge: run ended before this tool answered]` rather than
+  sending a dangling call, which every chat API rejects.
+* Reconstruction is fitted to a character budget derived from the model's
+  advertised context window (half of `max_context`, at four characters per
+  token). The **first** message is always kept — it is the session's original
+  ask — and the **most recent** messages fill the rest; anything dropped from
+  the middle is replaced by one `[forge: earlier conversation omitted…]`
+  system note, and a dropped assistant message takes its tool results with
+  it.
+* On a resume, routing, skill matching and graph context key on the session's
+  original ask, so a continuation is routed like the work it continues. A new
+  prompt routes on itself.
+* A log that cannot be read is logged and the run starts fresh — losing
+  history must not lose the run.
 
 ## Development
 
@@ -907,65 +1135,138 @@ just clean
 
 ### Embedded Needle brain (`ffi`)
 
-`just verify` runs with default features, where the needle router has no
-inference engine and degrades to static routing. Real on-device inference is
-behind a feature flag because it needs a per-platform native engine that this
-repo does not carry:
+Real on-device inference needs a per-platform native engine (`libneedle`) that
+this repo does not carry, so it sits behind one feature flag — **and enabling
+that flag is the whole job**, because the build fetches and checksum-verifies
+the engine for you:
+
+```bash
+cargo build --release -p forge-cli --features needle-ffi
+```
+
+That is the single command. No `curl`, no manual checksum step.
 
 | crate | feature | effect |
 | --- | --- | --- |
-| `forge-needle` | `ffi` | `FfiBackend` over `libneedle` instead of `UnavailableBackend` |
+| `forge-needle` | `ffi` | `FfiBackend` over `libneedle` instead of `UnavailableBackend`; turns on `needle-sys/fetch` |
 | `forge-needle` | `needle-e2e` | enables `tests/e2e.rs` (needs `ffi` + real weights) |
 | `forge-cli` | `needle-ffi` | builds the `forge` binary with the above |
 
+Prebuilt release binaries for the supported platforms below already have the
+engine linked in, and CI refuses to publish one that claims the feature and
+does not — see [Installation](#installation). You only need this section to
+build one yourself.
+
+#### How the engine gets there
+
+`crates/needle-sys/build.rs` resolves it in three steps, first hit wins:
+
+1. `NEEDLE_LIB_DIR=/path/to/dir` — an engine you supplied.
+2. `crates/needle-sys/vendor/<target-triple>/` — a vendored engine
+   (gitignored).
+3. **Download, verified against a pinned SHA-256** — only when the `ffi`
+   feature is on. A default build never reaches this step and never touches
+   the network.
+
 The engine ships per platform in the same Apache-2.0 Hugging Face repo as the
 weights, [`Cactus-Compute/needle3`](https://huggingface.co/Cactus-Compute/needle3).
-Fetch `libneedle.a` for your target once:
+Downloads are cached by content hash under `$CARGO_HOME/needle-engine/`
+(override with `NEEDLE_ENGINE_CACHE_DIR`), so it is fetched once per machine,
+not once per build, and a cache entry is re-hashed on every use.
+
+Targets forge will fetch automatically — the ones whose checksum has been
+verified and whose link has been exercised:
+
+| Rust target | artifact folder |
+| --- | --- |
+| `aarch64-apple-darwin` | `macos-arm64` |
+| `aarch64-unknown-linux-gnu` | `linux-arm64` |
+
+The pinned checksums live in `PINNED_ENGINES` in
+`crates/needle-sys/build_support.rs`, together with the collected-but-unwired
+checksums for the rest and the reason each is held back:
+
+- **Intel macOS: no engine exists.** There is no `macos-x86_64` folder in the
+  repo at all. This is the main reason `needle-ffi` is not a default feature —
+  making it one would turn "forge builds and routes statically" into "forge does
+  not build" on those machines.
+- **x86_64 Linux and x86_64 Windows: the archive cannot be linked.** Both leave
+  `std::__1::__hash_memory` undefined, and no distributed libc++ defines it
+  (checked across libc++ 18 and 20, dev and runtime, static and shared). That
+  symbol lives only inside Cactus's own libc++ build, which they ship
+  pre-linked inside their Python wheel's `.so` and do not publish separately.
+  The arm64 archives have no such problem.
+- **Windows also** publishes `libneedle.a` (a COFF `ar` archive) rather than the
+  `needle.lib` an MSVC `-lneedle` resolves, and needs a libc++ MSVC has not got.
+- **armv7/riscv64:** no forge target builds them, so the link is unexercised.
+
+On any other target, `--features needle-ffi` warns that no verified engine
+exists and links nothing; supply one yourself via step 1 or 2 if you have one
+you trust.
+
+#### The C++ runtime (Linux build prerequisite)
+
+`libneedle` is C++ built with clang against **libc++** — on every platform, not
+just macOS. (`nm --undefined-only` over each published artifact shows
+`_ZNSt3__1…`, libc++'s inline namespace, and zero libstdc++ `__cxx11` symbols.)
+So on Linux, building with `needle-ffi` needs libc++'s development files:
 
 ```bash
-TRIPLE=$(rustc -vV | sed -n 's/^host: //p')      # e.g. aarch64-apple-darwin
-mkdir -p crates/needle-sys/vendor/$TRIPLE
-curl -L -o crates/needle-sys/vendor/$TRIPLE/libneedle.a \
-  https://huggingface.co/Cactus-Compute/needle3/resolve/main/macos-arm64/libneedle.a
-
-# Verify against the pinned checksum (macos-arm64; see the spec's §8 for
-# other platforms as they get verified) before trusting the download:
-echo "60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a  crates/needle-sys/vendor/$TRIPLE/libneedle.a" | shasum -a 256 -c -
+sudo apt-get install libc++-dev libc++abi-dev     # Debian/Ubuntu
+sudo dnf install libcxx-devel libcxxabi-devel     # Fedora
 ```
 
-Substitute the platform folder for your target (`macos-arm64`,
-`linux-x86_64`, `linux-arm64`, `linux-armv7`, `linux-riscv64`,
-`linux-mipsel`, `windows-x86_64`, `windows-arm64`, `android-arm64`, ...; the
-full list is in `crates/needle-sys/build.rs`). `NEEDLE_LIB_DIR=/path/to/dir`
-overrides the vendored location. `crates/needle-sys/vendor/` is gitignored;
+forge links them **statically**, so the binary you get has no libc++ runtime
+dependency — it needs only glibc, `libgcc_s` and `libm`, exactly like a
+brain-less build. That is what makes a downloaded release asset work on a
+machine that has never heard of libc++. If the static archives are missing the
+build falls back to a dynamic link and says so loudly; the release workflow
+additionally asserts with `ldd` that no published asset was built that way.
+
+macOS needs nothing installed: `libc++.1.dylib` is part of the OS.
+
+Environment knobs:
+
+| variable | effect |
+| --- | --- |
+| `NEEDLE_LIB_DIR` | use the engine in this directory (step 1) |
+| `NEEDLE_NO_DOWNLOAD=1` | never download — offline, air-gapped and packaging builds |
+| `NEEDLE_REQUIRE_ENGINE=1` | fail the build instead of continuing engine-less (CI/release use this) |
+| `NEEDLE_ENGINE_BASE_URL` | fetch from a mirror instead of Hugging Face (same bytes: the checksum is not overridable) |
+| `NEEDLE_ENGINE_CACHE_DIR` | where verified engines are cached |
+| `NEEDLE_CXX_RUNTIME` | `static-libc++` (default), `libc++` (dynamic — for distro packages that must share the system runtime), `libstdc++` (escape hatch for a rebuilt engine), `none` (add no C++ runtime — for an engine that already carries its own) |
+
 `needle.h` is committed as the contract of record — `needle-sys` hand-writes
 its six `extern "C"` declarations rather than generating them (no `bindgen`, so
 no libclang needed to build forge), and a unit test fails if the committed
 header ever stops matching those declarations.
 
-Then:
+#### Running it
 
 ```bash
 just verify-ffi   # clippy + unit tests with `ffi` on
 just e2e          # real-weights end-to-end suite (release build)
-
-# build the forge binary itself against the real engine
-cargo build --release -p forge-cli --features needle-ffi
 ```
 
 `just verify` already type- and lint-checks the `ffi` code on every run via
 `just lint-ffi` — `cargo clippy` never links, so that needs no engine binary.
 The recipes above are what additionally *run* it.
 
-**If you enable `ffi` without fetching the engine**, the build gets all the way
-to linking and then fails with undefined symbols — `ld`/`lld` naming
-`_needle_init`, `_needle_decide`, `_needle_embed` and friends (`undefined
-symbol: needle_init` on Linux, `Undefined symbols for architecture arm64` on
-macOS). That is the *only* symptom, and the fix is the `curl` step above (or
-`NEEDLE_LIB_DIR`). A default build — no `ffi` — never links the engine and
-says nothing about it: `needle-sys` prints a note only under `cargo build -vv`,
-deliberately not a `cargo:warning`, because the crate compiles on every
-workspace build whether or not anything needs the engine.
+**If `ffi` is on and no engine could be resolved**, the build prints a
+`cargo:warning` naming the one thing to do next and carries on without link
+flags; a binary that actually calls into the engine then fails at link time
+with undefined `_needle_*` symbols, the warning still visible above it. It
+warns rather than stopping because `just lint-ffi` and CI compile the `ffi`
+code on machines with no engine on purpose, and that coverage is worth more
+than pre-empting a link error whose cause is already on screen. Set
+`NEEDLE_REQUIRE_ENGINE=1` when you would rather it stop — which is exactly
+what the release workflow does, so a brain-less binary can never ship
+labelled brain-enabled.
+
+A default build — no `ffi` — never links the engine and says nothing about it:
+`needle-sys` prints a note only under `cargo build -vv`, deliberately not a
+`cargo:warning`, because the crate compiles on every workspace build whether
+or not anything needs the engine.
 
 `just e2e` needs weights as well as the engine:
 
@@ -1051,18 +1352,37 @@ go in `specs/adrs/`.
   (`FORGE_MOCK_VERBOSE=1` additionally makes the mock echo a snippet of the
   assembled system context, when you want that plumbing visible in a test.)
 - Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
-  `just verify` — they need a native engine and real weights. See [Embedded
-  Needle brain (`ffi`)](#embedded-needle-brain-ffi).
+  `just verify` — the first downloads a native engine, the second also needs
+  real weights. `just verify` still type- and lint-checks all the `ffi` code
+  link-free via `just lint-ffi`. In CI the same split is two jobs: the required
+  `verify`, and an advisory `verify-ffi` that links and runs the backend for
+  real (so a stale engine checksum or a broken link cannot go unnoticed) but
+  cannot block a merge when the artifact host is down. See [Embedded Needle
+  brain (`ffi`)](#embedded-needle-brain-ffi).
 
 ## Known limitations (v0.3)
 
-- `forge resume` seeds the new run with the original prompt and the prior
-  (truncated) completion summary; full conversation replay is future work.
 - Symbol/call extraction is regex-based; `graph blast` covers two hops.
 - Server run-status state is in-memory (bounded at `MAX_TRACKED_RUNS` = 1024,
   terminal-first eviction); the session store persists across restarts.
 - Input delivery is in-process: `POST /v1/runs/:id/input` for a run owned by
   another process records the event but that loop does not consume it.
+- Background runs are in-process only: `attach`/`list_runs` see the live
+  events of runs *this* process started. A run in another process attaches to
+  its stored history, but its live events reach you only as the session log
+  grows — there is no cross-process detach/reattach (no daemon, no socket).
+- `forge session fork` copies a prefix, so a run id can exist in more than
+  one session; `resume <run-id>` picks the older one.
+- **Session logs now persist tool output, and redaction is best-effort.**
+  Replay (`tool_result`) stores what each tool returned — including file
+  contents, up to 64 KiB per call — in `.forge/sessions/*.jsonl`. The redactor
+  only catches *known* secret shapes (`sk-…`, `Bearer …`, `ghp_…`, `xox…`) and
+  the values of this process's `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env
+  vars, so an agent that reads a credentials file, a `.env` that was not in
+  this process's environment, or a private key lands in the log largely
+  unredacted. Treat `.forge/sessions/` as sensitive: it is already covered by
+  the repo's own `.gitignore` for `.forge/`, but back-ups, bug reports and
+  pasted logs are not.
 - The needle direct-dispatch fast path is read-only by design (`read_file`,
   `graph_context`, `graph_grep` only); writes, edits, deletes, and commands
   always go through the full agent loop and its approval gating.
@@ -1076,13 +1396,22 @@ go in `specs/adrs/`.
   with `extract()`-based argument repair in the agent loop) is not
   implemented yet; it needs real-model quality data first and is deferred to
   a later spec sub-project.
-- Default/prebuilt builds don't include the inference engine yet: the
-  `needle-ffi` feature is off by default and in release builds, so `forge
-  init` skips fetching needle weights entirely in such builds (there is no
-  backend to use them) and reports the skip rather than downloading ~35 MB
-  that would just sit unused. Build with `--features needle-ffi` (see
-  [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi)) to get real
-  fetch-on-init behavior.
+- `needle-ffi` is not a default cargo feature, so a plain `cargo build` still
+  produces a brain-less binary that routes statically (and `forge init` skips
+  the weights fetch in it, since there would be no backend to use them). It
+  cannot be a default: Cactus publishes no engine for Intel macOS at all, the
+  x86_64 archives need a libc++ nobody distributes, the Windows one is
+  link-untested, and offline builds would fail to link rather than degrade.
+  **Prebuilt release binaries for `aarch64-apple-darwin` and
+  `aarch64-unknown-linux-gnu` do have the engine**, so the installed default on
+  those platforms is a working brain; building it yourself is one flag (see
+  [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi)). Whichever build
+  you have, `forge doctor`'s `needle engine` / `needle brain` line-pair states
+  the backend, the weights, the verdict and the one command that changes it.
+  **x86_64 Linux is the notable gap** — the most common server platform, and it
+  stays brain-less until Cactus publishes an archive that links against a stock
+  libc++ (or forge learns to link their self-contained `.so` instead of the
+  `.a`).
 - `POST /v1/project/context` is lexical-only: the semantic blend that
   `forge graph context`/`graph grep --semantic` apply (needle engine +
   embedding index, when both exist) has not been ported to the server
@@ -1108,5 +1437,7 @@ go in `specs/adrs/`.
 `main` is protected: changes land via pull request only (direct pushes,
 force pushes, and branch deletion are rejected). Every PR must pass the
 `verify` CI job (`cargo fmt --check`, clippy with `-D warnings`, all tests,
-and the BDD suite — the same as `just verify` locally). No approvals are
-required for now; keep PRs small and green.
+and the BDD suite — the same as `just verify` locally). The `verify-ffi` job
+runs alongside it and links the real engine; it is advisory, since it depends
+on an upstream artifact download, but a red one is worth reading before you
+merge. No approvals are required for now; keep PRs small and green.

@@ -10,12 +10,33 @@ license.workspace = true
 # linkage would be a second claim on the same global state.
 links = "needle"
 
-# No build-dependencies on purpose: the six `extern "C"` declarations are
-# hand-written in src/lib.rs rather than generated, so build.rs needs no
-# bindgen and therefore no libclang — which would otherwise become an
-# undocumented prerequisite of every default workspace build.
+[features]
+# Resolution step 3: download the pinned, checksum-verified engine at build
+# time when it is not already vendored. Off by default, and turned on by
+# exactly one thing — `forge-needle`'s `ffi` feature — because a build script
+# cannot see downstream features, and `needle-sys` is a workspace member that
+# compiles on every `cargo build` whether or not anything links it. So this
+# feature is how build.rs knows the engine is actually going to be used, and
+# how a plain default build is guaranteed to touch no network.
+fetch = []
+
+# No bindgen, still: the six `extern "C"` declarations are hand-written in
+# src/lib.rs rather than generated, so build.rs parses no headers and needs no
+# libclang — which would otherwise become an undocumented prerequisite of
+# every default workspace build. `sha2` is the one build-dependency, and it
+# earns its place: build.rs verifies the downloaded engine against a pinned
+# SHA-256, and hand-rolling a hash function in a build script (or shelling out
+# to `shasum`/`sha256sum`/`certutil` and parsing three output formats) would
+# be a worse way to hold a supply-chain trust anchor. It is already a
+# workspace dependency, so it adds nothing to the lockfile.
+[build-dependencies]
+sha2.workspace = true
 
 [dev-dependencies]
+# `tests/engine_resolution.rs` includes `build_support.rs` directly, so the
+# download/verify/cache logic is unit-tested in-process against a `file://`
+# mirror — it needs the same hasher build.rs does.
+sha2.workspace = true
 # The build-script behavior tests drive real `cargo build` runs into a
 # throwaway target dir (build scripts are never covered by `cargo test`).
 tempfile.workspace = true

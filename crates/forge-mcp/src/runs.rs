@@ -14,7 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use forge_core::ForgeError;
+use forge_core::{ForgeError, RunState};
 use forge_runtime::RunOutcome;
 
 /// Upper bound on tracked runs. A long-lived MCP server (one per editor
@@ -30,6 +30,21 @@ pub(crate) enum Final {
 }
 
 impl Final {
+    /// Typed state for status mapping — what `tools.rs` classifies by
+    /// instead of passing `&'static str` labels around.
+    ///
+    /// The mapping is deliberately exhaustive over *this* enum rather than
+    /// derived from the run's error: `from_join` already folds every loop
+    /// error into `Failed`, and that is the status this adapter has always
+    /// reported for one.
+    pub(crate) fn state(&self) -> RunState {
+        match self {
+            Self::Completed(_) => RunState::Completed,
+            Self::Failed(_) => RunState::Failed,
+            Self::Cancelled => RunState::Cancelled,
+        }
+    }
+
     pub(crate) fn from_join(
         result: Result<Result<RunOutcome, ForgeError>, tokio::task::JoinError>,
     ) -> Self {

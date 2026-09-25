@@ -151,7 +151,16 @@ async fn run_lifecycle_end_to_end() {
         .iter()
         .map(|e| e["type"].as_str().expect("type"))
         .collect();
-    assert_eq!(types, ["run_started", "routing_decision_made", "completed"]);
+    assert_eq!(
+        types,
+        [
+            "run_started",
+            "routing_decision_made",
+            // v3 replay record of the model's answer
+            "assistant_message",
+            "completed"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -414,6 +423,75 @@ async fn read_sse_events(app: &Router, run_id: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Two properties of the SSE stream that the write-path-only redaction broke.
+///
+/// 1. **Frames are redacted.** The store scrubbed the line it wrote and
+///    returned the original, and the original is what gets broadcast — so a
+///    secret in tool output reached subscribers while the log stayed clean.
+///    v3's `tool_result` made that a whole file's contents.
+/// 2. **No frame is delivered twice.** The handler deduplicates replayed
+///    against live events by exact JSON string, so any event redaction
+///    rewrote appeared twice: once scrubbed (from the log) and once raw
+///    (from the channel).
+#[tokio::test]
+#[serial_test::serial]
+async fn sse_frames_are_redacted_and_never_delivered_twice() {
+    let secret = "sk-livekey-abcdef123456";
+    unsafe { std::env::set_var("FORGE_SERVER_SSE_TEST_TOKEN", secret) };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("creds.txt"), format!("token={secret}\n"))
+        .expect("write a file holding a secret");
+    // The session store snapshots the environment when it is constructed.
+    let app = scripted_app(
+        tmp.path(),
+        r#"[
+            {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "creds.txt"}}]},
+            {"text": "read it"}
+        ]"#,
+        "auto",
+    );
+    unsafe { std::env::remove_var("FORGE_SERVER_SSE_TEST_TOKEN") };
+
+    let (status, body) = post_json(&app, "/v1/runs", serde_json::json!({"prompt": "read"})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = body["run_id"].as_str().expect("run_id").to_string();
+    wait_for_terminal(&app, &run_id).await;
+
+    let events = read_sse_events(&app, &run_id).await;
+    let stream = serde_json::to_string(&events).expect("serialize");
+    assert!(
+        !stream.contains(secret),
+        "the SSE stream leaked the secret: {stream}"
+    );
+    assert!(
+        stream.contains("[REDACTED]"),
+        "the tool output must have been in this run at all: {stream}"
+    );
+
+    // Exactly one frame per (seq, type): no scrubbed-plus-raw pairs.
+    let mut keys: Vec<String> = events
+        .iter()
+        .map(|e| format!("{}:{}", e["seq"], e["type"]))
+        .collect();
+    let total = keys.len();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        total,
+        "an event was delivered twice: {events:#?}"
+    );
+
+    // The `GET /v1/runs/:id` view is clean too (it serializes stored events).
+    let (_, run) = get_json(&app, &format!("/v1/runs/{run_id}")).await;
+    assert!(
+        !serde_json::to_string(&run)
+            .expect("serialize")
+            .contains(secret),
+        "the run view leaked the secret"
+    );
+}
+
 #[tokio::test]
 async fn sse_streams_v2_tool_and_turn_events_in_order() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -447,22 +525,29 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
         [
             "run_started",
             "routing_decision_made",
+            "assistant_message",
             "tool_call_requested",
             "tool_started",
             "file_changed",
             "tool_completed",
+            "tool_result",
             "turn_completed",
+            "assistant_message",
             "completed"
         ],
         "event order: {types:?}"
     );
-    // v2 schema: sequence numbers are monotonic, confidence is clean f64.
+    // Sequence numbers are monotonic, confidence is clean f64.
     let seqs: Vec<u64> = events
         .iter()
         .map(|e| e["seq"].as_u64().expect("seq"))
         .collect();
-    assert_eq!(seqs, (1..=8).collect::<Vec<_>>());
-    assert!(events.iter().all(|e| e["v"] == 2));
+    assert_eq!(seqs, (1..=11).collect::<Vec<_>>());
+    assert!(
+        events
+            .iter()
+            .all(|e| e["v"] == forge_core::EVENT_SCHEMA_VERSION)
+    );
 }
 
 #[tokio::test]

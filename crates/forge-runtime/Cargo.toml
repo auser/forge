@@ -6,6 +6,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 forge-config.workspace = true
 forge-core.workspace = true
 forge-needle.workspace = true
@@ -21,4 +22,5 @@ async-trait.workspace = true
 forge-execution.workspace = true
 forge-graph.workspace = true
 forge-providers.workspace = true
+serial_test.workspace = true
 tempfile.workspace = true

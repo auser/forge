@@ -5,10 +5,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::execution::RiskLevel;
 
-/// Current event schema version. v2 adds `seq` (monotonic per run),
-/// `f64` routing confidence, and tool/approval/turn event kinds. v1 logs
-/// remain readable: missing `seq` deserializes to 0.
-pub const EVENT_SCHEMA_VERSION: u32 = 2;
+/// Current event schema version.
+///
+/// * v2 added `seq` (monotonic per run), `f64` routing confidence, and
+///   tool/approval/turn event kinds.
+/// * v3 adds the *replay* kinds — [`EventKind::AssistantMessage`],
+///   [`EventKind::ToolResult`] and [`EventKind::SessionForked`] — so a
+///   session's model conversation can be reconstructed verbatim.
+///
+/// The change is purely additive: no existing kind or field changed
+/// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
+/// to 0, a missing `prompt`/`reason` to `""`). A v3 log simply carries
+/// event kinds an older reader does not know; runs recorded before v3
+/// replay as well as their data allows (see
+/// `forge_runtime::replay::conversation_from_events`).
+pub const EVENT_SCHEMA_VERSION: u32 = 3;
+
+/// Cap on the tool output stored in an [`EventKind::ToolResult`].
+///
+/// A tool can return megabytes (a big `read_file`, a chatty command) and
+/// the session log is append-only, so storing results verbatim without a
+/// bound would let one run make a session file unreadable. Past the cap
+/// the output is cut and an explicit marker is appended, so a replayed
+/// conversation is *visibly* partial rather than quietly wrong.
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Cut `output` to [`MAX_TOOL_OUTPUT_BYTES`], appending an explicit marker
+/// when anything was dropped. Cuts on a char boundary — a truncated log
+/// line still has to be valid UTF-8 JSON.
+pub fn cap_tool_output(output: &str) -> String {
+    if output.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return output.to_string();
+    }
+    let mut cut = MAX_TOOL_OUTPUT_BYTES;
+    while cut > 0 && !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = output.len() - cut;
+    format!(
+        "{}\n[forge: tool output truncated, {dropped} bytes dropped]",
+        &output[..cut]
+    )
+}
 
 /// One append-only entry in a run/session event stream.
 ///
@@ -124,6 +162,38 @@ pub enum EventKind {
     Completed {
         summary: String,
     },
+
+    // --- v3: replay kinds ------------------------------------------------
+    //
+    // The `tool_*` and `completed` kinds above are the *observability*
+    // stream: short, redaction-safe summaries an editor or a human reads.
+    // The three kinds below are the *replay* stream: the verbatim model
+    // conversation, written so a later run can reconstruct the history
+    // exactly as the model saw it. Keeping them separate is deliberate —
+    // every pre-v3 consumer keeps reading exactly what it read before.
+    /// One assistant response, verbatim: its text and the tool calls it
+    /// requested (`tool_calls` empty for a plain answer). Emitted for every
+    /// model response, including the final one — where `Completed.summary`
+    /// stays the 80-character digest and this carries the whole answer.
+    AssistantMessage {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<crate::tool::ToolCall>,
+    },
+    /// A tool's output as the model saw it, keyed by the call it answers.
+    /// Capped by [`cap_tool_output`].
+    ToolResult {
+        call_id: String,
+        tool: String,
+        output: String,
+        is_error: bool,
+    },
+    /// Provenance of a session created by `forge session fork`: the source
+    /// session and the 1-based position of the last copied source event.
+    SessionForked {
+        from_session: String,
+        at_position: u64,
+    },
 }
 
 impl EventKind {
@@ -141,7 +211,102 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_serializes_with_schema_v2_and_snake_case_type() {
+    fn replay_kinds_serialize_snake_case_and_roundtrip() {
+        let assistant = Event::new(
+            "r",
+            "s",
+            EventKind::AssistantMessage {
+                text: "thinking".into(),
+                tool_calls: vec![crate::tool::ToolCall::new(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": "a.rs"}),
+                )],
+            },
+        );
+        let value = serde_json::to_value(&assistant).expect("serialize");
+        assert_eq!(value["type"], "assistant_message");
+        assert_eq!(value["v"], 3);
+        assert_eq!(value["tool_calls"][0]["name"], "read_file");
+
+        let result = Event::new(
+            "r",
+            "s",
+            EventKind::ToolResult {
+                call_id: "call_1".into(),
+                tool: "read_file".into(),
+                output: "fn main() {}".into(),
+                is_error: false,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&result).expect("serialize")["type"],
+            "tool_result"
+        );
+
+        let forked = Event::new(
+            "r",
+            "s",
+            EventKind::SessionForked {
+                from_session: "src".into(),
+                at_position: 7,
+            },
+        );
+        let value = serde_json::to_value(&forked).expect("serialize");
+        assert_eq!(value["type"], "session_forked");
+        assert_eq!(value["at_position"], 7);
+
+        // Every new kind reads back from its own line.
+        for event in [assistant, result, forked] {
+            let line = serde_json::to_string(&event).expect("ser");
+            let back: Event = serde_json::from_str(&line).expect("de");
+            assert_eq!(back.v, EVENT_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn an_assistant_message_without_tool_calls_omits_the_field() {
+        let event = Event::new(
+            "r",
+            "s",
+            EventKind::AssistantMessage {
+                text: "done".into(),
+                tool_calls: Vec::new(),
+            },
+        );
+        let value = serde_json::to_value(&event).expect("serialize");
+        assert!(value.get("tool_calls").is_none(), "got: {value}");
+        // ...and reads back as an empty list.
+        let back: Event = serde_json::from_value(value).expect("de");
+        assert!(matches!(
+            back.kind,
+            EventKind::AssistantMessage { ref tool_calls, .. } if tool_calls.is_empty()
+        ));
+    }
+
+    #[test]
+    fn tool_output_is_capped_with_an_explicit_marker() {
+        let short = "small output";
+        assert_eq!(cap_tool_output(short), short);
+
+        let long = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 500);
+        let capped = cap_tool_output(&long);
+        assert!(capped.len() < long.len());
+        assert!(
+            capped.contains("[forge: tool output truncated, 500 bytes dropped]"),
+            "missing marker: {}",
+            &capped[capped.len().saturating_sub(80)..]
+        );
+
+        // A multi-byte char straddling the cap must not be split.
+        let wide = "é".repeat(MAX_TOOL_OUTPUT_BYTES);
+        let capped = cap_tool_output(&wide);
+        assert!(capped.starts_with('é'));
+        assert!(capped.contains("truncated"));
+    }
+
+    #[test]
+    fn event_serializes_with_the_current_schema_and_snake_case_type() {
         let event = Event::new(
             "run-1",
             "session-1",
@@ -154,7 +319,7 @@ mod tests {
             },
         );
         let value = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(value["v"], 2);
+        assert_eq!(value["v"], EVENT_SCHEMA_VERSION);
         assert_eq!(value["type"], "routing_decision_made");
         assert_eq!(value["run_id"], "run-1");
         assert_eq!(value["session_id"], "session-1");

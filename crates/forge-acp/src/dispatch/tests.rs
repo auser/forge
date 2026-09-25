@@ -747,16 +747,25 @@ fn a_completed_run_ends_the_turn() {
     );
 }
 
+/// A classified failure, as `server.rs::settle` builds one.
+fn failure(state: forge_core::RunState, message: &str) -> crate::dispatch::RunFailure {
+    crate::dispatch::RunFailure::new(state, message)
+}
+
 #[test]
 fn a_cancelled_run_reports_the_cancelled_stop_reason() {
+    use forge_core::RunState;
     // Both routes to the same answer: we saw the Cancelled event, or the
     // loop returned its cancellation error.
     assert_eq!(
-        turn_end(Err("run cancelled".into()), false),
+        turn_end(Err(failure(RunState::Cancelled, "run cancelled")), false),
         TurnEnd::Stop(StopReason::Cancelled)
     );
     assert_eq!(
-        turn_end(Err("model provider exploded".into()), true),
+        turn_end(
+            Err(failure(RunState::Failed, "model provider exploded")),
+            true
+        ),
         TurnEnd::Stop(StopReason::Cancelled),
         "an observed cancellation wins over whatever error the loop raised"
     );
@@ -768,7 +777,13 @@ fn a_cancelled_run_reports_the_cancelled_stop_reason() {
 
 #[test]
 fn a_failed_run_becomes_a_json_rpc_error() {
-    let TurnEnd::Failed(error) = turn_end(Err("no model provider configured".into()), false) else {
+    let TurnEnd::Failed(error) = turn_end(
+        Err(failure(
+            forge_core::RunState::Failed,
+            "no model provider configured",
+        )),
+        false,
+    ) else {
         panic!("a failure must not be reported as a normal stop reason");
     };
     assert_eq!(error.code, -32603);
@@ -781,10 +796,32 @@ fn an_unanswerable_approval_is_reported_as_a_refusal() {
     // permission request — the turn stopped without doing the work, which
     // is a refusal rather than an internal error.
     let end = turn_end(
-        Err("approval required for: rm -rf build (destructive)".into()),
+        Err(failure(
+            forge_core::RunState::AwaitingApproval,
+            "approval required for: rm -rf build (destructive)",
+        )),
         false,
     );
     assert_eq!(end, TurnEnd::Stop(StopReason::Refusal));
+}
+
+/// The stop reason now follows the *state*, not the message. This is the
+/// property the old string matching could not have: an error that merely
+/// mentions cancellation is still a failure.
+#[test]
+fn the_stop_reason_follows_the_state_not_the_message() {
+    use forge_core::RunState;
+    let end = turn_end(
+        Err(failure(
+            RunState::Failed,
+            "the upstream cancelled our stream and approval required nothing",
+        )),
+        false,
+    );
+    assert!(
+        matches!(end, TurnEnd::Failed(_)),
+        "a failure whose text mentions cancellation is still a failure: {end:?}"
+    );
 }
 
 // --- malformed input ----------------------------------------------------

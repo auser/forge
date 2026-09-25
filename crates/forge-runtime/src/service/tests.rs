@@ -6,6 +6,7 @@ use forge_core::{DecisionRouter, EventKind, ForgeError, RiskLevel, RoutingReques
 use forge_execution::{MockExecution, NativeExecution};
 use forge_providers::{MockModel, MockRouter, ScriptedMockModel, ScriptedReply};
 use forge_session::JsonlSessionStore;
+use serial_test::serial;
 
 use super::*;
 
@@ -87,6 +88,9 @@ fn event_kinds(outcome: &RunOutcome) -> Vec<&str> {
             EventKind::ApprovalDecided { .. } => "approval_decided",
             EventKind::TurnCompleted { .. } => "turn_completed",
             EventKind::InputReceived { .. } => "input_received",
+            EventKind::AssistantMessage { .. } => "assistant_message",
+            EventKind::ToolResult { .. } => "tool_result",
+            EventKind::SessionForked { .. } => "session_forked",
             EventKind::Error { .. } => "error",
             EventKind::Cancelled { .. } => "cancelled",
             EventKind::Completed { .. } => "completed",
@@ -106,7 +110,13 @@ async fn full_run_emits_ordered_events() {
     assert_eq!(outcome.turns, 1);
     assert_eq!(
         event_kinds(&outcome),
-        ["run_started", "routing_decision_made", "completed"]
+        [
+            "run_started",
+            "routing_decision_made",
+            // v3: the model's answer, verbatim, for replay
+            "assistant_message",
+            "completed"
+        ]
     );
 
     // Everything was persisted, with monotonic sequence numbers.
@@ -114,10 +124,10 @@ async fn full_run_emits_ordered_events() {
         .sessions()
         .events_for(&outcome.session_id)
         .expect("read");
-    assert_eq!(persisted.len(), 3);
+    assert_eq!(persisted.len(), 4);
     assert!(persisted.iter().all(|e| e.run_id == outcome.run_id));
     let seqs: Vec<u64> = persisted.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, vec![1, 2, 3]);
+    assert_eq!(seqs, vec![1, 2, 3, 4]);
 }
 
 struct FailingRouter;
@@ -166,13 +176,38 @@ async fn cancel_unknown_run_is_typed_error() {
 #[tokio::test]
 async fn subscribers_receive_live_events() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let service = test_service(tmp.path());
-
-    let outcome = service.run("stream me").await.expect("run");
-    let mut rx = service.subscribe(&outcome.run_id);
-    service.cancel(&outcome.run_id).expect("cancel");
+    // A live (parked) run: subscribing mid-run streams its events, and a
+    // cancel reaches the subscriber.
+    let (service, run_id, handle) = parked_service(tmp.path()).await;
+    let mut rx = service.subscribe(&run_id);
+    service.cancel(&run_id).expect("cancel");
     let event = rx.try_recv().expect("broadcast delivered");
     assert!(matches!(event.kind, EventKind::Cancelled { .. }));
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn subscribing_after_a_run_finished_yields_a_closed_stream() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(tmp.path());
+    let outcome = service.run("stream me").await.expect("run");
+
+    // The run is over: there is nothing live to join, and registering a
+    // broadcaster for it would be the leak this replaces. `attach` (or the
+    // session store) is how a finished run is read.
+    let mut rx = service.subscribe(&outcome.run_id);
+    service
+        .cancel(&outcome.run_id)
+        .expect("cancel still records");
+    assert!(rx.try_recv().is_err(), "no live stream for a finished run");
+    assert!(
+        service
+            .events(&outcome.run_id)
+            .expect("events")
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Cancelled { .. })),
+        "the cancellation is still recorded"
+    );
 }
 
 // --- agent loop with the scripted mock ---
@@ -220,17 +255,23 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
         [
             "run_started",
             "routing_decision_made",
+            // v3 replay record of the model's tool-call turn
+            "assistant_message",
             "tool_call_requested",
             "tool_started",
             "file_changed",
             "tool_completed",
+            // v3 replay record of the tool's output
+            "tool_result",
             "turn_completed",
+            // v3 replay record of the final answer
+            "assistant_message",
             "completed"
         ]
     );
     // Sequence numbers are monotonic.
     let seqs: Vec<u64> = outcome.events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=8).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=11).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -556,6 +597,1080 @@ async fn resume_continues_in_same_session_with_prior_outcome() {
     );
 }
 
+/// The service under test plus the scripted model, so a test can inspect
+/// the requests the loop actually sent.
+fn recording_service(
+    root: &std::path::Path,
+    replies: Vec<ScriptedReply>,
+) -> (AgentService, Arc<ScriptedMockModel>) {
+    let model = Arc::new(ScriptedMockModel::new(replies));
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(NativeExecution::new(forge_core::ApprovalPolicy::Auto, root)),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions"))),
+        Config::default(),
+    );
+    (service, model)
+}
+
+#[tokio::test]
+async fn resume_replays_the_whole_conversation_to_the_model() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(
+        tmp.path(),
+        vec![
+            // Run 1: a tool call, then an answer.
+            tool_reply("read_file", serde_json::json!({"path": "notes.txt"})),
+            text_reply("notes.txt says hello"),
+            // Run 2 (the resume): one answer.
+            text_reply("and it still does"),
+        ],
+    );
+    std::fs::write(tmp.path().join("notes.txt"), "hello from disk").expect("write");
+
+    let first = service
+        .run("what is in notes.txt")
+        .await
+        .expect("first run");
+    assert_eq!(first.text, "notes.txt says hello");
+
+    let requests_before = model.recorded().len();
+    let resumed = service.resume(&first.run_id).await.expect("resume");
+    assert_eq!(resumed.text, "and it still does");
+    assert_eq!(resumed.session_id, first.session_id);
+
+    // The resumed run's request carries the FIRST run's conversation.
+    let resumed_request = model
+        .recorded()
+        .into_iter()
+        .nth(requests_before)
+        .expect("the resumed run called the model");
+    let shape: Vec<(forge_core::Role, String)> = resumed_request
+        .messages
+        .iter()
+        .map(|m| (m.role, m.content.clone()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (forge_core::Role::User, "what is in notes.txt".to_string()),
+            (forge_core::Role::Assistant, String::new()),
+            (forge_core::Role::Tool, "hello from disk".to_string()),
+            (
+                forge_core::Role::Assistant,
+                "notes.txt says hello".to_string()
+            ),
+            (
+                forge_core::Role::User,
+                "Continue the work in the conversation above.".to_string()
+            ),
+        ],
+        "the resumed run must see the full prior conversation"
+    );
+    // The tool call itself is replayed, not just its text.
+    assert_eq!(resumed_request.messages[1].tool_calls.len(), 1);
+    assert_eq!(resumed_request.messages[1].tool_calls[0].name, "read_file");
+    assert_eq!(
+        resumed_request.messages[2].tool_call_id.as_deref(),
+        Some(resumed_request.messages[1].tool_calls[0].id.as_str()),
+        "the replayed tool result must answer the replayed call"
+    );
+}
+
+/// End-to-end proof of the C1 regression: a run cancelled after the model
+/// asked for a tool but before the tool answered leaves a dangling call in
+/// the log. A later run in the SAME session replays it, and every chat API
+/// rejects an announced call with no result. The repair has to hold on the
+/// real emission path, not just in the replay unit tests.
+#[tokio::test]
+async fn a_cancelled_run_does_not_poison_the_next_runs_replay() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        // Run A: ask for a write (parks under `prompt`), then never finish.
+        tool_reply(
+            "write_file",
+            serde_json::json!({"path": "doomed.txt", "content": "x"}),
+        ),
+        text_reply("unreachable"),
+        // Run B: a plain answer, in the same session.
+        text_reply("run B answer"),
+        // Run C: the resume of B.
+        text_reply("run C answer"),
+    ]));
+    let service = Arc::new(AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(NativeExecution::new(
+            forge_core::ApprovalPolicy::Prompt,
+            tmp.path(),
+        )),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    ));
+
+    // Run A parks on the approval, then is cancelled: `assistant_message`
+    // with the call is already on disk, `tool_result` never will be.
+    let (run_a, session_id, handle) = service.start_run("write the file", None);
+    let mut events = service.subscribe(&run_a);
+    loop {
+        match events.recv().await {
+            Ok(event) if matches!(event.kind, EventKind::ApprovalRequested { .. }) => break,
+            Ok(_) => continue,
+            Err(e) => panic!("broadcast: {e}"),
+        }
+    }
+    service.cancel(&run_a).expect("cancel");
+    let _ = handle.await;
+
+    let logged = service.events(&run_a).expect("run A events");
+    assert!(
+        logged
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::AssistantMessage { tool_calls, .. } if !tool_calls.is_empty())),
+        "the call must be on disk for this test to mean anything: {logged:?}"
+    );
+    assert!(
+        !logged
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ToolResult { .. })),
+        "and its result must not be"
+    );
+
+    // Run B in the same session, then resume it.
+    let run_b = service
+        .run_with_options(
+            "and now something else",
+            RunOptions {
+                session_id: Some(session_id.clone()),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("run B");
+    let before = model.recorded().len();
+    service.resume(&run_b.run_id).await.expect("resume");
+
+    let request = model
+        .recorded()
+        .into_iter()
+        .nth(before)
+        .expect("the resumed run called the model");
+    let announced: Vec<&str> = request
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().map(|c| c.id.as_str()))
+        .collect();
+    let answered: Vec<&str> = request
+        .messages
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    assert!(!announced.is_empty(), "the dangling call was replayed");
+    assert_eq!(
+        announced, answered,
+        "a replayed conversation must never announce a call it does not answer: {:?}",
+        request.messages
+    );
+}
+
+/// Replay was wired to `forge resume` only, so every adapter that reuses one
+/// session id across turns — ACP (whose session id *is* the forge session
+/// id), `forge_run` with a `session_id`, `POST /v1/runs` with a
+/// `session_id` — still started each turn with an empty history, while
+/// claiming to continue the conversation. A prompt landing in a session that
+/// already has runs now continues it.
+#[tokio::test]
+async fn a_second_prompt_in_the_same_session_continues_the_conversation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(
+        tmp.path(),
+        vec![text_reply("first answer"), text_reply("second answer")],
+    );
+
+    let first = service.run("the first ask").await.expect("turn 1");
+    let before = model.recorded().len();
+    let second = service
+        .run_with_options(
+            "the second ask",
+            RunOptions {
+                session_id: Some(first.session_id.clone()),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("turn 2");
+    assert_eq!(second.session_id, first.session_id);
+    assert_ne!(second.run_id, first.run_id);
+
+    let request = model
+        .recorded()
+        .into_iter()
+        .nth(before)
+        .expect("turn 2 called the model");
+    let contents: Vec<&str> = request
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["the first ask", "first answer", "the second ask"],
+        "the second turn must see the first"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_session_starts_with_no_history() {
+    // The other half: `forge run` with no session id must be unaffected.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(tmp.path(), vec![text_reply("a"), text_reply("b")]);
+    service.run("first").await.expect("run 1");
+    let before = model.recorded().len();
+    service.run("second").await.expect("run 2");
+
+    let request = model
+        .recorded()
+        .into_iter()
+        .nth(before)
+        .expect("run 2 called the model");
+    let contents: Vec<&str> = request
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["second"],
+        "a separate session shares nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_started_run_in_an_existing_session_continues_it_too() {
+    // The `start_run` path is the one ACP, MCP and the REST server use.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(
+        tmp.path(),
+        vec![text_reply("turn one"), text_reply("turn two")],
+    );
+    let service = Arc::new(service);
+
+    let first = service.run("opening ask").await.expect("turn 1");
+    let before = model.recorded().len();
+    let (_, _, handle) = service.start_run("follow-up ask", Some(first.session_id.clone()));
+    handle.await.expect("join").expect("turn 2");
+
+    let request = model
+        .recorded()
+        .into_iter()
+        .nth(before)
+        .expect("turn 2 called the model");
+    let contents: Vec<&str> = request
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(contents, vec!["opening ask", "turn one", "follow-up ask"]);
+}
+
+#[tokio::test]
+async fn a_third_run_replays_both_earlier_runs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(
+        tmp.path(),
+        vec![
+            text_reply("answer one"),
+            text_reply("answer two"),
+            text_reply("answer three"),
+        ],
+    );
+
+    let first = service.run("the original ask").await.expect("run 1");
+    let second = service.resume(&first.run_id).await.expect("run 2");
+    let before = model.recorded().len();
+    service.resume(&second.run_id).await.expect("run 3");
+
+    let third = model
+        .recorded()
+        .into_iter()
+        .nth(before)
+        .expect("run 3 called the model");
+    let contents: Vec<&str> = third.messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec![
+            "the original ask",
+            "answer one",
+            "Continue the work in the conversation above.",
+            "answer two",
+            "Continue the work in the conversation above.",
+        ],
+        "every prior run replays, in order"
+    );
+}
+
+#[tokio::test]
+async fn resume_of_a_pre_v3_log_degrades_to_the_recorded_summary() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store_dir = tmp.path().join(".forge").join("sessions");
+    std::fs::create_dir_all(&store_dir).expect("mkdir");
+    // A v2 log: a prompt and a truncated completion summary, no v3 replay
+    // events at all.
+    std::fs::write(
+        store_dir.join("s1.jsonl"),
+        "{\"v\":2,\"seq\":1,\"ts\":\"2026-09-22T20:01:39.172579Z\",\"run_id\":\"old-run\",\"session_id\":\"s1\",\"type\":\"run_started\",\"provider\":\"scripted-mock\",\"model\":\"scripted-mock\",\"prompt\":\"the old ask\"}\n{\"v\":2,\"seq\":2,\"ts\":\"2026-09-22T20:01:40.172579Z\",\"run_id\":\"old-run\",\"session_id\":\"s1\",\"type\":\"completed\",\"summary\":\"the truncated old answer\"}\n",
+    )
+    .expect("write v2 log");
+
+    let (service, model) = recording_service(tmp.path(), vec![text_reply("carrying on")]);
+    let resumed = service.resume("old-run").await.expect("resume an old run");
+    assert_eq!(resumed.text, "carrying on");
+    assert_eq!(resumed.session_id, "s1");
+
+    let request = model
+        .recorded()
+        .into_iter()
+        .next()
+        .expect("the model was called");
+    let contents: Vec<&str> = request
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            "the old ask",
+            "the truncated old answer",
+            "Continue the work in the conversation above.",
+        ],
+        "an old log replays as well as its data allows"
+    );
+}
+
+// --- attach / list_runs / pruning ---------------------------------------
+
+/// Sizes of the three per-run tracking maps.
+fn map_sizes(service: &AgentService) -> (usize, usize, usize) {
+    fn len<T>(map: &Mutex<HashMap<String, T>>) -> usize {
+        map.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+    (
+        len(&service.inputs),
+        len(&service.broadcasters),
+        len(&service.cancel_tokens),
+    )
+}
+
+#[tokio::test]
+async fn tracking_maps_do_not_grow_across_runs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("a"), text_reply("b"), text_reply("c")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    for _ in 0..3 {
+        service.run("ask").await.expect("run");
+    }
+    assert_eq!(
+        map_sizes(&service),
+        (0, 0, 0),
+        "a finished run must leave no tracking entries behind"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_run_is_pruned_too() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = AgentService::new(
+        Arc::new(MockModel::new()),
+        Arc::new(FailingRouter),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(tmp.path().join("sessions"))),
+        Config::default(),
+    );
+    service.run("doomed").await.expect_err("routing fails");
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn send_input_to_a_finished_run_is_a_typed_error_not_a_resurrection() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+
+    let err = service
+        .send_input(&run.run_id, "y")
+        .expect_err("a finished run takes no input");
+    assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+    assert!(err.to_string().contains("completed"), "got: {err}");
+    assert_eq!(
+        map_sizes(&service),
+        (0, 0, 0),
+        "the refusal must not recreate the run's channels"
+    );
+}
+
+#[tokio::test]
+async fn subscribing_to_a_finished_run_does_not_grow_the_maps() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+    for _ in 0..5 {
+        let mut rx = service.subscribe(&run.run_id);
+        assert!(rx.try_recv().is_err(), "a finished run has no live events");
+    }
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn cancelling_a_finished_run_creates_no_tracking_entry() {
+    // `cancel` used to go through the *creating* token accessor, so
+    // cancelling a finished run (or one owned by another process) left a
+    // `cancel_tokens` entry nothing would ever prune.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+
+    for _ in 0..5 {
+        service
+            .cancel(&run.run_id)
+            .expect("cancel is still recorded");
+    }
+    assert_eq!(
+        map_sizes(&service),
+        (0, 0, 0),
+        "cancelling a finished run must not register anything"
+    );
+    // ...and the cancellation is still on disk, every time.
+    let cancels = service
+        .events(&run.run_id)
+        .expect("events")
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Cancelled { .. }))
+        .count();
+    assert_eq!(cancels, 5);
+}
+
+#[tokio::test]
+async fn subscribing_to_a_run_owned_by_another_process_creates_no_broadcaster() {
+    // The gap the terminal-state check left open: a run that is live *in
+    // another process* is not terminal, so `subscribe` registered a
+    // broadcaster for it — one nothing publishes to and nothing prunes. Its
+    // events only ever reach this process through the store.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store_dir = tmp.path().join(".forge").join("sessions");
+    std::fs::create_dir_all(&store_dir).expect("mkdir");
+    // A foreign run mid-flight: started, no terminal event.
+    std::fs::write(
+        store_dir.join("foreign.jsonl"),
+        "{\"v\":3,\"seq\":1,\"ts\":\"2026-09-23T10:00:00Z\",\"run_id\":\"foreign-run\",\"session_id\":\"foreign\",\"type\":\"run_started\",\"provider\":\"p\",\"model\":\"m\",\"prompt\":\"elsewhere\"}\n",
+    )
+    .expect("write foreign log");
+
+    let service = test_service(tmp.path());
+    for _ in 0..5 {
+        let mut rx = service.subscribe("foreign-run");
+        assert!(rx.try_recv().is_err(), "no live stream across processes");
+    }
+    assert_eq!(
+        map_sizes(&service),
+        (0, 0, 0),
+        "a foreign run must not register anything here"
+    );
+    // ...and input for it is refused rather than queued for nobody.
+    let err = service
+        .send_input("foreign-run", "y")
+        .expect_err("not ours to feed");
+    assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+
+    // It still attaches to its stored backlog, silently.
+    let attachment = service.attach("foreign-run").expect("attach");
+    assert_eq!(attachment.backlog.len(), 1);
+    assert_eq!(attachment.state, forge_core::RunState::Running);
+    assert!(!attachment.is_live(), "no live stream across processes");
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+}
+
+/// The case `subscribe` must keep serving, and why: ACP subscribes *before*
+/// `start_run_with_options` precisely so an early approval request cannot be
+/// emitted with nobody listening. An id nothing is known about may still be
+/// about to run here, so it gets a real channel — and that channel is pruned
+/// when the run finishes.
+#[tokio::test]
+async fn subscribing_before_a_run_starts_still_receives_its_events() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = Arc::new(scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    ));
+    let run_id = forge_session::new_run_id();
+
+    // Subscribe first, start second — the ACP ordering.
+    let mut events = service.subscribe(&run_id);
+    let outcome = service
+        .run_with_options(
+            "ask",
+            RunOptions {
+                run_id: Some(run_id.clone()),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("run");
+
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    assert_eq!(
+        seen.len(),
+        outcome.events.len(),
+        "an early subscriber must not miss a thing"
+    );
+    assert_eq!(
+        map_sizes(&service),
+        (0, 0, 0),
+        "and the channel is still pruned when the run ends"
+    );
+}
+
+/// The prune race: `send_input` checked `terminal_state` and *then* asked for
+/// a sender through a creating accessor, so a run terminating in between got
+/// the resurrected channel and swallowed message the fix was supposed to
+/// remove. Creation now re-checks the tombstone under the inputs lock.
+///
+/// Isolating that check deterministically: finish a run, then delete its
+/// session file. The store no longer knows the run, so `send_input`'s
+/// store-backed check cannot answer — exactly the state the race produces —
+/// and only the in-lock tombstone can refuse it.
+#[tokio::test]
+async fn the_tombstone_refuses_input_even_when_the_store_cannot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+    std::fs::remove_file(
+        service
+            .sessions()
+            .root()
+            .join(format!("{}.jsonl", run.session_id)),
+    )
+    .expect("remove the log");
+    assert!(
+        service.events(&run.run_id).is_err(),
+        "the store must no longer know this run for the test to isolate anything"
+    );
+
+    let err = service
+        .send_input(&run.run_id, "y")
+        .expect_err("a finished run takes no input, store or no store");
+    assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+    assert!(err.to_string().contains("completed"), "got: {err}");
+    assert_eq!(
+        map_sizes(&service),
+        (0, 0, 0),
+        "and nothing was resurrected"
+    );
+}
+
+#[tokio::test]
+async fn input_that_arrives_before_the_loop_starts_is_still_delivered() {
+    // The behaviour the fix must NOT break: `forge run` generates the run id
+    // and spawns its stdin feeder before calling `run_with_options`, so
+    // `echo y | forge run …` queues an approval for a run that has not
+    // started. Creating a channel on demand is load-bearing here; only
+    // creating one for a *finished* run is the bug.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![
+            tool_reply(
+                "write_file",
+                serde_json::json!({"path": "early.txt", "content": "x"}),
+            ),
+            text_reply("written"),
+        ],
+        forge_core::ApprovalPolicy::Prompt,
+    );
+    let run_id = forge_session::new_run_id();
+    service
+        .send_input(&run_id, "y")
+        .expect("input for a run that has not started must be accepted");
+
+    let outcome = service
+        .run_with_options(
+            "write it",
+            RunOptions {
+                run_id: Some(run_id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("run completes after the pre-queued approval");
+    assert_eq!(outcome.text, "written");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("early.txt")).expect("file"),
+        "x",
+        "the early approval really unblocked the write"
+    );
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+}
+
+/// Redaction used to cover the write path only: the store scrubbed the line
+/// it wrote and returned the unredacted event, which is what the runtime
+/// broadcasts and collects. v3 widened that gap — `tool_result` carries up to
+/// 64 KiB of verbatim tool output — so a secret read out of a file reached
+/// live subscribers and `--json` outcomes while the log on disk was clean.
+#[tokio::test]
+#[serial]
+async fn live_frames_and_run_outcomes_are_redacted_like_the_log() {
+    let secret = "sk-livekey-abcdef123456";
+    unsafe { std::env::set_var("FORGE_RUNTIME_LIVE_TEST_TOKEN", secret) };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("creds.txt"), format!("token={secret}\n"))
+        .expect("write a file with a secret in it");
+    // The store snapshots the environment when it is built.
+    let service = Arc::new(scripted_service(
+        tmp.path(),
+        vec![
+            tool_reply("read_file", serde_json::json!({"path": "creds.txt"})),
+            text_reply("read it"),
+        ],
+        forge_core::ApprovalPolicy::Auto,
+    ));
+    unsafe { std::env::remove_var("FORGE_RUNTIME_LIVE_TEST_TOKEN") };
+
+    let (run_id, _session, handle) = service.start_run("read creds.txt", None);
+    let mut live = service.subscribe(&run_id);
+    let mut frames: Vec<Event> = Vec::new();
+    while let Ok(event) = live.recv().await {
+        let terminal = event.kind.is_terminal();
+        frames.push(event);
+        if terminal {
+            break;
+        }
+    }
+    let outcome = handle.await.expect("join").expect("run");
+
+    let json = |events: &[Event]| serde_json::to_string(events).expect("serialize");
+    assert!(
+        !json(&frames).contains(secret),
+        "a live subscriber saw the secret: {}",
+        json(&frames)
+    );
+    assert!(
+        !json(&outcome.events).contains(secret),
+        "`--json` would print the secret"
+    );
+    // The tool output really was in this run (otherwise the test proves
+    // nothing) and really was scrubbed.
+    let redacted_output = outcome.events.iter().any(|e| {
+        matches!(&e.kind, EventKind::ToolResult { output, .. }
+            if output.contains("[REDACTED]") && output.contains("token="))
+    });
+    assert!(redacted_output, "got: {:?}", outcome.events);
+
+    // Live frames and stored events are now byte-identical, which is what
+    // the server's replay-vs-live deduplication relies on: a rewritten event
+    // used to be delivered twice, once scrubbed and once raw.
+    let stored = service.events(&run_id).expect("stored");
+    let line = |e: &Event| serde_json::to_string(e).expect("serialize");
+    for frame in &frames {
+        assert!(
+            stored.iter().any(|s| line(s) == line(frame)),
+            "live frame has no byte-identical stored twin: {}",
+            line(frame)
+        );
+    }
+}
+
+#[tokio::test]
+async fn attach_serves_a_terminal_runs_full_backlog() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+
+    let mut attachment = service.attach(&run.run_id).expect("attach");
+    assert_eq!(attachment.state, forge_core::RunState::Completed);
+    assert_eq!(attachment.session_id.as_deref(), Some(&*run.session_id));
+    assert_eq!(
+        attachment.backlog.len(),
+        run.events.len(),
+        "the backlog is the whole run"
+    );
+    assert!(!attachment.is_live());
+    assert!(attachment.recv().await.is_none());
+    assert_eq!(map_sizes(&service), (0, 0, 0), "attach must not leak");
+}
+
+#[tokio::test]
+async fn attach_on_an_unknown_run_is_a_typed_error_and_leaks_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(tmp.path());
+    let err = service.attach("no-such-run").expect_err("unknown");
+    assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_late_attach_gets_the_backlog_and_the_live_tail_without_gap_or_duplicate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // A run that parks on an approval: it is live and has a backlog, which
+    // is exactly the state a UI attaches to.
+    let (service, run_id, handle) = parked_service(tmp.path()).await;
+
+    let mut attachment = service.attach(&run_id).expect("attach mid-run");
+    assert!(attachment.is_live(), "a live run must stream");
+    assert_eq!(
+        attachment.state,
+        forge_core::RunState::WaitingForApproval,
+        "a run parked on an approval is waiting, not running"
+    );
+    assert!(!attachment.backlog.is_empty());
+    let backlog_seqs: Vec<u64> = attachment.backlog.iter().map(|e| e.seq).collect();
+    assert_eq!(
+        backlog_seqs,
+        (1..=backlog_seqs.len() as u64).collect::<Vec<_>>(),
+        "the backlog itself is a gapless prefix"
+    );
+
+    // Unblock the run and drain the live tail.
+    service.send_input(&run_id, "y").expect("approve");
+    let mut live_seqs = Vec::new();
+    while let Some(event) = attachment.recv().await {
+        live_seqs.push(event.seq);
+        if event.kind.is_terminal() {
+            break;
+        }
+    }
+    handle.await.expect("join").expect("run completes");
+
+    // Backlog then live = every seq exactly once, in order.
+    let mut all = backlog_seqs.clone();
+    all.extend(&live_seqs);
+    assert_eq!(
+        all,
+        (1..=all.len() as u64).collect::<Vec<_>>(),
+        "backlog {backlog_seqs:?} + live {live_seqs:?} must be gapless and duplicate-free"
+    );
+    // And it matches what the store holds.
+    let stored: Vec<u64> = service
+        .events(&run_id)
+        .expect("events")
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(all, stored);
+}
+
+#[tokio::test]
+async fn list_runs_reports_live_runs_first_and_bounds_terminal_ones() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        (0..LISTED_TERMINAL_RUNS + 5)
+            .map(|i| text_reply(&format!("answer {i}")))
+            .collect(),
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let mut finished = Vec::new();
+    for i in 0..LISTED_TERMINAL_RUNS + 5 {
+        finished.push(service.run(&format!("ask {i}")).await.expect("run").run_id);
+    }
+
+    let listed = service.list_runs().expect("list");
+    assert_eq!(
+        listed.len(),
+        LISTED_TERMINAL_RUNS,
+        "terminal runs are bounded"
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|s| s.state == forge_core::RunState::Completed),
+        "{listed:?}"
+    );
+    // The most recent ones survived.
+    let newest = finished.last().expect("a run");
+    assert!(listed.iter().any(|s| &s.run_id == newest), "{listed:?}");
+    let oldest = finished.first().expect("a run");
+    assert!(!listed.iter().any(|s| &s.run_id == oldest), "{listed:?}");
+    // Shape.
+    let summary = listed.first().expect("a summary");
+    assert!(summary.session_id.is_some());
+    assert!(summary.started_at.is_some());
+    assert!(summary.last_seq > 0);
+}
+
+#[tokio::test]
+async fn list_runs_never_hides_a_live_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, run_id, handle) = parked_service(tmp.path()).await;
+
+    let listed = service.list_runs().expect("list");
+    let parked = listed
+        .iter()
+        .find(|s| s.run_id == run_id)
+        .unwrap_or_else(|| panic!("the parked run must be listed: {listed:?}"));
+    assert_eq!(parked.state, forge_core::RunState::WaitingForApproval);
+
+    service.send_input(&run_id, "n").expect("deny");
+    handle.await.expect("join").expect("run completes");
+    let listed = service.list_runs().expect("list again");
+    assert_eq!(
+        listed.iter().find(|s| s.run_id == run_id).map(|s| s.state),
+        Some(forge_core::RunState::Completed)
+    );
+}
+
+#[tokio::test]
+async fn list_runs_ignores_a_fork_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+    service.fork_session(&run.session_id, None).expect("fork");
+
+    let listed = service.list_runs().expect("list");
+    assert_eq!(
+        listed.len(),
+        2,
+        "the original run and its copy in the fork — not the marker: {listed:?}"
+    );
+    assert!(listed.iter().all(|s| s.last_seq > 0), "{listed:?}");
+}
+
+// --- fork ---------------------------------------------------------------
+
+/// Bytes of a session's log file, for "the source was not touched" checks.
+fn session_bytes(service: &AgentService, session_id: &str) -> Vec<u8> {
+    std::fs::read(
+        service
+            .sessions()
+            .root()
+            .join(format!("{session_id}.jsonl")),
+    )
+    .expect("session file")
+}
+
+#[tokio::test]
+async fn fork_copies_the_whole_log_marks_provenance_and_leaves_the_source_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("the answer"), text_reply("forked answer")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let first = service.run("the ask").await.expect("run");
+    let source_before = session_bytes(&service, &first.session_id);
+    let source_events = service
+        .sessions()
+        .events_for(&first.session_id)
+        .expect("read source");
+
+    let fork = service
+        .fork_session(&first.session_id, None)
+        .expect("fork the whole log");
+
+    assert_ne!(fork.session_id, first.session_id);
+    assert_eq!(fork.source_session_id, first.session_id);
+    assert_eq!(fork.events_copied, source_events.len());
+    assert_eq!(fork.at_position, source_events.len() as u64);
+    assert_eq!(fork.at_run_id, first.run_id);
+
+    // The source is byte-identical.
+    assert_eq!(
+        session_bytes(&service, &first.session_id),
+        source_before,
+        "forking must never touch the source"
+    );
+
+    // The fork is the prefix plus one marker event.
+    let forked = service
+        .sessions()
+        .events_for(&fork.session_id)
+        .expect("read fork");
+    assert_eq!(forked.len(), source_events.len() + 1);
+    match &forked.last().expect("marker").kind {
+        EventKind::SessionForked {
+            from_session,
+            at_position,
+        } => {
+            assert_eq!(from_session, &first.session_id);
+            assert_eq!(*at_position, source_events.len() as u64);
+        }
+        other => panic!("expected a fork marker, got {other:?}"),
+    }
+    // Copied lines keep their original run id and seq.
+    assert_eq!(
+        forked[..source_events.len()]
+            .iter()
+            .map(|e| (e.run_id.as_str(), e.seq))
+            .collect::<Vec<_>>(),
+        source_events
+            .iter()
+            .map(|e| (e.run_id.as_str(), e.seq))
+            .collect::<Vec<_>>()
+    );
+    // The marker gets its own run so it cannot disturb a copied run's seq.
+    assert!(
+        source_events
+            .iter()
+            .all(|e| e.run_id != forked.last().expect("marker").run_id)
+    );
+}
+
+#[tokio::test]
+async fn a_forked_session_is_resumable_and_continues_the_copied_history() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(
+        tmp.path(),
+        vec![text_reply("original answer"), text_reply("fork continues")],
+    );
+    let first = service.run("the shared ask").await.expect("run");
+    let fork = service.fork_session(&first.session_id, None).expect("fork");
+
+    let before = model.recorded().len();
+    let resumed = service.resume(&fork.session_id).await.expect("resume fork");
+    assert_eq!(resumed.session_id, fork.session_id);
+    assert_eq!(resumed.text, "fork continues");
+
+    let request = model
+        .recorded()
+        .into_iter()
+        .nth(before)
+        .expect("the fork's run called the model");
+    let contents: Vec<&str> = request
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            "the shared ask",
+            "original answer",
+            "Continue the work in the conversation above.",
+        ],
+        "a fork replays the copied history, and the marker is not a turn"
+    );
+
+    // The source session gained nothing from the fork's run.
+    let source = service
+        .sessions()
+        .events_for(&first.session_id)
+        .expect("read source");
+    assert!(source.iter().all(|e| e.run_id == first.run_id));
+}
+
+#[tokio::test]
+async fn forking_at_a_mid_run_position_snaps_forward_to_the_run_boundary() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("one"), text_reply("two")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let first = service.run("ask one").await.expect("run 1");
+    let second = service.resume(&first.run_id).await.expect("run 2");
+    let all = service
+        .sessions()
+        .events_for(&first.session_id)
+        .expect("read");
+    let first_run_len = all.iter().filter(|e| e.run_id == first.run_id).count();
+
+    // Position 2 is inside run 1 → snap to the end of run 1.
+    let fork = service
+        .fork_session(&first.session_id, Some("2"))
+        .expect("fork mid-run");
+    assert_eq!(fork.at_run_id, first.run_id);
+    assert_eq!(fork.events_copied, first_run_len);
+    let forked = service
+        .sessions()
+        .events_for(&fork.session_id)
+        .expect("read fork");
+    assert!(
+        forked
+            .iter()
+            .all(|e| e.run_id == first.run_id || matches!(e.kind, EventKind::SessionForked { .. })),
+        "the second run must not be in the fork: {forked:?}"
+    );
+
+    // A run id cuts after that run, whichever position it occupies.
+    let by_run = service
+        .fork_session(&first.session_id, Some(&first.run_id))
+        .expect("fork by run id");
+    assert_eq!(by_run.events_copied, first_run_len);
+    assert_eq!(by_run.at_run_id, first.run_id);
+    // ...and the later run forks the whole log.
+    let whole = service
+        .fork_session(&first.session_id, Some(&second.run_id))
+        .expect("fork by later run id");
+    assert_eq!(whole.events_copied, all.len());
+}
+
+#[tokio::test]
+async fn fork_rejects_unknown_sessions_runs_and_positions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(tmp.path());
+    let run = service.run("ask").await.expect("run");
+    let events = service
+        .sessions()
+        .events_for(&run.session_id)
+        .expect("read")
+        .len();
+
+    for (at, needle) in [
+        (Some("0"), "1-based"),
+        (Some(&*format!("{}", events + 1)), "no position"),
+        (Some("no-such-run"), "has no run"),
+    ] {
+        let err = service
+            .fork_session(&run.session_id, at)
+            .expect_err("must reject");
+        assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+        assert!(err.to_string().contains(needle), "got: {err}");
+    }
+
+    let err = service
+        .fork_session("no-such-session", None)
+        .expect_err("unknown session");
+    assert!(err.to_string().contains("unknown or empty"), "got: {err}");
+}
+
 #[tokio::test]
 async fn resume_rejects_v1_runs_without_prompt() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -705,9 +1820,11 @@ async fn needle_fast_path_dispatches_exact_tool_prompt_without_the_model() {
             "run_started",
             "routing_decision_made", // model routing
             "routing_decision_made", // needle-dispatch
+            "assistant_message",     // v3: the call the brain made
             "tool_call_requested",
             "tool_started",
             "tool_completed",
+            "tool_result", // v3: its output, for replay
             "completed",
         ]
     );
@@ -755,7 +1872,12 @@ async fn needle_fast_path_absent_engine_changes_nothing() {
     assert_eq!(outcome.turns, 1);
     assert_eq!(
         event_kinds(&outcome),
-        ["run_started", "routing_decision_made", "completed"]
+        [
+            "run_started",
+            "routing_decision_made",
+            "assistant_message",
+            "completed"
+        ]
     );
 }
 

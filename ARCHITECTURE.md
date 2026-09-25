@@ -51,7 +51,22 @@ generate text — which is exactly why it is safe to run on every request.
 
 - `needle-sys` — six hand-written `extern "C"` declarations against
   `libneedle` (no bindgen, no libclang; a unit test pins the committed
-  `needle.h` against the declarations). Built only with the `ffi` feature.
+  `needle.h` against the declarations). The engine is resolved in three steps:
+  `NEEDLE_LIB_DIR` → `vendor/<target>/` → download at build time against a
+  pinned SHA-256, the last only under the `ffi` feature, so a default build
+  never reaches for the network. Downloads are cached by content hash, so
+  once per machine. `NEEDLE_NO_DOWNLOAD=1` opts out (offline/packaging);
+  `NEEDLE_REQUIRE_ENGINE=1` turns "no engine" from a warning into a build
+  failure, which is how release builds guarantee a brain-labelled binary has
+  one. Linked only with the `ffi` feature.
+- The engine's C++ runtime is chosen from the **artifact**, not the OS: every
+  published `libneedle.a` is clang/libc++ (`_ZNSt3__1…` undefined symbols, no
+  libstdc++ `__cxx11`), so Linux links libc++ — statically, plus the `-L` that
+  `rustc`'s `static=` lookup needs, so a release asset keeps the same runtime
+  dependencies as a brain-less build. `NEEDLE_CXX_RUNTIME` overrides it.
+  Choosing by OS instead is what broke the first brain-enabled Linux build.
+  Linkability is per *architecture*, not per OS: the x86_64 archives need a
+  libc++ symbol no distribution ships, so only the arm64 engines are pinned.
 - `forge-needle` — the safe layer. `NeedleEngine` owns the model on one
   dedicated OS thread (mpsc jobs, oneshot replies): lazy load, panic
   containment (`catch_unwind`), abandoned-job skip (a caller that timed out
@@ -62,6 +77,15 @@ generate text — which is exactly why it is safe to run on every request.
 - Weights are fetched once by `forge init` (SHA-256-pinned, atomic rename,
   refetch-once; `[needle] weights_sha256` lets an operator pin their own).
   Builds without the `ffi` feature skip the fetch and say so.
+- **One story about why the brain is off.** Two distinct causes, never
+  conflated: `BackendError::EngineMissing` ("no engine in this build", fixed by
+  a reinstall) and `BackendError::WeightsMissing` ("no weights on disk", fixed
+  by `forge init`). `forge-needle::ENGINE_REMEDY` is the single string the
+  first case quotes everywhere it surfaces — a failed route, `forge init`'s
+  skip note, and `forge doctor`'s `needle engine`/`needle brain` line-pair — so
+  the three cannot drift into telling a user two incompatible things (which is
+  exactly what they did: init said "build with the feature", the router said
+  "run `forge init`", and neither exit was reachable from the other).
 
 Needle answers four kinds of question in forge:
 
@@ -195,7 +219,9 @@ forge-graph       deterministic project graph + embeddings index format;
                   `query` = the one ranked-context/semantic-search
                   implementation, taking an Embedder the caller built
 forge-skills      SKILL.md discovery, progressive disclosure
-forge-session     append-only JSONL event store, secret redaction
+forge-session     append-only JSONL event store, secret redaction —
+                  the harness's memory: `forge resume` reconstructs the
+                  model conversation from it (forge-runtime::replay)
 forge-server      axum REST/SSE adapter over the same AgentService
 forge-mcp         Model Context Protocol (stdio) adapter over the same
                   AgentService: tool registry + schemas + dispatch
@@ -288,6 +314,43 @@ forge run "explain the parser"
   │                 → ExecutionProvider → events
   └─ every event appended to .forge/sessions/<id>.jsonl (redacted, replayable)
 ```
+
+**Continuing a session** runs the same path with one difference: before the
+loop starts, `forge-runtime::replay` reads the session's log and rebuilds the
+model conversation from it — `run_started` prompts, `assistant_message`
+records (text + tool calls, verbatim), `tool_result` records — across every
+prior run of the session, fitted to a character budget derived from the
+model's context window. This is not special to `forge resume`: every entry
+point that names an existing session (`run_with_options`,
+`start_run_with_options`, and so `POST /v1/runs`, `forge_run`, and each ACP
+turn) continues the conversation it names. A fresh session replays nothing.
+
+The log is therefore not just a trace: it is the only place the conversation
+lives between runs, which is why the v3 replay events are written even though
+no adapter displays them. Reconstruction also *repairs* the conversation — a
+run that died between announcing a tool call and recording its result leaves a
+call with no answer, and every chat API rejects that — so replay synthesizes
+the missing result rather than emitting a dangling call.
+
+Because the store is now read back into the model's context, `SessionStore::append`
+returns **the redacted event it wrote**, not the one it was handed: the runtime
+broadcasts and collects whatever `append` returns, so anything less would let
+secrets reach SSE subscribers and `--json` outcomes while the log on disk
+stayed clean. One redaction, at one boundary, for every consumer.
+
+`forge session fork` branches a session by copying its log prefix, so two
+conversations can continue from one shared past without either being able to
+disturb the other.
+
+Every run's in-memory tracking — input channel, broadcast sender,
+cancellation token — is keyed by run id and **pruned when the run reaches a
+terminal state** (`AgentService::finish_run`), with a bounded tombstone so a
+pruned run is still recognisably finished. What a caller can still want about
+a finished run comes from the session store instead: `attach(run_id)` returns
+its whole backlog, and a live run additionally gets a gap-free, duplicate-free
+stream (subscribe first, read the log second, filter the overlap by `seq`).
+`RunState` in `forge-core` is the one typed discriminant the ACP and MCP
+adapters classify a run's ending by.
 
 ## Failure ladder (what never breaks)
 

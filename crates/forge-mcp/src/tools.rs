@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use forge_core::ProjectGraph;
-use forge_core::{Event, EventKind, ForgeError, SessionStore};
+use forge_core::{Event, EventKind, ForgeError, RunState, SessionStore};
 use forge_graph::LocalGraph;
 use forge_needle::EngineEmbedder;
 use forge_runtime::{AgentService, RunOptions};
@@ -636,7 +636,7 @@ impl ForgeTools {
             Some(Some(Final::Completed(outcome))) => ToolOutcome::ok(json!({
                 "run_id": run_id,
                 "session_id": session_id,
-                "status": "completed",
+                "status": wire_status(RunState::Completed),
                 "text": outcome.text,
                 "turns": outcome.turns,
                 "tool_calls": outcome.tool_calls,
@@ -646,7 +646,7 @@ impl ForgeTools {
                 value: json!({
                     "run_id": run_id,
                     "session_id": session_id,
-                    "status": "failed",
+                    "status": wire_status(RunState::Failed),
                     "error": message,
                 }),
                 is_error: true,
@@ -654,7 +654,7 @@ impl ForgeTools {
             Some(Some(Final::Cancelled)) => ToolOutcome::ok(json!({
                 "run_id": run_id,
                 "session_id": session_id,
-                "status": "cancelled",
+                "status": wire_status(RunState::Cancelled),
             })),
             // The oneshot fired, so the monitor settled the run; anything
             // else means it was evicted under load. Events still answer.
@@ -680,15 +680,25 @@ impl ForgeTools {
             return ToolOutcome::error("unknown_run", format!("unknown run: {run_id}"));
         }
 
-        let (status, text, error) = match tracked {
+        let (state, text, error) = match tracked {
             Some(Some(Final::Completed(outcome))) => {
-                ("completed", Some(outcome.text.clone()), None)
+                (RunState::Completed, Some(outcome.text.clone()), None)
             }
-            Some(Some(Final::Failed(message))) => ("failed", None, Some(message)),
-            Some(Some(Final::Cancelled)) => ("cancelled", None, None),
-            // In flight here, or not ours: the event log decides.
-            _ => status_from_events(&events),
+            Some(Some(Final::Failed(message))) => (RunState::Failed, None, Some(message)),
+            Some(Some(Final::Cancelled)) => (RunState::Cancelled, None, None),
+            // In flight here, or not ours: the event log decides. A
+            // completed run's summary is its text, as before.
+            _ => match events.last().map(|e| &e.kind) {
+                Some(EventKind::Completed { summary }) => {
+                    (RunState::Completed, Some(summary.clone()), None)
+                }
+                Some(EventKind::Error { message }) => {
+                    (RunState::Failed, None, Some(message.clone()))
+                }
+                _ => (RunState::of_events(&events), None, None),
+            },
         };
+        let status = wire_status(state);
 
         let last_events: Vec<&Event> = events
             .iter()
@@ -732,17 +742,20 @@ impl ForgeTools {
         // 409. Ours settle in the registry; a run from another process
         // (`forge run`, `forge serve`) is judged by its event log.
         let finished = match &tracked {
-            Some(Some(state)) => Some(final_label(state)),
+            Some(Some(settled)) => Some(settled.state()),
             Some(None) => None,
-            None => match status_from_events(&events).0 {
-                status @ ("completed" | "failed" | "cancelled") => Some(status),
-                _ => None,
-            },
+            None => {
+                let state = RunState::of_events(&events);
+                state.is_terminal().then_some(state)
+            }
         };
-        if let Some(status) = finished {
+        if let Some(state) = finished {
             return ToolOutcome::error(
                 "run_finished",
-                format!("run {run_id} is {status}; not accepting input"),
+                format!(
+                    "run {run_id} is {}; not accepting input",
+                    wire_status(state)
+                ),
             );
         }
 
@@ -764,11 +777,17 @@ impl ForgeTools {
     }
 }
 
-fn final_label(state: &Final) -> &'static str {
+/// Wire spelling of a run state for this adapter.
+///
+/// Identical to [`RunState::as_str`] except for `AwaitingApproval`: the
+/// `forge_run*` tool schemas document five statuses, and an unanswered
+/// approval escaping the loop has always been reported here as `failed`
+/// (with the approval error in `error`). Naming a sixth status would change
+/// the tool contract, so it is folded in explicitly rather than by accident.
+fn wire_status(state: RunState) -> &'static str {
     match state {
-        Final::Completed(_) => "completed",
-        Final::Failed(_) => "failed",
-        Final::Cancelled => "cancelled",
+        RunState::AwaitingApproval => RunState::Failed.as_str(),
+        other => other.as_str(),
     }
 }
 
@@ -788,19 +807,6 @@ async fn wait_for_approval_request(events: &mut broadcast::Receiver<Event>) {
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
-    }
-}
-
-/// Status implied by a run's stored events, for runs this adapter does not
-/// own (a `forge run` in another process, or an evicted entry).
-fn status_from_events(events: &[Event]) -> (&'static str, Option<String>, Option<String>) {
-    match events.last().map(|e| &e.kind) {
-        Some(EventKind::Completed { summary }) => ("completed", Some(summary.clone()), None),
-        Some(EventKind::Cancelled { .. }) => ("cancelled", None, None),
-        Some(EventKind::Error { message }) => ("failed", None, Some(message.clone())),
-        // Parked in an approval wait: forge_run_input answers it.
-        Some(EventKind::ApprovalRequested { .. }) => ("waiting_for_approval", None, None),
-        _ => ("running", None, None),
     }
 }
 

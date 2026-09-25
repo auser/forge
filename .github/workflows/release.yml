@@ -1,6 +1,29 @@
 # Builds release binaries for every supported platform and attaches them
 # to the GitHub release when a version tag (v*) is pushed. Asset names
 # match what install.sh downloads: forge-<target-triple>.tar.gz[.sha256].
+#
+# **Brain-enabled where the engine is verified.** Every prebuilt binary used
+# to be built without `needle-ffi`, which made the embedded needle brain
+# permanently inert for anyone who installed forge the recommended way — the
+# headline feature, off by default, with no hint that a rebuild was the fix.
+# The two targets with a checksum-verified, link-verified `libneedle` — arm64
+# macOS and arm64 Linux — now build with the feature; `needle-sys`'s build
+# script fetches and verifies the engine, and
+# `NEEDLE_REQUIRE_ENGINE=1` makes an unresolvable engine fail the job rather
+# than quietly producing a brain-less binary under a brain-enabled label.
+#
+# The other three keep the engine-less build on purpose: Cactus publishes no
+# engine for Intel macOS at all; the Windows artifact is a COFF `libneedle.a`
+# rather than the `needle.lib` MSVC resolves and needs a libc++ MSVC has not
+# got; and the x86_64 Linux archive leaves `std::__1::__hash_memory` undefined,
+# a symbol no distributed libc++ provides. Those binaries route statically and
+# say so (`forge doctor`'s needle line-pair). See the design spec's §8.
+#
+# Brain-enabled assets add **no** runtime dependency. `libneedle` is C++ built
+# against libc++, and Linux links libc++ statically, so the asset still needs
+# only glibc, libgcc_s and libm — verified with `ldd` in an ubuntu:24.04
+# container and asserted below. macOS links the system `libc++.1.dylib`, which
+# is part of the OS.
 name: release
 
 on:
@@ -18,16 +41,29 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+            features: needle-ffi
           # Intel Mac: cross-compiled on the Apple Silicon runner —
           # macos-13 runners are deprecated and queue indefinitely.
+          # No `libneedle` is published for this target (there is no
+          # macos-x86_64 folder in the engine repo), so it stays engine-less.
           - os: macos-14
             target: x86_64-apple-darwin
+            features: ""
+          # x86_64 Linux stays engine-less: its `libneedle.a` leaves
+          # `std::__1::__hash_memory` undefined and no distributed libc++
+          # defines it, so the archive cannot be linked reproducibly. See
+          # PINNED_ENGINES in crates/needle-sys/build_support.rs.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: ""
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            features: needle-ffi
+          # The published Windows engine is a COFF `libneedle.a`, not the
+          # `needle.lib` MSVC resolves, and has never been link-tested.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            features: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,8 +72,78 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The engine is clang/libc++ on every platform (`nm --undefined-only`
+      # shows `_ZNSt3__1…`, never `__cxx11`), so Linux needs libc++ — *not* the
+      # libstdc++ a Linux build script would reach for by default. The static
+      # archives are what keep the published asset free of libc++ runtime
+      # dependencies a user's machine would not have; the `ldd` assertion below
+      # enforces that. macOS ships libc++ in the OS and needs nothing here.
+      - name: Install the C++ runtime the engine needs
+        if: matrix.features != '' && runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y libc++-dev libc++abi-dev
+
+      # Content-addressed, so the key needs no manual bumping when the pinned
+      # engine changes: a new pin is a new directory, and a stale entry is
+      # simply never read. Saves the ~1.5 MB fetch on re-runs.
+      - name: Cache the needle engine
+        if: matrix.features != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/needle-engine
+          key: needle-engine-${{ matrix.target }}
+
+      # `needle-sys`'s build script fetches the engine and verifies it against
+      # the SHA-256 pinned in crates/needle-sys/build_support.rs — one
+      # checksum table rather than a copy of it here that could drift.
+      # NEEDLE_REQUIRE_ENGINE turns "could not resolve an engine" from a
+      # warning into a failed job, so a release asset built with
+      # `--features needle-ffi` provably contains one.
+      - name: Build release binary (with the embedded brain)
+        if: matrix.features != ''
+        env:
+          NEEDLE_REQUIRE_ENGINE: "1"
+        run: >-
+          cargo build --release --locked -p forge-cli
+          --target ${{ matrix.target }}
+          --features ${{ matrix.features }}
+
       - name: Build release binary
+        if: matrix.features == ''
         run: cargo build --release --locked -p forge-cli --target ${{ matrix.target }}
+
+      # Ask the binary we are about to publish whether it has a brain, rather
+      # than trusting that passing `--features needle-ffi` was enough. Every
+      # brain-enabled target is native to its runner, so this runs the real
+      # artifact. `doctor` exits non-zero on any failing check (no model
+      # endpoint is configured here), so its status is ignored and only the
+      # needle line is asserted.
+      - name: Verify the asset actually has the brain
+        if: matrix.features != ''
+        shell: bash
+        run: |
+          out="$(./target/${{ matrix.target }}/release/forge doctor || true)"
+          printf '%s\n' "$out"
+          grep -q 'needle engine: backend built in' <<<"$out" || {
+            echo "::error::this asset was built with needle-ffi but reports no backend"
+            exit 1
+          }
+
+      # A brain-enabled asset must not have picked up a C++ runtime dependency:
+      # libc++ is statically linked precisely so a downloaded binary keeps
+      # working on a machine that has never heard of libc++1/libc++abi1. If
+      # `libc++.a` were ever missing from the runner, `needle-sys` falls back to
+      # a dynamic link (with a loud warning) and the asset would still build —
+      # this is what stops that fallback from being published.
+      - name: Verify the asset carries no C++ runtime dependency
+        if: matrix.features != '' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          deps="$(ldd ./target/${{ matrix.target }}/release/forge)"
+          printf '%s\n' "$deps"
+          if grep -qE 'libc\+\+|libunwind' <<<"$deps"; then
+            echo "::error::libc++ was linked dynamically; this asset would not run on a clean machine"
+            exit 1
+          fi
 
       - name: Package asset (unix)
         if: runner.os != 'Windows'

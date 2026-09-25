@@ -109,6 +109,44 @@ Each sub-project gets its own spec → plan → implementation cycle:
    its own design (TUI framework, streaming render, keybindings,
    approval UX, fork/background semantics).
 
+   **Phase A (session substrate): implemented** (sub-project 6a, branch
+   `tui-substrate`). The runtime half of the table stakes is done, with
+   no UI:
+
+   - **Full conversation replay.** Event schema v3 adds the verbatim
+     replay kinds `assistant_message`, `tool_result` and
+     `session_forked` (additively — v1/v2 logs stay readable), and
+     `forge-runtime::replay` rebuilds the model's `messages` from a
+     session's log across every prior run, fitted to a budget derived
+     from the model's `max_context`. The v0.3 "resume seeds a truncated
+     summary" limitation is gone. Every entry point that names an
+     existing session continues it — `forge resume`, and also
+     `POST /v1/runs`, `forge_run` and each ACP turn after the first, all
+     of which reuse one session id and previously started from an empty
+     history while claiming otherwise. Replay also repairs a run that
+     died between announcing a tool call and recording its result, which
+     would otherwise replay as a dangling call every chat API rejects.
+   - **Fork.** `AgentService::fork_session` + `forge session fork <id>
+     [--at <position|run-id>]`: a prefix copy into a new session with a
+     `session_forked` provenance marker, snapped to a run boundary, the
+     source never touched.
+   - **Background/attach primitives.** `attach(run_id)` (backlog + live
+     stream, gap-free and duplicate-free by `seq`) and `list_runs()`
+     (live runs plus a bounded tail of finished ones). Cross-process
+     detach/reattach remains out of scope and is recorded as a known
+     limitation.
+   - **Ledgered leak closed.** The never-pruned
+     `inputs`/`broadcasters`/`cancel_tokens` maps are pruned on terminal
+     state; `send_input` to a finished run is a typed error instead of
+     resurrecting its channel.
+   - **Typed run-outcome discriminant.** `forge_core::RunState` replaces
+     ACP's `message.contains("cancelled")` turn-end classification and
+     MCP's `&'static str` status hops; `ForgeError::Cancelled` makes
+     cancellation readable from the type. Both adapters' existing test
+     suites pass unmodified.
+
+   Phase B (the interactive UI itself) still needs its own design.
+
 Parallel track (in progress on main): **cloud subscription support** —
 credential detection for Claude Code OAuth, Codex, Kimi/Moonshot and
 friends (`forge auth status`), extending the generation-plane candidate
@@ -336,6 +374,164 @@ adds `router_name: "needle"` and confidence — no schema change.
     (1 158 184 bytes); `needle.h` =
     `3aa713942528d944598458cecb4a262f2cc49349bec63355f91df0b159964e55`
     (1 187 bytes, committed at `crates/needle-sys/needle.h`).
+
+  **Amendment (2026-09-24, `ffi-default`): resolution step 3 implemented; the
+  feature stays opt-in.** §3's third resolution step — download at build time
+  with checksum verification — now exists in
+  `crates/needle-sys/build_support.rs` (`PINNED_ENGINES` +
+  `ensure_cached_engine`), gated on a `needle-sys/fetch` feature that only
+  `forge-needle/ffi` turns on, so a default build still touches no network.
+  Cache is content-addressed under `$CARGO_HOME/needle-engine/<sha256>/`;
+  `NEEDLE_NO_DOWNLOAD=1` opts out for offline/packaging builds;
+  `NEEDLE_REQUIRE_ENGINE=1` makes an unresolvable engine fatal (release/CI use
+  it so a brain-less binary cannot ship brain-labelled); an unresolvable
+  engine is otherwise a `cargo:warning`, not a failure, so `just lint-ffi`'s
+  link-free coverage of `ffi_backend.rs` keeps working on machines with no
+  engine.
+
+  **Engine checksums, all downloaded and hashed locally 2026-09-24** (each
+  also matches the `x-linked-etag` Hugging Face serves, and macos-arm64
+  matches the value recorded above from the earlier session):
+
+  | folder | sha256 | bytes | wired up |
+  | --- | --- | --- | --- |
+  | `macos-arm64` | `60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a` | 1 158 184 | yes (`aarch64-apple-darwin`) |
+  | `linux-x86_64` | `2581e7d46acd4f66c5839bcfb06b0af11c157c8775636875beb0af5ca35ded54` | 1 675 104 | yes (`x86_64-unknown-linux-gnu`) |
+  | `linux-arm64` | `b36c214437b5230bae89291f684de571dceb0922834a09ceeb09a8e21464a481` | 1 539 978 | yes (`aarch64-unknown-linux-gnu`) |
+  | `windows-x86_64` | `6fb0b9bccfa9f54d46e05a279273c15021570a53a8b3945613d80d299ca1f634` | 1 808 664 | no |
+  | `windows-arm64` | `3a945065225cb383cab9b75333ebe0195d25c7e7c815f032d47857b354056d75` | 1 650 954 | no |
+  | `linux-armv7` | `b1c3cf3ac526cb01314529da2094b8e5b38f41acd5b4a956fc05f22fb4b99346` | 1 334 534 | no (etag only) |
+  | `linux-riscv64` | `11e0eea3d8dff6826171a702f6e741c3cbedde4e42a1ca1959d3712092adbc53` | 1 548 596 | no (etag only) |
+
+  **Why `needle-ffi` is still not a default feature.** Three findings, each
+  independently sufficient:
+
+  1. **Intel macOS has no engine.** The HF `siblings` listing has no
+     `macos-x86_64` folder (only a Python wheel). `x86_64-apple-darwin` is a
+     release target, so a default-on feature would turn "builds, routes
+     statically" into "does not link" on every Intel Mac.
+  2. **Windows is unverified.** Both Windows folders publish `libneedle.a` —
+     an `ar` archive of a COFF `needle.cpp.obj` — not the `needle.lib` an MSVC
+     `-lneedle` resolves. A rename is probably enough, but neither the rename
+     nor the C++ runtime pairing has been link-tested, and an unverified
+     default is not a default.
+  3. **Offline builds would break.** With `ffi` on and nothing cached, the
+     link fails. Today those builds succeed and route statically. Converting
+     graceful degradation into a build failure is a worse default than the
+     bug it would fix.
+
+  The user-visible fix for "the brain doesn't work out of the box" therefore
+  runs through the *release* artifacts and through coherent messaging, not
+  through the default feature set. Revisit if Cactus publishes an Intel macOS
+  engine, or once a Windows link is verified on a Windows runner.
+
+  **Amendment (2026-09-24): the distribution path, which was the real cause.**
+  `.github/workflows/release.yml` built `-p forge-cli` with no features for
+  every target, so *every* prebuilt binary was brain-less — the embedded brain
+  was effectively unreachable for anyone who installed forge the way the
+  README recommends. Now:
+
+  - The three verified targets build with `--features needle-ffi` and
+    `NEEDLE_REQUIRE_ENGINE=1`, so a job that cannot resolve a checksummed
+    engine fails instead of publishing a brain-less asset under a
+    brain-enabled label. A post-build step runs the artifact's own `forge
+    doctor` and greps for `needle engine: backend built in`, so the claim is
+    checked against the binary rather than against the build command.
+  - Intel macOS and Windows keep the engine-less build (reasons above) and
+    report it honestly at runtime.
+  - `install.sh` needed no change for the download path — it fetches whatever
+    the release published. Its `cargo install` *fallback* did: it now adds
+    `--features needle-ffi` on the three verified targets and retries without
+    it if the engine cannot be fetched or linked, so a source install matches
+    the asset install without letting an upstream outage cost the user their
+    install.
+  - CI gained an advisory `verify-ffi` job that links and *runs* the ffi
+    backend on x86_64 Linux. `just lint-ffi`'s link-free guarantee is
+    unchanged and still in the required `verify` job (now with
+    `NEEDLE_NO_DOWNLOAD=1`, so it stays network-free as well as link-free);
+    the new job is what would catch a pinned checksum going stale or the
+    engine ceasing to link — neither of which a type-check can see.
+  - Brain-enabled assets add no runtime dependency at all: libc++ is linked
+    statically on Linux, so the asset still needs only glibc, libgcc_s and
+    libm. (An earlier draft of this amendment said `libstdc++.so.6`, which was
+    wrong twice over — see the C++ runtime amendment below.)
+
+  **Amendment (2026-09-24, fix round 1): the engine is libc++, everywhere.**
+  The first brain-enabled Linux build failed to link —
+  `undefined symbol: std::__1::basic_string<…>::append(char const*)` — because
+  `build.rs` chose the C++ runtime from the *operating system* (`stdc++` on
+  Linux, the platform default) instead of from the *artifact*. `std::__1` is
+  libc++'s inline namespace, so the name was simply wrong.
+
+  Measured with `nm --undefined-only` over every published `libneedle.a`:
+
+  | artifact | `_ZNSt3__1…` (libc++) | `__cxx11` (libstdc++) |
+  | --- | --- | --- |
+  | `macos-arm64` | 44 | 0 |
+  | `linux-x86_64` | 45 | 0 |
+  | `linux-arm64` | 43 | 0 |
+  | `windows-x86_64` | 45 | 0 |
+  | `windows-arm64` | 43 | 0 |
+
+  Cactus builds every platform with clang against libc++. macOS had been
+  accidentally right; Linux was wrong; and this is a *third* independent reason
+  Windows is not wired up — an MSVC toolchain does not provide libc++ at all.
+
+  Resolution, verified by building and running in an `ubuntu:24.04` container:
+
+  - Linux links libc++ **statically** (`libc++.a` + `libc++abi.a`). Dynamic
+    also links and runs, but adds `libc++.so.1`, `libc++abi.so.1` and
+    `libunwind.so.1` to the binary — libraries a normal distro does not ship,
+    which would make a downloaded release asset fail to start. Static keeps the
+    runtime profile identical to a brain-less build (`libm`, `libgcc_s`,
+    `libc`), which is what lets Linux stay in the brain-enabled release set.
+  - `rustc`'s `static=` kind does its own file lookup and does **not** inherit
+    the C compiler's search path, so the plan also emits `-L` directories. Two
+    discovery strategies are needed: `cc -print-file-name=libc++.a` resolves on
+    Ubuntu 24.04 but `libc++abi.a` does not (that package installs it only
+    under `/usr/lib/llvm-<N>/lib`, which gcc never searches), so a scan of the
+    conventional directories backs it up.
+  - `-lm` is explicit: the engine calls `powf`/`sincosf`/`expf` directly, which
+    macOS folds into libSystem and Linux does not.
+  - `NEEDLE_CXX_RUNTIME=static-libc++|libc++|libstdc++` overrides the choice,
+    for distro packagers who must link the shared system runtime.
+  - CI and release install `libc++-dev` + `libc++abi-dev`, and the release job
+    asserts via `ldd` that no `libc++`/`libunwind` dependency reached the
+    published asset — so the dynamic fallback can never ship.
+
+  Evidence: `needle brain: active (model needle3, decide 98 ms)` from a
+  statically-linked binary in the container, with `ldd` showing only
+  `libm`/`libgcc_s`/`libc`.
+
+  **And x86_64 Linux had to be dropped from the brain-enabled set.** Probing the
+  x86_64 archive in the same container turned up a harder problem than the
+  runtime name: `linux-x86_64` (and `windows-x86_64`) leave
+  `std::__1::__hash_memory(void const*, unsigned long)`
+  (`_ZNSt3__113__hash_memoryEPKvm`) undefined, while the arm64 archives do not —
+  Cactus built the two architectures against different libc++ versions.
+
+  No distributed libc++ defines that symbol. Checked on Ubuntu 24.04: libc++ 18
+  and 20, dev and runtime packages, every `libc++*.a` and `libc++*.so*` on the
+  system — zero definitions, so neither a static nor a dynamic link can succeed.
+  The symbol exists only inside Cactus's own libc++ build, and they do not
+  publish it: their `manylinux2014_x86_64` wheel ships `libneedle3.so` with that
+  runtime already linked in (`objdump -p` shows only
+  libm/libc/libpthread/libdl, and no undefined `__hash_memory`). The published
+  `.a` for x86_64 is therefore incomplete for external linking.
+
+  So `x86_64-unknown-linux-gnu` is out of `PINNED_ENGINES`, out of the
+  brain-enabled release matrix, and out of `install.sh`'s feature list; its
+  checksum stays recorded against the day it becomes linkable. CI's advisory
+  `verify-ffi` job moved to `ubuntu-24.04-arm`, because a job that is *expected*
+  to fail is noise rather than signal. The brain-enabled set is now
+  `aarch64-apple-darwin` + `aarch64-unknown-linux-gnu`, both verified end to end
+  with real inference.
+
+  This is a real gap — x86_64 is the most common server platform. Two ways out,
+  neither in scope here: Cactus publishing an x86_64 archive that links against
+  a stock libc++, or forge learning to link their self-contained `.so` instead
+  of the `.a` (which would be a dylib linkage model, and would need the library
+  shipped alongside the binary).
   - **It is C++ behind an `extern "C"` facade.** `nm` shows libc++ symbols
     plus `__cxa_*`/`__gxx_personality_v0`, so `build.rs` links the C++
     runtime (`c++` on Apple/FreeBSD, `stdc++` on Linux, `c++_static` +
@@ -776,3 +972,47 @@ adds `router_name: "needle"` and confidence — no schema change.
   agent loop produces final text rather than a token stream, so the
   answer is one `agent_message_chunk` rather than a faked stream. Tool
   calls *are* streamed live.
+
+- **Session-substrate follow-ups** (recorded from sub-project 6a, Phase A).
+  Deliberately not in scope there:
+
+  - **Cross-process background runs.** `attach`/`list_runs` are
+    in-process: a run started by another `forge` process attaches to its
+    stored history, but its live events arrive only as the session log
+    grows. A real detach/reattach needs a daemon or a socket the runtime
+    does not have, and the chat UI (Phase B) drives runs in its own
+    process, so it does not need one yet.
+  - **Replay fidelity has two honest floors.** Tool output stored in
+    `tool_result` is capped (64 KiB, with an explicit truncation marker),
+    and the history is fitted to a character budget estimated from the
+    model's token context window at four characters per token. Both are
+    approximations that report themselves rather than failing silently;
+    a real tokenizer per provider would be the next step, if it ever
+    matters.
+  - **`forge resume` continues; it cannot branch in place.** A resume
+    replays everything up to the target run. Keeping two continuations of
+    the same past is what `forge session fork` is for. The cost of
+    copying is that a run id is no longer unique across sessions, which
+    `resume <run-id>` resolves in favour of the older session.
+  - **Forked-session ACP/MCP surface.** Neither adapter exposes forking
+    yet; `forge session fork` is CLI-only, and a fork is just a session
+    afterwards, so the adapters need no change to work with one.
+  - **Session logs are now sensitive.** `tool_result` persists what each
+    tool returned, so an agent that reads a credentials file writes it to
+    `.forge/sessions/*.jsonl`. The redactor is shape-based (`sk-…`,
+    `Bearer …`, `ghp_…`, `xox…`) plus this process's
+    `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env values, so anything it
+    does not recognise lands in the log. Recorded as a known limitation
+    rather than solved: the alternatives (not storing tool output, or
+    content-classifying it) each cost more than they buy at this stage —
+    the first removes the memory layer's whole point, the second is a
+    guess dressed as a guarantee.
+  - **`subscribe`/`send_input` still create state for an unknown run id.**
+    Both must serve an id that has been handed out but not yet started
+    (ACP subscribes before `start_run_with_options`; `forge run` queues
+    piped stdin before `run_with_options`), so an id nothing is known
+    about gets a real channel. Entries for *finished* runs and for runs
+    live in another process are refused, and a started run's entries are
+    pruned when it ends — but an id that is never run leaves one behind.
+    Every production caller passes an id it just generated; a UI that
+    subscribed to arbitrary strings would need a bound.

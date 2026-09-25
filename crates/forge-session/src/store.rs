@@ -92,6 +92,60 @@ impl JsonlSessionStore {
             .collect()
     }
 
+    /// The raw JSONL lines of one session, blank lines dropped (empty when
+    /// the file does not exist).
+    ///
+    /// Callers that need *events* want [`events_for`](Self::events_for).
+    /// This exists for copying: a fork must reproduce a prefix byte for
+    /// byte, including the original `v`, `seq` and timestamps, rather than
+    /// re-serializing through the current schema.
+    pub fn raw_lines(&self, session_id: &str) -> Result<Vec<String>, ForgeError> {
+        let path = self.file_for(session_id);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        Ok(std::fs::read_to_string(&path)
+            .map_err(ForgeError::Io)?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Create `target`'s session file from the first `lines` event lines of
+    /// `source`, copied verbatim. Returns the number of lines written.
+    ///
+    /// The source file is opened read-only and never written: forks are
+    /// prefix *copies*, which keeps every session file self-contained and
+    /// independently appendable (the price is disk, paid once per fork).
+    /// Refuses to overwrite an existing target — session ids are ULIDs, so
+    /// a collision means something is wrong rather than something to
+    /// silently clobber.
+    pub fn copy_prefix(
+        &self,
+        source: &str,
+        target: &str,
+        lines: usize,
+    ) -> Result<usize, ForgeError> {
+        let target_path = self.file_for(target);
+        if target_path.exists() {
+            return Err(ForgeError::session(format!(
+                "session {target} already exists at {}",
+                target_path.display()
+            )));
+        }
+        let prefix = self.raw_lines(source)?;
+        let take = lines.min(prefix.len());
+        std::fs::create_dir_all(&self.root).map_err(ForgeError::Io)?;
+        let mut body = String::new();
+        for line in &prefix[..take] {
+            body.push_str(line);
+            body.push('\n');
+        }
+        std::fs::write(&target_path, body).map_err(ForgeError::Io)?;
+        Ok(take)
+    }
+
     /// All sessions known under the root, sorted by session id.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, ForgeError> {
         let mut out = Vec::new();
@@ -179,6 +233,21 @@ impl JsonlSessionStore {
 }
 
 impl SessionStore for JsonlSessionStore {
+    /// Append an event and return **the redacted event that was written**.
+    ///
+    /// Returning the redacted form is the whole point: the runtime
+    /// broadcasts and collects whatever `append` hands back, so an
+    /// unredacted return value means secrets reach SSE subscribers, live
+    /// `Attachment` frames, and `--json` run outcomes even though the log on
+    /// disk is clean. It also makes the log and the stream byte-identical,
+    /// which is what the server's replay-versus-live deduplication compares —
+    /// a rewritten event used to be delivered twice, once scrubbed and once
+    /// raw.
+    ///
+    /// The redacted form is read back through serde so there is exactly one
+    /// definition of "what was written". `ts` is restored from the original:
+    /// it is the one field that is not a `String` in Rust but is one in JSON,
+    /// so it is the one field a redaction could make unparseable.
     fn append(&self, mut event: Event) -> Result<Event, ForgeError> {
         std::fs::create_dir_all(&self.root).map_err(ForgeError::Io)?;
         event.seq = self.next_seq(&event.session_id, &event.run_id)?;
@@ -188,6 +257,9 @@ impl SessionStore for JsonlSessionStore {
         self.redactor.redact_value(&mut value);
         let line = serde_json::to_string(&value)
             .map_err(|e| ForgeError::session(format!("serializing event: {e}")))?;
+        let mut redacted: Event = serde_json::from_value(value)
+            .map_err(|e| ForgeError::session(format!("re-reading a redacted event: {e}")))?;
+        redacted.ts = event.ts;
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -195,7 +267,7 @@ impl SessionStore for JsonlSessionStore {
             .open(self.file_for(&event.session_id))
             .map_err(ForgeError::Io)?;
         writeln!(file, "{line}").map_err(ForgeError::Io)?;
-        Ok(event)
+        Ok(redacted)
     }
 
     fn events(&self) -> Result<Vec<Event>, ForgeError> {
@@ -320,6 +392,154 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn replay_payloads_are_redacted_like_everything_else() {
+        // The v3 replay kinds carry verbatim model traffic — tool-call
+        // arguments and tool output — which is exactly where a secret is
+        // most likely to land. Redaction is deep, and this is the lock.
+        let secret = "sk-livekey-abcdef123456";
+        unsafe { std::env::set_var("FORGE_SESSION_REPLAY_TEST_TOKEN", secret) };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path()); // env snapshot here
+
+        store
+            .append(Event::new(
+                "run-1",
+                "sess-1",
+                EventKind::AssistantMessage {
+                    text: format!("using {secret}"),
+                    tool_calls: vec![forge_core::ToolCall::new(
+                        "call_1",
+                        "run_command",
+                        serde_json::json!({ "command": format!("curl -H 'Bearer {secret}'") }),
+                    )],
+                },
+            ))
+            .expect("append assistant message");
+        store
+            .append(Event::new(
+                "run-1",
+                "sess-1",
+                EventKind::ToolResult {
+                    call_id: "call_1".into(),
+                    tool: "run_command".into(),
+                    output: format!("the server echoed {secret}"),
+                    is_error: false,
+                },
+            ))
+            .expect("append tool result");
+        unsafe { std::env::remove_var("FORGE_SESSION_REPLAY_TEST_TOKEN") };
+
+        let raw = std::fs::read_to_string(tmp.path().join("sess-1.jsonl")).expect("read raw");
+        assert!(!raw.contains(secret), "leaked into a replay payload: {raw}");
+        assert_eq!(
+            raw.matches("[REDACTED]").count(),
+            3,
+            "text, tool-call arguments and tool output must all be redacted: {raw}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn append_returns_the_redacted_event_it_wrote() {
+        // The gap this closes: `append` used to redact a clone and return the
+        // ORIGINAL, so the runtime broadcast and collected the unredacted
+        // event — secrets reached SSE, live attachments and `--json` outcomes
+        // while the log on disk was clean.
+        let secret = "sk-livekey-abcdef123456";
+        unsafe { std::env::set_var("FORGE_SESSION_RETURN_TEST_TOKEN", secret) };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path()); // env snapshot here
+
+        let returned = store
+            .append(Event::new(
+                "run-1",
+                "sess-1",
+                EventKind::ToolResult {
+                    call_id: "call_1".into(),
+                    tool: "read_file".into(),
+                    output: format!("the file contained {secret}"),
+                    is_error: false,
+                },
+            ))
+            .expect("append");
+        unsafe { std::env::remove_var("FORGE_SESSION_RETURN_TEST_TOKEN") };
+
+        match &returned.kind {
+            EventKind::ToolResult { output, .. } => {
+                assert!(!output.contains(secret), "returned event leaks: {output}");
+                assert!(output.contains("[REDACTED]"), "got: {output}");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+        // Structural fields survive the round-trip...
+        assert_eq!(returned.seq, 1);
+        assert_eq!(returned.v, forge_core::EVENT_SCHEMA_VERSION);
+        assert_eq!(returned.run_id, "run-1");
+        // ...and what was returned is exactly what was written, which is what
+        // the server's replay-vs-live deduplication compares.
+        let raw = std::fs::read_to_string(tmp.path().join("sess-1.jsonl")).expect("read raw");
+        assert_eq!(
+            serde_json::to_string(&returned).expect("reserialize") + "\n",
+            raw,
+            "the stored line and the returned event must be identical"
+        );
+    }
+
+    #[test]
+    fn copy_prefix_reproduces_lines_verbatim_and_leaves_the_source_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A v1 line and a v2 line: a copy must preserve both exactly,
+        // schema versions included.
+        let original = "{\"v\":1,\"ts\":\"2026-09-22T20:01:39.172579Z\",\"run_id\":\"r1\",\"session_id\":\"src\",\"type\":\"run_started\",\"provider\":\"p\",\"model\":\"m\"}\n{\"v\":2,\"seq\":1,\"ts\":\"2026-09-22T20:01:40.172579Z\",\"run_id\":\"r2\",\"session_id\":\"src\",\"type\":\"completed\",\"summary\":\"done\"}\n";
+        std::fs::write(tmp.path().join("src.jsonl"), original).expect("write");
+
+        let store = JsonlSessionStore::new(tmp.path());
+        assert_eq!(store.copy_prefix("src", "dst", 1).expect("copy"), 1);
+
+        let copied = std::fs::read_to_string(tmp.path().join("dst.jsonl")).expect("read copy");
+        assert_eq!(
+            copied,
+            original.lines().next().expect("first line").to_string() + "\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("src.jsonl")).expect("read source"),
+            original,
+            "the source must be byte-identical afterwards"
+        );
+    }
+
+    #[test]
+    fn copy_prefix_clamps_to_the_log_length_and_refuses_to_overwrite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path());
+        store
+            .append(Event::new(
+                "r",
+                "src",
+                EventKind::ToolStarted { name: "t".into() },
+            ))
+            .expect("append");
+
+        assert_eq!(
+            store.copy_prefix("src", "dst", 99).expect("copy"),
+            1,
+            "asking for more lines than exist copies the whole log"
+        );
+        let err = store
+            .copy_prefix("src", "dst", 1)
+            .expect_err("must not clobber");
+        assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+    }
+
+    #[test]
+    fn raw_lines_of_an_unknown_session_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path());
+        assert!(store.raw_lines("nope").expect("raw").is_empty());
+    }
+
+    #[test]
     fn run_and_session_ids_are_unique_ulids() {
         let a = new_run_id();
         let b = new_run_id();
@@ -384,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn appending_to_a_v1_log_continues_with_v2_events() {
+    fn appending_to_a_v1_log_continues_with_current_schema_events() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // Hand-write a v1 line: no seq field.
         std::fs::write(
@@ -400,7 +620,8 @@ mod tests {
         assert_eq!(events[0].v, 1);
         assert_eq!(events[0].seq, 0);
 
-        // New appends are v2 and get seq starting at 1 (v1 had none).
+        // New appends carry the current schema version and get seq
+        // starting at 1 (v1 had none).
         let appended = store
             .append(Event::new(
                 "run-a",
@@ -410,7 +631,7 @@ mod tests {
                 },
             ))
             .expect("append");
-        assert_eq!(appended.v, 2);
+        assert_eq!(appended.v, forge_core::EVENT_SCHEMA_VERSION);
         assert_eq!(appended.seq, 1);
 
         let events = store.events_for("sess").expect("read mixed");

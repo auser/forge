@@ -524,7 +524,7 @@ impl ForgeAcpServer {
         tracing::info!(session = session_id, run = %run_id, root = %session.root.display(), "turn started");
 
         let mut state = dispatch::TurnState::for_run(run_id, &session.root);
-        let run_result: Result<String, String> = loop {
+        let run_result: Result<String, dispatch::RunFailure> = loop {
             tokio::select! {
                 received = events.recv() => match received {
                     Ok(event) => {
@@ -772,19 +772,34 @@ impl ForgeAcpServer {
 /// Await a run's task handle.
 async fn join(
     handle: &mut tokio::task::JoinHandle<Result<forge_runtime::RunOutcome, ForgeError>>,
-) -> Result<String, String> {
+) -> Result<String, dispatch::RunFailure> {
     settle(handle.await)
 }
 
-/// Reduce a joined run to "final text" or "why it failed".
+/// Reduce a joined run to "final text" or a classified failure.
+///
+/// The classification is typed: a `ForgeError` is read through
+/// [`RunState::of_error`], and an aborted task is a cancellation because
+/// `JoinError::is_cancelled` says so. Only the last arm — a task that
+/// *panicked* — has nothing but text to offer, and it is a failure either
+/// way.
 fn settle(
     joined: Result<Result<forge_runtime::RunOutcome, ForgeError>, tokio::task::JoinError>,
-) -> Result<String, String> {
+) -> Result<String, dispatch::RunFailure> {
     match joined {
         Ok(Ok(outcome)) => Ok(outcome.text),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(e) if e.is_cancelled() => Err("run cancelled".to_string()),
-        Err(e) => Err(format!("run task did not finish: {e}")),
+        Ok(Err(e)) => Err(dispatch::RunFailure::new(
+            forge_core::RunState::of_error(&e),
+            e.to_string(),
+        )),
+        Err(e) if e.is_cancelled() => Err(dispatch::RunFailure::new(
+            forge_core::RunState::Cancelled,
+            "run cancelled",
+        )),
+        Err(e) => Err(dispatch::RunFailure::new(
+            forge_core::RunState::Failed,
+            format!("run task did not finish: {e}"),
+        )),
     }
 }
 
@@ -953,6 +968,91 @@ mod tests {
     fn next(rx: &mut mpsc::Receiver<Outgoing>) -> Value {
         let message = rx.try_recv().expect("an outgoing message");
         serde_json::to_value(&message).expect("serialize")
+    }
+
+    // --- settle: the typed classification ------------------------------
+
+    fn settled(result: Result<forge_runtime::RunOutcome, ForgeError>) -> dispatch::RunFailure {
+        settle(Ok(result)).expect_err("this test is about failures")
+    }
+
+    /// `settle` is where a run's *type* becomes a `RunState`. Nothing else in
+    /// the adapter classifies, so if this drifts the stop reasons drift with
+    /// it — and it had no test of its own.
+    #[test]
+    fn settle_classifies_a_cancellation_from_the_error_variant() {
+        let failure = settled(Err(ForgeError::cancelled("cancellation requested")));
+        assert_eq!(failure.state, forge_core::RunState::Cancelled);
+        assert_eq!(
+            turn_end(Err(failure), false),
+            dispatch::TurnEnd::Stop(crate::protocol::StopReason::Cancelled)
+        );
+    }
+
+    #[test]
+    fn settle_classifies_an_unanswered_approval_from_the_error_variant() {
+        let failure = settled(Err(ForgeError::ApprovalRequired {
+            description: "rm -rf build".to_string(),
+            risk: forge_core::RiskLevel::Destructive,
+        }));
+        assert_eq!(failure.state, forge_core::RunState::AwaitingApproval);
+        assert_eq!(
+            turn_end(Err(failure), false),
+            dispatch::TurnEnd::Stop(crate::protocol::StopReason::Refusal)
+        );
+    }
+
+    #[test]
+    fn settle_classifies_everything_else_as_a_failure_whatever_it_says() {
+        // The message mentions cancellation; the variant does not. The old
+        // string matching would have called this a cancelled turn.
+        let failure = settled(Err(ForgeError::provider(
+            "the upstream cancelled our stream",
+        )));
+        assert_eq!(failure.state, forge_core::RunState::Failed);
+        assert!(failure.message.contains("cancelled our stream"));
+        assert!(matches!(
+            turn_end(Err(failure), false),
+            dispatch::TurnEnd::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn settle_reports_an_aborted_task_as_cancelled_and_a_panic_as_failed() {
+        // `JoinError::is_cancelled` is a type, not a message: an aborted run
+        // is a cancellation.
+        let handle = tokio::spawn(async {
+            std::future::pending::<Result<forge_runtime::RunOutcome, ForgeError>>().await
+        });
+        handle.abort();
+        let aborted = settle(handle.await).expect_err("aborted");
+        assert_eq!(aborted.state, forge_core::RunState::Cancelled);
+
+        // A panicked task is the one case with only text to go on, and it is
+        // a failure either way.
+        let handle = tokio::spawn(async {
+            panic!("the loop exploded");
+        });
+        let panicked = settle(handle.await).expect_err("panicked");
+        assert_eq!(panicked.state, forge_core::RunState::Failed);
+        assert!(
+            panicked.message.contains("did not finish"),
+            "got: {}",
+            panicked.message
+        );
+    }
+
+    #[test]
+    fn settle_passes_a_completed_runs_text_through() {
+        let outcome = forge_runtime::RunOutcome {
+            run_id: "r".into(),
+            session_id: "s".into(),
+            text: "all done".into(),
+            turns: 1,
+            tool_calls: 0,
+            events: Vec::new(),
+        };
+        assert_eq!(settle(Ok(Ok(outcome))).expect("completed"), "all done");
     }
 
     #[tokio::test]
