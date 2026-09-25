@@ -195,7 +195,9 @@ forge-graph       deterministic project graph + embeddings index format;
                   `query` = the one ranked-context/semantic-search
                   implementation, taking an Embedder the caller built
 forge-skills      SKILL.md discovery, progressive disclosure
-forge-session     append-only JSONL event store, secret redaction
+forge-session     append-only JSONL event store, secret redaction —
+                  the harness's memory: `forge resume` reconstructs the
+                  model conversation from it (forge-runtime::replay)
 forge-server      axum REST/SSE adapter over the same AgentService
 forge-mcp         Model Context Protocol (stdio) adapter over the same
                   AgentService: tool registry + schemas + dispatch
@@ -288,6 +290,15 @@ forge run "explain the parser"
   │                 → ExecutionProvider → events
   └─ every event appended to .forge/sessions/<id>.jsonl (redacted, replayable)
 ```
+
+`forge resume <id>` runs the same path with one difference: before the loop
+starts, `forge-runtime::replay` reads the session's log and rebuilds the model
+conversation from it — `run_started` prompts, `assistant_message` records
+(text + tool calls, verbatim), `tool_result` records — across every prior run
+of the session, fitted to a character budget derived from the model's context
+window. The log is therefore not just a trace: it is the only place the
+conversation lives between runs, which is why the v3 replay events are written
+even though no adapter displays them.
 
 ## Failure ladder (what never breaks)
 

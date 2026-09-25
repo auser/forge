@@ -870,24 +870,56 @@ growing set of other editors, speak natively.
 
 ## Sessions and events
 
-Every run appends versioned events (`"v": 2`, with a monotonic per-run `seq`
+Every run appends versioned events (`"v": 3`, with a monotonic per-run `seq`
 assigned by the session store on append) to
 `.forge/sessions/<session_id>.jsonl` — one JSON object per line, append-only.
-v1 logs (no `seq`, f32 confidence) remain readable. Event kinds: `run_started`,
-`routing_decision_made`, `skill_activated`, `tool_call_requested`,
-`tool_started`, `tool_completed`, `file_changed`, `approval_requested`,
-`approval_decided`, `turn_completed`, `input_received`, `note` (v1 compat),
-`error`, `cancelled`, `completed`. Events carry run/session IDs, provider,
-model, routing confidence, and fallback flags. Secret-looking values (API-key
-patterns, `Bearer` tokens, values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*`
-env vars) are redacted to `[REDACTED]` before anything is written.
+v1 logs (no `seq`, f32 confidence) and v2 logs remain readable.
+
+The log carries two streams, deliberately separated:
+
+* **Observability** — short, human- and editor-facing:
+  `run_started`, `routing_decision_made`, `skill_activated`,
+  `tool_call_requested`, `tool_started`, `tool_completed`, `file_changed`,
+  `approval_requested`, `approval_decided`, `turn_completed`,
+  `input_received`, `note` (v1 compat), `error`, `cancelled`, `completed`.
+* **Replay** (v3) — the model conversation, verbatim, so it can be
+  reconstructed later: `assistant_message` (one per model response: its text
+  and the tool calls it requested), `tool_result` (each tool's output as the
+  model saw it, capped at 64 KiB with an explicit truncation marker), and
+  `session_forked` (fork provenance).
+
+Events carry run/session IDs, provider, model, routing confidence, and
+fallback flags. Secret-looking values (API-key patterns, `Bearer` tokens,
+values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env vars) are redacted to
+`[REDACTED]` before anything is written — replay payloads included.
 
 ```bash
 forge session list        # sessions with event counts
 forge session show <id>   # full event history
-forge resume <id>         # continue a completed run (new run, same session,
-                          # seeded with the original prompt + prior outcome)
+forge resume <id>         # continue a completed run: a new run in the same
+                          # session, with the session's whole conversation
+                          # replayed as the model's history
 ```
+
+### What `forge resume` actually sends
+
+`forge resume <id>` rebuilds the model's `messages` from the event log —
+every prior run's prompts, assistant messages, tool calls and tool results,
+in order, up to and including the run being resumed — and appends a
+continuation instruction. It is a real continuation, not a re-ask:
+
+* Runs recorded before v3 have no verbatim payloads, so their turns replay
+  from the truncated `completed` summary. The resume still works; the log
+  line says `degraded=true`.
+* Reconstruction is fitted to a character budget derived from the model's
+  advertised context window (half of `max_context`, at four characters per
+  token). The **first** message is always kept — it is the session's original
+  ask — and the **most recent** messages fill the rest; anything dropped from
+  the middle is replaced by one `[forge: earlier conversation omitted…]`
+  system note, and a dropped assistant message takes its tool results with
+  it.
+* Routing, skill matching and graph context still key on the session's
+  original ask, so a continuation is routed like the work it continues.
 
 ## Development
 
@@ -1056,8 +1088,6 @@ go in `specs/adrs/`.
 
 ## Known limitations (v0.3)
 
-- `forge resume` seeds the new run with the original prompt and the prior
-  (truncated) completion summary; full conversation replay is future work.
 - Symbol/call extraction is regex-based; `graph blast` covers two hops.
 - Server run-status state is in-memory (bounded at `MAX_TRACKED_RUNS` = 1024,
   terminal-first eviction); the session store persists across restarts.

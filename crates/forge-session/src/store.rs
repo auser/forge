@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn appending_to_a_v1_log_continues_with_v2_events() {
+    fn appending_to_a_v1_log_continues_with_current_schema_events() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // Hand-write a v1 line: no seq field.
         std::fs::write(
@@ -400,7 +400,8 @@ mod tests {
         assert_eq!(events[0].v, 1);
         assert_eq!(events[0].seq, 0);
 
-        // New appends are v2 and get seq starting at 1 (v1 had none).
+        // New appends carry the current schema version and get seq
+        // starting at 1 (v1 had none).
         let appended = store
             .append(Event::new(
                 "run-a",
@@ -410,7 +411,7 @@ mod tests {
                 },
             ))
             .expect("append");
-        assert_eq!(appended.v, 2);
+        assert_eq!(appended.v, forge_core::EVENT_SCHEMA_VERSION);
         assert_eq!(appended.seq, 1);
 
         let events = store.events_for("sess").expect("read mixed");

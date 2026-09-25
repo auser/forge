@@ -46,6 +46,31 @@ fn format_event(event: &Event) -> String {
             format!("approval_decided command={command} approved={approved}")
         }
         EventKind::TurnCompleted { turn } => format!("turn_completed turn={turn}"),
+        EventKind::AssistantMessage { text, tool_calls } => {
+            let head: String = text.chars().take(80).collect();
+            let calls: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+            if calls.is_empty() {
+                format!("assistant_message text={head}")
+            } else {
+                format!(
+                    "assistant_message text={head} tool_calls={}",
+                    calls.join(",")
+                )
+            }
+        }
+        EventKind::ToolResult {
+            call_id,
+            tool,
+            output,
+            is_error,
+        } => {
+            let head: String = output.chars().take(80).collect();
+            format!("tool_result call_id={call_id} tool={tool} error={is_error} output={head}")
+        }
+        EventKind::SessionForked {
+            from_session,
+            at_position,
+        } => format!("session_forked from={from_session} at_position={at_position}"),
         EventKind::InputReceived { message } => format!("input_received message={message}"),
         EventKind::Note { message } => format!("note message={message}"),
         EventKind::Error { message } => format!("error message={message}"),
@@ -71,8 +96,9 @@ fn print_events(ctx: &Context, events: &[Event]) -> Result<(), ForgeError> {
 }
 
 /// `forge resume <id>` — continue a completed run: start a new run in the
-/// same session seeded with the original prompt and prior outcome, and
-/// print the new run's output. (`forge session show` for pure history.)
+/// same session whose model history is the session's conversation replayed
+/// from the event log, and print the new run's output. (`forge session
+/// show` for pure history.)
 pub async fn resume(ctx: &Context, id: &str) -> Result<(), ForgeError> {
     let service = build_service(ctx)?;
     let outcome = service.resume(id).await?;

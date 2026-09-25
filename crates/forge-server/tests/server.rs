@@ -151,7 +151,16 @@ async fn run_lifecycle_end_to_end() {
         .iter()
         .map(|e| e["type"].as_str().expect("type"))
         .collect();
-    assert_eq!(types, ["run_started", "routing_decision_made", "completed"]);
+    assert_eq!(
+        types,
+        [
+            "run_started",
+            "routing_decision_made",
+            // v3 replay record of the model's answer
+            "assistant_message",
+            "completed"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -447,22 +456,29 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
         [
             "run_started",
             "routing_decision_made",
+            "assistant_message",
             "tool_call_requested",
             "tool_started",
             "file_changed",
             "tool_completed",
+            "tool_result",
             "turn_completed",
+            "assistant_message",
             "completed"
         ],
         "event order: {types:?}"
     );
-    // v2 schema: sequence numbers are monotonic, confidence is clean f64.
+    // Sequence numbers are monotonic, confidence is clean f64.
     let seqs: Vec<u64> = events
         .iter()
         .map(|e| e["seq"].as_u64().expect("seq"))
         .collect();
-    assert_eq!(seqs, (1..=8).collect::<Vec<_>>());
-    assert!(events.iter().all(|e| e["v"] == 2));
+    assert_eq!(seqs, (1..=11).collect::<Vec<_>>());
+    assert!(
+        events
+            .iter()
+            .all(|e| e["v"] == forge_core::EVENT_SCHEMA_VERSION)
+    );
 }
 
 #[tokio::test]

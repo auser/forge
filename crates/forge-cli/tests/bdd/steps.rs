@@ -916,6 +916,40 @@ fn new_run_continues_in_same_session(world: &mut BddWorld) {
     );
 }
 
+#[then("the session log records the conversation verbatim")]
+fn session_log_records_conversation_verbatim(world: &mut BddWorld) {
+    let log = world.session_log();
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    // One `assistant_message` per run, carrying the answer verbatim (not
+    // the 80-character `completed` summary) — that is what a later run
+    // replays into the model's history.
+    let answers: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "assistant_message")
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    assert_eq!(answers.len(), 2, "one per run; log: {log}");
+    assert!(answers.iter().all(|text| !text.is_empty()), "log: {log}");
+    // The resumed run did not re-ask the original prompt: its history is
+    // the replayed conversation and its prompt is the continuation nudge.
+    let prompts: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "run_started")
+        .filter_map(|e| e["prompt"].as_str())
+        .collect();
+    assert_eq!(
+        prompts,
+        vec![
+            "original task",
+            "Continue the work in the conversation above."
+        ],
+        "log: {log}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // server-input.feature / cancellation.feature
 // ---------------------------------------------------------------------------

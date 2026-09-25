@@ -87,6 +87,9 @@ fn event_kinds(outcome: &RunOutcome) -> Vec<&str> {
             EventKind::ApprovalDecided { .. } => "approval_decided",
             EventKind::TurnCompleted { .. } => "turn_completed",
             EventKind::InputReceived { .. } => "input_received",
+            EventKind::AssistantMessage { .. } => "assistant_message",
+            EventKind::ToolResult { .. } => "tool_result",
+            EventKind::SessionForked { .. } => "session_forked",
             EventKind::Error { .. } => "error",
             EventKind::Cancelled { .. } => "cancelled",
             EventKind::Completed { .. } => "completed",
@@ -106,7 +109,13 @@ async fn full_run_emits_ordered_events() {
     assert_eq!(outcome.turns, 1);
     assert_eq!(
         event_kinds(&outcome),
-        ["run_started", "routing_decision_made", "completed"]
+        [
+            "run_started",
+            "routing_decision_made",
+            // v3: the model's answer, verbatim, for replay
+            "assistant_message",
+            "completed"
+        ]
     );
 
     // Everything was persisted, with monotonic sequence numbers.
@@ -114,10 +123,10 @@ async fn full_run_emits_ordered_events() {
         .sessions()
         .events_for(&outcome.session_id)
         .expect("read");
-    assert_eq!(persisted.len(), 3);
+    assert_eq!(persisted.len(), 4);
     assert!(persisted.iter().all(|e| e.run_id == outcome.run_id));
     let seqs: Vec<u64> = persisted.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, vec![1, 2, 3]);
+    assert_eq!(seqs, vec![1, 2, 3, 4]);
 }
 
 struct FailingRouter;
@@ -220,17 +229,23 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
         [
             "run_started",
             "routing_decision_made",
+            // v3 replay record of the model's tool-call turn
+            "assistant_message",
             "tool_call_requested",
             "tool_started",
             "file_changed",
             "tool_completed",
+            // v3 replay record of the tool's output
+            "tool_result",
             "turn_completed",
+            // v3 replay record of the final answer
+            "assistant_message",
             "completed"
         ]
     );
     // Sequence numbers are monotonic.
     let seqs: Vec<u64> = outcome.events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=8).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=11).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -556,6 +571,163 @@ async fn resume_continues_in_same_session_with_prior_outcome() {
     );
 }
 
+/// The service under test plus the scripted model, so a test can inspect
+/// the requests the loop actually sent.
+fn recording_service(
+    root: &std::path::Path,
+    replies: Vec<ScriptedReply>,
+) -> (AgentService, Arc<ScriptedMockModel>) {
+    let model = Arc::new(ScriptedMockModel::new(replies));
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(NativeExecution::new(forge_core::ApprovalPolicy::Auto, root)),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions"))),
+        Config::default(),
+    );
+    (service, model)
+}
+
+#[tokio::test]
+async fn resume_replays_the_whole_conversation_to_the_model() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(
+        tmp.path(),
+        vec![
+            // Run 1: a tool call, then an answer.
+            tool_reply("read_file", serde_json::json!({"path": "notes.txt"})),
+            text_reply("notes.txt says hello"),
+            // Run 2 (the resume): one answer.
+            text_reply("and it still does"),
+        ],
+    );
+    std::fs::write(tmp.path().join("notes.txt"), "hello from disk").expect("write");
+
+    let first = service
+        .run("what is in notes.txt")
+        .await
+        .expect("first run");
+    assert_eq!(first.text, "notes.txt says hello");
+
+    let requests_before = model.recorded().len();
+    let resumed = service.resume(&first.run_id).await.expect("resume");
+    assert_eq!(resumed.text, "and it still does");
+    assert_eq!(resumed.session_id, first.session_id);
+
+    // The resumed run's request carries the FIRST run's conversation.
+    let resumed_request = model
+        .recorded()
+        .into_iter()
+        .nth(requests_before)
+        .expect("the resumed run called the model");
+    let shape: Vec<(forge_core::Role, String)> = resumed_request
+        .messages
+        .iter()
+        .map(|m| (m.role, m.content.clone()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (forge_core::Role::User, "what is in notes.txt".to_string()),
+            (forge_core::Role::Assistant, String::new()),
+            (forge_core::Role::Tool, "hello from disk".to_string()),
+            (
+                forge_core::Role::Assistant,
+                "notes.txt says hello".to_string()
+            ),
+            (
+                forge_core::Role::User,
+                "Continue the work in the conversation above.".to_string()
+            ),
+        ],
+        "the resumed run must see the full prior conversation"
+    );
+    // The tool call itself is replayed, not just its text.
+    assert_eq!(resumed_request.messages[1].tool_calls.len(), 1);
+    assert_eq!(resumed_request.messages[1].tool_calls[0].name, "read_file");
+    assert_eq!(
+        resumed_request.messages[2].tool_call_id.as_deref(),
+        Some(resumed_request.messages[1].tool_calls[0].id.as_str()),
+        "the replayed tool result must answer the replayed call"
+    );
+}
+
+#[tokio::test]
+async fn a_third_run_replays_both_earlier_runs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(
+        tmp.path(),
+        vec![
+            text_reply("answer one"),
+            text_reply("answer two"),
+            text_reply("answer three"),
+        ],
+    );
+
+    let first = service.run("the original ask").await.expect("run 1");
+    let second = service.resume(&first.run_id).await.expect("run 2");
+    let before = model.recorded().len();
+    service.resume(&second.run_id).await.expect("run 3");
+
+    let third = model
+        .recorded()
+        .into_iter()
+        .nth(before)
+        .expect("run 3 called the model");
+    let contents: Vec<&str> = third.messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec![
+            "the original ask",
+            "answer one",
+            "Continue the work in the conversation above.",
+            "answer two",
+            "Continue the work in the conversation above.",
+        ],
+        "every prior run replays, in order"
+    );
+}
+
+#[tokio::test]
+async fn resume_of_a_pre_v3_log_degrades_to_the_recorded_summary() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store_dir = tmp.path().join(".forge").join("sessions");
+    std::fs::create_dir_all(&store_dir).expect("mkdir");
+    // A v2 log: a prompt and a truncated completion summary, no v3 replay
+    // events at all.
+    std::fs::write(
+        store_dir.join("s1.jsonl"),
+        "{\"v\":2,\"seq\":1,\"ts\":\"2026-09-22T20:01:39.172579Z\",\"run_id\":\"old-run\",\"session_id\":\"s1\",\"type\":\"run_started\",\"provider\":\"scripted-mock\",\"model\":\"scripted-mock\",\"prompt\":\"the old ask\"}\n{\"v\":2,\"seq\":2,\"ts\":\"2026-09-22T20:01:40.172579Z\",\"run_id\":\"old-run\",\"session_id\":\"s1\",\"type\":\"completed\",\"summary\":\"the truncated old answer\"}\n",
+    )
+    .expect("write v2 log");
+
+    let (service, model) = recording_service(tmp.path(), vec![text_reply("carrying on")]);
+    let resumed = service.resume("old-run").await.expect("resume an old run");
+    assert_eq!(resumed.text, "carrying on");
+    assert_eq!(resumed.session_id, "s1");
+
+    let request = model
+        .recorded()
+        .into_iter()
+        .next()
+        .expect("the model was called");
+    let contents: Vec<&str> = request
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            "the old ask",
+            "the truncated old answer",
+            "Continue the work in the conversation above.",
+        ],
+        "an old log replays as well as its data allows"
+    );
+}
+
 #[tokio::test]
 async fn resume_rejects_v1_runs_without_prompt() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -705,9 +877,11 @@ async fn needle_fast_path_dispatches_exact_tool_prompt_without_the_model() {
             "run_started",
             "routing_decision_made", // model routing
             "routing_decision_made", // needle-dispatch
+            "assistant_message",     // v3: the call the brain made
             "tool_call_requested",
             "tool_started",
             "tool_completed",
+            "tool_result", // v3: its output, for replay
             "completed",
         ]
     );
@@ -755,7 +929,12 @@ async fn needle_fast_path_absent_engine_changes_nothing() {
     assert_eq!(outcome.turns, 1);
     assert_eq!(
         event_kinds(&outcome),
-        ["run_started", "routing_decision_made", "completed"]
+        [
+            "run_started",
+            "routing_decision_made",
+            "assistant_message",
+            "completed"
+        ]
     );
 }
 

@@ -380,10 +380,12 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     assert!(list.status.success());
     let stdout = String::from_utf8(list.stdout).expect("utf8");
     assert!(stdout.contains(session_id), "list output: {stdout}");
-    assert!(stdout.contains("3 events"), "list output: {stdout}");
+    // run_started, routing_decision_made, assistant_message (the v3 replay
+    // record of the model's answer), completed.
+    assert!(stdout.contains("4 events"), "list output: {stdout}");
 
     // resume continues the completed run: a NEW run in the same session,
-    // seeded with the original prompt, printing the new run's output.
+    // replaying the session's conversation, printing the new run's output.
     let resume = forge(tmp.path())
         .args(["--project"])
         .arg(&project)
@@ -396,8 +398,11 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
         String::from_utf8_lossy(&resume.stderr)
     );
     let stdout = String::from_utf8(resume.stdout).expect("utf8");
+    // The mock echoes the prompt it received, which for a resume is the
+    // continuation instruction — the conversation itself is replayed as
+    // history above it rather than re-asked.
     assert!(
-        stdout.contains("mock response to: hi"),
+        stdout.contains("Continue the work in the conversation above"),
         "resume output: {stdout}"
     );
     // The resumed run landed in the same session (session show reveals

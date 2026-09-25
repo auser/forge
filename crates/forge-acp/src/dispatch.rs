@@ -403,7 +403,16 @@ impl TurnState {
             // 80 characters by the session store, so the turn's final text
             // comes from the run outcome instead (see `server.rs`); the
             // rest is bookkeeping the editor has no use for.
-            EventKind::RunStarted { .. }
+            //
+            // The v3 replay kinds (`AssistantMessage`, `ToolResult`,
+            // `SessionForked`) are deliberately silent too: the editor
+            // already gets the turn's text as one `agent_message_chunk`
+            // and its tool calls as `tool_call` updates, so narrating the
+            // replay records as well would duplicate the transcript.
+            EventKind::AssistantMessage { .. }
+            | EventKind::ToolResult { .. }
+            | EventKind::SessionForked { .. }
+            | EventKind::RunStarted { .. }
             | EventKind::ApprovalDecided { .. }
             | EventKind::TurnCompleted { .. }
             | EventKind::Note { .. }

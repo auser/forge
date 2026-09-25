@@ -80,16 +80,44 @@ pub struct RunOptions {
     pub session_id: Option<String>,
     /// Turn budget override (defaults to `config.max_turns`).
     pub max_turns: Option<u32>,
-    /// When resuming: the previous run's id and its final text.
-    pub resume_from: Option<ResumeSeed>,
 }
 
-/// Context carried into a resumed run.
-#[derive(Debug, Clone)]
-pub struct ResumeSeed {
-    pub old_run_id: String,
-    pub prior_text: String,
+/// Everything one run needs beyond the ids. Built by
+/// [`AgentService::run_with_options`] for a fresh prompt and by
+/// [`AgentService::resume`] for a continuation.
+struct RunPlan {
+    /// Recorded in `run_started`, and therefore what a later replay reads
+    /// back as this run's user turn.
+    prompt: String,
+    /// The text routing, skill matching and graph context key on. On a
+    /// resume this is the session's original ask, so a continuation is
+    /// routed and seeded like the work it continues rather than like the
+    /// word "continue".
+    task: String,
+    /// Conversation replayed from the session log, prepended to this run's
+    /// messages. Empty for a fresh run.
+    history: Vec<Message>,
+    /// The run this one continues, for the `input_received` link marker.
+    resumed_from: Option<String>,
 }
+
+impl RunPlan {
+    /// A fresh run: the prompt is the task and there is no history.
+    fn fresh(prompt: impl Into<String>) -> Self {
+        let prompt = prompt.into();
+        Self {
+            task: prompt.clone(),
+            prompt,
+            history: Vec::new(),
+            resumed_from: None,
+        }
+    }
+}
+
+/// The prompt a resumed run records and sends. `forge resume` takes no new
+/// instruction, so the conversation replayed above this line *is* the
+/// context and this is the nudge that makes the model act on it.
+const RESUME_PROMPT: &str = "Continue the work in the conversation above.";
 
 /// Input channel state for a run. `Closed` is a tombstone: closing before
 /// the run starts (e.g. stdin already at EOF) must still close the
@@ -341,6 +369,39 @@ impl AgentService {
         Ok(())
     }
 
+    /// Record one model response verbatim, so the conversation can be
+    /// replayed later (see [`crate::replay`]). This is the *replay* stream;
+    /// the `tool_*`/`completed` events remain the short observability
+    /// summaries every adapter already reads.
+    ///
+    /// A response with neither text nor tool calls records nothing: there
+    /// is no message to replay, and an empty assistant turn in the history
+    /// is noise a provider may well reject.
+    fn emit_assistant_message(
+        &self,
+        sender: &broadcast::Sender<Event>,
+        collected: &mut Vec<Event>,
+        run_id: &str,
+        session_id: &str,
+        response: &forge_core::CompletionResponse,
+    ) -> Result<(), ForgeError> {
+        if response.content.is_empty() && response.tool_calls.is_empty() {
+            return Ok(());
+        }
+        self.emit(
+            sender,
+            collected,
+            Event::new(
+                run_id,
+                session_id,
+                EventKind::AssistantMessage {
+                    text: response.content.clone(),
+                    tool_calls: response.tool_calls.clone(),
+                },
+            ),
+        )
+    }
+
     /// Run a prompt through the agent loop with fresh run/session ids.
     pub async fn run(&self, prompt: &str) -> Result<RunOutcome, ForgeError> {
         self.run_with_options(prompt, RunOptions::default()).await
@@ -355,11 +416,10 @@ impl AgentService {
         let run_id = options.run_id.unwrap_or_else(new_run_id);
         let session_id = options.session_id.unwrap_or_else(new_session_id);
         self.run_inner(
-            prompt,
+            RunPlan::fresh(prompt),
             &run_id,
             &session_id,
             options.max_turns,
-            options.resume_from,
         )
         .await
     }
@@ -388,8 +448,7 @@ impl AgentService {
 
     /// [`start_run`](Self::start_run) with explicit [`RunOptions`] — the
     /// MCP adapter needs a per-call turn budget, which the REST adapter
-    /// has no way to express. `options.resume_from` is ignored here:
-    /// resuming is [`resume`](Self::resume)'s job.
+    /// has no way to express. Resuming is [`resume`](Self::resume)'s job.
     pub fn start_run_with_options(
         self: &Arc<Self>,
         prompt: impl Into<String>,
@@ -410,7 +469,7 @@ impl AgentService {
         let max_turns = options.max_turns;
         let handle = tokio::spawn(async move {
             service
-                .run_inner(&prompt, &rid, &sid, max_turns, None)
+                .run_inner(RunPlan::fresh(prompt), &rid, &sid, max_turns)
                 .await
         });
         (run_id, session_id, handle)
@@ -553,12 +612,19 @@ impl AgentService {
 
     async fn run_inner(
         &self,
-        prompt: &str,
+        plan: RunPlan,
         run_id: &str,
         session_id: &str,
         max_turns: Option<u32>,
-        resume_from: Option<ResumeSeed>,
     ) -> Result<RunOutcome, ForgeError> {
+        let RunPlan {
+            prompt,
+            task,
+            history,
+            resumed_from,
+        } = plan;
+        let prompt = prompt.as_str();
+        let task = task.as_str();
         let run_id = run_id.to_string();
         let session_id = session_id.to_string();
         let max_turns = max_turns.unwrap_or(self.config.max_turns);
@@ -594,7 +660,7 @@ impl AgentService {
             ),
         )?;
 
-        if let Some(seed) = &resume_from {
+        if let Some(old_run_id) = &resumed_from {
             self.emit(
                 &sender,
                 &mut collected,
@@ -602,7 +668,7 @@ impl AgentService {
                     &run_id,
                     &session_id,
                     EventKind::InputReceived {
-                        message: format!("resume of run {}", seed.old_run_id),
+                        message: format!("resume of run {old_run_id}"),
                     },
                 ),
             )?;
@@ -615,7 +681,7 @@ impl AgentService {
         }
         candidates.sort();
         let routing_request = RoutingRequest {
-            task: prompt.to_string(),
+            task: task.to_string(),
             required_capabilities: Vec::new(),
             candidates,
         };
@@ -646,16 +712,12 @@ impl AgentService {
             ),
         )?;
 
-        // Build the conversation: resume seed, activated skills, graph
-        // context, then the user prompt.
+        // Build the conversation: system preamble (skills, graph context),
+        // then the replayed history of this session, then the user prompt.
+        // System first is what providers expect, and the history is a real
+        // user/assistant/tool transcript that must arrive in its own order.
         let mut messages = Vec::new();
-        if let Some(seed) = &resume_from {
-            messages.push(Message::system(format!(
-                "This run resumes run {}. Its final answer was:\n{}",
-                seed.old_run_id, seed.prior_text
-            )));
-        }
-        for meta in self.skills.match_task(prompt) {
+        for meta in self.skills.match_task(task) {
             match self.skills.activate(&meta.name) {
                 Ok(skill) => {
                     self.emit(
@@ -681,7 +743,7 @@ impl AgentService {
             }
         }
         if let Some(graph) = &self.graph {
-            let hits = graph.context(prompt, 5);
+            let hits = graph.context(task, 5);
             if !hits.is_empty() {
                 let listing = hits
                     .iter()
@@ -693,6 +755,8 @@ impl AgentService {
                 )));
             }
         }
+        let resuming = !history.is_empty();
+        messages.extend(history);
         messages.push(Message::user(prompt));
 
         // Resolve the provider for the routed model (defaults to the
@@ -721,7 +785,7 @@ impl AgentService {
         // must not turn it into tool execution. All other gates and the
         // dispatch itself live in `needle_fast_path`; `None` means "run
         // normally", and nothing has been emitted or executed by then.
-        if resume_from.is_none()
+        if !resuming
             && !tools.is_empty()
             && let Some(fast) = self.needle_fast_path(prompt, &run_id, &tools).await
         {
@@ -746,6 +810,21 @@ impl AgentService {
                             "needle filled and dispatched `{}` on device; no model call",
                             fast.call.name
                         ),
+                    },
+                ),
+            )?;
+            // Replay record: the brain stood in for the model, so the
+            // conversation this run contributes is "assistant asked for
+            // this call" + its result. A later resume continues from it.
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::AssistantMessage {
+                        text: String::new(),
+                        tool_calls: vec![fast.call.clone()],
                     },
                 ),
             )?;
@@ -797,6 +876,20 @@ impl AgentService {
                 ),
             )?;
             let text = fast.outcome.result.content;
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::ToolResult {
+                        call_id: fast.call.id.clone(),
+                        tool: fast.call.name.clone(),
+                        output: forge_core::cap_tool_output(&text),
+                        is_error: false,
+                    },
+                ),
+            )?;
             let summary: String = text.chars().take(80).collect();
             self.emit(
                 &sender,
@@ -822,6 +915,7 @@ impl AgentService {
                 Ok(response) => response,
                 Err(e) => return Err(fail(&mut collected, e)),
             };
+            self.emit_assistant_message(&sender, &mut collected, &run_id, &session_id, &response)?;
             let summary: String = response.content.chars().take(80).collect();
             self.emit(
                 &sender,
@@ -860,6 +954,8 @@ impl AgentService {
                 Ok(response) => response,
                 Err(e) => return Err(fail(&mut collected, e)),
             };
+
+            self.emit_assistant_message(&sender, &mut collected, &run_id, &session_id, &response)?;
 
             if response.tool_calls.is_empty() {
                 let summary: String = response.content.chars().take(80).collect();
@@ -1012,6 +1108,22 @@ impl AgentService {
                         },
                     ),
                 )?;
+                // Replay record: the result verbatim (capped), as the
+                // model is about to see it.
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(
+                        &run_id,
+                        &session_id,
+                        EventKind::ToolResult {
+                            call_id: call.id.clone(),
+                            tool: call.name.clone(),
+                            output: forge_core::cap_tool_output(&outcome.result.content),
+                            is_error: outcome.result.is_error,
+                        },
+                    ),
+                )?;
                 messages.push(Message::tool(
                     call.id.clone(),
                     outcome.result.content.clone(),
@@ -1114,9 +1226,21 @@ impl AgentService {
         Ok(())
     }
 
-    /// Resume a completed run: start a NEW run in the same session, seeded
-    /// with the original prompt and the prior run's final text. An
+    /// Resume a completed run: start a NEW run in the same session, whose
+    /// conversation is the session's history replayed from the event log —
+    /// every prior run's prompts, assistant messages, tool calls and tool
+    /// results, in order — followed by a continuation instruction. An
     /// `InputReceived` marker event links the new run to the old one.
+    ///
+    /// Everything up to and including the target run is replayed. Later
+    /// runs of the same session are not: resuming run *n* means continuing
+    /// from *n*, and a run started after it is a different branch (see
+    /// [`fork_session`](Self::fork_session) for keeping both).
+    ///
+    /// Runs recorded before event schema v3 have no verbatim assistant/tool
+    /// payloads, so their turns replay from the truncated `completed`
+    /// summary and the resume is logged as degraded. A run with no prompt at
+    /// all (v1) still cannot be resumed.
     pub async fn resume(&self, session_or_run_id: &str) -> Result<RunOutcome, ForgeError> {
         let session_id = match self.sessions.find_run(session_or_run_id)? {
             Some(session) => session,
@@ -1141,7 +1265,7 @@ impl AgentService {
         };
         let run_events: Vec<&Event> = events.iter().filter(|e| e.run_id == target_run).collect();
 
-        let prompt = run_events
+        let task = run_events
             .iter()
             .find_map(|e| match &e.kind {
                 EventKind::RunStarted { prompt, .. } if !prompt.is_empty() => Some(prompt.clone()),
@@ -1153,10 +1277,9 @@ impl AgentService {
                 ))
             })?;
 
-        // Only completed runs resume; the prior final text is the
-        // (truncated) completion summary recorded in the events.
-        let prior_text = match run_events.last().map(|e| &e.kind) {
-            Some(EventKind::Completed { summary }) => summary.clone(),
+        // Only completed runs resume.
+        match run_events.last().map(|e| &e.kind) {
+            Some(EventKind::Completed { .. }) => {}
             Some(EventKind::Error { .. } | EventKind::Cancelled { .. }) => {
                 return Err(ForgeError::agent(format!(
                     "run {target_run} ended without completion; cannot resume"
@@ -1167,17 +1290,36 @@ impl AgentService {
                     "run {target_run} is still in progress or empty; cannot resume"
                 )));
             }
-        };
+        }
+
+        // Replay everything up to the end of the target run.
+        let cut = events
+            .iter()
+            .rposition(|e| e.run_id == target_run)
+            .map_or(events.len(), |i| i + 1);
+        let replay = crate::replay::conversation_from_events(&events[..cut]);
+        let budget = crate::replay::history_budget_chars(&self.model.capabilities());
+        let replayed = replay.messages.len();
+        let history = crate::replay::fit_to_budget(replay.messages, budget);
+        tracing::info!(
+            session = %session_id,
+            run = %target_run,
+            replayed,
+            kept = history.len(),
+            degraded = replay.degraded,
+            "replaying session history for resume"
+        );
 
         self.run_inner(
-            &prompt,
+            RunPlan {
+                prompt: RESUME_PROMPT.to_string(),
+                task,
+                history,
+                resumed_from: Some(target_run),
+            },
             &new_run_id(),
             &session_id,
             None,
-            Some(ResumeSeed {
-                old_run_id: target_run,
-                prior_text,
-            }),
         )
         .await
     }

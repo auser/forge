@@ -4,8 +4,10 @@
 //! store and onto a per-run broadcast channel — `subscribe` is the seam
 //! the server's SSE transport consumes.
 
+pub mod replay;
 mod service;
 mod tools;
 
-pub use service::{AgentService, NullSkillRegistry, ResumeSeed, RunOptions, RunOutcome};
+pub use replay::{Replay, conversation_from_events, fit_to_budget, history_budget_chars};
+pub use service::{AgentService, NullSkillRegistry, RunOptions, RunOutcome};
 pub use tools::{ToolDispatcher, tool_definitions};
