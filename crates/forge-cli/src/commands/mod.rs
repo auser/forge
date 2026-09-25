@@ -1,5 +1,6 @@
 pub mod acp_cmd;
 pub mod auth_cmd;
+pub mod chat_cmd;
 pub mod config_cmd;
 pub mod doctor;
 pub mod graph_cmd;
@@ -63,8 +64,26 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
     let json = ctx.global.json;
 
     match cli.command {
-        Command::Init => init::run(&ctx),
-        Command::Version => {
+        // No subcommand: the interactive chat. Deliberately the same code
+        // path as `forge chat`, so the two can never drift.
+        None => chat_cmd::run(&ctx, chat_cmd::ChatArgs::default()).await,
+        Some(Command::Chat {
+            prompt,
+            continue_session,
+            session,
+        }) => {
+            chat_cmd::run(
+                &ctx,
+                chat_cmd::ChatArgs {
+                    prompt,
+                    continue_session,
+                    session,
+                },
+            )
+            .await
+        }
+        Some(Command::Init) => init::run(&ctx),
+        Some(Command::Version) => {
             let name = "forge";
             let version = env!("CARGO_PKG_VERSION");
             if json {
@@ -77,30 +96,30 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             }
             Ok(())
         }
-        Command::Doctor => doctor::run(&ctx).await,
-        Command::Auth { command } => match command {
+        Some(Command::Doctor) => doctor::run(&ctx).await,
+        Some(Command::Auth { command }) => match command {
             crate::cli::AuthCommand::Status => auth_cmd::status(&ctx),
         },
-        Command::Config { command } => config_cmd::run(&ctx, command),
+        Some(Command::Config { command }) => config_cmd::run(&ctx, command),
 
-        Command::Run { prompt, max_turns } => run_cmd::run(&ctx, prompt, max_turns).await,
-        Command::Resume { id } => session_cmd::resume(&ctx, &id).await,
-        Command::Cancel { id } => session_cmd::cancel(&ctx, &id),
-        Command::Session { command } => match command.unwrap_or(SessionCommand::List) {
+        Some(Command::Run { prompt, max_turns }) => run_cmd::run(&ctx, prompt, max_turns).await,
+        Some(Command::Resume { id }) => session_cmd::resume(&ctx, &id).await,
+        Some(Command::Cancel { id }) => session_cmd::cancel(&ctx, &id),
+        Some(Command::Session { command }) => match command.unwrap_or(SessionCommand::List) {
             SessionCommand::List => session_cmd::list(&ctx),
             SessionCommand::Show { id } => session_cmd::show(&ctx, &id),
             SessionCommand::Fork { id, at } => session_cmd::fork(&ctx, &id, at.as_deref()),
         },
-        Command::Model { command } => model_cmd::run(&ctx, command).await,
-        Command::Router { command } => match command {
+        Some(Command::Model { command }) => model_cmd::run(&ctx, command).await,
+        Some(Command::Router { command }) => match command {
             crate::cli::RouterCommand::Serve { host, port } => {
                 router_cmd::serve(&ctx, host, port).await
             }
         },
-        Command::Graph { command } => graph_cmd::run(&ctx, command).await,
-        Command::Skill { command } => skill_cmd::run(&ctx, command).await,
-        Command::Serve { host, port } => serve_cmd::run(&ctx, host, port).await,
-        Command::Mcp => mcp_cmd::run(&ctx).await,
-        Command::Acp => acp_cmd::run(&ctx).await,
+        Some(Command::Graph { command }) => graph_cmd::run(&ctx, command).await,
+        Some(Command::Skill { command }) => skill_cmd::run(&ctx, command).await,
+        Some(Command::Serve { host, port }) => serve_cmd::run(&ctx, host, port).await,
+        Some(Command::Mcp) => mcp_cmd::run(&ctx).await,
+        Some(Command::Acp) => acp_cmd::run(&ctx).await,
     }
 }

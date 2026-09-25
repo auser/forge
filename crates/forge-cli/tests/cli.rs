@@ -1,5 +1,5 @@
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_MODEL",
@@ -1617,6 +1617,79 @@ fn unknown_provider_errors_do_not_advertise_mocks() {
         "stderr: {stderr}"
     );
     assert!(!stderr.contains("mock"), "stderr advertises mock: {stderr}");
+}
+
+/// A project directory for the chat tests: a real project root, and a
+/// config that names no provider the chat could leak into its banner. The
+/// chat shell never calls a model, so it needs no mock — and `forge()`
+/// leaves `FORGE_TEST_MOCKS=1` set, which is precisely what makes the
+/// "no mock in the banner" assertion below worth making.
+fn scaffold(tmp: &Path) -> PathBuf {
+    let project = tmp.join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "approval = \"prompt\"\n",
+    )
+    .expect("write config");
+    project
+}
+
+#[test]
+fn bare_forge_opens_the_chat_and_exits_at_eof() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path());
+    // stdin is an empty pipe: the chat starts, reads EOF, exits cleanly.
+    let out = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("bare forge runs");
+    assert!(
+        out.status.success(),
+        "bare forge should exit 0, got {:?}",
+        out.status
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("forge "), "banner missing: {stdout}");
+    assert!(
+        stdout.contains("/help"),
+        "banner should point at /help: {stdout}"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("mock"),
+        "no mock may be named: {stdout}"
+    );
+}
+
+#[test]
+fn chat_refuses_json_output() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path());
+    let out = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "chat"])
+        .output()
+        .expect("runs");
+    assert!(!out.status.success(), "--json chat must fail");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing may reach stdout: {:?}",
+        out.stdout
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--json is not supported by the interactive chat"),
+        "{stderr}"
+    );
 }
 
 /// `--help` must not offer the test-only router either.
