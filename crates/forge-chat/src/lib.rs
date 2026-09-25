@@ -14,13 +14,22 @@
 //!   owned data.
 //! * [`render`] — the `Event` → [`Line`] mapping, as a pure function of a
 //!   [`TranscriptState`].
+//! * [`command`] — slash parsing and Tab completion: what a submitted line
+//!   *says*.
+//! * [`controller`] — the input/signal state machine: what may happen now.
+//!   The §6.3 Ctrl-C table lives there, which is why "Ctrl-C cancels the
+//!   turn and does not quit" is a unit test and not a hope.
 //!
 //! Design: `docs/superpowers/specs/2026-09-24-interactive-chat-ui-design.md`.
 
+pub mod command;
+pub mod controller;
 pub mod host;
 pub mod io;
 pub mod render;
 
+pub use command::{APPROVAL_MODES, COMMANDS, Command, Parsed, help_lines};
+pub use controller::{Action, ChatState, Controller, Signal};
 pub use host::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,
