@@ -25,7 +25,7 @@ const KNOWN_PROVIDER_KEYS: &[(&str, Option<&str>)] = &[
     ("MOONSHOT_API_KEY", Some("kimi-k2.7-code")),
     ("OPENAI_API_KEY", None),
     ("ANTHROPIC_API_KEY", None),
-    ("OPENROUTER_API_KEY", None),
+    ("OPENROUTER_API_KEY", Some("anthropic/claude-sonnet-4.5")),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

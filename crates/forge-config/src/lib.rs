@@ -345,6 +345,34 @@ impl Default for Config {
                 max_context: Some(256_000),
                 extra: toml::Table::new(),
             },
+            // OpenRouter brokers many models behind one key and one
+            // OpenAI-compatible endpoint, so a single built-in entry makes
+            // `OPENROUTER_API_KEY` immediately useful the way the DeepSeek and
+            // Moonshot keys already are. Before this, `forge init` detected the
+            // key and unlocked nothing.
+            //
+            // The id is qualified (`anthropic/…`) because that is how OpenRouter
+            // names models on the wire; the prices are OpenRouter's list prices
+            // for it. Treat them as a starting point, not a live feed — see
+            // docs/superpowers/specs/2026-09-25-openrouter-catalogue-design.md
+            // for why the `cheapest` router cannot trust hand-typed figures.
+            ModelEntry {
+                description: Some(
+                    "Claude Sonnet 4.5 via OpenRouter, one key for many models".to_string(),
+                ),
+                cost_input_per_mtok: 3.00,
+                cost_output_per_mtok: 15.00,
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                key_env: Some("OPENROUTER_API_KEY".to_string()),
+                provider: None,
+                max_output_tokens: None,
+                tools: Some(true),
+                streaming: Some(true),
+                structured_output: None,
+                vision: None,
+                max_context: Some(200_000),
+                extra: toml::Table::new(),
+            },
         ];
         Self {
             model: "qwen3-coder".to_string(),
@@ -373,6 +401,7 @@ impl Default for Config {
                 ("claude-sonnet".to_string(), models[2].clone()),
                 ("gpt-5".to_string(), models[3].clone()),
                 ("kimi-k2.7-code".to_string(), models[4].clone()),
+                ("anthropic/claude-sonnet-4.5".to_string(), models[5].clone()),
             ]
             .into_iter()
             .collect(),
