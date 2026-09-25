@@ -762,12 +762,14 @@ dependencies = [
 name = "forge-session"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "forge-core",
  "regex",
  "serde",
  "serde_json",
  "serial_test",
  "tempfile",
+ "tracing",
  "ulid",
 ]
 
