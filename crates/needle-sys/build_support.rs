@@ -245,7 +245,10 @@ fn engine_cache_root(out_dir: &Path) -> PathBuf {
             return PathBuf::from(cargo_home).join("needle-engine");
         }
     }
-    #[allow(deprecated)]
+    // `std::env::home_dir` is the pattern the rest of the repo uses for
+    // `~/.cache/forge` and `~/.config/forge` (see forge-config, forge-needle's
+    // weights.rs); un-deprecated since 1.85 and correct on every platform
+    // forge targets.
     match std::env::home_dir() {
         Some(home) => home.join(".cargo").join("needle-engine"),
         None => out_dir.join("needle-engine"),
@@ -408,10 +411,21 @@ fn ensure_cached_engine(
         });
     }
 
-    std::fs::rename(&part, &final_path).map_err(|e| {
+    if let Err(e) = std::fs::rename(&part, &final_path) {
         let _ = std::fs::remove_file(&part);
-        FetchError::Cache(format!("{} -> {}: {e}", part.display(), final_path.display()))
-    })?;
+        // A concurrent build may have won the race and published the identical
+        // bytes first (and on Windows, `rename` over an existing file fails
+        // outright). The content-addressed path can only hold the pin, so a
+        // destination that already verifies *is* success.
+        let already_there = sha256_file(&final_path).is_ok_and(|actual| actual == engine.sha256);
+        if !already_there {
+            return Err(FetchError::Cache(format!(
+                "{} -> {}: {e}",
+                part.display(),
+                final_path.display()
+            )));
+        }
+    }
     Ok(final_path)
 }
 

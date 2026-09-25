@@ -480,7 +480,7 @@ async fn needle_checks(config: &forge_config::Config) -> Vec<Check> {
 
     let using_hash_backend = std::env::var("FORGE_NEEDLE_BACKEND").as_deref() == Ok("hash");
     let backend = backend_state(using_hash_backend);
-    let weights = weights_state(config, &backend);
+    let weights = weights_state(config, using_hash_backend, backend.usable);
 
     let engine = Check {
         level: if backend.usable && weights.usable {
@@ -566,8 +566,12 @@ fn backend_state(using_hash_backend: bool) -> BackendState {
 /// init`": that binary's `forge init` skips the weights fetch on purpose, so
 /// the hint would be a dead end. It reports the situation instead and leaves
 /// the remedy to the backend half of the pair.
-fn weights_state(config: &forge_config::Config, backend: &BackendState) -> WeightsState {
-    if std::env::var("FORGE_NEEDLE_BACKEND").as_deref() == Ok("hash") {
+fn weights_state(
+    config: &forge_config::Config,
+    using_hash_backend: bool,
+    backend_usable: bool,
+) -> WeightsState {
+    if using_hash_backend {
         return WeightsState {
             usable: true,
             detail: "weights not needed (hash backend)".to_string(),
@@ -595,7 +599,7 @@ fn weights_state(config: &forge_config::Config, backend: &BackendState) -> Weigh
     if !path.is_file() {
         return WeightsState {
             usable: false,
-            detail: if backend.usable {
+            detail: if backend_usable {
                 format!("weights not on disk ({})", path.display())
             } else {
                 // Says *why* they were never fetched without naming `forge
@@ -607,7 +611,7 @@ fn weights_state(config: &forge_config::Config, backend: &BackendState) -> Weigh
                     path.display()
                 )
             },
-            remedy: if backend.usable {
+            remedy: if backend_usable {
                 Some("run `forge init` to fetch them".to_string())
             } else {
                 // The backend half carries the only useful remedy.
