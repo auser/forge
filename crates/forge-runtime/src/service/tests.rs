@@ -175,13 +175,38 @@ async fn cancel_unknown_run_is_typed_error() {
 #[tokio::test]
 async fn subscribers_receive_live_events() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let service = test_service(tmp.path());
-
-    let outcome = service.run("stream me").await.expect("run");
-    let mut rx = service.subscribe(&outcome.run_id);
-    service.cancel(&outcome.run_id).expect("cancel");
+    // A live (parked) run: subscribing mid-run streams its events, and a
+    // cancel reaches the subscriber.
+    let (service, run_id, handle) = parked_service(tmp.path()).await;
+    let mut rx = service.subscribe(&run_id);
+    service.cancel(&run_id).expect("cancel");
     let event = rx.try_recv().expect("broadcast delivered");
     assert!(matches!(event.kind, EventKind::Cancelled { .. }));
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn subscribing_after_a_run_finished_yields_a_closed_stream() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(tmp.path());
+    let outcome = service.run("stream me").await.expect("run");
+
+    // The run is over: there is nothing live to join, and registering a
+    // broadcaster for it would be the leak this replaces. `attach` (or the
+    // session store) is how a finished run is read.
+    let mut rx = service.subscribe(&outcome.run_id);
+    service
+        .cancel(&outcome.run_id)
+        .expect("cancel still records");
+    assert!(rx.try_recv().is_err(), "no live stream for a finished run");
+    assert!(
+        service
+            .events(&outcome.run_id)
+            .expect("events")
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Cancelled { .. })),
+        "the cancellation is still recorded"
+    );
 }
 
 // --- agent loop with the scripted mock ---
@@ -726,6 +751,254 @@ async fn resume_of_a_pre_v3_log_degrades_to_the_recorded_summary() {
         ],
         "an old log replays as well as its data allows"
     );
+}
+
+// --- attach / list_runs / pruning ---------------------------------------
+
+/// Sizes of the three per-run tracking maps.
+fn map_sizes(service: &AgentService) -> (usize, usize, usize) {
+    fn len<T>(map: &Mutex<HashMap<String, T>>) -> usize {
+        map.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+    (
+        len(&service.inputs),
+        len(&service.broadcasters),
+        len(&service.cancel_tokens),
+    )
+}
+
+#[tokio::test]
+async fn tracking_maps_do_not_grow_across_runs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("a"), text_reply("b"), text_reply("c")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    for _ in 0..3 {
+        service.run("ask").await.expect("run");
+    }
+    assert_eq!(
+        map_sizes(&service),
+        (0, 0, 0),
+        "a finished run must leave no tracking entries behind"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_run_is_pruned_too() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = AgentService::new(
+        Arc::new(MockModel::new()),
+        Arc::new(FailingRouter),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(tmp.path().join("sessions"))),
+        Config::default(),
+    );
+    service.run("doomed").await.expect_err("routing fails");
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn send_input_to_a_finished_run_is_a_typed_error_not_a_resurrection() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+
+    let err = service
+        .send_input(&run.run_id, "y")
+        .expect_err("a finished run takes no input");
+    assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+    assert!(err.to_string().contains("completed"), "got: {err}");
+    assert_eq!(
+        map_sizes(&service),
+        (0, 0, 0),
+        "the refusal must not recreate the run's channels"
+    );
+}
+
+#[tokio::test]
+async fn subscribing_to_a_finished_run_does_not_grow_the_maps() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+    for _ in 0..5 {
+        let mut rx = service.subscribe(&run.run_id);
+        assert!(rx.try_recv().is_err(), "a finished run has no live events");
+    }
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn attach_serves_a_terminal_runs_full_backlog() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+
+    let mut attachment = service.attach(&run.run_id).expect("attach");
+    assert_eq!(attachment.state, forge_core::RunState::Completed);
+    assert_eq!(attachment.session_id.as_deref(), Some(&*run.session_id));
+    assert_eq!(
+        attachment.backlog.len(),
+        run.events.len(),
+        "the backlog is the whole run"
+    );
+    assert!(!attachment.is_live());
+    assert!(attachment.recv().await.is_none());
+    assert_eq!(map_sizes(&service), (0, 0, 0), "attach must not leak");
+}
+
+#[tokio::test]
+async fn attach_on_an_unknown_run_is_a_typed_error_and_leaks_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(tmp.path());
+    let err = service.attach("no-such-run").expect_err("unknown");
+    assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+    assert_eq!(map_sizes(&service), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_late_attach_gets_the_backlog_and_the_live_tail_without_gap_or_duplicate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // A run that parks on an approval: it is live and has a backlog, which
+    // is exactly the state a UI attaches to.
+    let (service, run_id, handle) = parked_service(tmp.path()).await;
+
+    let mut attachment = service.attach(&run_id).expect("attach mid-run");
+    assert!(attachment.is_live(), "a live run must stream");
+    assert_eq!(
+        attachment.state,
+        forge_core::RunState::WaitingForApproval,
+        "a run parked on an approval is waiting, not running"
+    );
+    assert!(!attachment.backlog.is_empty());
+    let backlog_seqs: Vec<u64> = attachment.backlog.iter().map(|e| e.seq).collect();
+    assert_eq!(
+        backlog_seqs,
+        (1..=backlog_seqs.len() as u64).collect::<Vec<_>>(),
+        "the backlog itself is a gapless prefix"
+    );
+
+    // Unblock the run and drain the live tail.
+    service.send_input(&run_id, "y").expect("approve");
+    let mut live_seqs = Vec::new();
+    while let Some(event) = attachment.recv().await {
+        live_seqs.push(event.seq);
+        if event.kind.is_terminal() {
+            break;
+        }
+    }
+    handle.await.expect("join").expect("run completes");
+
+    // Backlog then live = every seq exactly once, in order.
+    let mut all = backlog_seqs.clone();
+    all.extend(&live_seqs);
+    assert_eq!(
+        all,
+        (1..=all.len() as u64).collect::<Vec<_>>(),
+        "backlog {backlog_seqs:?} + live {live_seqs:?} must be gapless and duplicate-free"
+    );
+    // And it matches what the store holds.
+    let stored: Vec<u64> = service
+        .events(&run_id)
+        .expect("events")
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(all, stored);
+}
+
+#[tokio::test]
+async fn list_runs_reports_live_runs_first_and_bounds_terminal_ones() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        (0..LISTED_TERMINAL_RUNS + 5)
+            .map(|i| text_reply(&format!("answer {i}")))
+            .collect(),
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let mut finished = Vec::new();
+    for i in 0..LISTED_TERMINAL_RUNS + 5 {
+        finished.push(service.run(&format!("ask {i}")).await.expect("run").run_id);
+    }
+
+    let listed = service.list_runs().expect("list");
+    assert_eq!(
+        listed.len(),
+        LISTED_TERMINAL_RUNS,
+        "terminal runs are bounded"
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|s| s.state == forge_core::RunState::Completed),
+        "{listed:?}"
+    );
+    // The most recent ones survived.
+    let newest = finished.last().expect("a run");
+    assert!(listed.iter().any(|s| &s.run_id == newest), "{listed:?}");
+    let oldest = finished.first().expect("a run");
+    assert!(!listed.iter().any(|s| &s.run_id == oldest), "{listed:?}");
+    // Shape.
+    let summary = listed.first().expect("a summary");
+    assert!(summary.session_id.is_some());
+    assert!(summary.started_at.is_some());
+    assert!(summary.last_seq > 0);
+}
+
+#[tokio::test]
+async fn list_runs_never_hides_a_live_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, run_id, handle) = parked_service(tmp.path()).await;
+
+    let listed = service.list_runs().expect("list");
+    let parked = listed
+        .iter()
+        .find(|s| s.run_id == run_id)
+        .unwrap_or_else(|| panic!("the parked run must be listed: {listed:?}"));
+    assert_eq!(parked.state, forge_core::RunState::WaitingForApproval);
+
+    service.send_input(&run_id, "n").expect("deny");
+    handle.await.expect("join").expect("run completes");
+    let listed = service.list_runs().expect("list again");
+    assert_eq!(
+        listed.iter().find(|s| s.run_id == run_id).map(|s| s.state),
+        Some(forge_core::RunState::Completed)
+    );
+}
+
+#[tokio::test]
+async fn list_runs_ignores_a_fork_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let run = service.run("ask").await.expect("run");
+    service.fork_session(&run.session_id, None).expect("fork");
+
+    let listed = service.list_runs().expect("list");
+    assert_eq!(
+        listed.len(),
+        2,
+        "the original run and its copy in the fork — not the marker: {listed:?}"
+    );
+    assert!(listed.iter().all(|s| s.last_seq > 0), "{listed:?}");
 }
 
 // --- fork ---------------------------------------------------------------

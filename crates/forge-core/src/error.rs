@@ -38,9 +38,17 @@ pub enum ForgeError {
         risk: crate::execution::RiskLevel,
     },
 
-    /// Agent-loop-level failure (budget exhaustion, cancellation).
+    /// Agent-loop-level failure (budget exhaustion, tool dispatch).
     #[error("agent error: {0}")]
     Agent(String),
+
+    /// The run was cancelled — `forge cancel`, the in-process token, or the
+    /// cross-process marker file. Its own variant so adapters can classify
+    /// a cancellation from the type instead of the message (see
+    /// [`crate::run::RunState::of_error`]); the Display text still says
+    /// "cancelled" for the log and for callers that only have a string.
+    #[error("run cancelled: {0}")]
+    Cancelled(String),
 
     /// Returned by commands or backends that exist in the interface but are
     /// scheduled for a later phase.
@@ -83,6 +91,10 @@ impl ForgeError {
 
     pub fn agent(message: impl Into<String>) -> Self {
         Self::Agent(message.into())
+    }
+
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::Cancelled(message.into())
     }
 
     pub fn not_implemented(what: impl Into<String>) -> Self {

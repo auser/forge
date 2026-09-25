@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use forge_core::{Event, EventKind};
+use forge_core::{Event, EventKind, RunState};
 use serde_json::Value;
 
 use crate::protocol::{
@@ -661,6 +661,44 @@ pub enum TurnEnd {
     Failed(RpcError),
 }
 
+/// Why a run produced no text, classified.
+///
+/// The `state` is the load-bearing part: the driver builds it from the
+/// run's typed `ForgeError` ([`RunState::of_error`]), so the turn's stop
+/// reason no longer depends on how an error happens to print. `message` is
+/// carried along for the JSON-RPC error a genuine failure becomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunFailure {
+    pub state: RunState,
+    pub message: String,
+}
+
+impl RunFailure {
+    pub fn new(state: RunState, message: impl Into<String>) -> Self {
+        Self {
+            state,
+            message: message.into(),
+        }
+    }
+}
+
+/// For the one caller with no typed error to read: a run whose tokio task
+/// died, where all that survives is text (see `server.rs::settle`).
+impl From<String> for RunFailure {
+    fn from(message: String) -> Self {
+        Self {
+            state: RunState::of_message(&message),
+            message,
+        }
+    }
+}
+
+impl From<&str> for RunFailure {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
 /// Decide the turn's ending from the run's result.
 ///
 /// `cancel_seen` is set when this session was cancelled (a `session/cancel`
@@ -668,21 +706,33 @@ pub enum TurnEnd {
 /// whatever the loop returned, because the spec requires `cancelled` to be
 /// the stop reason after a `session/cancel` "even if the cancellation
 /// causes exceptions in underlying operations".
-pub fn turn_end(result: Result<String, String>, cancel_seen: bool) -> TurnEnd {
+pub fn turn_end(result: Result<String, RunFailure>, cancel_seen: bool) -> TurnEnd {
     if cancel_seen {
         return TurnEnd::Stop(StopReason::Cancelled);
     }
-    match result {
-        Ok(_) => TurnEnd::Stop(StopReason::EndTurn),
-        Err(message) if message.contains("cancelled") => TurnEnd::Stop(StopReason::Cancelled),
-        // `ApprovalRequired` escaped the loop: nobody answered the
-        // permission request, so the risky operation did not happen and
-        // the turn stopped short. That is a refusal, not a crash.
-        Err(message) if message.contains("approval required") => {
-            tracing::info!(%message, "turn stopped on an unanswered approval");
+    let failure = match result {
+        Ok(_) => return TurnEnd::Stop(StopReason::EndTurn),
+        Err(failure) => failure,
+    };
+    match failure.state {
+        RunState::Cancelled => TurnEnd::Stop(StopReason::Cancelled),
+        // Approval was required and nobody could answer, so the risky
+        // operation did not happen and the turn stopped short. That is a
+        // refusal, not a crash.
+        RunState::AwaitingApproval => {
+            tracing::info!(
+                message = %failure.message,
+                "turn stopped on an unanswered approval"
+            );
             TurnEnd::Stop(StopReason::Refusal)
         }
-        Err(message) => TurnEnd::Failed(RpcError::internal(message)),
+        // `Completed`/`Running`/`WaitingForApproval` cannot reach here — a
+        // run that ends without text ended badly — and are reported as the
+        // failures they would be.
+        RunState::Completed
+        | RunState::Running
+        | RunState::WaitingForApproval
+        | RunState::Failed => TurnEnd::Failed(RpcError::internal(failure.message)),
     }
 }
 

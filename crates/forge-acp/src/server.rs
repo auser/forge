@@ -524,7 +524,7 @@ impl ForgeAcpServer {
         tracing::info!(session = session_id, run = %run_id, root = %session.root.display(), "turn started");
 
         let mut state = dispatch::TurnState::for_run(run_id, &session.root);
-        let run_result: Result<String, String> = loop {
+        let run_result: Result<String, dispatch::RunFailure> = loop {
             tokio::select! {
                 received = events.recv() => match received {
                     Ok(event) => {
@@ -772,19 +772,34 @@ impl ForgeAcpServer {
 /// Await a run's task handle.
 async fn join(
     handle: &mut tokio::task::JoinHandle<Result<forge_runtime::RunOutcome, ForgeError>>,
-) -> Result<String, String> {
+) -> Result<String, dispatch::RunFailure> {
     settle(handle.await)
 }
 
-/// Reduce a joined run to "final text" or "why it failed".
+/// Reduce a joined run to "final text" or a classified failure.
+///
+/// The classification is typed: a `ForgeError` is read through
+/// [`RunState::of_error`], and an aborted task is a cancellation because
+/// `JoinError::is_cancelled` says so. Only the last arm — a task that
+/// *panicked* — has nothing but text to offer, and it is a failure either
+/// way.
 fn settle(
     joined: Result<Result<forge_runtime::RunOutcome, ForgeError>, tokio::task::JoinError>,
-) -> Result<String, String> {
+) -> Result<String, dispatch::RunFailure> {
     match joined {
         Ok(Ok(outcome)) => Ok(outcome.text),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(e) if e.is_cancelled() => Err("run cancelled".to_string()),
-        Err(e) => Err(format!("run task did not finish: {e}")),
+        Ok(Err(e)) => Err(dispatch::RunFailure::new(
+            forge_core::RunState::of_error(&e),
+            e.to_string(),
+        )),
+        Err(e) if e.is_cancelled() => Err(dispatch::RunFailure::new(
+            forge_core::RunState::Cancelled,
+            "run cancelled",
+        )),
+        Err(e) => Err(dispatch::RunFailure::new(
+            forge_core::RunState::Failed,
+            format!("run task did not finish: {e}"),
+        )),
     }
 }
 

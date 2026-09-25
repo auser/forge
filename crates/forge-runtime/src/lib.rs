@@ -9,5 +9,7 @@ mod service;
 mod tools;
 
 pub use replay::{Replay, conversation_from_events, fit_to_budget, history_budget_chars};
-pub use service::{AgentService, ForkOutcome, NullSkillRegistry, RunOptions, RunOutcome};
+pub use service::{
+    AgentService, Attachment, ForkOutcome, NullSkillRegistry, RunOptions, RunOutcome, RunSummary,
+};
 pub use tools::{ToolDispatcher, tool_definitions};

@@ -300,6 +300,20 @@ window. The log is therefore not just a trace: it is the only place the
 conversation lives between runs, which is why the v3 replay events are written
 even though no adapter displays them.
 
+`forge session fork` branches a session by copying its log prefix, so two
+conversations can continue from one shared past without either being able to
+disturb the other.
+
+Every run's in-memory tracking — input channel, broadcast sender,
+cancellation token — is keyed by run id and **pruned when the run reaches a
+terminal state** (`AgentService::finish_run`), with a bounded tombstone so a
+pruned run is still recognisably finished. What a caller can still want about
+a finished run comes from the session store instead: `attach(run_id)` returns
+its whole backlog, and a live run additionally gets a gap-free, duplicate-free
+stream (subscribe first, read the log second, filter the overlap by `seq`).
+`RunState` in `forge-core` is the one typed discriminant the ACP and MCP
+adapters classify a run's ending by.
+
 ## Failure ladder (what never breaks)
 
 | Missing / failing            | Behavior                                            |

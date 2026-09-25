@@ -6,6 +6,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 forge-config.workspace = true
 forge-core.workspace = true
 forge-needle.workspace = true

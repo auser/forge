@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use forge_config::Config;
 use forge_core::{
     CompletionRequest, DecisionRouter, Event, EventKind, ExecutionProvider, ForgeError, Message,
-    ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, SessionStore, Skill, SkillMeta,
-    SkillRegistry, ToolCall, ToolResult,
+    ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, RunState, SessionStore, Skill,
+    SkillMeta, SkillRegistry, ToolCall, ToolResult,
 };
 use forge_needle::NeedleEngine;
 use forge_session::{JsonlSessionStore, new_run_id, new_session_id};
@@ -133,6 +134,112 @@ impl RunPlan {
 /// context and this is the nudge that makes the model act on it.
 const RESUME_PROMPT: &str = "Continue the work in the conversation above.";
 
+/// One run, as [`AgentService::list_runs`] reports it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunSummary {
+    pub run_id: String,
+    /// `None` for a run this process started that has not written its first
+    /// event yet.
+    pub session_id: Option<String>,
+    pub state: RunState,
+    pub started_at: Option<DateTime<Utc>>,
+    pub last_event_at: Option<DateTime<Utc>>,
+    /// Highest `seq` recorded for the run (0 when it has no events).
+    pub last_seq: u64,
+}
+
+/// A coherent view of one run: everything recorded so far, plus everything
+/// from now on, with no gap and no duplicate.
+///
+/// Returned by [`AgentService::attach`]. `backlog` is the run's events at
+/// the moment of attaching; [`recv`](Self::recv) yields the ones that come
+/// after, skipping any the backlog already contained.
+#[derive(Debug)]
+pub struct Attachment {
+    pub run_id: String,
+    pub session_id: Option<String>,
+    pub backlog: Vec<Event>,
+    /// The run's state as of the backlog.
+    pub state: RunState,
+    /// `None` when no further events can arrive in this process: the run is
+    /// terminal, or it belongs to another process (whose events reach this
+    /// one only through the store).
+    live: Option<broadcast::Receiver<Event>>,
+    last_seq: u64,
+}
+
+impl Attachment {
+    /// The next live event after the backlog, or `None` once no more can
+    /// arrive.
+    ///
+    /// Events already present in the backlog are skipped by `seq`, which is
+    /// what makes "subscribe, then read the log" gap-free *and*
+    /// duplicate-free: subscribing first means nothing appended in between
+    /// is missed, and the `seq` filter means nothing is delivered twice.
+    pub async fn recv(&mut self) -> Option<Event> {
+        let live = self.live.as_mut()?;
+        loop {
+            match live.recv().await {
+                // Already in the backlog. (`seq` 0 means a v1 event, which
+                // cannot be compared — deliver it and let the caller see
+                // it; live events are always store-assigned anyway.)
+                Ok(event) if event.seq != 0 && event.seq <= self.last_seq => continue,
+                Ok(event) => {
+                    self.last_seq = self.last_seq.max(event.seq);
+                    return Some(event);
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::warn!(
+                        run = %self.run_id,
+                        missed,
+                        "attached event stream lagged; read the session log for the gap"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// True when this attachment can still deliver live events.
+    pub fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+}
+
+/// How many terminal runs stay recognisable in memory after their tracking
+/// entries are pruned. Past this the oldest are forgotten and the session
+/// store answers instead — which it always can.
+const REMEMBERED_TERMINAL_RUNS: usize = 256;
+
+/// How many terminal runs [`AgentService::list_runs`] reports. Live runs are
+/// never dropped; a long-lived session directory must not turn `list_runs`
+/// into an unbounded response.
+const LISTED_TERMINAL_RUNS: usize = 20;
+
+/// Bounded record of runs this process finished, so a run whose tracking
+/// entries were pruned is still distinguishable from one never heard of.
+#[derive(Default)]
+struct FinishedRuns {
+    states: HashMap<String, RunState>,
+    order: VecDeque<String>,
+}
+
+impl FinishedRuns {
+    fn record(&mut self, run_id: &str, state: RunState) {
+        if self.states.insert(run_id.to_string(), state).is_none() {
+            self.order.push_back(run_id.to_string());
+        }
+        while self.order.len() > REMEMBERED_TERMINAL_RUNS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.states.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 /// Input channel state for a run. `Closed` is a tombstone: closing before
 /// the run starts (e.g. stdin already at EOF) must still close the
 /// receiver the loop will take, so approval waits fail instead of hanging.
@@ -175,9 +282,14 @@ pub struct AgentService {
     /// On-device brain for the direct-dispatch fast path. `None` (the
     /// default) means every run goes through the model loop.
     needle: Option<Arc<NeedleEngine>>,
+    /// Per-run tracking, pruned when a run reaches a terminal state (see
+    /// [`AgentService::finish_run`]).
     broadcasters: Mutex<HashMap<String, broadcast::Sender<Event>>>,
     inputs: Mutex<HashMap<String, InputState>>,
     cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
+    /// Bounded tombstones for pruned runs, so `send_input` can refuse a
+    /// finished run instead of resurrecting its channel.
+    finished: Mutex<FinishedRuns>,
 }
 
 impl AgentService {
@@ -202,6 +314,7 @@ impl AgentService {
             broadcasters: Mutex::new(HashMap::new()),
             inputs: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
+            finished: Mutex::new(FinishedRuns::default()),
         }
     }
 
@@ -258,10 +371,87 @@ impl AgentService {
             .clone()
     }
 
+    /// A run's broadcaster if one exists, without creating it. Callers that
+    /// only want to *publish to whoever is listening* use this: creating a
+    /// channel for a run nobody is running is how the map used to grow.
+    fn existing_broadcaster(&self, run_id: &str) -> Option<broadcast::Sender<Event>> {
+        self.broadcasters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+            .cloned()
+    }
+
     /// Subscribe to the live event stream of a run. This is the
     /// transport-neutral seam the server's SSE endpoint consumes.
+    ///
+    /// For a run already known to be terminal this hands back an
+    /// immediately-closed receiver rather than registering a broadcaster
+    /// nothing will ever publish to — the caller's own replay of the stored
+    /// events is the complete answer for such a run (and see
+    /// [`attach`](Self::attach) for that backlog in one call).
     pub fn subscribe(&self, run_id: &str) -> broadcast::Receiver<Event> {
+        if self.terminal_state(run_id).is_some() {
+            let (sender, receiver) = broadcast::channel(1);
+            drop(sender);
+            return receiver;
+        }
         self.broadcaster(run_id).subscribe()
+    }
+
+    /// Terminal state of a run, if it is known to have one: this process's
+    /// tombstones first, then the session store (which also covers runs
+    /// started by another process).
+    fn terminal_state(&self, run_id: &str) -> Option<RunState> {
+        if let Some(state) = self
+            .finished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .states
+            .get(run_id)
+            .copied()
+        {
+            return Some(state);
+        }
+        let events = self.events(run_id).ok()?;
+        if events.is_empty() {
+            return None;
+        }
+        let state = RunState::of_events(&events);
+        state.is_terminal().then_some(state)
+    }
+
+    /// A run reached a terminal state: drop its in-memory tracking.
+    ///
+    /// `inputs`, `broadcasters` and `cancel_tokens` are keyed by run id and
+    /// nothing ever removed them, so a long-lived process (`forge serve`,
+    /// `forge mcp`, `forge acp`) grew by three entries per run, forever.
+    /// Pruning is safe because everything still wanted about a finished run
+    /// lives in the session store: [`attach`](Self::attach) serves its
+    /// backlog from there, and the bounded tombstone remembers *that* it
+    /// finished so [`send_input`](Self::send_input) can refuse it.
+    ///
+    /// Called *after* the terminal event is emitted, so subscribers still
+    /// receive it: dropping the map's sender clone leaves already-buffered
+    /// events readable, and receivers only see `Closed` afterwards.
+    fn finish_run(&self, run_id: &str, state: RunState) {
+        self.finished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(run_id, state);
+        self.inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run_id);
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run_id);
+        self.broadcasters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run_id);
+        tracing::debug!(run_id, state = state.as_str(), "run tracking pruned");
     }
 
     /// Per-run input channel sender (created on demand). Used by
@@ -308,7 +498,18 @@ impl AgentService {
 
     /// Deliver user input to a run and record an `InputReceived` event
     /// (when the run is already persisted).
+    ///
+    /// A run that has already finished is a typed error, not a silent
+    /// no-op: before pruning existed, this created a fresh input channel for
+    /// a dead run id — leaking an entry and swallowing the message into a
+    /// queue with no reader.
     pub fn send_input(&self, run_id: &str, message: impl Into<String>) -> Result<(), ForgeError> {
+        if let Some(state) = self.terminal_state(run_id) {
+            return Err(ForgeError::session(format!(
+                "run {run_id} is {}; not accepting input",
+                state.as_str()
+            )));
+        }
         let message = message.into();
         let sender = self.input_sender(run_id)?;
         if let Ok(Some(session)) = self.sessions.find_run(run_id) {
@@ -319,11 +520,155 @@ impl AgentService {
                     message: message.clone(),
                 },
             ))?;
-            let _ = self.broadcaster(run_id).send(stored);
+            if let Some(broadcaster) = self.existing_broadcaster(run_id) {
+                let _ = broadcaster.send(stored);
+            }
         }
         sender
             .try_send(message)
             .map_err(|e| ForgeError::session(format!("input queue for run {run_id} is full: {e}")))
+    }
+
+    /// Attach to a run: its events so far *and* the ones still to come, in
+    /// one call, with no gap and no duplicate.
+    ///
+    /// This is the primitive a UI uses to join a run late — after the ids
+    /// were handed out, after a reattach, after a restart. The ordering is
+    /// the whole point: for a run this process is running, the live
+    /// subscription is taken *before* the stored backlog is read, so an
+    /// event appended in between arrives on the channel rather than falling
+    /// between the two reads; [`Attachment::recv`] then drops anything the
+    /// backlog already contained, by `seq`.
+    ///
+    /// A terminal run attaches to its backlog with no live stream. A run
+    /// owned by *another* process attaches to its stored backlog and a live
+    /// stream that will stay silent — that process's events reach this one
+    /// only through the store, which is the documented limit of in-process
+    /// attach.
+    pub fn attach(&self, run_id: &str) -> Result<Attachment, ForgeError> {
+        let terminal = self.terminal_state(run_id);
+        let tracked = self
+            .broadcasters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(run_id);
+
+        // Subscribe first, but only for a run we already track — attaching
+        // must never create a broadcaster for an id that turns out to be
+        // unknown.
+        let live = match (&terminal, tracked) {
+            (None, true) => Some(self.broadcaster(run_id).subscribe()),
+            _ => None,
+        };
+
+        let session_id = self.sessions.find_run(run_id)?;
+        let backlog: Vec<Event> = match &session_id {
+            Some(session) => self
+                .sessions
+                .events_for(session)?
+                .into_iter()
+                .filter(|e| e.run_id == run_id)
+                .collect(),
+            None => Vec::new(),
+        };
+        if backlog.is_empty() && terminal.is_none() && !tracked {
+            return Err(ForgeError::session(format!("unknown run: {run_id}")));
+        }
+
+        let state = terminal.unwrap_or_else(|| RunState::of_events(&backlog));
+        let last_seq = backlog.iter().map(|e| e.seq).max().unwrap_or(0);
+        Ok(Attachment {
+            run_id: run_id.to_string(),
+            session_id,
+            backlog,
+            state,
+            live,
+            last_seq,
+        })
+    }
+
+    /// Runs worth showing: every live one, plus the most recent
+    /// [`LISTED_TERMINAL_RUNS`] that have finished. Newest activity first.
+    ///
+    /// Live runs are never dropped from the list — a run you could still
+    /// talk to must not be hidden by a busy history — while terminal ones
+    /// are bounded, because a long-lived project accumulates them without
+    /// limit.
+    pub fn list_runs(&self) -> Result<Vec<RunSummary>, ForgeError> {
+        let mut summaries: Vec<RunSummary> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for info in self.sessions.list_sessions()? {
+            let events = self.sessions.events_for(&info.session_id)?;
+            let mut runs: Vec<String> = Vec::new();
+            for event in &events {
+                if !runs.contains(&event.run_id) {
+                    runs.push(event.run_id.clone());
+                }
+            }
+            for run_id in runs {
+                let own: Vec<&Event> = events.iter().filter(|e| e.run_id == run_id).collect();
+                // A fork marker is provenance, not a run.
+                if own
+                    .iter()
+                    .all(|e| matches!(e.kind, EventKind::SessionForked { .. }))
+                {
+                    continue;
+                }
+                let state = self
+                    .finished
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .states
+                    .get(&run_id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        RunState::of_events(
+                            &own.iter().map(|e| (*e).clone()).collect::<Vec<Event>>(),
+                        )
+                    });
+                seen.insert(run_id.clone());
+                summaries.push(RunSummary {
+                    run_id,
+                    session_id: Some(info.session_id.clone()),
+                    state,
+                    started_at: own.first().map(|e| e.ts),
+                    last_event_at: own.last().map(|e| e.ts),
+                    last_seq: own.iter().map(|e| e.seq).max().unwrap_or(0),
+                });
+            }
+        }
+
+        // Runs this process started that have not written an event yet.
+        let tracked: Vec<String> = self
+            .broadcasters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for run_id in tracked {
+            if seen.contains(&run_id) {
+                continue;
+            }
+            summaries.push(RunSummary {
+                run_id,
+                session_id: None,
+                state: RunState::Running,
+                started_at: None,
+                last_event_at: None,
+                last_seq: 0,
+            });
+        }
+
+        // Newest activity first; a run with no events yet is the newest
+        // thing there is.
+        summaries.sort_by_key(|s| std::cmp::Reverse(s.last_event_at));
+        let (live, terminal): (Vec<RunSummary>, Vec<RunSummary>) =
+            summaries.into_iter().partition(|s| !s.state.is_terminal());
+        let mut out = live;
+        out.extend(terminal.into_iter().take(LISTED_TERMINAL_RUNS));
+        Ok(out)
     }
 
     /// Close a run's input channel. The loop treats a closed channel
@@ -429,13 +774,29 @@ impl AgentService {
     ) -> Result<RunOutcome, ForgeError> {
         let run_id = options.run_id.unwrap_or_else(new_run_id);
         let session_id = options.session_id.unwrap_or_else(new_session_id);
-        self.run_inner(
+        self.run_tracked(
             RunPlan::fresh(prompt),
             &run_id,
             &session_id,
             options.max_turns,
         )
         .await
+    }
+
+    /// [`run_inner`](Self::run_inner) plus the bookkeeping every run owes:
+    /// whatever it returns, its tracking entries are pruned and its outcome
+    /// recorded. The classification is typed — [`RunState::of_result`] reads
+    /// the error's variant, never its message.
+    async fn run_tracked(
+        &self,
+        plan: RunPlan,
+        run_id: &str,
+        session_id: &str,
+        max_turns: Option<u32>,
+    ) -> Result<RunOutcome, ForgeError> {
+        let result = self.run_inner(plan, run_id, session_id, max_turns).await;
+        self.finish_run(run_id, RunState::of_result(&result));
+        result
     }
 
     /// Start a run on a tokio task without blocking the caller. Returns
@@ -483,7 +844,7 @@ impl AgentService {
         let max_turns = options.max_turns;
         let handle = tokio::spawn(async move {
             service
-                .run_inner(RunPlan::fresh(prompt), &rid, &sid, max_turns)
+                .run_tracked(RunPlan::fresh(prompt), &rid, &sid, max_turns)
                 .await
         });
         (run_id, session_id, handle)
@@ -959,7 +1320,7 @@ impl AgentService {
             }
             if self.cancel_requested(&run_id) {
                 // cancel() already recorded the Cancelled event.
-                return Err(ForgeError::agent("run cancelled"));
+                return Err(ForgeError::cancelled("cancellation requested"));
             }
 
             let request = CompletionRequest::new(selected.clone(), messages.clone())
@@ -987,7 +1348,7 @@ impl AgentService {
 
             for call in &response.tool_calls {
                 if self.cancel_requested(&run_id) {
-                    return Err(ForgeError::agent("run cancelled"));
+                    return Err(ForgeError::cancelled("cancellation requested"));
                 }
                 tool_call_count += 1;
                 let args_summary: String = call.arguments.to_string().chars().take(120).collect();
@@ -1191,11 +1552,11 @@ impl AgentService {
                     }
                 }
                 () = token.cancelled() => {
-                    return Err(ForgeError::agent("run cancelled"));
+                    return Err(ForgeError::cancelled("cancellation requested"));
                 }
                 _ = ticker.tick() => {
                     if self.cancel_marker(run_id).exists() {
-                        return Err(ForgeError::agent("run cancelled"));
+                        return Err(ForgeError::cancelled("cancellation requested"));
                     }
                 }
             }
@@ -1236,7 +1597,16 @@ impl AgentService {
                 reason: "cancelled by user".to_string(),
             },
         ))?;
-        let _ = self.broadcaster(run_or_session_id).send(stored);
+        // Publish to whoever is listening; never register a broadcaster for
+        // a run that is not (or no longer) live.
+        if let Some(broadcaster) = self.existing_broadcaster(run_or_session_id) {
+            let _ = broadcaster.send(stored);
+        }
+        // Pruning is deliberately left to the run itself: a live loop is
+        // still polling the token this cancel just fired, and taking it out
+        // from under it would leave only the marker file to notice. A run
+        // that is not live here has nothing to prune — `cancel` creates no
+        // tracking entries.
         Ok(())
     }
 
@@ -1329,7 +1699,7 @@ impl AgentService {
             "replaying session history for resume"
         );
 
-        self.run_inner(
+        self.run_tracked(
             RunPlan {
                 prompt: RESUME_PROMPT.to_string(),
                 task,

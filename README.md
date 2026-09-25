@@ -927,6 +927,30 @@ gain is that no session can be broken by anything happening to another.
   then resolves to the older session (the source); name the fork's *session*
   id to continue the fork.
 
+### Attaching to a run
+
+`AgentService` exposes the runtime primitives an interactive front end needs
+(no CLI surface yet — Phase B):
+
+* `attach(run_id)` — a run's events so far **and** the ones still to come,
+  in one call. The live subscription is taken before the stored backlog is
+  read and the overlap is removed by `seq`, so joining late loses nothing and
+  sees nothing twice. A finished run attaches to its backlog alone.
+* `list_runs()` — every live run (`running` / `waiting_for_approval`) plus
+  the 20 most recent finished ones, newest activity first.
+* `RunState` (in `forge-core`) is the typed discriminant the ACP and MCP
+  adapters classify by, instead of matching error text:
+  `running`, `waiting_for_approval`, `completed`, `cancelled`,
+  `awaiting_approval` (the loop stopped because a risky operation needed an
+  answer that could not arrive), `failed`.
+
+Per-run tracking (input channels, broadcast senders, cancellation tokens) is
+now pruned when a run reaches a terminal state, so a long-lived `forge
+serve` / `forge mcp` / `forge acp` no longer grows by three map entries per
+run. `send_input` to a finished run is a typed error rather than a silently
+recreated channel; `attach` still serves that run's whole history from the
+session store.
+
 ### What `forge resume` actually sends
 
 `forge resume <id>` rebuilds the model's `messages` from the event log —
@@ -1119,6 +1143,12 @@ go in `specs/adrs/`.
   terminal-first eviction); the session store persists across restarts.
 - Input delivery is in-process: `POST /v1/runs/:id/input` for a run owned by
   another process records the event but that loop does not consume it.
+- Background runs are in-process only: `attach`/`list_runs` see the live
+  events of runs *this* process started. A run in another process attaches to
+  its stored history, but its live events reach you only as the session log
+  grows — there is no cross-process detach/reattach (no daemon, no socket).
+- `forge session fork` copies a prefix, so a run id can exist in more than
+  one session; `resume <run-id>` picks the older one.
 - The needle direct-dispatch fast path is read-only by design (`read_file`,
   `graph_context`, `graph_grep` only); writes, edits, deletes, and commands
   always go through the full agent loop and its approval gating.

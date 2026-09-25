@@ -9,6 +9,7 @@ pub mod graph;
 pub mod model;
 pub mod project;
 pub mod router;
+pub mod run;
 pub mod session;
 pub mod skill;
 pub mod tool;
@@ -25,6 +26,7 @@ pub use model::{
 };
 pub use project::find_project_root;
 pub use router::{Capability, DecisionRouter, RoutingDecision, RoutingRequest};
+pub use run::RunState;
 pub use session::SessionStore;
 pub use skill::{Skill, SkillMeta, SkillRegistry};
 pub use tool::{ToolCall, ToolDefinition, ToolResult};

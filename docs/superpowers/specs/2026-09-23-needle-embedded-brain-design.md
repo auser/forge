@@ -109,6 +109,38 @@ Each sub-project gets its own spec → plan → implementation cycle:
    its own design (TUI framework, streaming render, keybindings,
    approval UX, fork/background semantics).
 
+   **Phase A (session substrate): implemented** (sub-project 6a, branch
+   `tui-substrate`). The runtime half of the table stakes is done, with
+   no UI:
+
+   - **Full conversation replay on resume.** Event schema v3 adds the
+     verbatim replay kinds `assistant_message`, `tool_result` and
+     `session_forked` (additively — v1/v2 logs stay readable), and
+     `forge-runtime::replay` rebuilds the model's `messages` from a
+     session's log across every prior run, fitted to a budget derived
+     from the model's `max_context`. The v0.3 "resume seeds a truncated
+     summary" limitation is gone.
+   - **Fork.** `AgentService::fork_session` + `forge session fork <id>
+     [--at <position|run-id>]`: a prefix copy into a new session with a
+     `session_forked` provenance marker, snapped to a run boundary, the
+     source never touched.
+   - **Background/attach primitives.** `attach(run_id)` (backlog + live
+     stream, gap-free and duplicate-free by `seq`) and `list_runs()`
+     (live runs plus a bounded tail of finished ones). Cross-process
+     detach/reattach remains out of scope and is recorded as a known
+     limitation.
+   - **Ledgered leak closed.** The never-pruned
+     `inputs`/`broadcasters`/`cancel_tokens` maps are pruned on terminal
+     state; `send_input` to a finished run is a typed error instead of
+     resurrecting its channel.
+   - **Typed run-outcome discriminant.** `forge_core::RunState` replaces
+     ACP's `message.contains("cancelled")` turn-end classification and
+     MCP's `&'static str` status hops; `ForgeError::Cancelled` makes
+     cancellation readable from the type. Both adapters' existing test
+     suites pass unmodified.
+
+   Phase B (the interactive UI itself) still needs its own design.
+
 Parallel track (in progress on main): **cloud subscription support** —
 credential detection for Claude Code OAuth, Codex, Kimi/Moonshot and
 friends (`forge auth status`), extending the generation-plane candidate
@@ -776,3 +808,28 @@ adds `router_name: "needle"` and confidence — no schema change.
   agent loop produces final text rather than a token stream, so the
   answer is one `agent_message_chunk` rather than a faked stream. Tool
   calls *are* streamed live.
+
+- **Session-substrate follow-ups** (recorded from sub-project 6a, Phase A).
+  Deliberately not in scope there:
+
+  - **Cross-process background runs.** `attach`/`list_runs` are
+    in-process: a run started by another `forge` process attaches to its
+    stored history, but its live events arrive only as the session log
+    grows. A real detach/reattach needs a daemon or a socket the runtime
+    does not have, and the chat UI (Phase B) drives runs in its own
+    process, so it does not need one yet.
+  - **Replay fidelity has two honest floors.** Tool output stored in
+    `tool_result` is capped (64 KiB, with an explicit truncation marker),
+    and the history is fitted to a character budget estimated from the
+    model's token context window at four characters per token. Both are
+    approximations that report themselves rather than failing silently;
+    a real tokenizer per provider would be the next step, if it ever
+    matters.
+  - **`forge resume` continues; it cannot branch in place.** A resume
+    replays everything up to the target run. Keeping two continuations of
+    the same past is what `forge session fork` is for. The cost of
+    copying is that a run id is no longer unique across sessions, which
+    `resume <run-id>` resolves in favour of the older session.
+  - **Forked-session ACP/MCP surface.** Neither adapter exposes forking
+    yet; `forge session fork` is CLI-only, and a fork is just a session
+    afterwards, so the adapters need no change to work with one.
