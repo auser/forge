@@ -2,8 +2,10 @@
 
 **Status:** design, awaiting implementation plan
 **Date:** 2026-09-25
-**Scope:** sub-project E. Depends on the Session core (A) for the approval
-contract and process model, and on streaming (F) for output.
+**Scope:** sub-project E. Depends on the Session core for the approval
+contract and process model, and on streaming (F) for output. The terminal REPL
+it sits beside is Phase B / sub-project 6b, already designed on `main`
+(`2026-09-24-interactive-chat-ui-design.md`).
 
 ## The problem
 
@@ -121,7 +123,7 @@ engine — which is the split A §20 already makes.
 
 ## Sequencing
 
-1. Session core (A) — the approval contract and daemon must exist first.
+1. Session core — the approval contract and daemon must exist first.
 2. Streaming (F) — an extension that cannot stream is a worse terminal.
 3. This spec.
 

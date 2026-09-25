@@ -2,7 +2,44 @@
 
 **Status:** design, awaiting implementation plan
 **Date:** 2026-09-25
-**Scope:** sub-project A of three. B (interactive REPL) and C (ACP + serve alignment) get their own specs.
+**Scope:** the Session core. See "How this relates to the existing program" below
+before reading further — this document was drafted in parallel with work that
+had already landed, and its lettering is not the project's only one.
+
+## How this relates to the existing program
+
+This spec was written against a branch that had diverged from `main`, and `main`
+meanwhile shipped overlapping work. Reconciling, so the two numbering schemes do
+not mislead:
+
+| This document | The program's existing name | Status on `main` |
+|---|---|---|
+| sub-project B — interactive REPL | **Phase B / sub-project 6b**, [`2026-09-24-interactive-chat-ui-design.md`](2026-09-24-interactive-chat-ui-design.md) | **already designed and planned** — do not re-spec it |
+| sub-project A — Session core | this document | partially superseded, see below |
+| sub-projects C, E, F | ACP+serve, editor integration, streaming | unclaimed |
+
+Three things this document proposed have since landed on `main` independently,
+and `main`'s versions win:
+
+- **Per-platform engine fetching.** `needle-sys/build_support.rs` implements it
+  with the same pinned digests, more thoroughly tested. The version drafted
+  alongside this spec was discarded.
+- **The honest no-engine error.** `BackendError::EngineMissing` with a shared
+  `ENGINE_REMEDY` is the same fix this spec described as `BackendUnavailable`.
+- **Session substrate** — replay, fork, attach — which §2's `Session` must be
+  designed *with* rather than alongside.
+
+What remains genuinely unbuilt from this document: the decision plane and its
+trait (§13), the gate and risk taxonomy (§3), egress tiers (§11), graph hygiene
+and freshness (§17), the approval contract (§18), budgets (§19), the daemon
+(§20), and earned autonomy (§15). The decision log (§4) has landed.
+
+**Still unported, recorded so it is not lost:** `main` has `default = []` for
+`forge-cli` and still branches on `cfg!(feature = "needle-ffi")` in seven places
+across `init.rs` and `doctor.rs`. Making the engine default-on with graceful
+degradation — the §16 single-command property — should be designed against
+`main`'s `EngineResolution`/`build_support` rather than transplanted from the
+abandoned branch.
 
 ## Goal
 
@@ -470,7 +507,9 @@ silicon, release build, 7 tools.
 
 ## §10 Out of scope
 
-- Interactive REPL — sub-project B.
+- Interactive REPL — already designed and planned on `main` as Phase B /
+  sub-project 6b (`2026-09-24-interactive-chat-ui-design.md`). Not this
+  document's to specify.
 - Editor integration for Cursor and VS Code, which do not speak ACP —
   sub-project E, specified separately.
 - Streaming model output — sub-project F, specified separately. `ModelProvider`
