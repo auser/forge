@@ -143,24 +143,33 @@ fn legacy_config_item(root: &Path, config: &forge_config::Config) -> Option<Init
 /// degrades to an informational item, matching the design's guarantee that
 /// forge stays fully functional on static routing without weights.
 ///
-/// Feature-gated first: the `needle-ffi` feature (off by default and in
-/// release builds — see `forge-cli/Cargo.toml`) is what actually lets
-/// anything *use* fetched weights (`FfiBackend` vs. `UnavailableBackend`).
-/// Without it, fetching the ~35 MB `full` artifact would only ever sit on
-/// disk unused, so this skips the fetch entirely rather than downloading
-/// bytes no build here can act on — regardless of `local_only`/`autofetch`,
-/// since the more fundamental reason to skip is "this binary has no
-/// inference backend to feed", not the config.
+/// Feature-gated first: the `needle-ffi` feature (off by default — see
+/// `forge-cli/Cargo.toml`) is what actually lets anything *use* fetched
+/// weights (`FfiBackend` vs. `UnavailableBackend`). Without it, fetching the
+/// ~35 MB `full` artifact would only ever sit on disk unused, so this skips
+/// the fetch entirely rather than downloading bytes no build here can act on
+/// — regardless of `local_only`/`autofetch`, since the more fundamental
+/// reason to skip is "this binary has no inference backend to feed", not the
+/// config.
+///
+/// That skip note carries [`forge_needle::ENGINE_REMEDY`] — the same single
+/// command the router's error and `forge doctor` name. It has to: the
+/// original note said "build with --features needle-ffi" while the router,
+/// later in the same session, said "weights missing — run `forge init` to
+/// fetch". Both sentences were true and together they described a loop with
+/// no exit. Whatever a reader sees first must now point at the one command
+/// that ends it.
 fn needle_weights_item(root: &Path, config: &forge_config::Config) -> InitItem {
     if !cfg!(feature = "needle-ffi") {
         return InitItem {
             status: ItemStatus::Detected,
             path: root.to_path_buf(),
-            note: Some(
-                "needle weights: skipped (this build has no embedded inference backend; \
-                 build with --features needle-ffi); routing falls back to static"
-                    .to_string(),
-            ),
+            note: Some(format!(
+                "needle weights: skipped — this build has no embedded inference backend \
+                 (`needle-ffi`), so weights would sit unused and routing stays static. \
+                 To fix, {}, then re-run `forge init` and it fetches them.",
+                forge_needle::ENGINE_REMEDY
+            )),
         };
     }
     if config.local_only {
@@ -451,6 +460,38 @@ mod tests {
             !weights_path.exists(),
             "no fetch should have happened, but a file exists at {}",
             weights_path.display()
+        );
+    }
+
+    /// The skip note must name the *one* command that gets a working brain —
+    /// the same string the router's error and `forge doctor` use. This is the
+    /// first half of the contradiction the user hit: init said "build with
+    /// --features needle-ffi", the router then said "run `forge init` to
+    /// fetch", and neither told them where the loop ends.
+    #[test]
+    fn the_skip_note_names_the_one_command_that_gets_a_working_brain() {
+        if cfg!(feature = "needle-ffi") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let config = forge_config::Config::default();
+        let note = needle_weights_item(dir.path(), &config)
+            .note
+            .expect("note present");
+
+        assert!(
+            note.contains(forge_needle::ENGINE_REMEDY),
+            "the note must carry the shared remedy verbatim, so init, the router and doctor \
+             cannot drift apart: {note}"
+        );
+        assert!(
+            note.contains("cargo install"),
+            "the remedy must be runnable as written: {note}"
+        );
+        assert!(
+            note.contains("static"),
+            "it must also say what happens meanwhile: {note}"
         );
     }
 }

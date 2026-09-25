@@ -9,7 +9,7 @@ pub mod weights;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub use backend::{BackendError, Decision, NeedleBackend, NeedleToolCall};
+pub use backend::{BackendError, Decision, ENGINE_REMEDY, NeedleBackend, NeedleToolCall};
 pub use engine::{EngineEmbedder, NeedleEngine};
 #[cfg(feature = "ffi")]
 pub use ffi_backend::FfiBackend;
@@ -22,11 +22,14 @@ pub use weights::{WeightsSpec, WeightsStatus, ensure_weights, spec_for, verify, 
 /// backend.
 ///
 /// With the `ffi` feature enabled this spawns the real [`FfiBackend`] over
-/// `libneedle`; without it — the default — it spawns `UnavailableBackend`, so
-/// `BackendError::WeightsMissing` names exactly where `forge init` should have
-/// put the weights and the `FallbackRouter` wrapping the needle router
-/// degrades to static rules. Forge is fully functional either way; the FFI
-/// backend is an upgrade, not a requirement.
+/// `libneedle`; without it — the default — it spawns `UnavailableBackend`,
+/// whose `load()` reports [`BackendError::EngineMissing`]: *this build has no
+/// engine*, carrying [`ENGINE_REMEDY`]. Not a weights complaint — a
+/// backend-less binary's `forge init` skips the weights fetch on purpose, so
+/// blaming the weights would send the reader in a circle. Either way the
+/// `FallbackRouter` wrapping the needle router degrades to static rules;
+/// forge is fully functional, and the FFI backend is an upgrade, not a
+/// requirement.
 ///
 /// Note what this deliberately does *not* do: it never checks whether the
 /// weights exist here. `FfiBackend::load()` reports a missing file as
@@ -42,15 +45,20 @@ pub use weights::{WeightsSpec, WeightsStatus, ensure_weights, spec_for, verify, 
 pub fn engine_from_config(
     needle: &forge_config::NeedleConfig,
 ) -> Result<NeedleEngine, forge_core::error::ForgeError> {
-    let path = weights::weights_path(needle).unwrap_or_else(|_| weights::best_effort_path(needle));
-
     #[cfg(feature = "ffi")]
     {
+        let path =
+            weights::weights_path(needle).unwrap_or_else(|_| weights::best_effort_path(needle));
         Ok(NeedleEngine::spawn(ffi_backend::FfiBackend::new(path)))
     }
     #[cfg(not(feature = "ffi"))]
     {
-        Ok(NeedleEngine::spawn(backend::UnavailableBackend::new(path)))
+        // No engine in this build, so where the weights would live is not
+        // information anyone can act on — and saying it invites exactly the
+        // wrong remedy. `select_engine` still keys its cache on the resolved
+        // path, which is the only place that path matters here.
+        let _ = needle;
+        Ok(NeedleEngine::spawn(backend::UnavailableBackend))
     }
 }
 

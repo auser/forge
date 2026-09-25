@@ -195,10 +195,24 @@ when `needle.autofetch` is on (the default) and the build has the
 `small`/`medium` report "no pinned weights artifact"), cached under
 `~/.cache/forge/models/`; re-running `init` re-verifies the checksum and
 skips the download if it already matches. Whenever weights aren't present
-(no network, `--local-only`, a prebuilt binary without `needle-ffi`, or a
+(no network, `--local-only`, a build without `needle-ffi`, or a
 variant with nothing to fetch), routing falls back to deterministic static
 routing (`fallback_used: true` in the events) and the run proceeds with the
 configured model — a fully supported, fully offline mode, not a degraded one.
+
+**Which of those it is, forge tells you in one place.** `forge doctor` reports
+the brain as a line-pair — the backend and the weights on the first line, the
+verdict and the single command that changes it on the second:
+
+```text
+[warn] needle engine: backend not in this build (`needle-ffi` off); weights not fetched (…) — nothing here could use them
+[warn] needle brain: inactive — falling back to static routing; install a build with the brain: `cargo install …`
+```
+
+A build *with* a backend and no weights says `run \`forge init\`` instead,
+because there that is the fix. The two never both fire: the remedy always
+matches the precondition that actually failed, so `forge init`, a failed route
+and `forge doctor` cannot send you around in a circle.
 
 ### Drop-in setup for existing projects
 
@@ -1203,13 +1217,18 @@ go in `specs/adrs/`.
   with `extract()`-based argument repair in the agent loop) is not
   implemented yet; it needs real-model quality data first and is deferred to
   a later spec sub-project.
-- Default/prebuilt builds don't include the inference engine yet: the
-  `needle-ffi` feature is off by default and in release builds, so `forge
-  init` skips fetching needle weights entirely in such builds (there is no
-  backend to use them) and reports the skip rather than downloading ~35 MB
-  that would just sit unused. Build with `--features needle-ffi` (see
-  [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi)) to get real
-  fetch-on-init behavior.
+- `needle-ffi` is not a default cargo feature, so a plain `cargo build` still
+  produces a brain-less binary that routes statically (and `forge init` skips
+  the weights fetch in it, since there would be no backend to use them). It
+  cannot be a default: Cactus publishes no engine for Intel macOS at all, the
+  Windows artifact is link-untested, and offline builds would fail to link
+  rather than degrade. **Prebuilt release binaries for `aarch64-apple-darwin`,
+  `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` do have the
+  engine**, so the installed default on those platforms is a working brain;
+  building it yourself is one flag (see [Embedded Needle brain
+  (`ffi`)](#embedded-needle-brain-ffi)). Whichever build you have, `forge
+  doctor`'s `needle engine` / `needle brain` line-pair states the backend, the
+  weights, the verdict and the one command that changes it.
 - `POST /v1/project/context` is lexical-only: the semantic blend that
   `forge graph context`/`graph grep --semantic` apply (needle engine +
   embedding index, when both exist) has not been ported to the server

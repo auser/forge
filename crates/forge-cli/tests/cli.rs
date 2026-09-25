@@ -312,6 +312,72 @@ fn serve_serves_health_on_ephemeral_port() {
     assert!(body.contains("\"status\":\"ok\""), "body: {body}");
 }
 
+/// The third message path, and the one the user actually pasted:
+///
+/// ```text
+/// WARN primary router failed; using fallback
+///      error=router error: needle: needle weights missing at ~/.cache/forge/models/needle3.cact
+///            (run `forge init` to fetch)
+/// ```
+///
+/// In a build with no inference backend that hint is a dead end — this
+/// binary's `forge init` skips the weights fetch precisely *because* there is
+/// no backend, so following it changes nothing and the user is back where they
+/// started. The fallback warning must name the real cause and the one command
+/// that fixes it.
+///
+/// Driven through the real binary rather than a unit test because the bug was
+/// in the composition: each layer's message was defensible on its own, and
+/// only the string that actually reaches a terminal shows whether the story
+/// holds together.
+#[test]
+fn a_failed_needle_route_never_tells_a_backend_less_build_to_run_forge_init() {
+    if cfg!(feature = "needle-ffi") {
+        return; // this binary has a backend; the hint is not reachable
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    // `router = "needle"` is the default; spelled out so the test does not
+    // silently stop covering this if the default ever moves.
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"mock-local\"\nrouter = \"needle\"\n",
+    )
+    .expect("write config");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        // -v so the router's fallback warning reaches stderr at all.
+        .args(["-v", "run", "hello"])
+        .output()
+        .expect("run");
+
+    assert!(
+        output.status.success(),
+        "a brain-less build must still complete the run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("primary router failed"),
+        "expected the fallback warning; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("no embedded inference backend"),
+        "the warning must name the real cause; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("forge init"),
+        "it must not send the reader to a `forge init` that skips the fetch; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("cargo install"),
+        "and it must carry the one command that fixes it; stderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn run_works_offline_with_mock_model() {
     let tmp = tempfile::tempdir().expect("tempdir");

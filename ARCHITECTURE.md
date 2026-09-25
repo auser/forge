@@ -69,6 +69,15 @@ generate text — which is exactly why it is safe to run on every request.
 - Weights are fetched once by `forge init` (SHA-256-pinned, atomic rename,
   refetch-once; `[needle] weights_sha256` lets an operator pin their own).
   Builds without the `ffi` feature skip the fetch and say so.
+- **One story about why the brain is off.** Two distinct causes, never
+  conflated: `BackendError::EngineMissing` ("no engine in this build", fixed by
+  a reinstall) and `BackendError::WeightsMissing` ("no weights on disk", fixed
+  by `forge init`). `forge-needle::ENGINE_REMEDY` is the single string the
+  first case quotes everywhere it surfaces — a failed route, `forge init`'s
+  skip note, and `forge doctor`'s `needle engine`/`needle brain` line-pair — so
+  the three cannot drift into telling a user two incompatible things (which is
+  exactly what they did: init said "build with the feature", the router said
+  "run `forge init`", and neither exit was reachable from the other).
 
 Needle answers four kinds of question in forge:
 

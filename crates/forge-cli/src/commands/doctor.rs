@@ -293,7 +293,7 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
             router_note(&config.router),
         ));
 
-        checks.push(needle_check(config).await);
+        checks.extend(needle_checks(config).await);
         checks.push(jev_check(config));
         checks.extend(credential_env_checks(config));
         if let Some(check) = legacy_router_check(config) {
@@ -444,98 +444,224 @@ fn check_config_file(checks: &mut Vec<Check>, label: &str, path: &Path) {
     }
 }
 
-/// Probe the embedded Needle brain: only meaningful when `router = "needle"`
-/// (else purely informational). Never returns `Level::Fail` — a broken or
-/// missing brain degrades to the configured static fallback, so forge stays
-/// usable either way; this check exists to surface *why* it degraded.
+/// Probe the embedded Needle brain and report it as **one line-pair**:
+///
+/// ```text
+/// [warn] needle engine: backend not in this build; weights not fetched (init skips them without a backend)
+/// [warn] needle brain: inactive — falling back to static routing; install a build with the brain: `cargo install …`
+/// ```
+///
+/// The pair is the fix for a specific failure: the single line this replaced
+/// could only report one cause at a time, so a user with no backend *and* no
+/// weights was told "weights missing at …; run `forge init` to fetch them" —
+/// a hint their `forge init` would refuse to act on, since it skips the fetch
+/// when there is no backend to feed. Line one now always states both
+/// preconditions; line two states the consequence and the remedy that matches
+/// whichever precondition actually failed.
+///
+/// Only meaningful when `router = "needle"` (else purely informational, and a
+/// single line). Never returns `Level::Fail` — a broken or missing brain
+/// degrades to the configured fallback, so forge stays usable either way;
+/// these checks exist to surface *why* it degraded.
 ///
 /// Filesystem/checksum only: this never fetches weights over the network
 /// (that's `forge init`'s job), so `forge doctor` stays fast and offline.
-async fn needle_check(config: &forge_config::Config) -> Check {
-    const LABEL: &str = "needle brain";
+async fn needle_checks(config: &forge_config::Config) -> Vec<Check> {
+    const ENGINE_LABEL: &str = "needle engine";
+    const BRAIN_LABEL: &str = "needle brain";
 
     if config.router != "needle" {
-        return Check {
+        return vec![Check {
             level: Level::Ok,
-            label: LABEL.into(),
+            label: BRAIN_LABEL.into(),
             detail: "not the active router".into(),
-        };
+        }];
     }
 
     let using_hash_backend = std::env::var("FORGE_NEEDLE_BACKEND").as_deref() == Ok("hash");
-    // Set once this function's own checksum step confirms weights are
-    // present and verified on disk — used below to give an honest message
-    // when `engine_from_config` still fails with a weights-missing-shaped
-    // error (today it always does: no `ffi` backend exists yet, so it
-    // always spawns `UnavailableBackend`, whose `load()` always reports
-    // `WeightsMissing` regardless of what's actually on disk). Without this
-    // flag the probe would print a `forge init` hint that's actively wrong
-    // — the weights *are* fetched and verified; the binary just can't load
-    // them yet.
-    let mut weights_verified = false;
+    let backend = backend_state(using_hash_backend);
+    let weights = weights_state(config, &backend);
 
-    if !using_hash_backend {
-        let path = match forge_needle::weights_path(&config.needle) {
-            Ok(path) => path,
-            Err(e) => {
-                // Typically an unpinned variant (e.g. "small"/"medium") —
-                // name the situation rather than pretending it's fixable
-                // with `forge init`.
-                return Check {
-                    level: Level::Warn,
-                    label: LABEL.into(),
-                    detail: format!("{e} (falling back to {} routing)", config.router_fallback),
-                };
-            }
-        };
-        if !path.is_file() {
-            return Check {
+    let engine = Check {
+        level: if backend.usable && weights.usable {
+            Level::Ok
+        } else {
+            Level::Warn
+        },
+        label: ENGINE_LABEL.into(),
+        detail: format!("{}; {}", backend.detail, weights.detail),
+    };
+
+    // Whichever precondition is missing decides the remedy, so the pair never
+    // points two ways at once. Backend first: without it, nothing about the
+    // weights is actionable.
+    let blocked_remedy = if !backend.usable {
+        Some(forge_needle::ENGINE_REMEDY.to_string())
+    } else {
+        weights.remedy.clone()
+    };
+    if let Some(remedy) = blocked_remedy {
+        return vec![
+            engine,
+            Check {
                 level: Level::Warn,
-                label: LABEL.into(),
+                label: BRAIN_LABEL.into(),
                 detail: format!(
-                    "weights missing at {}; run `forge init` to fetch them",
-                    path.display()
+                    "inactive — falling back to {} routing; {remedy}",
+                    config.router_fallback
+                ),
+            },
+        ];
+    }
+
+    // Both preconditions hold, so actually ask the brain something.
+    let brain = probe_brain(config, using_hash_backend).await;
+    vec![engine, brain]
+}
+
+/// Is there an inference engine in this binary at all?
+struct BackendState {
+    usable: bool,
+    detail: String,
+}
+
+/// Where the weights stand, and — if they are the thing blocking the brain —
+/// what fixes them.
+struct WeightsState {
+    usable: bool,
+    detail: String,
+    remedy: Option<String>,
+}
+
+/// The `needle-ffi` feature is an exact proxy for "this binary can run
+/// inference": with it, `engine_from_config` builds `FfiBackend` and the build
+/// linked a real `libneedle` (a build with the feature and no engine fails at
+/// link time, so a running binary that has the feature has the engine);
+/// without it, it builds `UnavailableBackend`, which cannot load anything.
+fn backend_state(using_hash_backend: bool) -> BackendState {
+    if using_hash_backend {
+        return BackendState {
+            usable: true,
+            detail: "backend overridden to the deterministic hash backend \
+                     (FORGE_NEEDLE_BACKEND=hash)"
+                .to_string(),
+        };
+    }
+    if cfg!(feature = "needle-ffi") {
+        BackendState {
+            usable: true,
+            detail: "backend built in (libneedle linked)".to_string(),
+        }
+    } else {
+        BackendState {
+            usable: false,
+            detail: "backend not in this build (`needle-ffi` off)".to_string(),
+        }
+    }
+}
+
+/// Resolve and checksum the weights on disk. Never touches the network.
+///
+/// When there is no backend this deliberately does **not** say "run `forge
+/// init`": that binary's `forge init` skips the weights fetch on purpose, so
+/// the hint would be a dead end. It reports the situation instead and leaves
+/// the remedy to the backend half of the pair.
+fn weights_state(config: &forge_config::Config, backend: &BackendState) -> WeightsState {
+    if std::env::var("FORGE_NEEDLE_BACKEND").as_deref() == Ok("hash") {
+        return WeightsState {
+            usable: true,
+            detail: "weights not needed (hash backend)".to_string(),
+            remedy: None,
+        };
+    }
+
+    let path = match forge_needle::weights_path(&config.needle) {
+        Ok(path) => path,
+        Err(e) => {
+            // Typically an unpinned variant (e.g. "small"/"medium") — name the
+            // situation rather than pretending it is fixable with `forge init`.
+            return WeightsState {
+                usable: false,
+                detail: format!("weights unresolvable: {e}"),
+                remedy: Some(
+                    "set `[needle] variant` to one with a pinned artifact (\"full\"), \
+                     or point `weights_path` at your own and pin `weights_sha256`"
+                        .to_string(),
                 ),
             };
         }
-        let expected_sha256 = if !config.needle.weights_sha256.trim().is_empty() {
-            config.needle.weights_sha256.clone()
-        } else {
-            match forge_needle::spec_for(&config.needle.variant) {
-                Ok(spec) => spec.sha256.to_string(),
-                Err(e) => {
-                    return Check {
-                        level: Level::Warn,
-                        label: LABEL.into(),
-                        detail: e.to_string(),
-                    };
-                }
-            }
+    };
+
+    if !path.is_file() {
+        return WeightsState {
+            usable: false,
+            detail: if backend.usable {
+                format!("weights not on disk ({})", path.display())
+            } else {
+                // Says *why* they were never fetched without naming `forge
+                // init` — naming it is what created the loop, and a reader
+                // who has just been told the backend is missing does not need
+                // a second, conflicting instruction.
+                format!(
+                    "weights not fetched ({}) — nothing here could use them",
+                    path.display()
+                )
+            },
+            remedy: if backend.usable {
+                Some("run `forge init` to fetch them".to_string())
+            } else {
+                // The backend half carries the only useful remedy.
+                None
+            },
         };
-        match forge_needle::verify(&path, &expected_sha256) {
-            Ok(true) => weights_verified = true,
-            Ok(false) => {
-                return Check {
-                    level: Level::Warn,
-                    label: LABEL.into(),
-                    detail: format!(
-                        "weights at {} failed checksum verification; run `forge init` to refetch them",
-                        path.display()
-                    ),
-                };
-            }
+    }
+
+    let expected_sha256 = if !config.needle.weights_sha256.trim().is_empty() {
+        config.needle.weights_sha256.clone()
+    } else {
+        match forge_needle::spec_for(&config.needle.variant) {
+            Ok(spec) => spec.sha256.to_string(),
             Err(e) => {
-                return Check {
-                    level: Level::Warn,
-                    label: LABEL.into(),
-                    detail: format!(
-                        "could not verify weights at {}: {e}; run `forge init`",
-                        path.display()
+                return WeightsState {
+                    usable: false,
+                    detail: format!("weights checksum unknown: {e}"),
+                    remedy: Some(
+                        "pin `[needle] weights_sha256` for these weights, or use a pinned variant"
+                            .to_string(),
                     ),
                 };
             }
         }
+    };
+
+    match forge_needle::verify(&path, &expected_sha256) {
+        Ok(true) => WeightsState {
+            usable: true,
+            detail: format!("weights present and verified ({})", path.display()),
+            remedy: None,
+        },
+        Ok(false) => WeightsState {
+            usable: false,
+            detail: format!("weights at {} failed checksum verification", path.display()),
+            remedy: Some("run `forge init` to refetch them".to_string()),
+        },
+        Err(e) => WeightsState {
+            usable: false,
+            detail: format!("weights at {} could not be read: {e}", path.display()),
+            remedy: Some(format!(
+                "fix permissions on {} or delete it and run `forge init`",
+                path.display()
+            )),
+        },
     }
+}
+
+/// Ask the brain one real question and time it. Only called once both
+/// preconditions hold, so anything that fails here is a genuine inference
+/// problem rather than a setup problem — which is why none of these messages
+/// suggests `forge init` or a rebuild.
+async fn probe_brain(config: &forge_config::Config, using_hash_backend: bool) -> Check {
+    const LABEL: &str = "needle brain";
 
     let engine_result = if using_hash_backend {
         Ok(forge_needle::NeedleEngine::spawn(
@@ -550,7 +676,10 @@ async fn needle_check(config: &forge_config::Config) -> Check {
             return Check {
                 level: Level::Warn,
                 label: LABEL.into(),
-                detail: format!("engine unavailable: {e}"),
+                detail: format!(
+                    "inactive — engine would not start ({e}); falling back to {} routing",
+                    config.router_fallback
+                ),
             };
         }
     };
@@ -578,7 +707,7 @@ async fn needle_check(config: &forge_config::Config) -> Check {
             Ok((model_id, _dims)) => Check {
                 level: Level::Ok,
                 label: LABEL.into(),
-                detail: format!("ok (model {model_id}, decide {elapsed_ms} ms)"),
+                detail: format!("active (model {model_id}, decide {elapsed_ms} ms)"),
             },
             Err(e) => Check {
                 level: Level::Warn,
@@ -586,42 +715,24 @@ async fn needle_check(config: &forge_config::Config) -> Check {
                 detail: format!("decide succeeded but model info failed: {e}"),
             },
         },
-        Ok(Err(e)) if weights_verified && is_weights_missing_shaped(&e) => Check {
-            // This function's own checksum check above just confirmed the
-            // weights ARE present and verified — a `forge init` hint here
-            // would be actively wrong. What's actually true: this binary was
-            // built without the `ffi` inference backend, so
-            // `engine_from_config` yields `UnavailableBackend`, which cannot
-            // load any weights, verified or not.
-            level: Level::Warn,
-            label: LABEL.into(),
-            detail: format!(
-                "weights present and verified, but this binary was built without the embedded \
-                 inference backend (rebuild with `--features needle-ffi`); falls back to {} routing",
-                config.router_fallback
-            ),
-        },
         Ok(Err(e)) => Check {
             level: Level::Warn,
             label: LABEL.into(),
-            detail: format!("decide failed: {e}"),
+            detail: format!(
+                "inactive — decide failed: {e}; falling back to {} routing",
+                config.router_fallback
+            ),
         },
         Err(_) => Check {
             level: Level::Warn,
             label: LABEL.into(),
-            detail: format!("decide timed out after {} ms", timeout.as_millis()),
+            detail: format!(
+                "inactive — decide timed out after {} ms; falling back to {} routing",
+                timeout.as_millis(),
+                config.router_fallback
+            ),
         },
     }
-}
-
-/// `NeedleEngine::decide`'s error is a stringly-typed `ForgeError::Router`
-/// by the time it reaches doctor — the engine layer collapses
-/// `BackendError` into a message rather than preserving the variant. This
-/// matches on the exact wording `BackendError::WeightsMissing`'s `Display`
-/// impl produces (`forge-needle/src/backend.rs`) so `needle_check` can tell
-/// "no ffi backend built in" apart from a genuine inference failure.
-fn is_weights_missing_shaped(err: &ForgeError) -> bool {
-    err.to_string().contains("weights missing at")
 }
 
 /// Probe the Jev escalation tier: credential + endpoint only, no network
@@ -865,43 +976,157 @@ mod tests {
 
     use super::*;
 
+    /// Find one check by label, for the line-pair assertions below.
+    fn find<'a>(checks: &'a [Check], label: &str) -> &'a Check {
+        checks
+            .iter()
+            .find(|c| c.label == label)
+            .unwrap_or_else(|| panic!("no {label:?} check in {:?}", labels(checks)))
+    }
+
+    fn labels(checks: &[Check]) -> Vec<&str> {
+        checks.iter().map(|c| c.label.as_str()).collect()
+    }
+
+    /// Both halves joined, which is what a reader actually sees.
+    fn pair_text(checks: &[Check]) -> String {
+        checks
+            .iter()
+            .map(|c| format!("{}: {}", c.label, c.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[tokio::test]
     #[serial]
-    async fn needle_check_when_router_is_not_needle_is_ok_and_informational() {
+    async fn needle_checks_when_router_is_not_needle_is_ok_and_informational() {
         let config = forge_config::Config {
             router: "static".to_string(),
             ..forge_config::Config::default()
         };
-        let check = needle_check(&config).await;
-        assert_eq!(check.level, Level::Ok);
-        assert!(check.detail.contains("not the active router"));
+        let checks = needle_checks(&config).await;
+        assert_eq!(checks.len(), 1, "no line-pair when needle is not in play");
+        assert_eq!(checks[0].level, Level::Ok);
+        assert!(checks[0].detail.contains("not the active router"));
     }
 
+    /// The whole point of the pair: every needle report states both
+    /// preconditions and the consequence, so no reader ever gets half the
+    /// story and has to guess the other half.
     #[tokio::test]
     #[serial]
-    async fn needle_check_reports_missing_weights_as_warn_not_fail() {
+    async fn the_needle_report_is_always_a_line_pair_covering_backend_and_weights() {
         let mut config = forge_config::Config::default();
-        config.needle.weights_path = "/nonexistent/needle.bin".to_string();
-        let check = needle_check(&config).await;
-        assert_eq!(check.level, Level::Warn);
-        assert!(check.detail.contains("forge init"));
+        config.needle.weights_path = "/nonexistent/needle.cact".to_string();
+
+        let checks = needle_checks(&config).await;
+
+        assert_eq!(labels(&checks), vec!["needle engine", "needle brain"]);
+        let engine = find(&checks, "needle engine");
+        assert!(
+            engine.detail.contains("backend"),
+            "line one must state the backend: {}",
+            engine.detail
+        );
+        assert!(
+            engine.detail.contains("weights"),
+            "line one must state the weights: {}",
+            engine.detail
+        );
+        let brain = find(&checks, "needle brain");
+        assert!(
+            brain.detail.contains("active") || brain.detail.contains("inactive"),
+            "line two must state the verdict: {}",
+            brain.detail
+        );
     }
 
+    /// The exact contradiction the user reported, from doctor's side: a build
+    /// with no backend must never be told to run `forge init`, because that
+    /// binary's `forge init` skips the weights fetch precisely because there
+    /// is no backend. It gets the one remedy that ends the loop instead.
     #[tokio::test]
     #[serial]
-    async fn needle_check_gives_honest_message_when_weights_verified_but_no_ffi_backend() {
-        // Weights genuinely present and checksum-verified on disk, but
-        // `engine_from_config` still can't load them (no `ffi` backend
-        // built into this binary until Task 8). The probe must not blame
-        // this on missing weights or suggest `forge init` — that would be
-        // actively wrong, since the checksum step just succeeded.
+    async fn a_backend_less_build_is_never_told_to_run_forge_init() {
+        if cfg!(feature = "needle-ffi") {
+            return; // this binary *has* a backend; nothing to assert
+        }
+        let mut config = forge_config::Config::default();
+        config.needle.weights_path = "/nonexistent/needle.cact".to_string();
+
+        let checks = needle_checks(&config).await;
+        let text = pair_text(&checks);
+
+        assert!(
+            !text.contains("forge init"),
+            "no half of the pair may point at `forge init` here: {text}"
+        );
+        assert!(
+            text.contains(forge_needle::ENGINE_REMEDY),
+            "the pair must carry the one shared remedy: {text}"
+        );
+        assert!(
+            find(&checks, "needle engine")
+                .detail
+                .contains("backend not in this build"),
+            "{text}"
+        );
+        assert!(
+            find(&checks, "needle brain").detail.contains("inactive"),
+            "{text}"
+        );
+        assert!(
+            find(&checks, "needle brain")
+                .detail
+                .contains(&config.router_fallback),
+            "the verdict must name what routes instead: {text}"
+        );
+        for check in &checks {
+            assert_ne!(check.level, Level::Fail, "a missing brain is never fatal");
+        }
+    }
+
+    /// The mirror image: with a backend present, missing weights *are* a
+    /// `forge init` job, and the hint must survive. (Only assertable in an
+    /// `ffi` build; the two tests together cover both branches, so neither
+    /// build configuration loses the coverage.)
+    #[tokio::test]
+    #[serial]
+    async fn missing_weights_with_a_backend_present_do_point_at_forge_init() {
+        if !cfg!(feature = "needle-ffi") {
+            return;
+        }
+        let mut config = forge_config::Config::default();
+        config.needle.weights_path = "/nonexistent/needle.cact".to_string();
+
+        let checks = needle_checks(&config).await;
+        let text = pair_text(&checks);
+
+        assert!(
+            text.contains("forge init"),
+            "with a backend, a refetch is exactly the remedy: {text}"
+        );
+        assert!(
+            !text.contains(forge_needle::ENGINE_REMEDY),
+            "and a reinstall is not: {text}"
+        );
+    }
+
+    /// Weights present and verified but no backend: line one must say so
+    /// *positively* about the weights (they are fine) and negatively about the
+    /// backend, and the verdict must not blame the weights.
+    #[tokio::test]
+    #[serial]
+    async fn verified_weights_without_a_backend_blame_the_backend_not_the_weights() {
+        if cfg!(feature = "needle-ffi") {
+            return;
+        }
         use sha2::{Digest, Sha256};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("weights.bin");
         let bytes = b"arbitrary-bytes-standing-in-for-real-needle-weights";
         std::fs::write(&path, bytes).expect("write fake weights");
-        let sha256 = format!("{:x}", Sha256::digest(bytes));
 
         let config = forge_config::Config {
             needle: forge_config::NeedleConfig {
@@ -911,62 +1136,64 @@ mod tests {
                 // Operator-supplied override bypasses the pinned-spec
                 // checksum lookup entirely, so an arbitrary payload can
                 // verify cleanly.
-                weights_sha256: sha256,
+                weights_sha256: format!("{:x}", Sha256::digest(bytes)),
             },
             ..forge_config::Config::default()
         };
 
-        let check = needle_check(&config).await;
+        let checks = needle_checks(&config).await;
+        let engine = find(&checks, "needle engine");
 
-        assert_eq!(check.level, Level::Warn);
+        assert_eq!(engine.level, Level::Warn);
         assert!(
-            !check.detail.contains("forge init"),
-            "must not suggest `forge init` once weights are already verified: {}",
-            check.detail
+            engine.detail.contains("weights present and verified"),
+            "the weights are fine and must be reported as fine: {}",
+            engine.detail
         );
         assert!(
-            check
-                .detail
-                .contains("without the embedded inference backend"),
-            "detail: {}",
-            check.detail
+            engine.detail.contains("backend not in this build"),
+            "and the backend is what is missing: {}",
+            engine.detail
         );
-        // The message has to tell the operator how to fix it, which is a
-        // rebuild with the feature — not a refetch.
-        assert!(
-            check.detail.contains("needle-ffi"),
-            "should name the feature that turns the backend on: {}",
-            check.detail
-        );
+        let text = pair_text(&checks);
+        assert!(!text.contains("forge init"), "{text}");
+        assert!(text.contains(forge_needle::ENGINE_REMEDY), "{text}");
     }
 
     #[tokio::test]
     #[serial]
-    async fn needle_check_warns_for_unpinned_variant_without_panicking() {
+    async fn needle_checks_warn_for_unpinned_variant_without_panicking() {
         // "medium" is config-valid but has no pinned artifact yet (see
         // forge-needle's weights module doc) — must degrade to Warn, never
         // panic or Fail.
         let mut config = forge_config::Config::default();
         config.needle.variant = "medium".to_string();
-        let check = needle_check(&config).await;
-        assert_eq!(check.level, Level::Warn);
-        assert!(check.detail.contains("medium"), "detail: {}", check.detail);
+        let checks = needle_checks(&config).await;
+        let text = pair_text(&checks);
+        assert!(text.contains("medium"), "{text}");
+        for check in &checks {
+            assert_ne!(check.level, Level::Fail, "{text}");
+        }
+        assert_eq!(find(&checks, "needle engine").level, Level::Warn);
     }
 
     #[tokio::test]
     #[serial]
-    async fn needle_check_with_hash_backend_reports_ok_and_latency() {
+    async fn needle_checks_with_hash_backend_report_active_and_latency() {
         // SAFETY: test-only env mutation, serialized via #[serial] against
         // any other test touching FORGE_NEEDLE_BACKEND in this crate.
         unsafe {
             std::env::set_var("FORGE_NEEDLE_BACKEND", "hash");
         }
-        let check = needle_check(&forge_config::Config::default()).await;
+        let checks = needle_checks(&forge_config::Config::default()).await;
         unsafe {
             std::env::remove_var("FORGE_NEEDLE_BACKEND");
         }
-        assert_eq!(check.level, Level::Ok);
-        assert!(check.detail.contains("ms")); // measured decide() latency
+        assert_eq!(find(&checks, "needle engine").level, Level::Ok);
+        let brain = find(&checks, "needle brain");
+        assert_eq!(brain.level, Level::Ok);
+        assert!(brain.detail.contains("active"), "{}", brain.detail);
+        assert!(brain.detail.contains("ms"), "{}", brain.detail); // measured decide() latency
     }
 
     // --- jev ---

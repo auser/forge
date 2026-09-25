@@ -473,6 +473,35 @@ pub(crate) mod tests {
         assert_eq!(load_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// "This build has no engine" is the one load failure that cannot change
+    /// while the process lives — only a reinstall fixes it — so it must be
+    /// sticky, and every job must keep reporting it verbatim (remedy
+    /// included) rather than degrading into a vaguer error.
+    #[tokio::test]
+    async fn engine_never_retries_a_build_with_no_backend() {
+        let engine = NeedleEngine::spawn(crate::backend::UnavailableBackend);
+
+        for attempt in 1..=3 {
+            let err = engine
+                .decide("t".to_string(), vec!["a".to_string()])
+                .await
+                .expect_err("a backend-less build cannot route");
+            let message = err.to_string();
+            assert!(
+                message.contains("no embedded inference backend"),
+                "attempt {attempt}: {message}"
+            );
+            assert!(
+                message.contains(crate::ENGINE_REMEDY),
+                "attempt {attempt} must still carry the remedy: {message}"
+            );
+            assert!(
+                !message.contains("forge init"),
+                "attempt {attempt} must not send the reader to `forge init`: {message}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn engine_skips_queued_jobs_whose_callers_gave_up() {
         // A slow backend plus tiny caller timeouts: six decides are enqueued
