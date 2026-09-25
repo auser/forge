@@ -22,6 +22,16 @@
 //! logs do carry — the truncated `completed { summary }` — and the replay
 //! is flagged [`degraded`](Replay::degraded). That is the honest floor: old
 //! logs replay as well as their data allows.
+//!
+//! ## Run order, not file order
+//!
+//! A session's log is one append-only file shared by every run in it, so two
+//! runs live at once interleave their lines. Replay therefore groups events
+//! **by `run_id`** and flattens the groups in order of first appearance (see
+//! [`conversation_from_events`]) rather than reading the file straight
+//! through. That keeps each run's messages contiguous, which is what keeps a
+//! tool result next to the call it answers — see [`repair_tool_pairs`] for
+//! what file order costs.
 
 use forge_core::{Event, EventKind, Message, ModelCapabilities, Role};
 
@@ -66,16 +76,79 @@ pub fn history_budget_chars(capabilities: &ModelCapabilities) -> usize {
 
 /// Rebuild the model conversation of a whole session (every run, in order).
 ///
-/// `events` is the session's log as stored. Events are consumed in file
-/// order: runs of one session are appended sequentially, so file order *is*
-/// chronological order across runs.
+/// `events` is the session's log as stored. It is **grouped by `run_id`**
+/// first, and the groups are flattened in order of first appearance, so each
+/// run's messages come out contiguous and in its own log order.
+///
+/// Grouping rather than reading the file straight through is the correctness
+/// requirement, not a nicety. A session log is one file per session, so two
+/// runs live at once interleave their lines, and in file order another run's
+/// assistant message can land between a tool call and the `tool_result` that
+/// answers it. [`repair_tool_pairs`] then discards that result as an orphan
+/// and synthesizes [`UNANSWERED_TOOL`] in its place — a *successful* call
+/// replayed to the model as unanswered, which is an invitation to retry a
+/// side-effecting operation. Grouping removes the interleave before pairing
+/// ever sees it.
+///
+/// For a log with no interleave this is exactly file order, which is why the
+/// common case is unchanged.
 pub fn conversation_from_events(events: &[Event]) -> Replay {
     let mut messages: Vec<Message> = Vec::new();
     let mut degraded = false;
-    // Runs that recorded at least one v3 replay event. A run with none and
-    // a `completed` predates v3, so its truncated summary is the only
-    // assistant text available.
-    let mut replayable_runs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for run in group_by_run(events) {
+        let replayed = run_messages(&run);
+        degraded |= replayed.degraded;
+        messages.extend(replayed.messages);
+    }
+
+    Replay {
+        messages: repair_tool_pairs(messages),
+        degraded,
+    }
+}
+
+/// A session's events split per run, the runs in order of first appearance
+/// and each run's events in log order.
+fn group_by_run(events: &[Event]) -> Vec<Vec<&Event>> {
+    use std::collections::hash_map::Entry;
+
+    let mut order: Vec<&str> = Vec::new();
+    let mut groups: std::collections::HashMap<&str, Vec<&Event>> = std::collections::HashMap::new();
+    for event in events {
+        let run_id = event.run_id.as_str();
+        match groups.entry(run_id) {
+            Entry::Vacant(slot) => {
+                order.push(run_id);
+                slot.insert(vec![event]);
+            }
+            Entry::Occupied(mut slot) => slot.get_mut().push(event),
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|run_id| groups.remove(run_id))
+        .collect()
+}
+
+/// One run's contribution to the conversation.
+struct RunReplay {
+    messages: Vec<Message>,
+    /// The run predates the v3 replay events, so its assistant turn came
+    /// from the truncated `completed` summary.
+    degraded: bool,
+}
+
+/// Replay a single run's events, in log order.
+///
+/// `events` must all belong to one run — [`group_by_run`] guarantees that.
+fn run_messages(events: &[&Event]) -> RunReplay {
+    let mut messages: Vec<Message> = Vec::new();
+    // Set by the first v3 replay event. A run with none and a `completed`
+    // predates v3, so its truncated summary is the only assistant text
+    // available.
+    let mut replayable = false;
+    let mut degraded = false;
 
     for event in events {
         match &event.kind {
@@ -94,7 +167,7 @@ pub fn conversation_from_events(events: &[Event]) -> Replay {
             }
 
             EventKind::AssistantMessage { text, tool_calls } => {
-                replayable_runs.insert(event.run_id.as_str());
+                replayable = true;
                 let mut assistant = Message::assistant_tool_calls(tool_calls.clone());
                 assistant.content.clone_from(text);
                 messages.push(assistant);
@@ -103,14 +176,14 @@ pub fn conversation_from_events(events: &[Event]) -> Replay {
             EventKind::ToolResult {
                 call_id, output, ..
             } => {
-                replayable_runs.insert(event.run_id.as_str());
+                replayable = true;
                 messages.push(Message::tool(call_id, output));
             }
 
             // Pre-v3 fallback: a run that recorded no replay events at all
             // has only its truncated summary to offer.
             EventKind::Completed { summary } => {
-                if !replayable_runs.contains(event.run_id.as_str()) {
+                if !replayable {
                     degraded = true;
                     if !summary.is_empty() {
                         messages.push(Message::assistant(summary));
@@ -134,10 +207,7 @@ pub fn conversation_from_events(events: &[Event]) -> Replay {
         }
     }
 
-    Replay {
-        messages: repair_tool_pairs(messages),
-        degraded,
-    }
+    RunReplay { messages, degraded }
 }
 
 /// Runtime bookkeeping written as `input_received`, which must not be
@@ -164,9 +234,9 @@ const UNANSWERED_TOOL: &str = "[forge: run ended before this tool answered]";
 ///   `assistant_message` *before* it dispatches, so a run cancelled at a
 ///   per-call checkpoint, one whose dispatch failed, or one whose approval
 ///   nobody answered leaves a call with no `tool_result`. Any session that
-///   reuses one session id across runs (every ACP turn, `forge_run` with a
-///   `session_id`, `POST /v1/runs` with a `session_id`) then replays that
-///   run's dangling call on the next resume. Repaired by synthesizing an
+///   reuses one session id across runs (every ACP turn, `forge resume`,
+///   `POST /v1/runs` with a `session_id`) then replays that run's dangling
+///   call on the next resume. Repaired by synthesizing an
 ///   [`UNANSWERED_TOOL`] result: the model is told the agent tried the call
 ///   and got nothing, which is both legal and true — dropping the call
 ///   instead would hide an attempt that may have had side effects.
@@ -174,6 +244,21 @@ const UNANSWERED_TOOL: &str = "[forge: run ended before this tool answered]";
 ///   missing (a log truncated between the two), and whatever
 ///   [`fit_to_budget`] leaves behind after dropping messages from the front.
 ///   Dropped: there is no call to attach it to.
+///
+/// **This runs on already-grouped input, and depends on it.** Answers are
+/// taken only from the messages *directly* following the call, so anything
+/// between the two is read as the call going unanswered. In a log where two
+/// runs interleaved, reading in file order puts the other run's assistant
+/// message there: this function would then drop the real result as an orphan
+/// and synthesize [`UNANSWERED_TOOL`] for a call that in fact succeeded.
+///
+/// The output would still be *API-valid* — every call answered, every answer
+/// attached — so there is no provider rejection to notice, and earlier
+/// write-ups of this bug were wrong to predict one. The damage is worse than
+/// a 400: a model told its tool call went unanswered may legitimately retry
+/// it, so a corrupted replay invites a duplicated side effect.
+/// [`conversation_from_events`] groups by `run_id` precisely so that cannot
+/// reach here.
 fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut messages = messages.into_iter().peekable();

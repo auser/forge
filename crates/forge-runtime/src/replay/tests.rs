@@ -205,6 +205,212 @@ fn real_user_input_is_replayed_but_the_resume_marker_is_not() {
     assert_eq!(contents, vec!["start", "also check b.rs", "ok"]);
 }
 
+// --- interleaved runs ---------------------------------------------------
+
+/// The bug this module's grouping exists for.
+///
+/// Two runs were live in one session at once, so the log interleaves: run
+/// `b`'s assistant message sits between run `a`'s tool call and its result.
+/// Replayed in file order, `repair_tool_pairs` consumes only the messages
+/// *directly* after the assistant call, finds `b`'s assistant message there,
+/// discards `a`'s real result as an orphan and synthesizes
+/// [`UNANSWERED_TOOL`] for the call — telling the model a successful,
+/// possibly side-effecting call went unanswered, which invites it to retry.
+///
+/// The output stays API-valid either way, which is why this had no visible
+/// symptom.
+#[test]
+fn an_interleaved_tool_result_still_answers_its_own_call() {
+    let call = ToolCall::new("call_a", "read_file", serde_json::json!({"path": "a.rs"}));
+    let events = vec![
+        run_started("a", 1, "ask a"),
+        run_started("b", 1, "ask b"),
+        assistant("a", 2, "reading a.rs", vec![call.clone()]),
+        // Run b's turn lands between run a's call and its answer.
+        assistant("b", 2, "thinking about b", Vec::new()),
+        tool_result("a", 3, "call_a", "fn a() {}"),
+        completed("a", 4, "a.rs defines a()"),
+        assistant("b", 3, "b answer", Vec::new()),
+        completed("b", 4, "b answer"),
+    ];
+    let replay = conversation_from_events(&events);
+
+    let answer = replay
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_a"))
+        .expect("call_a answered");
+    assert_eq!(
+        answer.content, "fn a() {}",
+        "the call's real output must survive: {:?}",
+        replay.messages
+    );
+    assert!(
+        !replay.messages.iter().any(|m| m.content == UNANSWERED_TOOL),
+        "a call that WAS answered must not be replayed as unanswered: {:?}",
+        replay.messages
+    );
+    // Each run's messages stay contiguous, runs in first-appearance order.
+    let shape: Vec<(Role, &str)> = replay
+        .messages
+        .iter()
+        .map(|m| (m.role, m.content.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (Role::User, "ask a"),
+            (Role::Assistant, "reading a.rs"),
+            (Role::Tool, "fn a() {}"),
+            (Role::User, "ask b"),
+            (Role::Assistant, "thinking about b"),
+            (Role::Assistant, "b answer"),
+        ]
+    );
+}
+
+#[test]
+fn three_interleaved_runs_each_keep_their_own_messages() {
+    let events = vec![
+        run_started("one", 1, "ask one"),
+        run_started("two", 1, "ask two"),
+        assistant("one", 2, "answer one", Vec::new()),
+        run_started("three", 1, "ask three"),
+        assistant("three", 2, "answer three", Vec::new()),
+        assistant("two", 2, "answer two", Vec::new()),
+        completed("two", 3, "answer two"),
+        completed("three", 3, "answer three"),
+        completed("one", 3, "answer one"),
+    ];
+    let replay = conversation_from_events(&events);
+    let contents: Vec<&str> = replay.messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec![
+            "ask one",
+            "answer one",
+            "ask two",
+            "answer two",
+            "ask three",
+            "answer three",
+        ],
+        "runs are ordered by first appearance, not by id or completion"
+    );
+}
+
+/// Run order is *first appearance*, which is neither id order nor the order
+/// the runs finished in. `zzz` starts first, so it replays first.
+#[test]
+fn run_order_follows_first_appearance_not_run_id() {
+    let events = vec![
+        run_started("zzz", 1, "the earlier ask"),
+        run_started("aaa", 1, "the later ask"),
+        assistant("aaa", 2, "later answer", Vec::new()),
+        assistant("zzz", 2, "earlier answer", Vec::new()),
+        completed("aaa", 3, "later answer"),
+        completed("zzz", 3, "earlier answer"),
+    ];
+    let replay = conversation_from_events(&events);
+    let contents: Vec<&str> = replay.messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec![
+            "the earlier ask",
+            "earlier answer",
+            "the later ask",
+            "later answer",
+        ]
+    );
+}
+
+/// Grouping must not cost the pre-v3 fallback: a v1/v2 run interleaved with
+/// a v3 one still replays from its `completed` summary and still flags the
+/// replay degraded.
+#[test]
+fn an_interleaved_pre_v3_run_still_degrades_to_its_summary() {
+    let events = vec![
+        run_started("old", 1, "old ask"),
+        run_started("new", 1, "new ask"),
+        assistant("new", 2, "new answer", Vec::new()),
+        event(
+            "old",
+            2,
+            EventKind::ToolCompleted {
+                name: "read_file".into(),
+                success: true,
+            },
+        ),
+        completed("old", 3, "truncated old answer"),
+        completed("new", 3, "new answer"),
+    ];
+    let replay = conversation_from_events(&events);
+    assert!(replay.degraded, "the v1/v2 run must still be flagged");
+    let contents: Vec<&str> = replay.messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec!["old ask", "truncated old answer", "new ask", "new answer"]
+    );
+}
+
+/// Both repairs compose: grouping reattaches the interleaved result, and
+/// `repair_tool_pairs` still answers the genuinely dangling call.
+#[test]
+fn an_interleaved_log_with_a_dangling_call_gets_both_repairs() {
+    let answered = ToolCall::new("call_a", "read_file", serde_json::json!({"path": "a.rs"}));
+    let dangling = ToolCall::new(
+        "call_b",
+        "run_command",
+        serde_json::json!({"command": "ls"}),
+    );
+    let events = vec![
+        run_started("a", 1, "ask a"),
+        run_started("b", 1, "ask b"),
+        assistant("a", 2, "reading a.rs", vec![answered]),
+        // b announces a call it never gets to dispatch...
+        assistant("b", 2, "listing", vec![dangling]),
+        // ...while a's answer arrives after it.
+        tool_result("a", 3, "call_a", "fn a() {}"),
+        completed("a", 4, "a.rs defines a()"),
+        event(
+            "b",
+            3,
+            EventKind::Cancelled {
+                reason: "cancelled by user".into(),
+            },
+        ),
+    ];
+    let replay = conversation_from_events(&events);
+
+    let shape: Vec<(Role, &str)> = replay
+        .messages
+        .iter()
+        .map(|m| (m.role, m.content.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (Role::User, "ask a"),
+            (Role::Assistant, "reading a.rs"),
+            (Role::Tool, "fn a() {}"),
+            (Role::User, "ask b"),
+            (Role::Assistant, "listing"),
+            (Role::Tool, UNANSWERED_TOOL),
+        ]
+    );
+    // And the pairing invariant holds over the whole history.
+    let announced: std::collections::HashSet<&str> = replay
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().map(|c| c.id.as_str()))
+        .collect();
+    let answers: std::collections::HashSet<&str> = replay
+        .messages
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    assert_eq!(announced, answers);
+}
+
 #[test]
 fn a_pre_v3_run_degrades_to_its_completion_summary() {
     // v1/v2 logs have no assistant_message/tool_result events at all.
@@ -307,9 +513,9 @@ fn a_tool_result_without_its_assistant_call_is_dropped() {
 /// *before* it dispatches, so a run that died between the two leaves a call
 /// with no result. Replayed as-is, that is a provider 400 — every chat API
 /// requires each announced tool call to be answered — and it reaches a real
-/// run because any session reusing one session id (ACP turns, `forge_run`
-/// with a `session_id`, `POST /v1/runs` with a `session_id`) replays the
-/// aborted run on the next resume.
+/// run because any session reusing one session id (ACP turns, `forge
+/// resume`, `POST /v1/runs` with a `session_id`) replays the aborted run on
+/// the next resume.
 #[test]
 fn an_unanswered_tool_call_gets_a_synthetic_result_instead_of_dangling() {
     let call = ToolCall::new(

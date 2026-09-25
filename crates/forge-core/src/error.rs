@@ -27,6 +27,20 @@ pub enum ForgeError {
     #[error("session error: {0}")]
     Session(String),
 
+    /// A run was asked to start in a session that already has one in flight.
+    ///
+    /// Its own variant, not a [`Session`](Self::Session) string, because the
+    /// refusal is a *conflict* rather than a missing or broken session: the
+    /// REST adapter answers 409 on this and 404 on `Session`, and the choice
+    /// has to come from the type. One live run per session is a correctness
+    /// requirement, not a policy — two runs writing into one session log
+    /// interleave their events, and the interleave corrupts the next replay
+    /// of that session (see `forge_runtime::replay`).
+    #[error(
+        "session {session_id} already has a run in flight ({run_id}); wait for it or cancel it"
+    )]
+    SessionBusy { session_id: String, run_id: String },
+
     #[error("server error: {0}")]
     Server(String),
 
@@ -83,6 +97,13 @@ impl ForgeError {
 
     pub fn session(message: impl Into<String>) -> Self {
         Self::Session(message.into())
+    }
+
+    pub fn session_busy(session_id: impl Into<String>, run_id: impl Into<String>) -> Self {
+        Self::SessionBusy {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+        }
     }
 
     pub fn server(message: impl Into<String>) -> Self {

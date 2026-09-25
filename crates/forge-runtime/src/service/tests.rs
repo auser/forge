@@ -519,7 +519,10 @@ async fn parked_service(
         ],
         forge_core::ApprovalPolicy::Prompt,
     ));
-    let (run_id, _session, handle) = service.start_run("park me", None);
+    let started = service
+        .start_run("park me", None)
+        .expect("a fresh session is never busy");
+    let (run_id, handle) = (started.run_id, started.handle);
     // Wait until the loop is actually parked in the approval wait.
     let mut rx = service.subscribe(&run_id);
     loop {
@@ -568,6 +571,111 @@ async fn cancel_marker_file_stops_a_loop_without_token() {
     let err = handle.await.expect("join").expect_err("run aborted");
     assert!(err.to_string().contains("cancelled"), "got: {err}");
     assert!(!tmp.path().join("parked.txt").exists());
+}
+
+// --- one live run per session -------------------------------------------
+
+/// The session a parked run belongs to.
+fn session_of(service: &AgentService, run_id: &str) -> String {
+    service
+        .sessions()
+        .find_run(run_id)
+        .expect("store readable")
+        .expect("the parked run has a session")
+}
+
+/// The guard that makes an interleaved session log uncreatable: two runs in
+/// one session would write into one append-only log, and their interleaved
+/// events corrupt the next replay of that session.
+#[tokio::test]
+async fn a_session_with_a_run_in_flight_refuses_a_second_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, parked_run, handle) = parked_service(tmp.path()).await;
+    let session_id = session_of(&service, &parked_run);
+
+    let err = service
+        .start_run("a concurrent second ask", Some(session_id.clone()))
+        .expect_err("a session with a live run must refuse a second one");
+    match &err {
+        ForgeError::SessionBusy {
+            session_id: busy,
+            run_id: holder,
+        } => {
+            assert_eq!(busy, &session_id);
+            assert_eq!(holder, &parked_run, "the refusal names the holder");
+        }
+        other => panic!("expected SessionBusy, got: {other:?}"),
+    }
+
+    // `forge resume` takes the same claim, so it is refused too — and
+    // refused *before* it inspects the run's state, because starting
+    // alongside the live run is the thing being prevented.
+    let err = service
+        .resume(&session_id)
+        .await
+        .expect_err("resume of a busy session must be refused");
+    assert!(
+        matches!(err, ForgeError::SessionBusy { .. }),
+        "got: {err:?}"
+    );
+
+    service.cancel(&parked_run).expect("cancel");
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn sequential_runs_in_one_session_are_never_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = Arc::new(scripted_service(
+        tmp.path(),
+        vec![
+            text_reply("answer one"),
+            text_reply("answer two"),
+            text_reply("answer three"),
+        ],
+        forge_core::ApprovalPolicy::Auto,
+    ));
+
+    // All three entry points, one after another, in one session.
+    let first = service.run("ask one").await.expect("run 1");
+    let second = service
+        .start_run("ask two", Some(first.session_id.clone()))
+        .expect("the first run released the session")
+        .handle
+        .await
+        .expect("join")
+        .expect("run 2");
+    let third = service
+        .resume(&second.run_id)
+        .await
+        .expect("the second run released the session");
+
+    assert_eq!(second.session_id, first.session_id);
+    assert_eq!(third.session_id, first.session_id);
+    assert_eq!(third.text, "answer three");
+}
+
+/// The REST adapter cancels by aborting the task, so the claim has to be
+/// released by `Drop` rather than by a line at the end of the run — an
+/// aborted run that kept its session would wedge it for the process's life.
+#[tokio::test]
+async fn an_aborted_run_task_releases_its_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, parked_run, handle) = parked_service(tmp.path()).await;
+    let session_id = session_of(&service, &parked_run);
+
+    handle.abort();
+    // Awaiting the aborted handle is what tells us the task — and with it the
+    // run's future, and with that the claim — has been dropped.
+    let joined = handle.await;
+    assert!(
+        joined.as_ref().err().is_some_and(|e| e.is_cancelled()),
+        "expected an aborted task, got: {joined:?}"
+    );
+
+    service
+        .start_run("after the abort", Some(session_id))
+        .expect("an aborted run must not keep its session");
 }
 
 #[tokio::test]
@@ -715,7 +823,10 @@ async fn a_cancelled_run_does_not_poison_the_next_runs_replay() {
 
     // Run A parks on the approval, then is cancelled: `assistant_message`
     // with the call is already on disk, `tool_result` never will be.
-    let (run_a, session_id, handle) = service.start_run("write the file", None);
+    let started = service
+        .start_run("write the file", None)
+        .expect("a fresh session is never busy");
+    let (run_a, session_id, handle) = (started.run_id, started.session_id, started.handle);
     let mut events = service.subscribe(&run_a);
     loop {
         match events.recv().await {
@@ -862,7 +973,10 @@ async fn a_started_run_in_an_existing_session_continues_it_too() {
 
     let first = service.run("opening ask").await.expect("turn 1");
     let before = model.recorded().len();
-    let (_, _, handle) = service.start_run("follow-up ask", Some(first.session_id.clone()));
+    let handle = service
+        .start_run("follow-up ask", Some(first.session_id.clone()))
+        .expect("the first run has finished, so its session is free")
+        .handle;
     handle.await.expect("join").expect("turn 2");
 
     let request = model
@@ -1266,7 +1380,10 @@ async fn live_frames_and_run_outcomes_are_redacted_like_the_log() {
     ));
     unsafe { std::env::remove_var("FORGE_RUNTIME_LIVE_TEST_TOKEN") };
 
-    let (run_id, _session, handle) = service.start_run("read creds.txt", None);
+    let started = service
+        .start_run("read creds.txt", None)
+        .expect("a fresh session is never busy");
+    let (run_id, handle) = (started.run_id, started.handle);
     let mut live = service.subscribe(&run_id);
     let mut frames: Vec<Event> = Vec::new();
     while let Ok(event) = live.recv().await {
