@@ -4,7 +4,7 @@
 
 **Goal:** `forge` with no subcommand opens an interactive conversation — a scrolling inline transcript, a rich input line with history and Tab-completed slash commands, discovered skills as `/name`, inline approvals, backgroundable turns, and `/fork` — over the same `AgentService` the CLI, server, MCP and ACP adapters already share. No new runtime capability: Phase A shipped replay, fork, `attach`/`list_runs` and `RunState`.
 
-**Architecture:** A new **pure** crate `forge-chat` (no terminal, no `rustyline`, no I/O syscalls) holds slash parsing + completion (`command.rs`), the `Event → Vec<Line>` mapping (`render.rs`), the input/signal state machine (`controller.rs`), and the async driver (`app.rs`) over two seams: `ChatIo` (terminal) and `ChatHost` (everything config-shaped). `forge-cli` implements both — `TerminalIo` over `rustyline` on a dedicated editor thread (the `NeedleEngine` pattern), `CliHost` over the existing `build_run_service` path. This is `forge-acp`'s pure-`dispatch`/impure-`server` split, with the impure half moved out of the crate entirely, so `cargo test -p forge-chat` can never need a TTY. The turn driver copies `forge-acp::server::run_turn` (subscribe-before-start → `select!` → flush → settle), and approvals reuse MCP/ACP's parked-run round trip (`ApprovalRequested` → `send_input("y"/"n")`) rather than adding a second mechanism.
+**Architecture:** A new **pure** crate `forge-chat` (no terminal, no `rustyline`, no I/O syscalls) holds slash parsing + completion (`command.rs`), the `Event → Vec<Line>` mapping (`render.rs`), the input/signal state machine (`controller.rs`), and the async driver (`app.rs`) over two seams: `ChatIo` (terminal) and `ChatHost` (everything config-shaped). `forge-cli` implements both — `TerminalIo` over `rustyline` on a dedicated editor thread (the `NeedleEngine` pattern), `CliHost` over the existing `build_run_service` path. This is `forge-acp`'s pure-`dispatch`/impure-`server` split, with the impure half moved out of the crate entirely, so `cargo test -p forge-chat` can never need a TTY. The turn driver copies `forge-acp::server::run_turn` (subscribe-before-start → `select!` → flush → settle), and approvals reuse MCP/ACP's parked-run round trip (`ApprovalRequested` → `send_input("y"/"n")`) rather than adding a second mechanism. **The one-live-run-per-session invariant is the runtime's**, not this plan's: `AgentService` is separately gaining a typed refusal of a second *concurrent* run on a live session, and replay is gaining `run_id` grouping (spec §10.1.1). No task here implements or duplicates that guard — the chat simply does not provoke it, by forking the foreground conversation on `/bg`.
 
 **Tech Stack:** Rust edition 2024, tokio (existing `signal`/`sync`/`time` features), async-trait, thiserror, serde_json, `rustyline` 18 (`default-features = false`, features `custom-bindings` + `with-file-history`; 8 new transitive packages, measured), cucumber BDD, tempfile.
 
@@ -35,6 +35,7 @@ The input classes most likely to bite a real user, each pinned to a test:
 6. **Typing during a turn** must not be discarded; a completed line typed mid-turn becomes the next turn. → Task 8 (documented + `TCSADRAIN` assertion note) and Task 10 (piped-mode ordering test).
 7. **A turn that fails** (unreachable model endpoint, denied approval, unreadable session log) must print one error line and return to the prompt, never end the chat. → Task 7 and Task 10.
 8. **`forge` in a non-TTY** (`printf '…' | forge`, `forge < script.txt`) must behave like `forge run`'s piped stdin: a line while a run is parked is the approval answer, otherwise it is a prompt; EOF exits 0. → Task 9 and Task 10.
+9. **A prompt typed while a turn is running** must queue and run *after* it, never start a second concurrent run in the same session — which would replay a successful tool call as unanswered and invite a duplicate side effect (spec §10.1.1). The runtime's guard is the backstop; the queue is what means the chat never reaches it. → Task 5 (FIFO queue) and Task 10 (two piped lines, two turns, in order, one session).
 
 ---
 
@@ -1058,9 +1059,11 @@ mod tests {
         assert_eq!(sessions.len(), 1, "two turns, one session: {sessions:?}");
     }
 
-    /// `/bg` detaches *and* moves the conversation to a fork, because two
-    /// runs writing into one session log would replay interleaved (spec
-    /// §10.1.1). This is the test that pins that.
+    /// `/bg` detaches *and* moves the conversation to a fork: two runs in
+    /// one session log replay interleaved, which silently replays a
+    /// successful tool call as unanswered and invites the model to retry a
+    /// side effect (spec §10.1.1). The runtime enforces the invariant; this
+    /// test pins the UI behaviour that keeps the chat clear of it.
     #[tokio::test]
     async fn bg_detaches_and_continues_in_a_fork() {
         let (host, _tmp) = FakeHost::with_slow_script();
@@ -1126,7 +1129,7 @@ mod tests {
   - transcript lines go to `io.write` between turns and `io.notify` while a turn is running (the terminal implementation puts the latter through rustyline's `ExternalPrinter`, which redraws the prompt underneath). Both take the same `Line`, so the transcript is identical either way;
   - the turn driver, copied from `forge-acp::server::run_turn`: `subscribe` **before** `start_run_with_options`; drain `try_recv` after settling; print the answer per §4.3; print the footer; then submit the first queued prompt. On cancel, `service.cancel(run_id)` then await the handle with a 2-second grace before giving up on it;
   - the approval round trip: on `ApprovalRequested`, render the question as a transcript line and let the **already-outstanding read** carry the answer (`service.send_input(run_id, "y"|"n")`). Nothing swaps the prompt text and no second read path exists — unlike ACP, which has to spawn the ask because its reader must stay free;
-  - **never start a turn in a session that already has a live run** (spec §5): `Action::Background` forks the session for the foreground and leaves the detached run in the original, and `/fork` while a turn is attached is refused with the message that names `/bg`;
+  - `Action::Background` forks the session for the foreground and leaves the detached run in the original, and `/fork` while a turn is attached is refused with the message that names `/bg`. **Do not add a concurrency guard here**: `AgentService` owns the one-live-run-per-session refusal (spec §5, §10.1.1), and a second copy in the UI would be two layers owning one rule. If that typed error ever does surface, render it as a normal failed turn;
   - the background watcher: a task per detached run consuming its stream and emitting only the two notice kinds of §10.1;
   - `/attach`: `service.attach(run_id)`, render the backlog, then stream while `is_live()`, else print the cross-process note and return.
 - [ ] **Step 5: Run** → PASS.

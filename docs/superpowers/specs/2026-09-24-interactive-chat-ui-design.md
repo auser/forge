@@ -373,12 +373,18 @@ the ordering is the part that is load-bearing:
    prompt if there is one. The queue is FIFO and unbounded: what the user
    typed is never dropped.
 
-**One live run per session, always.** A session's log is replayed in file
-order, so two runs writing into one session concurrently would interleave
-into a history no provider would accept (§10.1.1). The chat therefore
-never starts a turn in a session that already has a live run: the
-foreground run is the only one the current session can have, and `/bg`
-moves the foreground to a fork rather than sharing.
+**One live run per session, and the runtime is what enforces it.** Two
+runs writing into one session concurrently corrupt the *next* turn's
+replayed history in a way no error reports (§10.1.1). That guard belongs
+in `AgentService`, not here — it is being added there as a typed refusal
+of a second *concurrent* run on a live session (sequential reuse of a
+session id is unchanged and still the normal case). The chat's job is
+therefore not to police it but to avoid provoking it: `/bg` moves the
+foreground conversation into a fork, so the detached run keeps its session
+and the next thing you type lands somewhere else. If the runtime's refusal
+ever does surface — a race, or another process — it arrives as a typed
+`ForgeError` and is rendered as one `  ! error:` line like any other
+failed turn (§6.3).
 
 **Naming the session is what makes history real.** Phase A made every
 entry point that names an existing session continue it: the runtime
@@ -768,21 +774,57 @@ not the work:
 
 ### 10.1.1 Why `/bg` forks the conversation
 
-The second line is not decoration, it is a correctness requirement.
+The second line is not decoration. It keeps the chat clear of a real
+corruption, whose failure mode is worth stating precisely because the
+obvious guess about it is wrong.
+
 `forge-runtime::replay::conversation_from_events` walks a session's log in
 **file order**, explicitly documented as valid because "runs of one
-session are appended sequentially". A backgrounded run plus a new
-foreground turn in the same session would break that assumption: the two
-runs' events interleave, so the next replay could hand the model an
-assistant tool call from one run followed by a `tool_result` carrying the
-other run's `call_id` — which chat APIs reject. Losing a turn to a
-malformed history is much worse than a second session id.
+session are appended sequentially". Two runs in one session break that
+assumption — but the result is **not** a provider error.
+`replay::repair_tool_pairs` keeps the history API-valid either way: for an
+assistant message with tool calls it consumes only the immediately
+following `Role::Tool` messages, keeps those whose id is in `expected`,
+**silently drops the rest as orphans** (`replay.rs:199`), synthesizes an
+`UNANSWERED_TOOL` result for every expected id it did not see
+(`replay.rs:202-204`), and drops a bare tool message with no assistant
+call in front of it (`replay.rs:208`). There is no 400.
 
-So `/bg` moves the *foreground* into `fork_session(current, None)` — the
-primitive that exists for exactly this ("keeping two continuations of the
-same past is what `forge session fork` is for") — and the detached run
-keeps the session it started in. Consequences, all stated plainly in the
-transcript and the README:
+What actually happens is quieter and worse. With runs A and B interleaved
+— A's assistant tool call, then B's assistant message, then A's
+`tool_result` — A's real, *successful* result is discarded as an orphan
+and A's call is replayed to the model as
+`[forge: run ended before this tool answered]`. **A model told that its
+tool call went unanswered can legitimately retry it**, and the call it
+retries may have written a file, deleted one, or run a command. So the
+hazard is a corrupted history inviting a duplicate side effect, reported
+by nothing: no error, no warning, no `degraded` flag.
+
+This is reachable on `main` today and has nothing to do with the chat:
+`AgentService` has no per-session concurrency guard, and
+`forge-server/src/handlers.rs:124` passes a caller-supplied `session_id`
+straight into `start_run`, so two overlapping runs on one session are
+creatable over REST. It is being fixed in the runtime, in two layers:
+replay will group events by `run_id` so logs that are *already*
+interleaved replay correctly, and `AgentService` will refuse a second
+concurrent run on a live session with a typed error (sequential reuse
+unchanged). **This design is written against that fixed world** — the
+invariant is the runtime's to enforce, and the chat relies on it rather
+than being the only thing upholding it (§5).
+
+`/bg` still forks, for two reasons that both survive the fix:
+
+- **UX.** Backgrounding a long turn and then typing something else are two
+  continuations of one past, which is exactly what `fork_session` is for
+  ("keeping two continuations of the same past is what `forge session
+  fork` is for"). Without the fork the user's next sentence would have
+  nowhere to go until the job finished.
+- **Defence in depth.** Forking means the chat never even asks the runtime
+  to start a second concurrent run on a live session, so its behaviour
+  does not depend on which side of that fix a given binary is on.
+
+The detached run keeps the session it started in. Consequences, all stated
+plainly in the transcript and the README:
 
 - the fork contains the backgrounded run's events *so far*, so its history
   ends mid-run; replay already repairs an unanswered tool call the same way
@@ -1070,6 +1112,11 @@ Deliberately out of scope, each with the reason and the shape of the fix:
 - **Cross-process background runs.** Needs a daemon or a socket the
   runtime does not have (Phase A's recorded limitation). Until then the
   chat's jobs live and die with its process, and it says so.
+- **The per-session concurrency guard** (`AgentService` refusing a second
+  concurrent run on a live session, and replay grouping events by
+  `run_id`) is a runtime fix landing separately, not part of this
+  sub-project. The chat is written to rely on it and not to provoke it
+  (§10.1.1).
 - **Explicit skill activation.** `/name` relies on lexical
   `match_task`. The fix is `RunOptions::activate_skills` in the runtime,
   which also fixes the same weakness for `forge run`, `forge mcp` and
@@ -1116,6 +1163,7 @@ Deliberately out of scope, each with the reason and the shape of the fix:
   rather than assumed: starting a *fresh* session by default instead of
   resuming (§7); refusing `/model`/`/approval`/`/fork` while a run is live
   instead of hot-swapping (§9.1, §11); and `/bg` moving the foreground
-  conversation into a fork (§10.1.1) — which is the one place the design
-  does something the user did not literally ask for, and it is there
-  because the alternative is a replayed history that a provider rejects.
+  conversation into a fork (§10.1.1) — the one place the design does
+  something the user did not literally ask for. It is justified as UX (two
+  continuations of one past need two sessions) plus defence in depth; the
+  concurrency invariant itself is the runtime's to enforce, not the UI's.
