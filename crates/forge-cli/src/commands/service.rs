@@ -1,8 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use forge_config::CliOverrides;
 use forge_core::{ApprovalPolicy, ExecutionProvider, ForgeError};
-use forge_execution::{MockExecution, NativeExecution};
+use forge_execution::{ApprovalChannel, MockExecution, NativeExecution};
 use forge_runtime::AgentService;
 use forge_session::JsonlSessionStore;
 use forge_skills::FsSkillRegistry;
@@ -22,10 +23,23 @@ pub fn build_execution(
     config: &forge_config::Config,
     project_root: &Path,
 ) -> Result<Arc<dyn ExecutionProvider>, ForgeError> {
+    build_execution_with(config, project_root, ApprovalChannel::default())
+}
+
+/// [`build_execution`] with an explicit approval channel: a front end that
+/// owns stdin itself (the interactive chat) passes
+/// [`ApprovalChannel::Parked`] so a risky operation pauses the run instead
+/// of reading stdin behind the line editor's back.
+fn build_execution_with(
+    config: &forge_config::Config,
+    project_root: &Path,
+    approvals: ApprovalChannel,
+) -> Result<Arc<dyn ExecutionProvider>, ForgeError> {
     match config.execution.as_str() {
-        "native" => Ok(Arc::new(NativeExecution::new(
+        "native" => Ok(Arc::new(NativeExecution::with_channel(
             ApprovalPolicy::parse(&config.approval)?,
             project_root,
+            approvals,
         ))),
         "mock" => {
             forge_config::ensure_test_mocks_allowed("execution = \"mock\"")?;
@@ -50,9 +64,45 @@ pub fn build_execution(
 /// inspection) use plain [`build_service`]: the fast path cannot apply to
 /// them, so probing the engine would only cost them latency.
 pub async fn build_run_service(ctx: &Context) -> Result<AgentService, ForgeError> {
-    let service = build_service(ctx)?;
+    build_run_service_with(ctx, ServiceOptions::default()).await
+}
+
+/// [`build_run_service`] with explicit [`ServiceOptions`].
+pub async fn build_run_service_with(
+    ctx: &Context,
+    options: ServiceOptions,
+) -> Result<AgentService, ForgeError> {
+    let service = build_service_with(ctx, options)?;
     let engine = forge_needle::engine_if_available(service.config()).await;
     Ok(service.with_needle(engine))
+}
+
+/// Non-default choices a front end makes about its runtime.
+///
+/// `model`/`approval` hold the same strings the `--model`/`--approval`
+/// flags take and are applied into `CliOverrides` before `Config::load`,
+/// so the chat's `/model` and `/approval` go through the *one* override
+/// path rather than a second one that could resolve differently.
+#[derive(Debug, Clone, Default)]
+pub struct ServiceOptions {
+    /// How a risky operation asks. Default: today's behaviour.
+    pub approvals: ApprovalChannel,
+    pub model: Option<String>,
+    pub approval: Option<String>,
+}
+
+/// The flags' own override layer with a front end's choices applied on top.
+/// One function, so there is exactly one answer to "what did this runtime
+/// resolve from" for `forge config show` and the chat alike.
+fn overrides_for(ctx: &Context, options: &ServiceOptions) -> CliOverrides {
+    let mut overrides = ctx.cli_overrides();
+    if let Some(model) = &options.model {
+        overrides.model = Some(model.clone());
+    }
+    if let Some(approval) = &options.approval {
+        overrides.approval = Some(approval.clone());
+    }
+    overrides
 }
 
 /// Build the transport-neutral agent runtime from the resolved
@@ -60,8 +110,17 @@ pub async fn build_run_service(ctx: &Context) -> Result<AgentService, ForgeError
 /// execution provider, filesystem skill registry, and the JSONL session
 /// store.
 pub fn build_service(ctx: &Context) -> Result<AgentService, ForgeError> {
-    let resolved = ctx.resolve_config()?;
+    build_service_with(ctx, ServiceOptions::default())
+}
+
+/// [`build_service`] with explicit [`ServiceOptions`]. `ServiceOptions::default()`
+/// *is* [`build_service`], so no existing call site changes.
+pub fn build_service_with(
+    ctx: &Context,
+    options: ServiceOptions,
+) -> Result<AgentService, ForgeError> {
     let root = ctx.project_root()?;
+    let resolved = forge_config::Config::load(Some(&root), &overrides_for(ctx, &options))?;
 
     let model = forge_providers::model_from_config(&resolved.config, &root)?;
     // Routing registry: `[models]` entries that declare capabilities are
@@ -75,7 +134,7 @@ pub fn build_service(ctx: &Context) -> Result<AgentService, ForgeError> {
     registry.push((model.name().to_string(), model.capabilities()));
     let router = forge_providers::router_from_config(&resolved.config, &registry)?;
 
-    let execution = build_execution(&resolved.config, &root)?;
+    let execution = build_execution_with(&resolved.config, &root, options.approvals)?;
     let skills = Arc::new(FsSkillRegistry::new(&root, Some(execution.clone())));
 
     let sessions = Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions")));
@@ -103,4 +162,57 @@ pub fn build_service(ctx: &Context) -> Result<AgentService, ForgeError> {
             .with_graph(graph)
             .with_model_factory(Arc::new(factory)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::GlobalOpts;
+
+    /// The default must *be* today's runtime, because every existing call
+    /// site reaches `build_service_with` through it.
+    #[test]
+    fn service_options_default_is_todays_inline_channel() {
+        let options = ServiceOptions::default();
+        assert_eq!(
+            options.approvals,
+            forge_execution::ApprovalChannel::InlineTty
+        );
+        assert_eq!(options.model, None);
+        assert_eq!(options.approval, None);
+    }
+
+    /// `/model` and `/approval` must ride the *same* override layer the
+    /// `--model`/`--approval` flags do, not a second resolution path that
+    /// could disagree with `forge config show`.
+    #[test]
+    fn model_and_approval_options_ride_the_one_override_path() {
+        let ctx = Context {
+            global: GlobalOpts {
+                model: Some("from-flag".to_string()),
+                router: Some("static".to_string()),
+                ..GlobalOpts::default()
+            },
+        };
+
+        // Nothing chosen: exactly the flags' own overrides.
+        let untouched = overrides_for(&ctx, &ServiceOptions::default());
+        assert_eq!(untouched.model.as_deref(), Some("from-flag"));
+        assert_eq!(untouched.approval, None);
+        assert_eq!(untouched.router.as_deref(), Some("static"));
+
+        // Chosen in the front end: layered over the flags, everything else
+        // still the flags'.
+        let chosen = overrides_for(
+            &ctx,
+            &ServiceOptions {
+                model: Some("from-chat".to_string()),
+                approval: Some("deny".to_string()),
+                ..ServiceOptions::default()
+            },
+        );
+        assert_eq!(chosen.model.as_deref(), Some("from-chat"));
+        assert_eq!(chosen.approval.as_deref(), Some("deny"));
+        assert_eq!(chosen.router.as_deref(), Some("static"));
+    }
 }

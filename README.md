@@ -791,7 +791,14 @@ runs locally with approval gating: `Risky` operations pause for approval under
 `approval = "prompt"`, while `prompt-dangerous` asks only for `Destructive`
 ones (non-interactive stdin → typed "approval required" error, which the agent
 loop treats as a pause: answer via piped stdin lines, e.g.
-`echo y | forge run ...`). `auto` runs, `deny` blocks. The test-only `mock`
+`echo y | forge run ...`). Where that question goes is an explicit choice, not
+an inference from stdin: the default `inline-tty` channel is the behaviour just
+described, while a front end that owns stdin itself takes the *parked* channel,
+where a risky operation always returns an `approval required` pause and is
+answered through the run's input channel — so nothing ever reads stdin behind
+the protocol's or the line editor's back. `forge mcp` and `forge acp` get that
+same pause today because their stdin is the protocol rather than a terminal.
+`auto` runs, `deny` blocks. The test-only `mock`
 *execution* provider records requests
 for tests. MVM/container/remote executors plug into the same trait later.
 

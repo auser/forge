@@ -24,9 +24,10 @@ use crate::commands::Context;
 ///    global `--json` flag is meaningless for this command, and diagnostics
 ///    already go to stderr (`tracing_setup::init`).
 /// 2. **stdin is the protocol channel too**, so the run loop can never
-///    prompt on it — and it does not: `NativeExecution::prompt_for_approval`
-///    checks `stdin().is_terminal()` first, and under an editor stdin is a
-///    pipe. A risky operation under `approval = "prompt"` therefore pauses
+///    prompt on it — and it does not: `NativeExecution::ask_approval` asks
+///    inline only on the `ApprovalChannel::InlineTty` channel *and* a
+///    terminal stdin, and under an editor stdin is a pipe. A risky
+///    operation under `approval = "prompt"` therefore pauses
 ///    the run and waits for input delivered out of band, which here is the
 ///    answer to a `session/request_permission` request. That is how a
 ///    permission prompt ends up in the editor's own UI.

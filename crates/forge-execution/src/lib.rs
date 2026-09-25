@@ -5,4 +5,4 @@ mod mock;
 mod native;
 
 pub use mock::MockExecution;
-pub use native::NativeExecution;
+pub use native::{ApprovalChannel, NativeExecution};
