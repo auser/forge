@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/forge-acp",
+    "crates/forge-chat",
     "crates/forge-cli",
     "crates/forge-config",
     "crates/forge-core",
@@ -24,6 +25,7 @@ license = "MIT"
 
 [workspace.dependencies]
 forge-acp = { path = "crates/forge-acp" }
+forge-chat = { path = "crates/forge-chat" }
 forge-core = { path = "crates/forge-core" }
 forge-config = { path = "crates/forge-config" }
 forge-execution = { path = "crates/forge-execution" }

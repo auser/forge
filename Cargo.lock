@@ -569,6 +569,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-chat"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "forge-config",
+ "forge-core",
+ "forge-execution",
+ "forge-providers",
+ "forge-runtime",
+ "forge-session",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "forge-cli"
 version = "0.1.0"
 dependencies = [

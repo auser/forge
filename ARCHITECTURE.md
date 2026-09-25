@@ -256,6 +256,9 @@ forge-mcp         Model Context Protocol (stdio) adapter over the same
 forge-acp         Agent Client Protocol (stdio) adapter over the same
                   AgentService: forge *as the agent* — v1 wire types,
                   pure event→update dispatch, prompt-turn driver
+forge-chat        interactive chat: pure slash parsing, event->transcript
+                  rendering and the input state machine, over ChatIo /
+                  ChatHost seams the CLI implements (no terminal here)
 forge-cli         clap command tree, doctor, init, the forge binary
 ```
 

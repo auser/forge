@@ -1,0 +1,22 @@
+[package]
+name = "forge-chat"
+description = "Pure interactive-chat layer for Forge: slash parsing, transcript rendering and the input state machine, over the ChatIo/ChatHost seams"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+forge-runtime.workspace = true
+forge-session.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+forge-config.workspace = true
+forge-execution.workspace = true
+forge-providers.workspace = true
+tempfile.workspace = true
