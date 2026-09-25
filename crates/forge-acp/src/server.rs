@@ -511,7 +511,14 @@ impl ForgeAcpServer {
         // could be emitted with nobody listening.
         let mut events = session.service.subscribe(run_id);
 
-        let (_, _, mut handle) = session.service.start_run_with_options(
+        // The runtime enforces one live run per session too. It cannot
+        // double-refuse a legitimate turn: `claim_turn` has already
+        // established that this session has no turn in flight, and the
+        // runtime's claim is released inside the spawned run — before the
+        // handle resolves, and so before `TurnSlotGuard` frees the slot this
+        // turn holds. A refusal here therefore means a run reached the
+        // session by some other route, which is worth reporting, not hiding.
+        let mut handle = match session.service.start_run_with_options(
             prompt,
             RunOptions {
                 run_id: Some(run_id.to_string()),
@@ -520,7 +527,10 @@ impl ForgeAcpServer {
                 session_id: Some(session_id.to_string()),
                 ..RunOptions::default()
             },
-        );
+        ) {
+            Ok(started) => started.handle,
+            Err(e) => return Err(RpcError::invalid_request(e.to_string())),
+        };
         tracing::info!(session = session_id, run = %run_id, root = %session.root.display(), "turn started");
 
         let mut state = dispatch::TurnState::for_run(run_id, &session.root);

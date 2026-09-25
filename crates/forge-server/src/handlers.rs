@@ -30,6 +30,9 @@ impl From<ForgeError> for ApiError {
     fn from(err: ForgeError) -> Self {
         let status = match &err {
             ForgeError::Session(_) => StatusCode::NOT_FOUND,
+            // The session exists and is fine; it is busy. A retry after the
+            // in-flight run finishes succeeds, which is exactly 409.
+            ForgeError::SessionBusy { .. } => StatusCode::CONFLICT,
             ForgeError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ForgeError::Config(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -111,6 +114,12 @@ pub struct CreateRun {
 }
 
 /// Start a run on a tokio task; respond immediately with 202 + ids.
+///
+/// Naming a `session_id` whose run is still in flight is **409 Conflict**:
+/// the caller may not put two runs in one session, because their events would
+/// interleave in the session log and corrupt its replay. Waiting for the run
+/// (or cancelling it) and retrying is the fix, which is what 409 tells a
+/// client.
 pub async fn create_run(
     State(state): State<AppState>,
     Json(body): Json<CreateRun>,
@@ -121,7 +130,11 @@ pub async fn create_run(
             message: "prompt must not be empty".to_string(),
         });
     }
-    let (run_id, session_id, handle) = state.service.start_run(body.prompt, body.session_id);
+    let forge_runtime::StartedRun {
+        run_id,
+        session_id,
+        handle,
+    } = state.service.start_run(body.prompt, body.session_id)?;
 
     state.insert_run(
         run_id.clone(),

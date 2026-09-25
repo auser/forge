@@ -551,14 +551,23 @@ impl ForgeTools {
         let run_id = new_run_id();
         let mut events = self.service.subscribe(&run_id);
 
-        let (run_id, session_id, handle) = self.service.start_run_with_options(
+        // `forge_run` names no session, so every call gets a fresh one and
+        // the one-live-run-per-session guard cannot fire here. Reported
+        // rather than unwrapped: this tool must never panic the server, and
+        // if the schema ever grows a `session_id` the refusal is already
+        // handled.
+        let started = match self.service.start_run_with_options(
             prompt,
             RunOptions {
                 run_id: Some(run_id),
                 max_turns,
                 ..RunOptions::default()
             },
-        );
+        ) {
+            Ok(started) => started,
+            Err(e) => return ToolOutcome::error("session_busy", e.to_string()),
+        };
+        let (run_id, session_id, handle) = (started.run_id, started.session_id, started.handle);
         self.runs.start(&run_id);
 
         // The monitor owns the join handle, so a timed-out call still

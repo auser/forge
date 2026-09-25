@@ -72,6 +72,19 @@ pub struct RunOutcome {
     pub events: Vec<Event>,
 }
 
+/// A run started on its own task: the ids a transport can answer with
+/// immediately, plus the handle it needs to await or abort.
+///
+/// A struct rather than a tuple because the call is now fallible — a session
+/// with a run already in flight is refused — and `Result<(String, String,
+/// JoinHandle<…>), _>` reads as noise at every call site.
+#[derive(Debug)]
+pub struct StartedRun {
+    pub run_id: String,
+    pub session_id: String,
+    pub handle: tokio::task::JoinHandle<Result<RunOutcome, ForgeError>>,
+}
+
 /// What [`AgentService::fork_session`] created.
 #[derive(Debug, Clone, Serialize)]
 pub struct ForkOutcome {
@@ -262,6 +275,57 @@ impl InputState {
     }
 }
 
+/// Sessions with a run in flight in this process, `session_id -> run_id`.
+///
+/// Held behind an `Arc` rather than inline in [`AgentService`] so a
+/// [`SessionClaim`] can outlive the borrow that created it and travel into a
+/// spawned task.
+#[derive(Default)]
+struct LiveSessions {
+    runs: Mutex<HashMap<String, String>>,
+}
+
+impl LiveSessions {
+    /// Claim `session_id` for `run_id`, or report who holds it.
+    fn claim(self: &Arc<Self>, session_id: &str, run_id: &str) -> Result<SessionClaim, ForgeError> {
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = runs.get(session_id) {
+            return Err(ForgeError::session_busy(session_id, active));
+        }
+        runs.insert(session_id.to_string(), run_id.to_string());
+        Ok(SessionClaim {
+            sessions: Arc::clone(self),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn release(&self, session_id: &str) {
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+    }
+}
+
+/// A session held for the lifetime of one run: while this value exists, no
+/// second run can start in that session.
+///
+/// Release is `Drop` rather than an explicit call at the end of the run so
+/// that every way a run can end frees the session — a normal finish, an
+/// error, a panic inside the loop, and the aborted task the REST adapter's
+/// cancel produces. A claim that leaked would wedge its session permanently.
+struct SessionClaim {
+    sessions: Arc<LiveSessions>,
+    session_id: String,
+}
+
+impl Drop for SessionClaim {
+    fn drop(&mut self) {
+        self.sessions.release(&self.session_id);
+        tracing::debug!(session = %self.session_id, "session claim released");
+    }
+}
+
 /// Transport-neutral agent runtime: routing → model → tool loop → events.
 /// CLI and server share this type.
 ///
@@ -291,6 +355,8 @@ pub struct AgentService {
     /// Bounded tombstones for pruned runs, so `send_input` can refuse a
     /// finished run instead of resurrecting its channel.
     finished: Mutex<FinishedRuns>,
+    /// One live run per session (see [`AgentService::claim_session`]).
+    live_sessions: Arc<LiveSessions>,
 }
 
 impl AgentService {
@@ -316,6 +382,7 @@ impl AgentService {
             inputs: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
             finished: Mutex::new(FinishedRuns::default()),
+            live_sessions: Arc::new(LiveSessions::default()),
         }
     }
 
@@ -878,6 +945,35 @@ impl AgentService {
         )
     }
 
+    /// Take the session for one run, or refuse: **one live run per session.**
+    ///
+    /// Two runs in one session are not merely racy, they corrupt data that
+    /// outlives them. Both write into the same append-only log, so their
+    /// events interleave, and the next replay of that session has to
+    /// disentangle them (see [`crate::replay`]) — which it now does, but a
+    /// log that never interleaves is better than one that has to be repaired.
+    /// They would also each replay a history that does not include the other,
+    /// so the two conversations silently diverge.
+    ///
+    /// Claimed at the *entry points* (`run_with_options`,
+    /// `start_run_with_options`, `resume`) rather than deeper in the loop,
+    /// because the refusal has to reach the caller **synchronously**: a
+    /// transport that has already answered "202, here is your run id" has
+    /// nowhere left to report a conflict. The claim then travels into
+    /// [`run_tracked`](Self::run_tracked), whose scope is the run's lifetime,
+    /// so release needs no bookkeeping of its own.
+    ///
+    /// Sequential reuse of a session is untouched: the claim is gone before
+    /// the run's future resolves, so the next turn, resume or `POST /v1/runs`
+    /// naming that session claims it freely.
+    ///
+    /// The scope is this process. Two `forge resume` processes on one session
+    /// directory are still able to interleave, which is exactly why replay
+    /// had to be fixed as well as guarded.
+    fn claim_session(&self, session_id: &str, run_id: &str) -> Result<SessionClaim, ForgeError> {
+        self.live_sessions.claim(session_id, run_id)
+    }
+
     /// Run a prompt through the agent loop with fresh run/session ids.
     pub async fn run(&self, prompt: &str) -> Result<RunOutcome, ForgeError> {
         self.run_with_options(prompt, RunOptions::default()).await
@@ -889,6 +985,10 @@ impl AgentService {
     /// conversation is replayed as the model's history and the prompt is the
     /// next turn. A fresh session (the default) starts with nothing, so
     /// `forge run` is unaffected.
+    ///
+    /// Naming a session that has a run *in flight* is
+    /// [`ForgeError::SessionBusy`] — see
+    /// [`claim_session`](Self::claim_session).
     pub async fn run_with_options(
         &self,
         prompt: &str,
@@ -896,12 +996,14 @@ impl AgentService {
     ) -> Result<RunOutcome, ForgeError> {
         let run_id = options.run_id.unwrap_or_else(new_run_id);
         let session_id = options.session_id.unwrap_or_else(new_session_id);
+        let claim = self.claim_session(&session_id, &run_id)?;
         let history = self.session_history(&session_id);
         self.run_tracked(
             RunPlan::new_prompt(prompt, history),
             &run_id,
             &session_id,
             options.max_turns,
+            claim,
         )
         .await
     }
@@ -910,12 +1012,17 @@ impl AgentService {
     /// whatever it returns, its tracking entries are pruned and its outcome
     /// recorded. The classification is typed — [`RunState::of_result`] reads
     /// the error's variant, never its message.
+    ///
+    /// `_claim` is the session claim the caller took; holding it here means
+    /// the session is released exactly when the run's future ends, however it
+    /// ends.
     async fn run_tracked(
         &self,
         plan: RunPlan,
         run_id: &str,
         session_id: &str,
         max_turns: Option<u32>,
+        _claim: SessionClaim,
     ) -> Result<RunOutcome, ForgeError> {
         let result = self.run_inner(plan, run_id, session_id, max_turns).await;
         self.finish_run(run_id, RunState::of_result(&result));
@@ -926,15 +1033,15 @@ impl AgentService {
     /// the pre-generated `(run_id, session_id)` and the task handle so
     /// transports (the REST server) can return ids immediately and abort
     /// the task on cancel. Events are persisted and broadcast as usual.
+    ///
+    /// `Err` only for a session that already has a run in flight (see
+    /// [`claim_session`](Self::claim_session)); the run's own failures arrive
+    /// through the handle.
     pub fn start_run(
         self: &Arc<Self>,
         prompt: impl Into<String>,
         session_id: Option<String>,
-    ) -> (
-        String,
-        String,
-        tokio::task::JoinHandle<Result<RunOutcome, ForgeError>>,
-    ) {
+    ) -> Result<StartedRun, ForgeError> {
         self.start_run_with_options(
             prompt,
             RunOptions {
@@ -949,18 +1056,21 @@ impl AgentService {
     /// has no way to express. Resuming is [`resume`](Self::resume)'s job.
     ///
     /// Like [`run_with_options`](Self::run_with_options), a prompt landing in
-    /// a session that already has runs continues that conversation.
+    /// a session that already has runs continues that conversation, and a
+    /// prompt landing in one with a run *in flight* is refused.
+    ///
+    /// The session is claimed **before** the task is spawned and before any
+    /// tracking entry is created, so a refusal leaves nothing behind and the
+    /// caller learns about it in time to answer with a conflict rather than an
+    /// accepted run that later fails.
     pub fn start_run_with_options(
         self: &Arc<Self>,
         prompt: impl Into<String>,
         options: RunOptions,
-    ) -> (
-        String,
-        String,
-        tokio::task::JoinHandle<Result<RunOutcome, ForgeError>>,
-    ) {
+    ) -> Result<StartedRun, ForgeError> {
         let run_id = options.run_id.unwrap_or_else(new_run_id);
         let session_id = options.session_id.unwrap_or_else(new_session_id);
+        let claim = self.claim_session(&session_id, &run_id)?;
         // Create the broadcast channel now so subscribers connecting right
         // after the ids are handed out miss nothing.
         self.broadcaster(&run_id);
@@ -971,10 +1081,20 @@ impl AgentService {
         let handle = tokio::spawn(async move {
             let history = service.session_history(&sid);
             service
-                .run_tracked(RunPlan::new_prompt(prompt, history), &rid, &sid, max_turns)
+                .run_tracked(
+                    RunPlan::new_prompt(prompt, history),
+                    &rid,
+                    &sid,
+                    max_turns,
+                    claim,
+                )
                 .await
         });
-        (run_id, session_id, handle)
+        Ok(StartedRun {
+            run_id,
+            session_id,
+            handle,
+        })
     }
 
     /// The conversation a session already holds, replayed and fitted to the
@@ -1806,6 +1926,10 @@ impl AgentService {
                 )));
             }
         };
+        // Claimed before anything is read, so a resume of a session that is
+        // already running is refused rather than started alongside it.
+        let resumed_run = new_run_id();
+        let claim = self.claim_session(&session_id, &resumed_run)?;
         let events = self.sessions.events_for(&session_id)?;
 
         // The target run: the id itself when it names a run, else the
@@ -1882,9 +2006,10 @@ impl AgentService {
                 history,
                 resumed_from: Some(target_run),
             },
-            &new_run_id(),
+            &resumed_run,
             &session_id,
             None,
+            claim,
         )
         .await
     }
@@ -1912,10 +2037,12 @@ impl AgentService {
     /// "the prefix ends at a boundary for every run in it": if two runs of
     /// one session were in flight at once, their events interleave, and
     /// cutting after the anchor's last event can still land mid-way through
-    /// the other one. The fork is then honest but partial — replay repairs
-    /// the truncated run's unanswered tool calls the same way it repairs an
-    /// aborted one (see [`crate::replay`]). Concurrent runs in a single
-    /// session are not something forge's own CLI or adapters produce.
+    /// the other one. The fork is then honest but partial — replay groups the
+    /// prefix by run and repairs the truncated run's unanswered tool calls the
+    /// same way it repairs an aborted one (see [`crate::replay`]).
+    /// [`claim_session`](Self::claim_session) stops this process producing
+    /// such a log at all; a log written by two forge processes at once, or one
+    /// written before that guard existed, can still contain it.
     ///
     /// The prefix is copied verbatim and the source is never touched, so
     /// the fork is self-contained: it can be resumed, cancelled and forked

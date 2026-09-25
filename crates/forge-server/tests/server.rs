@@ -619,6 +619,75 @@ async fn approval_over_http_pause_then_approve() {
     assert_eq!(decided["approved"], true);
 }
 
+/// Two runs in one session would interleave their events in that session's
+/// log and corrupt its replay, so the second `POST /v1/runs` naming a busy
+/// session is a **409**, not a 500 and not an accepted run that quietly fails
+/// later. Once the first run is out of the way the same request succeeds,
+/// which is what makes 409 the honest code.
+#[tokio::test]
+async fn a_second_run_in_a_busy_session_is_a_conflict() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = scripted_app(
+        tmp.path(),
+        r#"[
+            {"tool_calls": [{"id": "call_1", "name": "write_file", "arguments": {"path": "guarded.txt", "content": "x"}}]},
+            {"text": "written"},
+            {"text": "the sequential follow-up"}
+        ]"#,
+        "prompt",
+    );
+
+    let (status, body) = post_json(&app, "/v1/runs", serde_json::json!({"prompt": "write"})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = body["run_id"].as_str().expect("run_id").to_string();
+    let session_id = body["session_id"].as_str().expect("session_id").to_string();
+
+    // Park the first run so it is unambiguously still in flight.
+    let mut parked = false;
+    for _ in 0..200 {
+        let (_, run) = get_json(&app, &format!("/v1/runs/{run_id}")).await;
+        if run["status"] == "waiting_for_approval" {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(parked, "run never parked at approval");
+
+    let (status, body) = post_json(
+        &app,
+        "/v1/runs",
+        serde_json::json!({"prompt": "a concurrent second ask", "session_id": session_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let message = body["error"].as_str().expect("error message");
+    assert!(
+        message.contains(&session_id) && message.contains(&run_id),
+        "the conflict must name the session and its holder: {message}"
+    );
+
+    // Let the first run finish, then the very same request is accepted:
+    // sequential reuse of a session is untouched.
+    let (status, _) = post_json(
+        &app,
+        &format!("/v1/runs/{run_id}/input"),
+        serde_json::json!({"input": "y"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run = wait_for_terminal(&app, &run_id).await;
+    assert_eq!(run["status"], "completed");
+
+    let (status, _) = post_json(
+        &app,
+        "/v1/runs",
+        serde_json::json!({"prompt": "the sequential follow-up", "session_id": session_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
 #[tokio::test]
 async fn cancel_parked_run_terminates_with_cancelled_event() {
     let tmp = tempfile::tempdir().expect("tempdir");
