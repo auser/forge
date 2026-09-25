@@ -66,12 +66,21 @@ impl Line {
         Self::gutter(Style::Ok, "    -> ", text)
     }
 
-    /// A failure: a tool result that did not succeed, an error, a
-    /// cancellation. Shares the `  ! ` gutter with [`Line::warn`] and
-    /// differs only in style, because to a reader they are the same
-    /// interruption of the flow.
+    /// A failure that interrupts the flow: an error, a cancellation, a
+    /// denial. Shares the `  ! ` gutter with [`Line::warn`] and differs
+    /// only in style, because to a reader they are the same interruption.
+    /// A tool result that *failed* is [`Line::failed`] instead — it belongs
+    /// under its call, not in the margin.
     pub fn bad(text: impl AsRef<str>) -> Self {
         Self::gutter(Style::Bad, "  ! ", text)
+    }
+
+    /// A tool result that did not succeed, or an approval that was denied:
+    /// the same `    -> ` slot as [`Line::ok`], because it answers the same
+    /// call and a reader looks for the outcome in one place. Only the style
+    /// differs, which is the writer's cue to colour it. `    -> `
+    pub fn failed(text: impl AsRef<str>) -> Self {
+        Self::gutter(Style::Bad, "    -> ", text)
     }
 
     /// A question that stops the turn until it is answered. `  ! `
@@ -208,6 +217,11 @@ mod tests {
     fn every_constructor_uses_its_documented_gutter() {
         assert!(Line::tool("read_file src/main.rs").text.starts_with("  * "));
         assert!(Line::ok("ok (12 ms)").text.starts_with("    -> "));
+        // A failed result shares the result gutter and differs in style: the
+        // reader looks for a call's outcome in exactly one place.
+        let failed = Line::failed("failed (12 ms)");
+        assert!(failed.text.starts_with("    -> "));
+        assert_eq!(failed.style, Style::Bad);
         assert!(Line::bad("error: boom").text.starts_with("  ! "));
         assert!(
             Line::warn("approval needed: x (risky)")

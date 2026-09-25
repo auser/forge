@@ -12,14 +12,18 @@
 //!   the transcript's only output type.
 //! * [`host`] — the [`ChatHost`] seam: everything config-shaped, as plain
 //!   owned data.
+//! * [`render`] — the `Event` → [`Line`] mapping, as a pure function of a
+//!   [`TranscriptState`].
 //!
 //! Design: `docs/superpowers/specs/2026-09-24-interactive-chat-ui-design.md`.
 
 pub mod host;
 pub mod io;
+pub mod render;
 
 pub use host::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,
 };
 pub use io::{ChatIo, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome, Style};
+pub use render::{TranscriptState, summarize_call};
