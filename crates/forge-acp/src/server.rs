@@ -970,6 +970,91 @@ mod tests {
         serde_json::to_value(&message).expect("serialize")
     }
 
+    // --- settle: the typed classification ------------------------------
+
+    fn settled(result: Result<forge_runtime::RunOutcome, ForgeError>) -> dispatch::RunFailure {
+        settle(Ok(result)).expect_err("this test is about failures")
+    }
+
+    /// `settle` is where a run's *type* becomes a `RunState`. Nothing else in
+    /// the adapter classifies, so if this drifts the stop reasons drift with
+    /// it — and it had no test of its own.
+    #[test]
+    fn settle_classifies_a_cancellation_from_the_error_variant() {
+        let failure = settled(Err(ForgeError::cancelled("cancellation requested")));
+        assert_eq!(failure.state, forge_core::RunState::Cancelled);
+        assert_eq!(
+            turn_end(Err(failure), false),
+            dispatch::TurnEnd::Stop(crate::protocol::StopReason::Cancelled)
+        );
+    }
+
+    #[test]
+    fn settle_classifies_an_unanswered_approval_from_the_error_variant() {
+        let failure = settled(Err(ForgeError::ApprovalRequired {
+            description: "rm -rf build".to_string(),
+            risk: forge_core::RiskLevel::Destructive,
+        }));
+        assert_eq!(failure.state, forge_core::RunState::AwaitingApproval);
+        assert_eq!(
+            turn_end(Err(failure), false),
+            dispatch::TurnEnd::Stop(crate::protocol::StopReason::Refusal)
+        );
+    }
+
+    #[test]
+    fn settle_classifies_everything_else_as_a_failure_whatever_it_says() {
+        // The message mentions cancellation; the variant does not. The old
+        // string matching would have called this a cancelled turn.
+        let failure = settled(Err(ForgeError::provider(
+            "the upstream cancelled our stream",
+        )));
+        assert_eq!(failure.state, forge_core::RunState::Failed);
+        assert!(failure.message.contains("cancelled our stream"));
+        assert!(matches!(
+            turn_end(Err(failure), false),
+            dispatch::TurnEnd::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn settle_reports_an_aborted_task_as_cancelled_and_a_panic_as_failed() {
+        // `JoinError::is_cancelled` is a type, not a message: an aborted run
+        // is a cancellation.
+        let handle = tokio::spawn(async {
+            std::future::pending::<Result<forge_runtime::RunOutcome, ForgeError>>().await
+        });
+        handle.abort();
+        let aborted = settle(handle.await).expect_err("aborted");
+        assert_eq!(aborted.state, forge_core::RunState::Cancelled);
+
+        // A panicked task is the one case with only text to go on, and it is
+        // a failure either way.
+        let handle = tokio::spawn(async {
+            panic!("the loop exploded");
+        });
+        let panicked = settle(handle.await).expect_err("panicked");
+        assert_eq!(panicked.state, forge_core::RunState::Failed);
+        assert!(
+            panicked.message.contains("did not finish"),
+            "got: {}",
+            panicked.message
+        );
+    }
+
+    #[test]
+    fn settle_passes_a_completed_runs_text_through() {
+        let outcome = forge_runtime::RunOutcome {
+            run_id: "r".into(),
+            session_id: "s".into(),
+            text: "all done".into(),
+            turns: 1,
+            tool_calls: 0,
+            events: Vec::new(),
+        };
+        assert_eq!(settle(Ok(Ok(outcome))).expect("completed"), "all done");
+    }
+
     #[tokio::test]
     async fn session_new_then_prompt_drives_a_run_and_ends_the_turn() {
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -1019,7 +1019,7 @@ values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env vars) are redacted to
 
 ```bash
 forge session list        # sessions with event counts
-forge session show <id>   # full event history
+forge session show <id>   # full event history, numbered for --at
 forge session fork <id>   # branch: a new session holding a copy of this
                           # session's history (--at cuts it short)
 forge resume <id>         # continue a completed run: a new run in the same
@@ -1042,7 +1042,8 @@ normal session afterwards — resumable, cancellable, forkable again — with no
 reference back to its parent. The price is disk, paid once per fork; the
 gain is that no session can be broken by anything happening to another.
 
-* `--at` inside a run **snaps forward** to that run's end. A half-run prefix
+* `--at` inside a run **snaps forward** to that run's end (`forge session
+  show` numbers its output with the positions `--at` takes). A half-run prefix
   would replay as an assistant tool call with no result, which is not a state
   any model should be handed.
 * Copying means a run id can exist in two sessions. `forge resume <run-id>`
@@ -1073,16 +1074,31 @@ run. `send_input` to a finished run is a typed error rather than a silently
 recreated channel; `attach` still serves that run's whole history from the
 session store.
 
-### What `forge resume` actually sends
+### A session is a conversation
 
-`forge resume <id>` rebuilds the model's `messages` from the event log —
-every prior run's prompts, assistant messages, tool calls and tool results,
-in order, up to and including the run being resumed — and appends a
-continuation instruction. It is a real continuation, not a re-ask:
+**Anything that names an existing session continues it.** The session's
+conversation is rebuilt from the event log — every prior run's prompts,
+assistant messages, tool calls and tool results, in order — and becomes the
+model's history for the new run. That covers:
+
+* `forge resume <id>` — replays up to the run being resumed and appends a
+  continuation instruction (there is no new prompt to send).
+* A **new prompt in an existing session** — `POST /v1/runs` with a
+  `session_id`, `forge_run` with a `session_id`, and every ACP turn after the
+  first (an editor session *is* a forge session) — replays the history and
+  the prompt is the next turn.
+
+A fresh session starts with nothing, so plain `forge run` is unaffected.
+
+How reconstruction behaves at the edges:
 
 * Runs recorded before v3 have no verbatim payloads, so their turns replay
-  from the truncated `completed` summary. The resume still works; the log
-  line says `degraded=true`.
+  from the truncated `completed` summary. It still works; the log line says
+  `degraded=true`.
+* A run that died between asking for a tool and getting its result (cancelled,
+  dispatch failed, approval unanswered) leaves a call with no answer. Replay
+  answers it with `[forge: run ended before this tool answered]` rather than
+  sending a dangling call, which every chat API rejects.
 * Reconstruction is fitted to a character budget derived from the model's
   advertised context window (half of `max_context`, at four characters per
   token). The **first** message is always kept — it is the session's original
@@ -1090,8 +1106,11 @@ continuation instruction. It is a real continuation, not a re-ask:
   the middle is replaced by one `[forge: earlier conversation omitted…]`
   system note, and a dropped assistant message takes its tool results with
   it.
-* Routing, skill matching and graph context still key on the session's
-  original ask, so a continuation is routed like the work it continues.
+* On a resume, routing, skill matching and graph context key on the session's
+  original ask, so a continuation is routed like the work it continues. A new
+  prompt routes on itself.
+* A log that cannot be read is logged and the run starts fresh — losing
+  history must not lose the run.
 
 ## Development
 
@@ -1318,6 +1337,16 @@ go in `specs/adrs/`.
   grows — there is no cross-process detach/reattach (no daemon, no socket).
 - `forge session fork` copies a prefix, so a run id can exist in more than
   one session; `resume <run-id>` picks the older one.
+- **Session logs now persist tool output, and redaction is best-effort.**
+  Replay (`tool_result`) stores what each tool returned — including file
+  contents, up to 64 KiB per call — in `.forge/sessions/*.jsonl`. The redactor
+  only catches *known* secret shapes (`sk-…`, `Bearer …`, `ghp_…`, `xox…`) and
+  the values of this process's `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env
+  vars, so an agent that reads a credentials file, a `.env` that was not in
+  this process's environment, or a private key lands in the log largely
+  unredacted. Treat `.forge/sessions/` as sensitive: it is already covered by
+  the repo's own `.gitignore` for `.forge/`, but back-ups, bug reports and
+  pasted logs are not.
 - The needle direct-dispatch fast path is read-only by design (`read_file`,
   `graph_context`, `graph_grep` only); writes, edits, deletes, and commands
   always go through the full agent loop and its approval gating.

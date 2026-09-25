@@ -233,6 +233,21 @@ impl JsonlSessionStore {
 }
 
 impl SessionStore for JsonlSessionStore {
+    /// Append an event and return **the redacted event that was written**.
+    ///
+    /// Returning the redacted form is the whole point: the runtime
+    /// broadcasts and collects whatever `append` hands back, so an
+    /// unredacted return value means secrets reach SSE subscribers, live
+    /// `Attachment` frames, and `--json` run outcomes even though the log on
+    /// disk is clean. It also makes the log and the stream byte-identical,
+    /// which is what the server's replay-versus-live deduplication compares —
+    /// a rewritten event used to be delivered twice, once scrubbed and once
+    /// raw.
+    ///
+    /// The redacted form is read back through serde so there is exactly one
+    /// definition of "what was written". `ts` is restored from the original:
+    /// it is the one field that is not a `String` in Rust but is one in JSON,
+    /// so it is the one field a redaction could make unparseable.
     fn append(&self, mut event: Event) -> Result<Event, ForgeError> {
         std::fs::create_dir_all(&self.root).map_err(ForgeError::Io)?;
         event.seq = self.next_seq(&event.session_id, &event.run_id)?;
@@ -242,6 +257,9 @@ impl SessionStore for JsonlSessionStore {
         self.redactor.redact_value(&mut value);
         let line = serde_json::to_string(&value)
             .map_err(|e| ForgeError::session(format!("serializing event: {e}")))?;
+        let mut redacted: Event = serde_json::from_value(value)
+            .map_err(|e| ForgeError::session(format!("re-reading a redacted event: {e}")))?;
+        redacted.ts = event.ts;
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -249,7 +267,7 @@ impl SessionStore for JsonlSessionStore {
             .open(self.file_for(&event.session_id))
             .map_err(ForgeError::Io)?;
         writeln!(file, "{line}").map_err(ForgeError::Io)?;
-        Ok(event)
+        Ok(redacted)
     }
 
     fn events(&self) -> Result<Vec<Event>, ForgeError> {
@@ -418,6 +436,53 @@ mod tests {
             raw.matches("[REDACTED]").count(),
             3,
             "text, tool-call arguments and tool output must all be redacted: {raw}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn append_returns_the_redacted_event_it_wrote() {
+        // The gap this closes: `append` used to redact a clone and return the
+        // ORIGINAL, so the runtime broadcast and collected the unredacted
+        // event — secrets reached SSE, live attachments and `--json` outcomes
+        // while the log on disk was clean.
+        let secret = "sk-livekey-abcdef123456";
+        unsafe { std::env::set_var("FORGE_SESSION_RETURN_TEST_TOKEN", secret) };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path()); // env snapshot here
+
+        let returned = store
+            .append(Event::new(
+                "run-1",
+                "sess-1",
+                EventKind::ToolResult {
+                    call_id: "call_1".into(),
+                    tool: "read_file".into(),
+                    output: format!("the file contained {secret}"),
+                    is_error: false,
+                },
+            ))
+            .expect("append");
+        unsafe { std::env::remove_var("FORGE_SESSION_RETURN_TEST_TOKEN") };
+
+        match &returned.kind {
+            EventKind::ToolResult { output, .. } => {
+                assert!(!output.contains(secret), "returned event leaks: {output}");
+                assert!(output.contains("[REDACTED]"), "got: {output}");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+        // Structural fields survive the round-trip...
+        assert_eq!(returned.seq, 1);
+        assert_eq!(returned.v, forge_core::EVENT_SCHEMA_VERSION);
+        assert_eq!(returned.run_id, "run-1");
+        // ...and what was returned is exactly what was written, which is what
+        // the server's replay-vs-live deduplication compares.
+        let raw = std::fs::read_to_string(tmp.path().join("sess-1.jsonl")).expect("read raw");
+        assert_eq!(
+            serde_json::to_string(&returned).expect("reserialize") + "\n",
+            raw,
+            "the stored line and the returned event must be identical"
         );
     }
 

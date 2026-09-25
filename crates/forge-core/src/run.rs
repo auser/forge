@@ -3,7 +3,9 @@
 //! Before this existed, ACP decided a turn's stop reason with
 //! `message.contains("cancelled")` and MCP passed `&'static str` status
 //! labels between its own functions. Both are now derived from types: a
-//! `ForgeError` variant or an [`EventKind`].
+//! `ForgeError` variant or an [`EventKind`]. There is deliberately no
+//! classify-from-message constructor — that is the thing being replaced, and
+//! keeping one "for the cases without a type" is how it comes back.
 
 use crate::error::ForgeError;
 use crate::events::{Event, EventKind};
@@ -85,20 +87,6 @@ impl RunState {
             Some(EventKind::Error { .. }) => Self::Failed,
             Some(EventKind::ApprovalRequested { .. }) => Self::WaitingForApproval,
             _ => Self::Running,
-        }
-    }
-
-    /// Classify from an error *message*, for the one caller that has no
-    /// typed error to read: a run whose tokio task died, where all that
-    /// survives is text. Everything with a `ForgeError` in hand should use
-    /// [`of_error`](Self::of_error) instead.
-    pub fn of_message(message: &str) -> Self {
-        if message.contains("cancelled") {
-            Self::Cancelled
-        } else if message.contains("approval required") {
-            Self::AwaitingApproval
-        } else {
-            Self::Failed
         }
     }
 }
@@ -189,18 +177,5 @@ mod tests {
             assert_eq!(state.as_str(), name);
             assert_eq!(state.is_terminal(), terminal, "{name}");
         }
-    }
-
-    #[test]
-    fn message_classification_is_the_documented_fallback() {
-        assert_eq!(RunState::of_message("run cancelled"), RunState::Cancelled);
-        assert_eq!(
-            RunState::of_message("approval required for: rm -rf build (destructive)"),
-            RunState::AwaitingApproval
-        );
-        assert_eq!(
-            RunState::of_message("no model provider configured"),
-            RunState::Failed
-        );
     }
 }

@@ -135,7 +135,7 @@ pub fn conversation_from_events(events: &[Event]) -> Replay {
     }
 
     Replay {
-        messages: drop_orphan_tool_messages(messages),
+        messages: repair_tool_pairs(messages),
         degraded,
     }
 }
@@ -146,32 +146,66 @@ fn is_runtime_marker(message: &str) -> bool {
     message.starts_with("resume of run ")
 }
 
-/// Keep the history a provider will accept: a `Role::Tool` message is only
-/// legal when the assistant message before it requested that call id.
+/// Stands in for a tool result the log never recorded, so an assistant
+/// message that requested a call is never replayed without an answer.
+const UNANSWERED_TOOL: &str = "[forge: run ended before this tool answered]";
+
+/// Make the history one a provider will accept, in both directions.
 ///
-/// This matters for logs where a run was cancelled or errored between the
-/// assistant's tool call and the tool's result, and again after
-/// [`fit_to_budget`] has dropped messages from the front.
-fn drop_orphan_tool_messages(messages: Vec<Message>) -> Vec<Message> {
-    let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(messages.len());
-    for message in messages {
+/// Chat APIs enforce a strict pairing: every `Role::Tool` message must
+/// answer a call the preceding assistant message made, **and** every call an
+/// assistant message makes must be answered. Either half missing is a 400,
+/// not a degraded answer (see `forge-providers`' OpenAI mapping, which
+/// forwards `tool_calls` and `tool_call_id` verbatim).
+///
+/// Both halves really occur in logs:
+///
+/// * **Dangling call** — the common one. The loop records
+///   `assistant_message` *before* it dispatches, so a run cancelled at a
+///   per-call checkpoint, one whose dispatch failed, or one whose approval
+///   nobody answered leaves a call with no `tool_result`. Any session that
+///   reuses one session id across runs (every ACP turn, `forge_run` with a
+///   `session_id`, `POST /v1/runs` with a `session_id`) then replays that
+///   run's dangling call on the next resume. Repaired by synthesizing an
+///   [`UNANSWERED_TOOL`] result: the model is told the agent tried the call
+///   and got nothing, which is both legal and true — dropping the call
+///   instead would hide an attempt that may have had side effects.
+/// * **Orphan result** — a `tool_result` whose `assistant_message` is
+///   missing (a log truncated between the two), and whatever
+///   [`fit_to_budget`] leaves behind after dropping messages from the front.
+///   Dropped: there is no call to attach it to.
+fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut messages = messages.into_iter().peekable();
+
+    while let Some(message) = messages.next() {
         match message.role {
-            Role::Assistant => {
-                for call in &message.tool_calls {
-                    announced.insert(call.id.clone());
-                }
+            Role::Assistant if !message.tool_calls.is_empty() => {
+                let expected: Vec<String> =
+                    message.tool_calls.iter().map(|c| c.id.clone()).collect();
                 out.push(message);
-            }
-            Role::Tool => {
-                let known = message
-                    .tool_call_id
-                    .as_ref()
-                    .is_some_and(|id| announced.contains(id));
-                if known {
-                    out.push(message);
+
+                // The answers, if any, are the messages directly following.
+                let mut answered: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                while messages.peek().is_some_and(|next| next.role == Role::Tool) {
+                    let Some(answer) = messages.next() else { break };
+                    match answer.tool_call_id.as_deref() {
+                        Some(id) if expected.iter().any(|e| e == id) => {
+                            answered.insert(id.to_string());
+                            out.push(answer);
+                        }
+                        // Answers somebody else's call: an orphan.
+                        _ => {}
+                    }
+                }
+                for id in expected.iter().filter(|id| !answered.contains(*id)) {
+                    out.push(Message::tool(id, UNANSWERED_TOOL));
                 }
             }
+            // A tool message reached here without an assistant call in front
+            // of it.
+            Role::Tool => {}
             _ => out.push(message),
         }
     }
@@ -228,7 +262,7 @@ pub fn fit_to_budget(messages: Vec<Message>, budget_chars: usize) -> Vec<Message
     kept.reverse();
 
     let mut out = vec![first, note];
-    out.extend(drop_orphan_tool_messages(kept));
+    out.extend(repair_tool_pairs(kept));
     out
 }
 

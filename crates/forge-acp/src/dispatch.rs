@@ -663,10 +663,15 @@ pub enum TurnEnd {
 
 /// Why a run produced no text, classified.
 ///
-/// The `state` is the load-bearing part: the driver builds it from the
-/// run's typed `ForgeError` ([`RunState::of_error`]), so the turn's stop
-/// reason no longer depends on how an error happens to print. `message` is
-/// carried along for the JSON-RPC error a genuine failure becomes.
+/// The `state` is the load-bearing part: every construction site builds it
+/// from a type — `RunState::of_error` for a `ForgeError`,
+/// `JoinError::is_cancelled` for an aborted task (see `server.rs::settle`) —
+/// so the turn's stop reason never depends on how an error happens to print.
+/// `message` is carried along only for the JSON-RPC error a genuine failure
+/// becomes.
+///
+/// There is deliberately no `From<String>`: an inferred conversion here is
+/// how string classification creeps back in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFailure {
     pub state: RunState,
@@ -679,23 +684,6 @@ impl RunFailure {
             state,
             message: message.into(),
         }
-    }
-}
-
-/// For the one caller with no typed error to read: a run whose tokio task
-/// died, where all that survives is text (see `server.rs::settle`).
-impl From<String> for RunFailure {
-    fn from(message: String) -> Self {
-        Self {
-            state: RunState::of_message(&message),
-            message,
-        }
-    }
-}
-
-impl From<&str> for RunFailure {
-    fn from(message: &str) -> Self {
-        Self::from(message.to_string())
     }
 }
 

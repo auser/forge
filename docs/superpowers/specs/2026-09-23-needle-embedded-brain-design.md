@@ -113,13 +113,19 @@ Each sub-project gets its own spec → plan → implementation cycle:
    `tui-substrate`). The runtime half of the table stakes is done, with
    no UI:
 
-   - **Full conversation replay on resume.** Event schema v3 adds the
-     verbatim replay kinds `assistant_message`, `tool_result` and
+   - **Full conversation replay.** Event schema v3 adds the verbatim
+     replay kinds `assistant_message`, `tool_result` and
      `session_forked` (additively — v1/v2 logs stay readable), and
      `forge-runtime::replay` rebuilds the model's `messages` from a
      session's log across every prior run, fitted to a budget derived
      from the model's `max_context`. The v0.3 "resume seeds a truncated
-     summary" limitation is gone.
+     summary" limitation is gone. Every entry point that names an
+     existing session continues it — `forge resume`, and also
+     `POST /v1/runs`, `forge_run` and each ACP turn after the first, all
+     of which reuse one session id and previously started from an empty
+     history while claiming otherwise. Replay also repairs a run that
+     died between announcing a tool call and recording its result, which
+     would otherwise replay as a dangling call every chat API rejects.
    - **Fork.** `AgentService::fork_session` + `forge session fork <id>
      [--at <position|run-id>]`: a prefix copy into a new session with a
      `session_forked` provenance marker, snapped to a run boundary, the
@@ -912,3 +918,22 @@ adds `router_name: "needle"` and confidence — no schema change.
   - **Forked-session ACP/MCP surface.** Neither adapter exposes forking
     yet; `forge session fork` is CLI-only, and a fork is just a session
     afterwards, so the adapters need no change to work with one.
+  - **Session logs are now sensitive.** `tool_result` persists what each
+    tool returned, so an agent that reads a credentials file writes it to
+    `.forge/sessions/*.jsonl`. The redactor is shape-based (`sk-…`,
+    `Bearer …`, `ghp_…`, `xox…`) plus this process's
+    `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env values, so anything it
+    does not recognise lands in the log. Recorded as a known limitation
+    rather than solved: the alternatives (not storing tool output, or
+    content-classifying it) each cost more than they buy at this stage —
+    the first removes the memory layer's whole point, the second is a
+    guess dressed as a guarantee.
+  - **`subscribe`/`send_input` still create state for an unknown run id.**
+    Both must serve an id that has been handed out but not yet started
+    (ACP subscribes before `start_run_with_options`; `forge run` queues
+    piped stdin before `run_with_options`), so an id nothing is known
+    about gets a real channel. Entries for *finished* runs and for runs
+    live in another process are refused, and a started run's entries are
+    pruned when it ends — but an id that is never run leaves one behind.
+    Every production caller passes an id it just generated; a UI that
+    subscribed to arbitrary strings would need a bound.

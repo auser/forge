@@ -88,8 +88,12 @@ fn print_events(ctx: &Context, events: &[Event]) -> Result<(), ForgeError> {
                 .map_err(|e| ForgeError::session(format!("serializing events: {e}")))?
         );
     } else {
-        for event in events {
-            println!("{}", format_event(event));
+        // Numbered with the 1-based log position, which is what
+        // `forge session fork --at <N>` takes — otherwise you would have to
+        // re-run with `--json` and count lines to find a cut point.
+        let width = events.len().to_string().len();
+        for (position, event) in events.iter().enumerate() {
+            println!("{:>width$}  {}", position + 1, format_event(event));
         }
     }
     Ok(())

@@ -22,4 +22,5 @@ async-trait.workspace = true
 forge-execution.workspace = true
 forge-graph.workspace = true
 forge-providers.workspace = true
+serial_test.workspace = true
 tempfile.workspace = true

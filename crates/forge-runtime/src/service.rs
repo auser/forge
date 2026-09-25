@@ -117,13 +117,14 @@ struct RunPlan {
 }
 
 impl RunPlan {
-    /// A fresh run: the prompt is the task and there is no history.
-    fn fresh(prompt: impl Into<String>) -> Self {
+    /// A new instruction: the prompt is the task, and `history` is whatever
+    /// the session it lands in already contains (empty for a fresh session).
+    fn new_prompt(prompt: impl Into<String>, history: Vec<Message>) -> Self {
         let prompt = prompt.into();
         Self {
             task: prompt.clone(),
             prompt,
-            history: Vec::new(),
+            history,
             resumed_from: None,
         }
     }
@@ -382,35 +383,85 @@ impl AgentService {
             .cloned()
     }
 
-    /// Subscribe to the live event stream of a run. This is the
-    /// transport-neutral seam the server's SSE endpoint consumes.
+    /// True when this process is running (or about to run) the run:
+    /// `start_run` registers the broadcaster before spawning the loop, and
+    /// `finish_run` removes it first when pruning, so this is the one flag
+    /// that means "our loop, live".
+    fn is_tracked(&self, run_id: &str) -> bool {
+        self.broadcasters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(run_id)
+    }
+
+    /// A receiver on a channel with no sender: nothing can ever arrive.
+    fn closed_stream() -> broadcast::Receiver<Event> {
+        let (sender, receiver) = broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+
+    /// Can this process still publish events for `run_id`?
     ///
-    /// For a run already known to be terminal this hands back an
-    /// immediately-closed receiver rather than registering a broadcaster
-    /// nothing will ever publish to — the caller's own replay of the stored
-    /// events is the complete answer for such a run (and see
-    /// [`attach`](Self::attach) for that backlog in one call).
+    /// True when the run is already ours, or when nothing is known about it
+    /// at all — an id handed out but not yet started. Both
+    /// [`subscribe`](Self::subscribe) and
+    /// [`input_sender`](Self::input_sender) need that second case: ACP
+    /// subscribes *before* `start_run_with_options` so an early approval
+    /// cannot be emitted with nobody listening, and `forge run` queues piped
+    /// stdin before calling `run_with_options`.
+    ///
+    /// False for the two cases that used to grow the maps with entries
+    /// nothing would publish to or prune: a run this process already
+    /// finished, and a run that is live *in another process* (it has stored
+    /// events but is not ours — its events never reach this channel).
+    fn may_become_live(&self, run_id: &str) -> bool {
+        if self.is_tracked(run_id) {
+            return true;
+        }
+        if self.tombstoned_state(run_id).is_some() {
+            return false;
+        }
+        // Unknown to the store as well: nothing has run under this id, so it
+        // may still be about to start here.
+        self.events(run_id).map(|e| e.is_empty()).unwrap_or(true)
+    }
+
+    /// Subscribe to the live event stream of a run. This is the
+    /// transport-neutral seam the server's SSE endpoint consumes, and the
+    /// one ACP calls *before* starting a run so no early event is emitted
+    /// with nobody listening.
+    ///
+    /// A run that can no longer produce events here — already finished, or
+    /// live in another process — gets an immediately-closed receiver instead
+    /// of registering a broadcaster nothing will ever publish to and nothing
+    /// will ever prune. Those runs are read from the session store: see
+    /// [`attach`](Self::attach), which returns the backlog and the live
+    /// stream together.
     pub fn subscribe(&self, run_id: &str) -> broadcast::Receiver<Event> {
-        if self.terminal_state(run_id).is_some() {
-            let (sender, receiver) = broadcast::channel(1);
-            drop(sender);
-            return receiver;
+        if !self.may_become_live(run_id) {
+            return Self::closed_stream();
         }
         self.broadcaster(run_id).subscribe()
+    }
+
+    /// Terminal state this process recorded for a run when it pruned it.
+    /// Cheap (one lock, no IO), which is why it is the check that runs
+    /// inside [`input_sender`](Self::input_sender)'s critical section.
+    fn tombstoned_state(&self, run_id: &str) -> Option<RunState> {
+        self.finished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .states
+            .get(run_id)
+            .copied()
     }
 
     /// Terminal state of a run, if it is known to have one: this process's
     /// tombstones first, then the session store (which also covers runs
     /// started by another process).
     fn terminal_state(&self, run_id: &str) -> Option<RunState> {
-        if let Some(state) = self
-            .finished
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .states
-            .get(run_id)
-            .copied()
-        {
+        if let Some(state) = self.tombstoned_state(run_id) {
             return Some(state);
         }
         let events = self.events(run_id).ok()?;
@@ -434,11 +485,23 @@ impl AgentService {
     /// Called *after* the terminal event is emitted, so subscribers still
     /// receive it: dropping the map's sender clone leaves already-buffered
     /// events readable, and receivers only see `Closed` afterwards.
+    ///
+    /// **Order matters.** The tombstone is recorded *first*, before any map
+    /// entry disappears: [`input_sender`](Self::input_sender) re-checks it
+    /// under the inputs lock, so recording it up front is what stops a run
+    /// terminating mid-`send_input` from getting a resurrected channel.
+    ///
+    /// Each lock is taken and released on its own; nothing here nests, so
+    /// `input_sender`'s nesting cannot deadlock against it.
     fn finish_run(&self, run_id: &str, state: RunState) {
         self.finished
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .record(run_id, state);
+        self.broadcasters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run_id);
         self.inputs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -447,23 +510,56 @@ impl AgentService {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(run_id);
-        self.broadcasters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(run_id);
         tracing::debug!(run_id, state = state.as_str(), "run tracking pruned");
     }
 
-    /// Per-run input channel sender (created on demand). Used by
-    /// `send_input` (server input endpoint / CLI stdin feeder) and by the
-    /// approval pause inside the loop.
+    /// Per-run input channel sender. Used by `send_input` (server input
+    /// endpoint / CLI stdin feeder) and by the approval pause inside the
+    /// loop.
+    ///
+    /// Creating the channel on demand is deliberate and load-bearing:
+    /// `forge run` generates the run id and spawns its stdin feeder *before*
+    /// calling `run_with_options`, so `echo y | forge run …` legitimately
+    /// queues an approval for a run that has not started. What must never
+    /// happen is creating one for a run that has already **finished** — the
+    /// resurrection that swallowed the message and leaked the entry.
+    ///
+    /// The tombstone is therefore re-checked *while holding the inputs
+    /// lock*. That closes the window [`send_input`](Self::send_input)'s
+    /// earlier check leaves open: [`finish_run`](Self::finish_run) records
+    /// the tombstone before it prunes anything, so a run that terminates
+    /// between the two is already tombstoned by the time creation is
+    /// considered. Nesting order is `inputs` → {`finished`, `broadcasters`},
+    /// and this is the only place these locks nest; `finish_run` holds one at
+    /// a time and so can never be the other half of a cycle.
     fn input_sender(&self, run_id: &str) -> Result<mpsc::Sender<String>, ForgeError> {
         let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        match inputs.get(run_id) {
+            Some(InputState::Open { sender, .. }) => return Ok(sender.clone()),
+            Some(InputState::Closed) => {
+                return Err(ForgeError::session(format!(
+                    "input channel for run {run_id} is closed"
+                )));
+            }
+            None => {}
+        }
+        if let Some(state) = self.tombstoned_state(run_id) {
+            return Err(ForgeError::session(format!(
+                "run {run_id} is {}; not accepting input",
+                state.as_str()
+            )));
+        }
+        if !self.may_become_live(run_id) {
+            return Err(ForgeError::session(format!(
+                "run {run_id} has no live input channel in this process; not accepting input"
+            )));
+        }
         match inputs
             .entry(run_id.to_string())
             .or_insert_with(InputState::open)
         {
             InputState::Open { sender, .. } => Ok(sender.clone()),
+            // Just inserted as Open; unreachable in practice.
             InputState::Closed => Err(ForgeError::session(format!(
                 "input channel for run {run_id} is closed"
             ))),
@@ -547,11 +643,7 @@ impl AgentService {
     /// attach.
     pub fn attach(&self, run_id: &str) -> Result<Attachment, ForgeError> {
         let terminal = self.terminal_state(run_id);
-        let tracked = self
-            .broadcasters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(run_id);
+        let tracked = self.is_tracked(run_id);
 
         // Subscribe first, but only for a run we already track — attaching
         // must never create a broadcaster for an id that turns out to be
@@ -663,9 +755,17 @@ impl AgentService {
             });
         }
 
-        // Newest activity first; a run with no events yet is the newest
-        // thing there is.
-        summaries.sort_by_key(|s| std::cmp::Reverse(s.last_event_at));
+        // Newest activity first, with the just-started (no events yet) runs
+        // ahead of everything — they are the newest thing there is. The
+        // `is_some()` term is load-bearing: `None < Some(_)`, so
+        // `Reverse(None)` is the *maximum* and sorting on the timestamp
+        // alone would bury them at the end.
+        summaries.sort_by_key(|s| {
+            (
+                s.last_event_at.is_some(),
+                std::cmp::Reverse(s.last_event_at),
+            )
+        });
         let (live, terminal): (Vec<RunSummary>, Vec<RunSummary>) =
             summaries.into_iter().partition(|s| !s.state.is_terminal());
         let mut out = live;
@@ -683,6 +783,8 @@ impl AgentService {
             .insert(run_id.to_string(), InputState::Closed);
     }
 
+    /// The run's cancellation token, created if absent. Only the loop calls
+    /// this, for its own run — `finish_run` prunes what it creates.
     fn cancel_token(&self, run_id: &str) -> CancellationToken {
         self.cancel_tokens
             .lock()
@@ -690,6 +792,19 @@ impl AgentService {
             .entry(run_id.to_string())
             .or_default()
             .clone()
+    }
+
+    /// The run's cancellation token if one exists, without creating it —
+    /// what [`cancel`](Self::cancel) uses. A run with no token has no loop
+    /// in this process listening for one, and the cross-process marker file
+    /// covers it; creating a token for it would leave an entry nothing
+    /// prunes.
+    fn existing_cancel_token(&self, run_id: &str) -> Option<CancellationToken> {
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+            .cloned()
     }
 
     fn runs_dir(&self) -> PathBuf {
@@ -769,6 +884,11 @@ impl AgentService {
     }
 
     /// Run a prompt with explicit options.
+    ///
+    /// Naming a session that already has runs **continues** it: the session's
+    /// conversation is replayed as the model's history and the prompt is the
+    /// next turn. A fresh session (the default) starts with nothing, so
+    /// `forge run` is unaffected.
     pub async fn run_with_options(
         &self,
         prompt: &str,
@@ -776,8 +896,9 @@ impl AgentService {
     ) -> Result<RunOutcome, ForgeError> {
         let run_id = options.run_id.unwrap_or_else(new_run_id);
         let session_id = options.session_id.unwrap_or_else(new_session_id);
+        let history = self.session_history(&session_id);
         self.run_tracked(
-            RunPlan::fresh(prompt),
+            RunPlan::new_prompt(prompt, history),
             &run_id,
             &session_id,
             options.max_turns,
@@ -826,6 +947,9 @@ impl AgentService {
     /// [`start_run`](Self::start_run) with explicit [`RunOptions`] — the
     /// MCP adapter needs a per-call turn budget, which the REST adapter
     /// has no way to express. Resuming is [`resume`](Self::resume)'s job.
+    ///
+    /// Like [`run_with_options`](Self::run_with_options), a prompt landing in
+    /// a session that already has runs continues that conversation.
     pub fn start_run_with_options(
         self: &Arc<Self>,
         prompt: impl Into<String>,
@@ -845,11 +969,47 @@ impl AgentService {
         let (rid, sid) = (run_id.clone(), session_id.clone());
         let max_turns = options.max_turns;
         let handle = tokio::spawn(async move {
+            let history = service.session_history(&sid);
             service
-                .run_tracked(RunPlan::fresh(prompt), &rid, &sid, max_turns)
+                .run_tracked(RunPlan::new_prompt(prompt, history), &rid, &sid, max_turns)
                 .await
         });
         (run_id, session_id, handle)
+    }
+
+    /// The conversation a session already holds, replayed and fitted to the
+    /// model's budget. Empty for a fresh session.
+    ///
+    /// This is what makes the session store the harness's memory for *every*
+    /// caller, not just `forge resume`: an ACP session's second turn, a
+    /// `forge_run` with a `session_id`, a `POST /v1/runs` naming a session —
+    /// all of them continue the conversation they name, which is what those
+    /// APIs already claim to do.
+    ///
+    /// A replay failure is never a run failure: a corrupt or unreadable log
+    /// is logged and the run starts fresh, because losing history is worse
+    /// than losing the run only if the run survives.
+    fn session_history(&self, session_id: &str) -> Vec<Message> {
+        let events = match self.sessions.events_for(session_id) {
+            Ok(events) if !events.is_empty() => events,
+            Ok(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(session = session_id, error = %e, "could not read session history; starting fresh");
+                return Vec::new();
+            }
+        };
+        let replay = crate::replay::conversation_from_events(&events);
+        let budget = crate::replay::history_budget_chars(&self.model.capabilities());
+        let history = crate::replay::fit_to_budget(replay.messages, budget);
+        if !history.is_empty() {
+            tracing::info!(
+                session = session_id,
+                messages = history.len(),
+                degraded = replay.degraded,
+                "continuing an existing session"
+            );
+        }
+        history
     }
 
     /// Try to answer a prompt with one local tool call instead of the
@@ -1132,7 +1292,6 @@ impl AgentService {
                 )));
             }
         }
-        let resuming = !history.is_empty();
         messages.extend(history);
         messages.push(Message::user(prompt));
 
@@ -1154,15 +1313,19 @@ impl AgentService {
         };
 
         // Fast path: the on-device brain answers a well-defined prompt with
-        // one local tool call, before the model is called. Only for a fresh
-        // prompt — a resume continues a conversation, so re-running the
-        // original prompt's tool would be wrong — and only when the run
-        // actually has tools, i.e. the resolved provider is tool-capable:
+        // one local tool call, before the model is called. Only when there is
+        // a *new* instruction to answer — a resume continues a conversation
+        // with no fresh prompt, so re-running the original prompt's tool
+        // would be wrong. Replayed history does not disqualify it: the second
+        // turn of a session is still a new instruction, and gating on history
+        // instead of on `resumed_from` would silently switch the fast path
+        // off for every continuation. And only when the run actually has
+        // tools, i.e. the resolved provider is tool-capable:
         // a chat-only model's run is a plain completion and the fast path
         // must not turn it into tool execution. All other gates and the
         // dispatch itself live in `needle_fast_path`; `None` means "run
         // normally", and nothing has been emitted or executed by then.
-        if !resuming
+        if resumed_from.is_none()
             && !tools.is_empty()
             && let Some(fast) = self.needle_fast_path(prompt, &run_id, &tools).await
         {
@@ -1584,8 +1747,14 @@ impl AgentService {
             )));
         };
 
-        // In-process + cross-process cancellation signals.
-        self.cancel_token(run_or_session_id).cancel();
+        // In-process + cross-process cancellation signals. The token is
+        // fired only if one exists: a run with none has no loop here to
+        // interrupt, and the marker file below is what reaches the process
+        // that does — creating a token for it would leave a map entry
+        // nothing prunes.
+        if let Some(token) = self.existing_cancel_token(run_or_session_id) {
+            token.cancel();
+        }
         let marker = self.cancel_marker(run_or_session_id);
         if let Some(parent) = marker.parent() {
             std::fs::create_dir_all(parent).map_err(ForgeError::Io)?;
@@ -1739,6 +1908,15 @@ impl AgentService {
     /// per-run and therefore cannot address a session-wide point on its
     /// own, which is why the position is a log position.)
     ///
+    /// Snapping is to the *anchored* run's boundary, which is not the same as
+    /// "the prefix ends at a boundary for every run in it": if two runs of
+    /// one session were in flight at once, their events interleave, and
+    /// cutting after the anchor's last event can still land mid-way through
+    /// the other one. The fork is then honest but partial — replay repairs
+    /// the truncated run's unanswered tool calls the same way it repairs an
+    /// aborted one (see [`crate::replay`]). Concurrent runs in a single
+    /// session are not something forge's own CLI or adapters produce.
+    ///
     /// The prefix is copied verbatim and the source is never touched, so
     /// the fork is self-contained: it can be resumed, cancelled and forked
     /// again with no reference back. A `session_forked` marker event under
@@ -1801,7 +1979,6 @@ impl AgentService {
         let events_copied = self
             .sessions
             .copy_prefix(source_session_id, &session_id, lines)?;
-        #[allow(clippy::cast_possible_truncation)]
         let at_position = lines as u64;
         self.sessions.append(Event::new(
             new_run_id(),

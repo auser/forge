@@ -307,14 +307,28 @@ forge run "explain the parser"
   └─ every event appended to .forge/sessions/<id>.jsonl (redacted, replayable)
 ```
 
-`forge resume <id>` runs the same path with one difference: before the loop
-starts, `forge-runtime::replay` reads the session's log and rebuilds the model
-conversation from it — `run_started` prompts, `assistant_message` records
-(text + tool calls, verbatim), `tool_result` records — across every prior run
-of the session, fitted to a character budget derived from the model's context
-window. The log is therefore not just a trace: it is the only place the
-conversation lives between runs, which is why the v3 replay events are written
-even though no adapter displays them.
+**Continuing a session** runs the same path with one difference: before the
+loop starts, `forge-runtime::replay` reads the session's log and rebuilds the
+model conversation from it — `run_started` prompts, `assistant_message`
+records (text + tool calls, verbatim), `tool_result` records — across every
+prior run of the session, fitted to a character budget derived from the
+model's context window. This is not special to `forge resume`: every entry
+point that names an existing session (`run_with_options`,
+`start_run_with_options`, and so `POST /v1/runs`, `forge_run`, and each ACP
+turn) continues the conversation it names. A fresh session replays nothing.
+
+The log is therefore not just a trace: it is the only place the conversation
+lives between runs, which is why the v3 replay events are written even though
+no adapter displays them. Reconstruction also *repairs* the conversation — a
+run that died between announcing a tool call and recording its result leaves a
+call with no answer, and every chat API rejects that — so replay synthesizes
+the missing result rather than emitting a dangling call.
+
+Because the store is now read back into the model's context, `SessionStore::append`
+returns **the redacted event it wrote**, not the one it was handed: the runtime
+broadcasts and collects whatever `append` returns, so anything less would let
+secrets reach SSE subscribers and `--json` outcomes while the log on disk
+stayed clean. One redaction, at one boundary, for every consumer.
 
 `forge session fork` branches a session by copying its log prefix, so two
 conversations can continue from one shared past without either being able to

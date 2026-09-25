@@ -303,6 +303,180 @@ fn a_tool_result_without_its_assistant_call_is_dropped() {
     );
 }
 
+/// The regression this exists for: the loop records `assistant_message`
+/// *before* it dispatches, so a run that died between the two leaves a call
+/// with no result. Replayed as-is, that is a provider 400 — every chat API
+/// requires each announced tool call to be answered — and it reaches a real
+/// run because any session reusing one session id (ACP turns, `forge_run`
+/// with a `session_id`, `POST /v1/runs` with a `session_id`) replays the
+/// aborted run on the next resume.
+#[test]
+fn an_unanswered_tool_call_gets_a_synthetic_result_instead_of_dangling() {
+    let call = ToolCall::new(
+        "call_1",
+        "run_command",
+        serde_json::json!({"command": "rm -rf x"}),
+    );
+    let events = vec![
+        run_started("r1", 1, "clean up"),
+        // Recorded before dispatch...
+        assistant("r1", 2, "removing it", vec![call]),
+        // ...and then the run was cancelled at the per-call checkpoint.
+        event(
+            "r1",
+            3,
+            EventKind::Cancelled {
+                reason: "cancelled by user".into(),
+            },
+        ),
+        // A later run in the SAME session is what makes this reachable.
+        run_started("r2", 1, "what happened?"),
+        assistant("r2", 2, "nothing ran", Vec::new()),
+        completed("r2", 3, "nothing ran"),
+    ];
+    let replay = conversation_from_events(&events);
+
+    let shape: Vec<(Role, &str)> = replay
+        .messages
+        .iter()
+        .map(|m| (m.role, m.content.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (Role::User, "clean up"),
+            (Role::Assistant, "removing it"),
+            (Role::Tool, "[forge: run ended before this tool answered]"),
+            (Role::User, "what happened?"),
+            (Role::Assistant, "nothing ran"),
+        ],
+        "an announced call must always be answered"
+    );
+    assert_eq!(replay.messages[2].tool_call_id.as_deref(), Some("call_1"));
+    // The call itself survives: the agent did attempt it, and a replay that
+    // hid the attempt would misdescribe what happened.
+    assert_eq!(replay.messages[1].tool_calls.len(), 1);
+}
+
+#[test]
+fn every_announced_call_is_answered_even_when_only_some_ran() {
+    // A multi-call turn cancelled partway: the first call answered, the
+    // second never dispatched.
+    let calls = vec![
+        ToolCall::new("call_1", "read_file", serde_json::json!({"path": "a.rs"})),
+        ToolCall::new("call_2", "read_file", serde_json::json!({"path": "b.rs"})),
+    ];
+    let events = vec![
+        run_started("r1", 1, "read both"),
+        assistant("r1", 2, "", calls),
+        tool_result("r1", 3, "call_1", "contents of a"),
+        event(
+            "r1",
+            4,
+            EventKind::Error {
+                message: "dispatch failed".into(),
+            },
+        ),
+    ];
+    let replay = conversation_from_events(&events);
+
+    let announced: Vec<&str> = replay.messages[1]
+        .tool_calls
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    let answers: Vec<&str> = replay
+        .messages
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    assert_eq!(announced, vec!["call_1", "call_2"]);
+    assert_eq!(answers, announced, "every call needs exactly one answer");
+    assert_eq!(replay.messages[2].content, "contents of a");
+    assert_eq!(
+        replay.messages[3].content,
+        "[forge: run ended before this tool answered]"
+    );
+}
+
+#[test]
+fn a_result_answering_a_call_nobody_made_is_dropped_not_reattached() {
+    // Two assistant turns; the second's "answer" names the first's call id,
+    // which would silently mislabel the second turn's history.
+    let events = vec![
+        run_started("r1", 1, "ask"),
+        assistant(
+            "r1",
+            2,
+            "first",
+            vec![ToolCall::new("call_1", "read_file", serde_json::json!({}))],
+        ),
+        tool_result("r1", 3, "call_1", "first output"),
+        assistant(
+            "r1",
+            4,
+            "second",
+            vec![ToolCall::new("call_2", "read_file", serde_json::json!({}))],
+        ),
+        tool_result("r1", 5, "call_1", "a stale answer"),
+        completed("r1", 6, "done"),
+    ];
+    let replay = conversation_from_events(&events);
+    assert!(
+        !replay
+            .messages
+            .iter()
+            .any(|m| m.content == "a stale answer"),
+        "got: {:?}",
+        replay.messages
+    );
+    // call_2 still gets an answer, just not that one.
+    let answer = replay
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_2"))
+        .expect("call_2 answered");
+    assert_eq!(
+        answer.content,
+        "[forge: run ended before this tool answered]"
+    );
+}
+
+#[test]
+fn budget_truncation_never_leaves_a_dangling_call_or_orphan_result() {
+    // Whatever the budget drops, the survivors must still pair up.
+    let long = "x".repeat(300);
+    let messages = vec![
+        Message::user("anchor"),
+        {
+            let mut m = Message::assistant_tool_calls(vec![ToolCall::new(
+                "call_1",
+                "read_file",
+                serde_json::json!({}),
+            )]);
+            m.content = long.clone();
+            m
+        },
+        Message::tool("call_1", long.clone()),
+        Message::assistant("final"),
+    ];
+    for budget in [80, 150, 260, 400, 700, 1_200] {
+        let fitted = fit_to_budget(messages.clone(), budget);
+        let announced: std::collections::HashSet<&str> = fitted
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().map(|c| c.id.as_str()))
+            .collect();
+        let answered: std::collections::HashSet<&str> = fitted
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(
+            announced, answered,
+            "budget {budget} left an unpaired message: {fitted:?}"
+        );
+    }
+}
+
 #[test]
 fn a_cancelled_run_replays_what_it_produced_without_a_completion() {
     let call = ToolCall::new("call_1", "read_file", serde_json::json!({"path": "a.rs"}));
