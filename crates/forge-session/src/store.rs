@@ -92,6 +92,60 @@ impl JsonlSessionStore {
             .collect()
     }
 
+    /// The raw JSONL lines of one session, blank lines dropped (empty when
+    /// the file does not exist).
+    ///
+    /// Callers that need *events* want [`events_for`](Self::events_for).
+    /// This exists for copying: a fork must reproduce a prefix byte for
+    /// byte, including the original `v`, `seq` and timestamps, rather than
+    /// re-serializing through the current schema.
+    pub fn raw_lines(&self, session_id: &str) -> Result<Vec<String>, ForgeError> {
+        let path = self.file_for(session_id);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        Ok(std::fs::read_to_string(&path)
+            .map_err(ForgeError::Io)?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Create `target`'s session file from the first `lines` event lines of
+    /// `source`, copied verbatim. Returns the number of lines written.
+    ///
+    /// The source file is opened read-only and never written: forks are
+    /// prefix *copies*, which keeps every session file self-contained and
+    /// independently appendable (the price is disk, paid once per fork).
+    /// Refuses to overwrite an existing target — session ids are ULIDs, so
+    /// a collision means something is wrong rather than something to
+    /// silently clobber.
+    pub fn copy_prefix(
+        &self,
+        source: &str,
+        target: &str,
+        lines: usize,
+    ) -> Result<usize, ForgeError> {
+        let target_path = self.file_for(target);
+        if target_path.exists() {
+            return Err(ForgeError::session(format!(
+                "session {target} already exists at {}",
+                target_path.display()
+            )));
+        }
+        let prefix = self.raw_lines(source)?;
+        let take = lines.min(prefix.len());
+        std::fs::create_dir_all(&self.root).map_err(ForgeError::Io)?;
+        let mut body = String::new();
+        for line in &prefix[..take] {
+            body.push_str(line);
+            body.push('\n');
+        }
+        std::fs::write(&target_path, body).map_err(ForgeError::Io)?;
+        Ok(take)
+    }
+
     /// All sessions known under the root, sorted by session id.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, ForgeError> {
         let mut out = Vec::new();
@@ -317,6 +371,59 @@ mod tests {
         assert!(!raw.contains(secret), "leaked env secret: {raw}");
         assert!(!raw.contains("Bearer abcdef123"), "leaked bearer: {raw}");
         assert!(raw.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn copy_prefix_reproduces_lines_verbatim_and_leaves_the_source_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A v1 line and a v2 line: a copy must preserve both exactly,
+        // schema versions included.
+        let original = "{\"v\":1,\"ts\":\"2026-09-22T20:01:39.172579Z\",\"run_id\":\"r1\",\"session_id\":\"src\",\"type\":\"run_started\",\"provider\":\"p\",\"model\":\"m\"}\n{\"v\":2,\"seq\":1,\"ts\":\"2026-09-22T20:01:40.172579Z\",\"run_id\":\"r2\",\"session_id\":\"src\",\"type\":\"completed\",\"summary\":\"done\"}\n";
+        std::fs::write(tmp.path().join("src.jsonl"), original).expect("write");
+
+        let store = JsonlSessionStore::new(tmp.path());
+        assert_eq!(store.copy_prefix("src", "dst", 1).expect("copy"), 1);
+
+        let copied = std::fs::read_to_string(tmp.path().join("dst.jsonl")).expect("read copy");
+        assert_eq!(
+            copied,
+            original.lines().next().expect("first line").to_string() + "\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("src.jsonl")).expect("read source"),
+            original,
+            "the source must be byte-identical afterwards"
+        );
+    }
+
+    #[test]
+    fn copy_prefix_clamps_to_the_log_length_and_refuses_to_overwrite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path());
+        store
+            .append(Event::new(
+                "r",
+                "src",
+                EventKind::ToolStarted { name: "t".into() },
+            ))
+            .expect("append");
+
+        assert_eq!(
+            store.copy_prefix("src", "dst", 99).expect("copy"),
+            1,
+            "asking for more lines than exist copies the whole log"
+        );
+        let err = store
+            .copy_prefix("src", "dst", 1)
+            .expect_err("must not clobber");
+        assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+    }
+
+    #[test]
+    fn raw_lines_of_an_unknown_session_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path());
+        assert!(store.raw_lines("nope").expect("raw").is_empty());
     }
 
     #[test]

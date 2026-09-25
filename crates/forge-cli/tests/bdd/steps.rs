@@ -950,6 +950,76 @@ fn session_log_records_conversation_verbatim(world: &mut BddWorld) {
     );
 }
 
+#[when("I fork the session")]
+async fn i_fork_the_session(world: &mut BddWorld) {
+    let session_id = world.session_id.clone();
+    world.source_log_before = world.session_file(&session_id);
+    world
+        .run_forge(&["--json", "session", "fork", &session_id])
+        .await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let fork: serde_json::Value =
+        serde_json::from_str(world.last_stdout.trim()).expect("fork json");
+    world.fork_session_id = fork["session_id"]
+        .as_str()
+        .expect("forked session id")
+        .to_string();
+    assert_ne!(world.fork_session_id, session_id, "fork: {fork}");
+}
+
+#[then("a new session holds the copied history and a fork marker")]
+fn forked_session_holds_copied_history(world: &mut BddWorld) {
+    let fork_id = world.fork_session_id.clone();
+    let session_id = world.session_id.clone();
+    let forked = world.session_file(&fork_id);
+    let events: Vec<serde_json::Value> = forked
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let source_lines = world.source_log_before.lines().count();
+    assert_eq!(
+        events.len(),
+        source_lines + 1,
+        "prefix plus one marker; fork: {forked}"
+    );
+    let marker = events.last().expect("marker");
+    assert_eq!(marker["type"], "session_forked", "marker: {marker}");
+    assert_eq!(marker["from_session"], session_id.as_str());
+    // The copied lines keep their original session id: a prefix copy is
+    // verbatim, and `forge session show` reads the file, not the field.
+    assert!(
+        events[..source_lines]
+            .iter()
+            .all(|e| e["session_id"] == session_id.as_str()),
+        "fork: {forked}"
+    );
+}
+
+#[then("the source session is unchanged")]
+fn source_session_unchanged(world: &mut BddWorld) {
+    let session_id = world.session_id.clone();
+    let before = world.source_log_before.clone();
+    assert_eq!(
+        world.session_file(&session_id),
+        before,
+        "forking must never touch the source"
+    );
+}
+
+#[then("the forked session can be resumed")]
+async fn forked_session_can_be_resumed(world: &mut BddWorld) {
+    let fork_id = world.fork_session_id.clone();
+    world.run_forge(&["resume", &fork_id]).await;
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let forked = world.session_file(&fork_id);
+    let run_starts = forked
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["type"] == "run_started")
+        .count();
+    assert_eq!(run_starts, 2, "the fork gained its own run: {forked}");
+}
+
 // ---------------------------------------------------------------------------
 // server-input.feature / cancellation.feature
 // ---------------------------------------------------------------------------

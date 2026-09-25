@@ -71,6 +71,20 @@ pub struct RunOutcome {
     pub events: Vec<Event>,
 }
 
+/// What [`AgentService::fork_session`] created.
+#[derive(Debug, Clone, Serialize)]
+pub struct ForkOutcome {
+    /// The new session.
+    pub session_id: String,
+    pub source_session_id: String,
+    /// 1-based position of the last copied source event (after snapping).
+    pub at_position: u64,
+    /// The last run included in the fork.
+    pub at_run_id: String,
+    /// Event lines copied from the source, excluding the fork marker.
+    pub events_copied: usize,
+}
+
 /// Optional parameters for a run.
 #[derive(Debug, Default)]
 pub struct RunOptions {
@@ -1254,12 +1268,17 @@ impl AgentService {
         let events = self.sessions.events_for(&session_id)?;
 
         // The target run: the id itself when it names a run, else the
-        // session's latest run.
+        // session's latest real run. A `session_forked` marker is
+        // provenance, not a run, so it never becomes the resume target —
+        // otherwise the first resume of every fork would look at a run with
+        // no prompt.
         let target_run = if events.iter().any(|e| e.run_id == session_or_run_id) {
             session_or_run_id.to_string()
         } else {
             events
-                .last()
+                .iter()
+                .rev()
+                .find(|e| !matches!(e.kind, EventKind::SessionForked { .. }))
                 .map(|e| e.run_id.clone())
                 .ok_or_else(|| ForgeError::session("session has no runs"))?
         };
@@ -1322,6 +1341,115 @@ impl AgentService {
             None,
         )
         .await
+    }
+
+    /// Fork a session: create a NEW session whose event log is a prefix of
+    /// `source`, so both can be continued independently.
+    ///
+    /// `at` selects the cut point and accepts either spelling:
+    ///
+    /// * an integer — a 1-based position in the source log, exactly as
+    ///   `forge session show --json` lists the events;
+    /// * a run id — fork after that run.
+    ///
+    /// `None` forks the whole log.
+    ///
+    /// **Snapping.** A cut inside a run is allowed but snapped *forward* to
+    /// the end of the run containing it. A half-run prefix would replay as
+    /// a conversation with an assistant tool call and no result, which is
+    /// not a state any model should be handed; a run boundary is the only
+    /// semantically clean place to branch. (The source log's `seq` is
+    /// per-run and therefore cannot address a session-wide point on its
+    /// own, which is why the position is a log position.)
+    ///
+    /// The prefix is copied verbatim and the source is never touched, so
+    /// the fork is self-contained: it can be resumed, cancelled and forked
+    /// again with no reference back. A `session_forked` marker event under
+    /// its own run id records the provenance.
+    ///
+    /// **One consequence of copying:** the copied run ids exist in two
+    /// sessions. `resume <run-id>` therefore resolves to whichever session
+    /// [`JsonlSessionStore::find_run`] finds first — sessions are listed by
+    /// id and session ids are ULIDs, so that is the older session, i.e. the
+    /// source. Name the fork's *session* id to continue the fork.
+    pub fn fork_session(
+        &self,
+        source_session_id: &str,
+        at: Option<&str>,
+    ) -> Result<ForkOutcome, ForgeError> {
+        let events = self.sessions.events_for(source_session_id)?;
+        if events.is_empty() {
+            return Err(ForgeError::session(format!(
+                "unknown or empty session: {source_session_id}"
+            )));
+        }
+
+        // Resolve `at` to an index into `events` that must be included.
+        let anchor = match at {
+            None => events.len() - 1,
+            Some(value) => match value.parse::<usize>() {
+                Ok(0) => {
+                    return Err(ForgeError::session(
+                        "--at is a 1-based log position; 0 is not an event",
+                    ));
+                }
+                Ok(position) if position <= events.len() => position - 1,
+                Ok(position) => {
+                    return Err(ForgeError::session(format!(
+                        "session {source_session_id} has {} events; no position {position}",
+                        events.len()
+                    )));
+                }
+                // Not a number: a run id.
+                Err(_) => events
+                    .iter()
+                    .rposition(|e| e.run_id == value)
+                    .ok_or_else(|| {
+                        ForgeError::session(format!(
+                            "session {source_session_id} has no run {value}"
+                        ))
+                    })?,
+            },
+        };
+
+        // Snap forward to the end of the run that owns the anchor.
+        let at_run_id = events[anchor].run_id.clone();
+        let cut = events
+            .iter()
+            .rposition(|e| e.run_id == at_run_id)
+            .unwrap_or(anchor);
+        let lines = cut + 1;
+
+        let session_id = new_session_id();
+        let events_copied = self
+            .sessions
+            .copy_prefix(source_session_id, &session_id, lines)?;
+        #[allow(clippy::cast_possible_truncation)]
+        let at_position = lines as u64;
+        self.sessions.append(Event::new(
+            new_run_id(),
+            &session_id,
+            EventKind::SessionForked {
+                from_session: source_session_id.to_string(),
+                at_position,
+            },
+        ))?;
+
+        tracing::info!(
+            source = source_session_id,
+            session = %session_id,
+            at_position,
+            run = %at_run_id,
+            events_copied,
+            "forked session"
+        );
+        Ok(ForkOutcome {
+            session_id,
+            source_session_id: source_session_id.to_string(),
+            at_position,
+            at_run_id,
+            events_copied,
+        })
     }
 
     /// All events belonging to one run (for the server events endpoint).

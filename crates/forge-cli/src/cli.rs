@@ -165,6 +165,15 @@ pub enum SessionCommand {
         #[arg(value_name = "ID")]
         id: String,
     },
+    /// Branch a session into a new one, copying its history.
+    Fork {
+        #[arg(value_name = "SESSION_ID")]
+        id: String,
+        /// Cut point: a 1-based log position or a run id (default: the
+        /// whole log). A cut inside a run snaps forward to that run's end.
+        #[arg(long, value_name = "POSITION_OR_RUN_ID")]
+        at: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

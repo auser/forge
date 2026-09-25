@@ -155,6 +155,31 @@ pub fn list(ctx: &Context) -> Result<(), ForgeError> {
     Ok(())
 }
 
+/// `forge session fork <id> [--at <position-or-run-id>]` — branch a session
+/// into a new one whose log is a copy of the source's prefix. The source is
+/// untouched; the fork is resumable like any other session.
+pub fn fork(ctx: &Context, id: &str, at: Option<&str>) -> Result<(), ForgeError> {
+    let service = build_service(ctx)?;
+    let fork = service.fork_session(id, at)?;
+    if ctx.global.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&fork)
+                .map_err(|e| ForgeError::session(format!("serializing fork: {e}")))?
+        );
+    } else {
+        println!(
+            "forked {} at position {} (run {}) -> {} ({} events copied)",
+            fork.source_session_id,
+            fork.at_position,
+            fork.at_run_id,
+            fork.session_id,
+            fork.events_copied
+        );
+    }
+    Ok(())
+}
+
 /// `forge session show <id>`
 pub fn show(ctx: &Context, id: &str) -> Result<(), ForgeError> {
     let events = store(ctx)?.events_for(id)?;

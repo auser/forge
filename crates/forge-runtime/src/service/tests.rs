@@ -728,6 +728,204 @@ async fn resume_of_a_pre_v3_log_degrades_to_the_recorded_summary() {
     );
 }
 
+// --- fork ---------------------------------------------------------------
+
+/// Bytes of a session's log file, for "the source was not touched" checks.
+fn session_bytes(service: &AgentService, session_id: &str) -> Vec<u8> {
+    std::fs::read(
+        service
+            .sessions()
+            .root()
+            .join(format!("{session_id}.jsonl")),
+    )
+    .expect("session file")
+}
+
+#[tokio::test]
+async fn fork_copies_the_whole_log_marks_provenance_and_leaves_the_source_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("the answer"), text_reply("forked answer")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let first = service.run("the ask").await.expect("run");
+    let source_before = session_bytes(&service, &first.session_id);
+    let source_events = service
+        .sessions()
+        .events_for(&first.session_id)
+        .expect("read source");
+
+    let fork = service
+        .fork_session(&first.session_id, None)
+        .expect("fork the whole log");
+
+    assert_ne!(fork.session_id, first.session_id);
+    assert_eq!(fork.source_session_id, first.session_id);
+    assert_eq!(fork.events_copied, source_events.len());
+    assert_eq!(fork.at_position, source_events.len() as u64);
+    assert_eq!(fork.at_run_id, first.run_id);
+
+    // The source is byte-identical.
+    assert_eq!(
+        session_bytes(&service, &first.session_id),
+        source_before,
+        "forking must never touch the source"
+    );
+
+    // The fork is the prefix plus one marker event.
+    let forked = service
+        .sessions()
+        .events_for(&fork.session_id)
+        .expect("read fork");
+    assert_eq!(forked.len(), source_events.len() + 1);
+    match &forked.last().expect("marker").kind {
+        EventKind::SessionForked {
+            from_session,
+            at_position,
+        } => {
+            assert_eq!(from_session, &first.session_id);
+            assert_eq!(*at_position, source_events.len() as u64);
+        }
+        other => panic!("expected a fork marker, got {other:?}"),
+    }
+    // Copied lines keep their original run id and seq.
+    assert_eq!(
+        forked[..source_events.len()]
+            .iter()
+            .map(|e| (e.run_id.as_str(), e.seq))
+            .collect::<Vec<_>>(),
+        source_events
+            .iter()
+            .map(|e| (e.run_id.as_str(), e.seq))
+            .collect::<Vec<_>>()
+    );
+    // The marker gets its own run so it cannot disturb a copied run's seq.
+    assert!(
+        source_events
+            .iter()
+            .all(|e| e.run_id != forked.last().expect("marker").run_id)
+    );
+}
+
+#[tokio::test]
+async fn a_forked_session_is_resumable_and_continues_the_copied_history() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (service, model) = recording_service(
+        tmp.path(),
+        vec![text_reply("original answer"), text_reply("fork continues")],
+    );
+    let first = service.run("the shared ask").await.expect("run");
+    let fork = service.fork_session(&first.session_id, None).expect("fork");
+
+    let before = model.recorded().len();
+    let resumed = service.resume(&fork.session_id).await.expect("resume fork");
+    assert_eq!(resumed.session_id, fork.session_id);
+    assert_eq!(resumed.text, "fork continues");
+
+    let request = model
+        .recorded()
+        .into_iter()
+        .nth(before)
+        .expect("the fork's run called the model");
+    let contents: Vec<&str> = request
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            "the shared ask",
+            "original answer",
+            "Continue the work in the conversation above.",
+        ],
+        "a fork replays the copied history, and the marker is not a turn"
+    );
+
+    // The source session gained nothing from the fork's run.
+    let source = service
+        .sessions()
+        .events_for(&first.session_id)
+        .expect("read source");
+    assert!(source.iter().all(|e| e.run_id == first.run_id));
+}
+
+#[tokio::test]
+async fn forking_at_a_mid_run_position_snaps_forward_to_the_run_boundary() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("one"), text_reply("two")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let first = service.run("ask one").await.expect("run 1");
+    let second = service.resume(&first.run_id).await.expect("run 2");
+    let all = service
+        .sessions()
+        .events_for(&first.session_id)
+        .expect("read");
+    let first_run_len = all.iter().filter(|e| e.run_id == first.run_id).count();
+
+    // Position 2 is inside run 1 → snap to the end of run 1.
+    let fork = service
+        .fork_session(&first.session_id, Some("2"))
+        .expect("fork mid-run");
+    assert_eq!(fork.at_run_id, first.run_id);
+    assert_eq!(fork.events_copied, first_run_len);
+    let forked = service
+        .sessions()
+        .events_for(&fork.session_id)
+        .expect("read fork");
+    assert!(
+        forked
+            .iter()
+            .all(|e| e.run_id == first.run_id || matches!(e.kind, EventKind::SessionForked { .. })),
+        "the second run must not be in the fork: {forked:?}"
+    );
+
+    // A run id cuts after that run, whichever position it occupies.
+    let by_run = service
+        .fork_session(&first.session_id, Some(&first.run_id))
+        .expect("fork by run id");
+    assert_eq!(by_run.events_copied, first_run_len);
+    assert_eq!(by_run.at_run_id, first.run_id);
+    // ...and the later run forks the whole log.
+    let whole = service
+        .fork_session(&first.session_id, Some(&second.run_id))
+        .expect("fork by later run id");
+    assert_eq!(whole.events_copied, all.len());
+}
+
+#[tokio::test]
+async fn fork_rejects_unknown_sessions_runs_and_positions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(tmp.path());
+    let run = service.run("ask").await.expect("run");
+    let events = service
+        .sessions()
+        .events_for(&run.session_id)
+        .expect("read")
+        .len();
+
+    for (at, needle) in [
+        (Some("0"), "1-based"),
+        (Some(&*format!("{}", events + 1)), "no position"),
+        (Some("no-such-run"), "has no run"),
+    ] {
+        let err = service
+            .fork_session(&run.session_id, at)
+            .expect_err("must reject");
+        assert!(matches!(err, ForgeError::Session(_)), "got: {err}");
+        assert!(err.to_string().contains(needle), "got: {err}");
+    }
+
+    let err = service
+        .fork_session("no-such-session", None)
+        .expect_err("unknown session");
+    assert!(err.to_string().contains("unknown or empty"), "got: {err}");
+}
+
 #[tokio::test]
 async fn resume_rejects_v1_runs_without_prompt() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -271,9 +271,10 @@ Interrupt and continue:
 
 ```bash
 forge cancel <run-id>        # works from another terminal while a run is live
-forge resume <run-id>        # continues the completed run in its session
+forge resume <run-id>        # continues the run, replaying its conversation
 forge session list           # what happened, per session
 forge session show <id>      # full event history (JSONL, one event per line)
+forge session fork <id>      # branch the conversation into a new session
 ```
 
 Drive it over HTTP:
@@ -300,6 +301,7 @@ forge acp                           Serve ACP over stdio (forge as the agent
 forge resume <run-or-session-id>    Continue a completed run in its session
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
+forge session fork <id> [--at X]    Branch a session into a new one
 forge graph build|check|map|grep|callers|blast|context
 forge skill list|show|test
 forge router serve [--host --port]  Run the local Laya decision-router adapter
@@ -896,10 +898,34 @@ values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env vars) are redacted to
 ```bash
 forge session list        # sessions with event counts
 forge session show <id>   # full event history
+forge session fork <id>   # branch: a new session holding a copy of this
+                          # session's history (--at cuts it short)
 forge resume <id>         # continue a completed run: a new run in the same
                           # session, with the session's whole conversation
                           # replayed as the model's history
 ```
+
+### Forking a session
+
+```bash
+forge session fork <session-id>             # branch from the whole history
+forge session fork <session-id> --at 12     # 1-based log position
+forge session fork <session-id> --at <run>  # after a particular run
+```
+
+A fork is a **prefix copy**: the new session file holds the source's lines
+verbatim (original `v`, `seq` and timestamps included) plus one
+`session_forked` marker. The source is never touched, and the fork is a
+normal session afterwards — resumable, cancellable, forkable again — with no
+reference back to its parent. The price is disk, paid once per fork; the
+gain is that no session can be broken by anything happening to another.
+
+* `--at` inside a run **snaps forward** to that run's end. A half-run prefix
+  would replay as an assistant tool call with no result, which is not a state
+  any model should be handed.
+* Copying means a run id can exist in two sessions. `forge resume <run-id>`
+  then resolves to the older session (the source); name the fork's *session*
+  id to continue the fork.
 
 ### What `forge resume` actually sends
 

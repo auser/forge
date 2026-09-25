@@ -90,6 +90,10 @@ pub struct BddWorld {
     pub run_id: String,
     pub run_status: u16,
     pub session_id: String,
+    /// The session `forge session fork` created.
+    pub fork_session_id: String,
+    /// The source session's log, captured before forking.
+    pub source_log_before: String,
     pub secret: String,
     pub sse_content_type: String,
     pub sse_body: String,
@@ -552,6 +556,16 @@ impl BddWorld {
         }
         content.push('\n');
         self.write_file(".forge/config.toml", &content);
+    }
+
+    /// One session's JSONL content ("" when there is no such file).
+    pub fn session_file(&mut self, session_id: &str) -> String {
+        let path = self
+            .project()
+            .join(".forge")
+            .join("sessions")
+            .join(format!("{session_id}.jsonl"));
+        std::fs::read_to_string(path).unwrap_or_default()
     }
 
     /// All session JSONL content under .forge/sessions, concatenated.
