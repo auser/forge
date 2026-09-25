@@ -52,15 +52,17 @@ we are building:
 ```
 session.turn(prompt)
 │
-│ 0. RETRIEVE ─── needle.embed → top-K tools      seam only; no-op while ≤10 tools
+│ 0. SELECT ───── graph → ranked files/symbols → StatePayload at the configured
+│                 egress tier (§11). Deterministic, model-free, never source.
 │
 │ 1. DECIDE ───── two calls fired CONCURRENTLY (they contend for nothing:
-│                 needle owns a blocking OS thread, Jev is async network I/O)
+│                 needle owns a blocking OS thread, a remote plane is async I/O)
 │
 │      needle.tool_call(prompt, tools) ─────────────────▶ ~1.1 s   name + arguments
-│      jev.batch{tool, safety, model}  ────▶ ~250 ms              choices + probabilities
+│      plane.ask{tool, safety, model}  ────▶ ~250 ms              choices + probabilities
 │
-│                 Jev's answers land first and are free by the time needle returns.
+│                 The plane's answers land first and are free by the time needle
+│                 returns. With a local plane (§13) they cost no network at all.
 │
 │ 2. BRANCH ───── control layer, on typed values only
 │                 ├ needle confident ────▶ GATE ─▶ dispatch    no LLM, no routing
@@ -83,11 +85,12 @@ question once a model is known to be answering. The saving is modest in a warm
 session (`needle.decide` is ~120 ms) but the structure is honest, and it removes
 provider resolution from turns that never reach a provider.
 
-**Needle and Jev run concurrently.** This is the main performance idea. Needle
-occupies its own thread; Jev is network I/O on the tokio runtime. Running them
-together hides Jev's latency completely behind needle's, which makes the
-fall-back-to-Jev branch cheap: on a decline, Jev's answer is already in hand and
-the retry costs only needle's fill, not a round-trip.
+**Needle and the decision plane run concurrently.** This is the main performance
+idea. Needle occupies its own thread; a remote plane is network I/O on the tokio
+runtime. Running them together hides the plane's latency completely behind
+needle's, which makes the fall-back branch cheap: on a decline, the plane's
+answer is already in hand and the retry costs only needle's fill, not a
+round-trip.
 
 Expected value of the decline retry, using measured numbers (§7):
 
@@ -103,20 +106,23 @@ just the fill (~1.1 s) when concurrent, against an avoided LLM turn of ~6.5 s:
 The concurrent form is what makes this worth shipping rather than hiding behind
 a flag.
 
-**All Jev questions go in one request.** The API takes `questions` as a map and
+**All questions go in one request.** The API takes `questions` as a map and
 processes them together with shared latency and billing; input tokens are
 charged once for the shared `state` and answers are free. Asking tool choice,
 safety and model selection separately would be three round-trips for no benefit.
-Forge asks one question today; that is the change.
+Forge asks one question today; that is the change. Implementations that cannot
+batch answer sequentially behind the same trait method (§13).
 
-**Jev is speculative and sometimes discarded.** When needle answers confidently
-we throw Jev's reply away. That costs one `state`'s worth of input tokens
-(~$0.0001) and no wall-clock. Accepted deliberately.
+**The plane's answer is speculative and sometimes discarded.** When needle answers
+confidently we throw it away. With a local plane that costs nothing at all; with
+a hosted one it costs a `state`'s worth of input tokens (~$0.0001) and no
+wall-clock. Accepted deliberately — but note this is *per turn*, which is exactly
+why §11 bounds what `state` may contain.
 
 ### Batched request shape
 
 ```json
-{"state": "<prompt + relevant context>",
+{"state": "<StatePayload at the configured egress tier — never source (§11)>",
  "model": "jev-latest",
  "questions": {
    "tool":   {"type": "choice",
@@ -157,14 +163,21 @@ pub struct Session {
     /// the ~8 s cold install is paid once per conversation rather than per turn.
     warmed: Arc<AtomicBool>,
 
-    /// Decision-plane client. `None` without a credential; everything still works.
-    jev: Option<Arc<JevClient>>,
+    /// The decision plane (§13). Never optional: absence is `NullPlane`, and an
+    /// on-device `NeedlePlane` needs no credential and no network.
+    plane: Arc<dyn DecisionPlane>,
+    /// Builds every `state` payload, enforcing the egress tier (§11). The only
+    /// permitted constructor.
+    payloads: StatePayloadBuilder,
 
     gate: Gate,
     log: DecisionLog,
     /// Session-scoped memo, keyed by a hash of (prompt, ordered tool set): an
     /// identical request reuses its decision instead of re-deciding.
     memo: HashMap<u64, DecisionOutcome>,
+
+    /// Head/tail retention with a compacted middle (§12).
+    context: ContextBudget,
 
     cancel: CancellationToken,
     store: Arc<JsonlSessionStore>,
@@ -235,10 +248,11 @@ Evaluated in order; each may only narrow:
    permits. `deny` blocks everything; `prompt` asks for everything;
    `prompt-dangerous` asks for anything above `ReadOnly`; `auto` permits
    everything — an explicit human decision to accept the risk.
-3. **A model signal may widen only under all of:** the class is `ReadOnly`, the
-   mode already permits auto for `ReadOnly`, and **Jev's** `safety` answer has
-   confidence exactly **1.000**. Needle's confidence never widens (§3, "Without
-   Jev").
+3. **A model signal may widen only under all of:** `[gate.autonomy]` sets a
+   float for the call's class, the mode already permits auto for that class, and
+   the decision plane's `safety` answer meets that float. Only a decision plane
+   reporting calibrated probabilities may widen; needle's own confidence never
+   does (§3, "Without a decision plane").
 4. **A model signal may always narrow.** Low confidence on a call the mode would
    have auto-run escalates it to a prompt — including in `auto` mode.
 
@@ -249,7 +263,30 @@ on a destructive call; it may still narrow to a prompt under rule 4 when the
 decision plane is unsure. A model can only ever make forge quieter than `prompt`
 for read-only work, or noisier than `auto` when it has doubts.
 
-### Why exactly 1.000
+### Autonomy thresholds
+
+Configurable, per risk class, because the consequence of being wrong differs by
+class — which is what the published guidance also says: *different actions within
+the same system should be gated at different levels depending on the consequences
+of getting it wrong.*
+
+```toml
+[gate.autonomy]
+readonly    = 1.0      # auto-approve at or above this confidence
+risky       = false    # never auto-approve on a model signal
+privileged  = false
+destructive = false
+exfiltration = false
+```
+
+`false` means "no confidence auto-approves this class" — the static floor, which
+no setting can lower below the approval mode's own ceiling. A float sets the bar
+for that class. Defaults are the conservative end of the evidence below;
+operators who want 0.95 or 0.75 can say so, and the decision log records the
+confidence of every auto-approval so the cost of that choice is measurable rather
+than theoretical.
+
+### What the evidence says about where to set them
 
 From a 60-case benchmark on this precise task (34 clear, 14 ambiguous, 12
 adversarial): overall accuracy 91.7%; the 0.9–1.0 bin held 50 of 60 predictions
@@ -257,22 +294,31 @@ at 98.0% accuracy; **every incorrect answer carried confidence below 1.000**,
 and all 40 answers at exactly 1.000 were correct.
 
 Accuracy was also non-monotonic in confidence — the 0.4–0.5 bin scored 100%
-where 0.1–0.2 scored 0% — which is what an uncalibrated signal looks like. A
-tunable slider invites a value the evidence does not support, so the threshold
-is a constant, not a config knob. Gating at 0.9 would auto-approve a
-misclassification roughly 2% of the time.
+where 0.1–0.2 scored 0% — which is what an uncalibrated signal looks like. So
+lowering a threshold does not trade accuracy smoothly for autonomy; at 0.9 the
+observed error rate is ~2%, and below that the signal stops ordering reliably.
+That is the number to weigh when setting these, and it is why the defaults sit at
+1.0 and `false` rather than somewhere more permissive.
 
-Thresholds are **per question**, never shared: a threshold calibrated for
-"which tool?" does not transfer to "is this safe?", even when the questions are
-logically equivalent.
+**A caveat on transfer, stated plainly:** that benchmark used its own taxonomy
+and its own prompt wording. Published calibration work is explicit that a
+threshold does not transfer between question formulations, even logically
+equivalent ones — so forge's own numbers will differ. The defaults are chosen to
+be maximally conservative precisely because they are borrowed: erring this way
+means asking too often, not approving too readily. Re-derive them from
+`.forge/sessions/*.decisions.jsonl` once there is traffic; that is what the log
+is for.
 
-### Without Jev
+Thresholds are also **per question**, never shared: one calibrated for "which
+tool?" does not transfer to "is this safe?".
 
-The gate uses the static floor plus needle's confidence and **never
-auto-approves** — needle's confidence head is not calibrated for this task and
-no benchmark supports a cutoff for it. Behaviour matches today's, minus the
-misdiagnosis fixed earlier. Gaining autonomy requires a credential; losing the
-credential loses autonomy, not function.
+### Without a decision plane
+
+The gate uses the static floor alone and **never auto-approves** — needle's
+confidence head is not calibrated for this task and no benchmark supports a
+cutoff for it. Behaviour matches today's, minus the
+misdiagnosis fixed earlier. Gaining autonomy requires a decision plane — which
+may be entirely local (§13); losing it costs autonomy, not function.
 
 ## §4 Decision log
 
@@ -292,6 +338,8 @@ existing transcript and already gitignored. On by default.
 - `decider`: `needle | jev | static | llm`
 - `outcome`: `dispatched | declined | approved | prompted | blocked | errored`
 - `speculative`: true when the answer was fetched concurrently and discarded
+- `plane`: which `DecisionPlane` answered, and `egress`: the tier its payload
+  used — so an audit can show what left the machine, not just what was decided
 
 **No prompt text, no tool arguments, no file contents.** Records join to the
 existing transcript by `session` + `turn`, so full context is recoverable
@@ -310,11 +358,14 @@ Nothing here may fail a turn that could otherwise proceed.
 |---|---|
 | No engine linked (`HAS_EMBEDDED_BACKEND == false`) | No reflex, no needle routing. Static routing, gate is static-only |
 | Engine present, weights missing | As above; `WeightsMissing` is retried per job so a concurrent fetch recovers without restart |
-| No Jev credential | No batched call. Gate never auto-approves; route escalation skipped |
-| Jev `429` / `529` | Exponential backoff; on exhaustion treat as absent for this turn |
-| Jev `422` | Log and treat as absent. Never retried — the request is wrong, not the service |
-| Jev `401` | Log once per session, then treat Jev as absent |
-| Jev slower than needle | Ignored for this turn; needle's answer stands |
+| `provider = "none"`, or a remote plane with no credential | `NullPlane`. Gate never auto-approves; route escalation skipped |
+| `local_only = true` with a remote provider configured | Provider pruned with a warning; falls back to `NeedlePlane` if available, else `NullPlane` |
+| Secret scan trips on the payload | Refuse to send, log the refusal, proceed as if the plane were absent |
+| Remote plane `429` / `529` | Exponential backoff; on exhaustion treat as absent for this turn |
+| Remote plane `422` | Log and treat as absent. Never retried — the request is wrong, not the service |
+| Remote plane `401` | Log once per session, then treat as absent |
+| Plane slower than needle | Ignored for this turn; needle's answer stands |
+| Context budget exceeded | Compact the middle (§12) before the turn; never truncate the head |
 | needle declines, no Jev answer | Passthrough to the LLM |
 | Cancellation | In-flight decisions dropped; the engine's existing abandon check discards queued jobs |
 | Reflex disabled by config | Skip stages 0–2 entirely; behave as the pre-existing loop |
@@ -369,6 +420,10 @@ silicon, release build, 7 tools.
 | Single engine thread contention across sessions | Accepted; queued with per-session fairness. Worst case N × 1.1 s |
 | `choice` capped at 255 options; a community-reported 32 k window | Retrieval seam at stage 0, disabled until the surface grows |
 | `laya` scores 34.1% on JevBench's hard tier, last in field | Documented as not recommended; never permitted in the gate |
+| Source code leaking to a hosted decision plane | §11: `StatePayload` is the only constructor, `source` is not a remote tier, secret scan refuses before send, `local_only` prunes, and `NeedlePlane` needs no network at all |
+| Borrowed thresholds do not transfer between question formulations | Conservative defaults (1.0 / `false`), every auto-approval's confidence logged, thresholds re-derived from own traffic |
+| Long sessions exceeding the context window | §12: head/tail retention with a compacted middle; tool results demoted to graph references |
+| A deep graph pass sends source to a model once at build time | Opt-in, separate from the per-turn path, cached by content hash; `structure` tier needs no pass at all |
 
 ## §9 Considered and rejected
 
@@ -402,6 +457,162 @@ silicon, release build, 7 tools.
 - Migration to `needle-infer`, and Needle 2 support. Both previously assessed;
   neither is needed here.
 
+## §11 Egress budget: what may leave the machine
+
+**Source code is never sent to a remote decision plane.** Not per turn, not
+ever. This section is normative and overrides any convenience elsewhere in the
+design.
+
+The mechanism is the project graph, used the way `graft` uses its own: graph
+operations are deterministic, local, and model-free, and what gets sent is an
+*abstraction over* the code rather than the code.
+
+### The only constructor
+
+A `StatePayload` builder is the sole way the `state` field of any decision-plane
+request may be constructed. No call site assembles `state` by hand; that is what
+makes the policy auditable rather than aspirational.
+
+### Tiers
+
+| Tier | Contents | Model needed | May go to a remote plane |
+|---|---|---|---|
+| `none` | Prompt text and tool names/descriptions only. No project content. | no | yes |
+| `structure` | Plus ranked file paths, symbol names, kinds, and **signatures** — `graft skeleton`'s trick, roughly a tenth the tokens of the bodies. | no | yes (default) |
+| `summaries` | Plus cached per-symbol summaries and crux excerpts (the few lines carrying the logic). | yes, once at build time | only when explicitly enabled |
+| `source` | File contents. | — | **never** |
+
+`source` reaches only the generation-plane model the operator configured, for
+files that model asked for. It is not a decision-plane tier.
+
+### Config
+
+```toml
+[decision]
+provider = "needle"        # needle | systemone | none      (see §13)
+egress   = "structure"     # none | structure | summaries
+```
+
+- `local_only = true` prunes any non-local provider entirely, as it already does
+  for routing.
+- A provider reporting `is_local() == true` makes the tier moot — nothing
+  leaves — so `summaries` is a reasonable default there and a deliberate
+  opt-in for a hosted one.
+- Before any egress, the payload passes a secret scan (the same patterns
+  `forge auth` already knows) and refuses rather than redacts on a hit: a
+  redacted payload that still describes a credential's location is not obviously
+  safe.
+
+### What the graph must gain
+
+Forge's `SymbolInfo` is `{name, kind, file, line}` today — no signature, so the
+`structure` tier cannot be built from it. Two additions, both deterministic:
+
+- `signature: Option<String>` on `SymbolInfo`, captured during the existing parse.
+- `summary: Option<String>` and `crux: Option<String>`, populated only by an
+  opt-in deep pass and cached by content hash so a rebuild touches only changed
+  files.
+
+Ranking reuses `context(query, limit)`, which already returns scored hits with
+reasons. `graft`'s refinement is worth copying: rank by in-edge coupling and
+rank each scope separately before fusing, so one large subtree cannot crowd out a
+small one.
+
+### Why this is also the performance story
+
+The same pruning that keeps source off the wire is what shrinks prompts to the
+generation plane. `graft` reports 42% fewer tokens, 46% fewer tool calls and 60%
+less wall-clock from exactly this (23/25/32% on SWE-bench Verified). Privacy and
+speed are the same change here, not a trade.
+
+## §12 Context management
+
+A session used to build forge for hours will exceed any context window.
+`history: Vec<Message>` cannot grow unbounded.
+
+### Retention shape
+
+Framing and recency are what matter; the middle is what compacts.
+
+```
+[ first K messages ]  [ ...... compacted ...... ]  [ last N messages ]
+   the task, the         a running summary of        current working
+   constraints, the      what was tried and           state, open
+   plan — never          what it changed              threads
+   evicted
+```
+
+- **Head, always retained.** The opening messages carry the task and its
+  constraints. Losing them is how an agent forgets what it was asked.
+- **Tail, always retained.** The live working set.
+- **Middle, compacted** into a running summary when the budget is approached,
+  oldest first.
+
+Budget is enforced against the routed model's `max_context`, which
+`ModelEntry` already carries.
+
+### Where the graph replaces history
+
+This is the part that makes the problem tractable rather than merely deferred.
+Tool results are the bulk of transcript growth, and file contents are the bulk of
+tool results. So a completed `read_file` is compacted to a **graph reference** —
+path, symbol, content hash — not its bytes. The content is re-resolvable from the
+graph on demand, at the tier the situation calls for.
+
+The transcript therefore stops being the store of project knowledge. The graph is
+the store; the transcript holds the conversation. That is what keeps a long
+session viable, and it is the same abstraction §11 needs, so both are served by
+one addition to the graph rather than two mechanisms.
+
+Compaction is deterministic and model-free wherever possible: dropping a file
+body in favour of a reference needs no model. Only the prose summary of the
+compacted middle does, and it is produced once per compaction, not per turn.
+
+## §13 The `DecisionPlane` trait
+
+Jev must not be a hard dependency, and a self-hosted or on-device implementation
+must be a first-class citizen rather than a fallback. So the batched-question
+capability is a trait, and Jev is one implementation of it.
+
+```rust
+#[async_trait]
+pub trait DecisionPlane: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// True when answering involves no network egress. The egress policy in §11
+    /// is enforced against this, so the guarantee lives in the type rather than
+    /// in a comment.
+    fn is_local(&self) -> bool;
+
+    /// Answer every question in one call. Implementations that cannot batch
+    /// answer sequentially; callers must not care.
+    async fn ask(
+        &self,
+        state: &StatePayload,
+        questions: &Questions,
+    ) -> Result<Answers, ForgeError>;
+}
+```
+
+`Questions`/`Answers` model the System One primitives — `choice` (with
+`probabilities` and `confidence`), `noul`, `score` — because that is the richest
+contract of the candidates and the others are expressible within it.
+
+Planned implementations:
+
+| Impl | Transport | `is_local` | Notes |
+|---|---|---|---|
+| `NeedlePlane` | on-device | **true** | Answers `choice` via `needle.decide`. No egress, no credential, no network. Cannot offer calibrated probabilities across arbitrary questions, so it never widens the gate (§3). |
+| `SystemOnePlane` | HTTP | from URL | One implementation serves hosted Jev and self-hosted OpenJev: the wire contract is shared, only the URL and credential differ. `is_local` is true for a loopback URL. |
+| `NullPlane` | — | true | Explicit "no decision plane". Keeps the absent case a normal code path rather than an `Option` threaded everywhere. |
+
+Adding SemIf, djev or another clone is a new impl and a config value, with no
+change to `Session` or the gate.
+
+**This resolves the credential question:** a forge with `provider = "needle"`
+has a working decision plane with zero keys and zero egress. A key buys
+calibrated probabilities, which buys gate autonomy — and nothing else changes.
+
 ## Sources
 
 - TypeSafe API reference — <https://docs.typesafe.ai/api.md>
@@ -414,3 +625,4 @@ silicon, release build, 7 tools.
 - Decision-model comparison — <https://huggingface.co/blog/sora-2/jev-ai-vs-djev-vs-laya-vs-openjev-vs-semif-which-d>
 - Open-Jev benchmarks — <https://zefan-cai.github.io/open-jev/benchmarks/>
 - Needle 3 — <https://github.com/cactus-compute/needle>
+- Graft, graph-first context reduction for coding agents — <https://github.com/nanonets/graft>
