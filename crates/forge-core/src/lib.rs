@@ -15,7 +15,9 @@ pub mod skill;
 pub mod tool;
 
 pub use error::ForgeError;
-pub use events::{EVENT_SCHEMA_VERSION, Event, EventKind, MAX_TOOL_OUTPUT_BYTES, cap_tool_output};
+pub use events::{
+    EVENT_SCHEMA_VERSION, Event, EventKind, MAX_TOOL_OUTPUT_BYTES, cap_tool_output, tool_arg_field,
+};
 pub use execution::{
     ApprovalPolicy, ExecRequest, ExecResult, ExecutionProvider, FileOp, FileOpResult, RiskLevel,
     RunningProcess, path_escapes_root,
