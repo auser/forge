@@ -453,7 +453,14 @@ silicon, release build, 7 tools.
 
 - Interactive REPL — sub-project B.
 - ACP and `forge serve` alignment — sub-project C.
-- Any training or fine-tuning pipeline. This spec produces the substrate only.
+- The `bootstrap` / `update` command surface and its relationship to
+  `install.sh` — sub-project D. §16 records the requirements it must satisfy,
+  because the Session core must not assume a setup step that will not exist.
+- Any training or fine-tuning pipeline. This spec produces the substrate only;
+  §15's local calibration is a threshold fit over the decision log, not training.
+- An in-process Rust port of a calibrated decision model via Candle. Recorded in
+  §13 as the roadmap target for keeping calibrated probabilities single-command;
+  the model choice must be settled first.
 - Migration to `needle-infer`, and Needle 2 support. Both previously assessed;
   neither is needed here.
 
@@ -489,7 +496,7 @@ files that model asked for. It is not a decision-plane tier.
 
 ```toml
 [decision]
-provider = "needle"        # needle | systemone | none      (see §13)
+provider = "needle"        # names an entry in [decision.providers] (§13)
 egress   = "structure"     # none | structure | summaries
 ```
 
@@ -600,18 +607,184 @@ contract of the candidates and the others are expressible within it.
 
 Planned implementations:
 
-| Impl | Transport | `is_local` | Notes |
-|---|---|---|---|
-| `NeedlePlane` | on-device | **true** | Answers `choice` via `needle.decide`. No egress, no credential, no network. Cannot offer calibrated probabilities across arbitrary questions, so it never widens the gate (§3). |
-| `SystemOnePlane` | HTTP | from URL | One implementation serves hosted Jev and self-hosted OpenJev: the wire contract is shared, only the URL and credential differ. `is_local` is true for a loopback URL. |
-| `NullPlane` | — | true | Explicit "no decision plane". Keeps the absent case a normal code path rather than an `Option` threaded everywhere. |
+### Two independent axes
 
-Adding SemIf, djev or another clone is a new impl and a config value, with no
-change to `Session` or the gate.
+A provider is described by **what protocol it speaks** and **how it is reached**.
+These are orthogonal, and conflating them was a mistake in an earlier draft:
+tinyjev can equally be a sidecar forge supervises or an endpoint the operator
+already runs, and the same is true of OpenJev and laya.
 
-**This resolves the credential question:** a forge with `provider = "needle"`
-has a working decision plane with zero keys and zero egress. A key buys
-calibrated probabilities, which buys gate autonomy — and nothing else changes.
+**`kind`** — the protocol, which selects the implementation:
+
+| `kind` | Protocol | Notes |
+|---|---|---|
+| `needle` | in-process FFI | The default. No egress, no credential, nothing to install. Its confidence is not calibrated for risk classification, so it does not widen the gate until §15 earns that locally. |
+| `systemone` | `POST /v1/systemone` | Serves hosted Jev **and** self-hosted OpenJev — one wire contract, differing only by URL and credential. |
+| `tinyjev` | tinyjev's HTTP surface | MIT, Qwen3 + pointer head. Choice/Noul/Score with calibrated probabilities; ~65 ms per question, ~110 ms for three batched in one forward pass. Costs a Python runtime and 1.2 GB of weights. **Whether its HTTP shape matches `systemone` is unverified** — if it does, this collapses into that kind. |
+| `laya` | laya's HTTP surface | Already implemented in forge. Scores 34.1% on JevBench's hard tier, last in field; permitted but documented as not recommended, and barred from the gate (§8). |
+| `null` | — | Explicit "no decision plane". Keeps the absent case a normal code path rather than an `Option` threaded everywhere. |
+
+**`mode`** — how it is reached:
+
+| `mode` | Meaning |
+|---|---|
+| `in-process` | Linked into forge. Only `needle` today; a Candle port would join it. |
+| `sidecar` | Forge spawns and supervises it (§14), bound to loopback. |
+| `endpoint` | Something the operator already runs, or a hosted service. Forge only calls the URL. |
+
+**`is_local()` is derived, never declared** — true for `in-process`, and for a
+URL that resolves to loopback. That is what §11's egress policy keys on, so a
+provider cannot mislabel itself: a tinyjev sidecar on `127.0.0.1` is local, and
+the same tinyjev on a colleague's GPU box is not.
+
+### Configuration
+
+Mirrors the existing `[models.<name>]` shape, so it reads like the rest of
+forge's config:
+
+```toml
+[decision]
+provider = "needle"            # which of the below is active
+
+[decision.providers.needle]
+kind = "needle"
+mode = "in-process"
+
+[decision.providers.tinyjev]
+kind    = "tinyjev"
+mode    = "sidecar"            # forge starts it and cleans it up
+command = "tinyjev serve --port 8077"
+url     = "http://127.0.0.1:8077"
+
+[decision.providers.openjev]
+kind = "systemone"
+mode = "endpoint"              # already running; forge just calls it
+url  = "http://127.0.0.1:8088/v1/systemone"
+
+[decision.providers.jev]
+kind    = "systemone"
+mode    = "endpoint"
+url     = "https://api.typesafe.ai/v1/systemone"
+key_env = "TYPESAFE_API_KEY"
+```
+
+Switching provider is a one-line change, and the same software can be run either
+way without touching code. Adding SemIf, djev, or `openJev-verdict-2.0` (151M,
+claimed ECE 0.0144 — small enough to be a serious candidate for the in-process
+Rust port) means a new `kind` plus a config entry, with no change to `Session`
+or the gate.
+
+**Accuracy claims across these are not comparable.** tinyjev's 88% / 94.8% are
+its author's own held-out set with its author's harness; Jev's 74.1% is
+JevBench's *hard* tier. Different exams. The only cross-comparable figures are
+JevBench's own (Jev 74.1, djev 69.5, OpenJev 65.5, SemIf 59.5, laya 34.1). Treat
+every self-reported number as a reason to evaluate, not a ranking.
+
+**This resolves the credential question:** a default forge has a working decision
+plane with zero keys, zero egress and nothing to install. Everything above it is
+an upgrade the operator chooses.
+
+### The in-process Rust path
+
+tinyjev is Qwen3 plus a custom pointer head, MIT-licensed, weights in
+safetensors. Candle (HuggingFace's Rust ML framework) has Qwen support and reads
+safetensors directly, so a plane running in-process with no Python and no sidecar
+is feasible: load the backbone, reimplement the pointer head, one forward pass,
+no generation.
+
+That is the only route to calibrated probabilities that keeps the single-command
+property, so it is the roadmap target rather than an idle option. The bounded
+risk is reimplementing a custom head against a Python reference with no written
+spec, and the model choice should be settled first — a 151M model is far more
+shippable than a 596M one. Not planned here; recorded so it is not rediscovered.
+
+## §14 Sidecar supervision
+
+Opt-in planes may need a child process. A forge that leaves orphaned servers
+behind is worse than one that never started them, so supervision is specified
+rather than improvised.
+
+`kill_on_drop` alone is insufficient: it only fires if `Drop` runs, so a
+`SIGKILL`'d forge orphans the child. Cleanup is therefore layered, and the
+portable backstop does not depend on forge running any code at exit:
+
+| Platform | Mechanism |
+|---|---|
+| Linux | `prctl(PR_SET_PDEATHSIG, SIGTERM)` — the kernel signals the child when the parent dies |
+| macOS | No PDEATHSIG equivalent. The child inherits a pipe and holds the read end; the parent's death closes the write end, the child reads EOF and exits |
+| Windows | Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` |
+| all | Spawn into a dedicated process group so the whole tree is signalled, not just the direct child |
+
+Beyond teardown, a supervised sidecar must: bind loopback only, be health-checked
+before the first request is routed to it, never block a turn while starting
+(the turn proceeds on `NeedlePlane` until the sidecar is ready), and surface its
+state through `forge doctor`.
+
+This machinery is not specific to decision planes — `router_autostart` needs
+exactly the same thing for OpenJev and laya today — so it lands as a reusable
+supervisor rather than inside any one plane.
+
+## §15 Earned autonomy: local calibration
+
+The single-command default has no calibrated probabilities, so by §3 it never
+auto-approves. That is safe and it is also the friction this project set out to
+remove. The resolution is to earn the threshold instead of borrowing one.
+
+**Every approval prompt is a labelled example.** When the operator answers `y` or
+`n`, that is ground truth about whether the decision plane's classification at
+that confidence was correct. §4 already records the confidence, the class and the
+outcome of every gate decision.
+
+So:
+
+1. Ship prompting always. Nothing auto-approves.
+2. Accumulate `(risk_class, confidence, approved?)` from real use.
+3. Once a class has enough samples, fit a local calibration and compute the
+   confidence at which observed approval was unanimous across a meaningful
+   window.
+4. **Offer** that threshold to the operator — show the evidence, let them accept.
+   Never enable autonomy silently.
+
+This is what every calibration source says to do anyway: *do not assume a
+threshold calibrated for one question formulation transfers to another*, and
+*re-derive on your own production distribution*. It is also the only mechanism
+here that makes autonomy available without a credential, a sidecar, or a
+borrowed benchmark — and it turns the learning goal into something that pays off
+in the first release rather than a future one.
+
+Defaults stay as §3 states; this only ever proposes moving them, with evidence,
+and only upward in autonomy for classes the static floor already permits.
+
+## §16 Bootstrap and lifecycle
+
+The product requirement is one command. Concretely:
+
+```
+$ cargo install --git https://github.com/auser/forge forge-cli    # or install.sh
+$ forge
+  first run: building graph (396 files)… fetching needle weights (35 MB)… ready
+› implement the DecisionPlane trait
+```
+
+- **No credential, no Python, no server, no separate init** on the default path.
+- `forge bootstrap` exists as an explicit, idempotent command for CI and for
+  re-running after an upgrade; `install.sh` invokes it so an interactive first
+  run has nothing left to do. A bare `forge` with no `.forge/` performs the same
+  work inline with visible progress rather than failing or silently degrading.
+- `forge update` / `forge upgrade` manages the installed binary: resolve the
+  latest release, download the asset for the host triple, **verify the published
+  SHA-256** (`release.yml` already emits `forge-<triple>.tar.gz.sha256`), replace
+  atomically, then re-run bootstrap for any new assets.
+
+**Note this reverses an earlier decision in this document's history.** Weight
+fetching was to stay gated behind `forge init`; the single-command requirement
+overrides that. `init` becomes an alias for `bootstrap` rather than a
+prerequisite.
+
+The command surface itself — `bootstrap`, `update`, and their interaction with
+`install.sh` — is **sub-project D** and gets its own spec. Requirements are
+recorded here so the Session core does not assume a setup step that will not
+exist.
 
 ## Sources
 
