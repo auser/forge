@@ -161,15 +161,48 @@ fi
 if [[ -z "$INSTALLED" ]]; then
     command -v cargo >/dev/null 2>&1 \
         || die "cargo not found and no release asset available. Install Rust via https://rustup.rs and re-run."
+
+    # Release assets for these targets ship with the embedded needle brain, so
+    # a source install has to as well — otherwise falling back to cargo would
+    # silently hand someone a statically-routing forge and they would have no
+    # way to know why the headline feature is inert. The engine is fetched and
+    # checksum-verified by needle-sys's build script; the list is the one in
+    # crates/needle-sys/build_support.rs, and anything not on it has no
+    # published engine (Intel macOS) or an unverified one (Windows).
+    NEEDLE_FEATURES=()
+    case "$TRIPLE" in
+        aarch64-apple-darwin|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
+            NEEDLE_FEATURES=(--features needle-ffi) ;;
+    esac
+
     SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || true
     if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/Cargo.toml" ]]; then
-        info "installing with cargo from this checkout"
-        cargo install --path "$SCRIPT_DIR/crates/forge-cli" --locked --root "$WORK/cargo-root"
+        CARGO_ARGS=(install --path "$SCRIPT_DIR/crates/forge-cli")
+        SOURCE_DESC="this checkout"
     else
         REPO="${FORGE_REPO:-$FORGE_REPO_HTTPS}"
-        info "installing with cargo from $REPO"
-        cargo install --git "$REPO" forge-cli --locked --root "$WORK/cargo-root"
+        CARGO_ARGS=(install --git "$REPO" forge-cli)
+        SOURCE_DESC="$REPO"
     fi
+    CARGO_ARGS+=(--locked --root "$WORK/cargo-root")
+
+    if [[ ${#NEEDLE_FEATURES[@]} -gt 0 ]]; then
+        info "installing with cargo from $SOURCE_DESC (with the embedded brain)"
+        # Retry without the feature if the engine could not be fetched or
+        # linked: a brain-less forge is fully functional on static routing, so
+        # an unreachable Hugging Face must not turn a working install into no
+        # install at all. `forge doctor` reports which one you ended up with.
+        if ! cargo "${CARGO_ARGS[@]}" "${NEEDLE_FEATURES[@]}"; then
+            warn "could not build with the embedded brain (engine download or link failed);"
+            warn "retrying without it — forge will route with static rules."
+            warn "run \`forge doctor\` afterwards; the 'needle brain' line says how to add it."
+            cargo "${CARGO_ARGS[@]}"
+        fi
+    else
+        info "installing with cargo from $SOURCE_DESC"
+        cargo "${CARGO_ARGS[@]}"
+    fi
+
     mkdir -p "$PREFIX"
     install -m 0755 "$WORK/cargo-root/bin/$BIN_NAME" "$TARGET"
     ok "installed via cargo"

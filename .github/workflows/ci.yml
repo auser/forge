@@ -1,5 +1,7 @@
 # CI gate for PRs and the merge queue: fmt, clippy, tests, BDD.
-# The `verify` job name is the required status check on `main`.
+# The `verify` job name is the required status check on `main`. A second job,
+# `verify-ffi`, links and runs the needle FFI backend for real — advisory, not
+# required, because it depends on an upstream artifact download.
 name: ci
 
 on:
@@ -27,13 +29,20 @@ jobs:
         run: cargo fmt --all --check
 
       # Default features only: the `ffi` feature links libneedle, a native
-      # engine binary CI runners don't have. `cargo clippy` never links, so
-      # the ffi/e2e code still gets full type+lint coverage via the second
-      # step (this mirrors `just lint` + `just lint-ffi` + `just test`).
+      # engine binary this job deliberately does without. `cargo clippy` never
+      # links, so the ffi/e2e code still gets full type+lint coverage via the
+      # next step (this mirrors `just lint` + `just lint-ffi` + `just test`),
+      # and the `verify-ffi` job below links and runs it for real.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # NEEDLE_NO_DOWNLOAD keeps this pass link-free *and* network-free: `ffi`
+      # turns on needle-sys/fetch, and there is no reason to pull an engine
+      # binary for a pass that never links one. An unresolvable engine is a
+      # warning rather than an error precisely so this keeps working.
       - name: Clippy (ffi, link-free)
+        env:
+          NEEDLE_NO_DOWNLOAD: "1"
         run: cargo clippy -p forge-needle --features "ffi needle-e2e" --all-targets -- -D warnings
 
       - name: Tests
@@ -41,3 +50,49 @@ jobs:
 
       - name: BDD
         run: cargo test -p forge-cli --test bdd
+
+  # Links and *runs* the ffi backend, which the `verify` job can only
+  # type-check. Not the required status check: it fetches the engine from
+  # Hugging Face, so an outage upstream must not be able to block a merge —
+  # but nothing else in CI would notice a pinned checksum going stale, an
+  # engine that stops linking, or an ffi unit test that starts failing for
+  # real rather than merely compiling.
+  #
+  # x86_64-unknown-linux-gnu is one of the three targets with a verified
+  # engine, so NEEDLE_REQUIRE_ENGINE is safe to set here: "could not get an
+  # engine" should fail this job loudly rather than silently degrade it into a
+  # second, weaker copy of the link-free pass.
+  verify-ffi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Content-addressed cache: a new pin is a new directory, so the key
+      # never needs bumping and a stale entry is simply never read.
+      - name: Cache the needle engine
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/needle-engine
+          key: needle-engine-x86_64-unknown-linux-gnu
+
+      - name: Clippy (ffi, linked)
+        env:
+          NEEDLE_REQUIRE_ENGINE: "1"
+        run: >-
+          cargo clippy -p needle-sys -p forge-needle --all-targets
+          --features "ffi needle-e2e" -- -D warnings
+
+      # The weights themselves are not fetched here (35 MB, and the e2e suite
+      # that needs them is gated behind `needle-e2e` + an env var), so this is
+      # the ffi unit suite: the engine loads, the JSON envelopes parse, the
+      # unsafe wrappers behave.
+      - name: Tests (ffi)
+        env:
+          NEEDLE_REQUIRE_ENGINE: "1"
+        run: cargo test -p forge-needle --features ffi

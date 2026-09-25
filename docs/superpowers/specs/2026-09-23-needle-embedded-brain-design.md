@@ -415,10 +415,38 @@ adds `router_name: "needle"` and confidence — no schema change.
      bug it would fix.
 
   The user-visible fix for "the brain doesn't work out of the box" therefore
-  runs through the *release* artifacts (brain-enabled for the three verified
-  targets, `.github/workflows/release.yml`) and through coherent messaging,
-  not through the default feature set. Revisit if Cactus publishes an Intel
-  macOS engine, or once a Windows link is verified on a Windows runner.
+  runs through the *release* artifacts and through coherent messaging, not
+  through the default feature set. Revisit if Cactus publishes an Intel macOS
+  engine, or once a Windows link is verified on a Windows runner.
+
+  **Amendment (2026-09-24): the distribution path, which was the real cause.**
+  `.github/workflows/release.yml` built `-p forge-cli` with no features for
+  every target, so *every* prebuilt binary was brain-less — the embedded brain
+  was effectively unreachable for anyone who installed forge the way the
+  README recommends. Now:
+
+  - The three verified targets build with `--features needle-ffi` and
+    `NEEDLE_REQUIRE_ENGINE=1`, so a job that cannot resolve a checksummed
+    engine fails instead of publishing a brain-less asset under a
+    brain-enabled label. A post-build step runs the artifact's own `forge
+    doctor` and greps for `needle engine: backend built in`, so the claim is
+    checked against the binary rather than against the build command.
+  - Intel macOS and Windows keep the engine-less build (reasons above) and
+    report it honestly at runtime.
+  - `install.sh` needed no change for the download path — it fetches whatever
+    the release published. Its `cargo install` *fallback* did: it now adds
+    `--features needle-ffi` on the three verified targets and retries without
+    it if the engine cannot be fetched or linked, so a source install matches
+    the asset install without letting an upstream outage cost the user their
+    install.
+  - CI gained an advisory `verify-ffi` job that links and *runs* the ffi
+    backend on x86_64 Linux. `just lint-ffi`'s link-free guarantee is
+    unchanged and still in the required `verify` job (now with
+    `NEEDLE_NO_DOWNLOAD=1`, so it stays network-free as well as link-free);
+    the new job is what would catch a pinned checksum going stale or the
+    engine ceasing to link — neither of which a type-check can see.
+  - Brain-enabled Linux assets now link `libstdc++.so.6` (libneedle is C++).
+    Noted in the workflow; minimal containers may need `libstdc++6`.
   - **It is C++ behind an `extern "C"` facade.** `nm` shows libc++ symbols
     plus `__cxa_*`/`__gxx_personality_v0`, so `build.rs` links the C++
     runtime (`c++` on Apple/FreeBSD, `stdc++` on Linux, `c++_static` +

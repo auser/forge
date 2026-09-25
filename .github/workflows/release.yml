@@ -1,6 +1,25 @@
 # Builds release binaries for every supported platform and attaches them
 # to the GitHub release when a version tag (v*) is pushed. Asset names
 # match what install.sh downloads: forge-<target-triple>.tar.gz[.sha256].
+#
+# **Brain-enabled where the engine is verified.** Every prebuilt binary used
+# to be built without `needle-ffi`, which made the embedded needle brain
+# permanently inert for anyone who installed forge the recommended way — the
+# headline feature, off by default, with no hint that a rebuild was the fix.
+# The three targets with a checksum-verified `libneedle` now build with the
+# feature; `needle-sys`'s build script fetches and verifies the engine, and
+# `NEEDLE_REQUIRE_ENGINE=1` makes an unresolvable engine fail the job rather
+# than quietly producing a brain-less binary under a brain-enabled label.
+#
+# The other two targets keep the engine-less build on purpose: Cactus
+# publishes no engine for Intel macOS at all, and the Windows artifact is a
+# COFF `libneedle.a` rather than the `needle.lib` MSVC resolves, link-untested.
+# Those binaries route statically and say so (`forge doctor`'s needle
+# line-pair). See the design spec's §8 for the evidence.
+#
+# Note for brain-enabled Linux assets: `libneedle` is C++, so they link
+# `libstdc++.so.6` in addition to glibc. Present on any normal distro; a
+# minimal container may need `libstdc++6`.
 name: release
 
 on:
@@ -18,16 +37,25 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+            features: needle-ffi
           # Intel Mac: cross-compiled on the Apple Silicon runner —
           # macos-13 runners are deprecated and queue indefinitely.
+          # No `libneedle` is published for this target (there is no
+          # macos-x86_64 folder in the engine repo), so it stays engine-less.
           - os: macos-14
             target: x86_64-apple-darwin
+            features: ""
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: needle-ffi
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            features: needle-ffi
+          # The published Windows engine is a COFF `libneedle.a`, not the
+          # `needle.lib` MSVC resolves, and has never been link-tested.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            features: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,8 +64,51 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Content-addressed, so the key needs no manual bumping when the pinned
+      # engine changes: a new pin is a new directory, and a stale entry is
+      # simply never read. Saves the ~1.5 MB fetch on re-runs.
+      - name: Cache the needle engine
+        if: matrix.features != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/needle-engine
+          key: needle-engine-${{ matrix.target }}
+
+      # `needle-sys`'s build script fetches the engine and verifies it against
+      # the SHA-256 pinned in crates/needle-sys/build_support.rs — one
+      # checksum table rather than a copy of it here that could drift.
+      # NEEDLE_REQUIRE_ENGINE turns "could not resolve an engine" from a
+      # warning into a failed job, so a release asset built with
+      # `--features needle-ffi` provably contains one.
+      - name: Build release binary (with the embedded brain)
+        if: matrix.features != ''
+        env:
+          NEEDLE_REQUIRE_ENGINE: "1"
+        run: >-
+          cargo build --release --locked -p forge-cli
+          --target ${{ matrix.target }}
+          --features ${{ matrix.features }}
+
       - name: Build release binary
+        if: matrix.features == ''
         run: cargo build --release --locked -p forge-cli --target ${{ matrix.target }}
+
+      # Ask the binary we are about to publish whether it has a brain, rather
+      # than trusting that passing `--features needle-ffi` was enough. Every
+      # brain-enabled target is native to its runner, so this runs the real
+      # artifact. `doctor` exits non-zero on any failing check (no model
+      # endpoint is configured here), so its status is ignored and only the
+      # needle line is asserted.
+      - name: Verify the asset actually has the brain
+        if: matrix.features != ''
+        shell: bash
+        run: |
+          out="$(./target/${{ matrix.target }}/release/forge doctor || true)"
+          printf '%s\n' "$out"
+          grep -q 'needle engine: backend built in' <<<"$out" || {
+            echo "::error::this asset was built with needle-ffi but reports no backend"
+            exit 1
+          }
 
       - name: Package asset (unix)
         if: runner.os != 'Windows'

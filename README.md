@@ -61,6 +61,17 @@ on your `PATH`, and respects `NO_COLOR` and non-interactive terminals.
 Release assets are built by CI for every `v*` tag (see
 `.github/workflows/release.yml`).
 
+**The embedded brain comes with it** on `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` — the three
+platforms whose on-device engine has a verified checksum. Release assets for
+those targets are built with `needle-ffi`, CI asserts each one really has the
+engine before publishing, and the `cargo install` fallback adds the feature
+too (retrying without it if the engine cannot be fetched, so a bad network
+never costs you the install). Intel macOS and Windows get a statically-routing
+binary, because no verified engine exists for them yet; `forge doctor` says
+which one you have on its `needle engine` line. Full detail:
+[Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi).
+
 ## Quickstart
 
 ### Three commands to a working agent
@@ -78,9 +89,12 @@ What each does:
 2. **`forge init`** — writes `.forge/config.toml` (starter config: local
    model + embedded on-device router), builds the project graph at
    `.forge/graph/` (deterministic, no model calls), adds `.forge/` to
-   `.gitignore`, and on builds with the `needle-ffi` feature fetches +
+   `.gitignore`, and — on a build that has the inference backend, which the
+   release binaries for macOS arm64 and Linux x86-64/arm64 do — fetches +
    checksum-verifies the ~35 MB brain weights into `~/.cache/forge/models/`.
-   Idempotent — safe to re-run any time.
+   On a build without the backend it skips that fetch (nothing could use the
+   weights) and prints the one command that gets you one. Idempotent — safe
+   to re-run any time.
 3. **`forge run "…"`** — the multi-turn agent loop against whatever model
    you picked below.
 
@@ -1021,8 +1035,9 @@ That is the single command. No `curl`, no manual checksum step.
 | `forge-cli` | `needle-ffi` | builds the `forge` binary with the above |
 
 Prebuilt release binaries for the supported platforms below already have the
-engine linked in — see [Installation](#installation). You only need this
-section to build one yourself.
+engine linked in, and CI refuses to publish one that claims the feature and
+does not — see [Installation](#installation). You only need this section to
+build one yourself.
 
 #### How the engine gets there
 
@@ -1188,8 +1203,13 @@ go in `specs/adrs/`.
   (`FORGE_MOCK_VERBOSE=1` additionally makes the mock echo a snippet of the
   assembled system context, when you want that plumbing visible in a test.)
 - Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
-  `just verify` — they need a native engine and real weights. See [Embedded
-  Needle brain (`ffi`)](#embedded-needle-brain-ffi).
+  `just verify` — the first downloads a native engine, the second also needs
+  real weights. `just verify` still type- and lint-checks all the `ffi` code
+  link-free via `just lint-ffi`. In CI the same split is two jobs: the required
+  `verify`, and an advisory `verify-ffi` that links and runs the backend for
+  real (so a stale engine checksum or a broken link cannot go unnoticed) but
+  cannot block a merge when the artifact host is down. See [Embedded Needle
+  brain (`ffi`)](#embedded-needle-brain-ffi).
 
 ## Known limitations (v0.3)
 
@@ -1254,5 +1274,7 @@ go in `specs/adrs/`.
 `main` is protected: changes land via pull request only (direct pushes,
 force pushes, and branch deletion are rejected). Every PR must pass the
 `verify` CI job (`cargo fmt --check`, clippy with `-D warnings`, all tests,
-and the BDD suite — the same as `just verify` locally). No approvals are
-required for now; keep PRs small and green.
+and the BDD suite — the same as `just verify` locally). The `verify-ffi` job
+runs alongside it and links the real engine; it is advisory, since it depends
+on an upstream artifact download, but a red one is worth reading before you
+merge. No approvals are required for now; keep PRs small and green.
