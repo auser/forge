@@ -374,6 +374,54 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn replay_payloads_are_redacted_like_everything_else() {
+        // The v3 replay kinds carry verbatim model traffic — tool-call
+        // arguments and tool output — which is exactly where a secret is
+        // most likely to land. Redaction is deep, and this is the lock.
+        let secret = "sk-livekey-abcdef123456";
+        unsafe { std::env::set_var("FORGE_SESSION_REPLAY_TEST_TOKEN", secret) };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path()); // env snapshot here
+
+        store
+            .append(Event::new(
+                "run-1",
+                "sess-1",
+                EventKind::AssistantMessage {
+                    text: format!("using {secret}"),
+                    tool_calls: vec![forge_core::ToolCall::new(
+                        "call_1",
+                        "run_command",
+                        serde_json::json!({ "command": format!("curl -H 'Bearer {secret}'") }),
+                    )],
+                },
+            ))
+            .expect("append assistant message");
+        store
+            .append(Event::new(
+                "run-1",
+                "sess-1",
+                EventKind::ToolResult {
+                    call_id: "call_1".into(),
+                    tool: "run_command".into(),
+                    output: format!("the server echoed {secret}"),
+                    is_error: false,
+                },
+            ))
+            .expect("append tool result");
+        unsafe { std::env::remove_var("FORGE_SESSION_REPLAY_TEST_TOKEN") };
+
+        let raw = std::fs::read_to_string(tmp.path().join("sess-1.jsonl")).expect("read raw");
+        assert!(!raw.contains(secret), "leaked into a replay payload: {raw}");
+        assert_eq!(
+            raw.matches("[REDACTED]").count(),
+            3,
+            "text, tool-call arguments and tool output must all be redacted: {raw}"
+        );
+    }
+
+    #[test]
     fn copy_prefix_reproduces_lines_verbatim_and_leaves_the_source_alone() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // A v1 line and a v2 line: a copy must preserve both exactly,

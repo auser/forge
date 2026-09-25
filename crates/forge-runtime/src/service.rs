@@ -623,9 +623,11 @@ impl AgentService {
                     .get(&run_id)
                     .copied()
                     .unwrap_or_else(|| {
-                        RunState::of_events(
-                            &own.iter().map(|e| (*e).clone()).collect::<Vec<Event>>(),
-                        )
+                        // Only the last event decides; borrow it rather than
+                        // cloning the whole run to ask.
+                        own.last().map_or(RunState::Running, |last| {
+                            RunState::of_events(std::slice::from_ref(*last))
+                        })
                     });
                 seen.insert(run_id.clone());
                 summaries.push(RunSummary {
@@ -1687,6 +1689,11 @@ impl AgentService {
             .rposition(|e| e.run_id == target_run)
             .map_or(events.len(), |i| i + 1);
         let replay = crate::replay::conversation_from_events(&events[..cut]);
+        // The budget comes from the *configured* model's advertised window:
+        // routing happens inside the run, after the history is assembled, so
+        // a `[models]` entry with a different context window is approximated
+        // by the default. The budget is an estimate either way (see
+        // `history_budget_chars`) and the model enforces the real limit.
         let budget = crate::replay::history_budget_chars(&self.model.capabilities());
         let replayed = replay.messages.len();
         let history = crate::replay::fit_to_budget(replay.messages, budget);
