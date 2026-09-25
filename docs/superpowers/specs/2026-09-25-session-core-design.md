@@ -452,6 +452,10 @@ silicon, release build, 7 tools.
 ## §10 Out of scope
 
 - Interactive REPL — sub-project B.
+- Editor integration for Cursor and VS Code, which do not speak ACP —
+  sub-project E, specified separately.
+- Streaming model output — sub-project F, specified separately. `ModelProvider`
+  exposes only a request/response `complete`, so no surface can stream today.
 - ACP and `forge serve` alignment — sub-project C.
 - The `bootstrap` / `update` command surface and its relationship to
   `install.sh` — sub-project D. §16 records the requirements it must satisfy,
@@ -785,6 +789,185 @@ The command surface itself — `bootstrap`, `update`, and their interaction with
 `install.sh` — is **sub-project D** and gets its own spec. Requirements are
 recorded here so the Session core does not assume a setup step that will not
 exist.
+
+## §17 Graph hygiene and freshness
+
+Sections 11 and 12 both rest on the project graph — one sends graph-derived
+payloads off the machine, the other replaces transcript content with graph
+references. Two properties of today's graph make that unsafe as written.
+
+### The graph indexes secrets
+
+`GraphBuilder::walk` filters on a fixed `SKIP_DIRS` list and nothing else: no
+`.gitignore`, no dotfile rule. A `.env` at the project root is walked, hashed and
+classified as `Config` — the same file this repository just had to add ignore
+rules for.
+
+That makes the graph the wrong place for §11's guarantee to *start*. A symbol
+named `STRIPE_SECRET_KEY` reaches the `structure` tier entirely legitimately,
+because nothing upstream decided it should not exist.
+
+So exclusion moves to the walk:
+
+- Respect `.gitignore` (and nested ones) — if it is not in version control, it is
+  not project knowledge.
+- A built-in denylist independent of git, because `.gitignore` is not a security
+  boundary: `.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `.netrc`,
+  `.npmrc`, `.pypirc`.
+- `.forgeignore` for project-specific additions.
+
+**A file excluded from the graph is excluded from every egress tier by
+construction**, and from `graph grep`, `graph context` and semantic search as
+well. That last part is intended: an agent that cannot see `.env` cannot read it
+into a transcript either. §11's payload scan stays as the second line of
+defence, not the first.
+
+### Nothing keeps the graph fresh
+
+There is no file watcher anywhere in the workspace, and `forge doctor` already
+reports `project graph: stale (4 added, 39 modified)` on this repository. In an
+editor, files change every few seconds. A stale graph means the agent reasons
+about code that no longer exists — and both §11 and §12 hand it that graph as
+ground truth.
+
+`ProjectGraph::is_fresh()` and an incremental `build()` already exist, so:
+
+- **Check at turn start.** `is_fresh()` compares stored mtimes and hashes; it is
+  cheap and correct.
+- **Rebuild incrementally when stale**, within a budget. `build()` already only
+  touches changed files.
+- **If the rebuild exceeds its budget, proceed on the stale graph and finish the
+  rebuild in the background.** A turn must never block indefinitely on indexing;
+  a slightly stale graph degrades answer quality, while a stalled turn degrades
+  the product.
+- Record staleness in the decision log, so a bad decision made against a stale
+  graph is diagnosable rather than mysterious.
+
+A `notify`-based watcher is a later optimisation. It becomes clearly worthwhile
+under §20, where one long-lived process serves several clients and can amortise
+the watch across all of them.
+
+## §18 Approval presentation contract
+
+The gate yields `Approve | Prompt | Block`, and the spec has so far said nothing
+about what `Prompt` *means* to a surface. A terminal asks `y/N`; an editor should
+render a diff with per-hunk accept; `forge serve` returns a pending state a
+client polls. Without a contract each surface invents its own — and because §15
+treats every prompt as a labelled training example, inconsistent semantics
+corrupt the calibration signal at its source.
+
+So the request is typed, and the response vocabulary is fixed:
+
+```rust
+pub struct ApprovalRequest {
+    pub id: ApprovalId,
+    pub call: ToolCall,
+    pub class: RiskClass,
+    /// Present only when a decision plane answered; `None` under `NullPlane`.
+    pub confidence: Option<f64>,
+    pub preview: ApprovalPreview,
+}
+
+/// Enough for any surface to render the decision without re-deriving it.
+pub enum ApprovalPreview {
+    Diff { path: PathBuf, before: String, after: String },  // write_file / edit_file
+    Command { program: String, args: Vec<String>, cwd: PathBuf },
+    Read { path: PathBuf },
+}
+
+pub enum ApprovalResponse {
+    Approve,
+    /// Remember for this tool/command shape until the session ends.
+    ApproveForSession,
+    Reject,
+    Cancel,
+}
+```
+
+Surfaces differ in presentation and must not differ in vocabulary. `Diff` is
+what makes editor integration possible at all: the editor renders its own diff UI
+from `before`/`after` rather than forge trying to describe a change in prose.
+
+`ApproveForSession` is the session-scoped trust discussed during design. It is
+also the strongest calibration label available — an operator who trusts a shape
+for a whole session is making a stronger statement than one who approves once.
+
+## §19 Budget ceiling
+
+`max_turns` bounds turns, not spend. A harness running all day against cloud
+models needs a ceiling, and every input it requires already exists: `ModelEntry`
+carries `cost_input_per_mtok` and `cost_output_per_mtok`, and §4 records usage
+per decision.
+
+```toml
+[budget]
+session_tokens = 500_000
+session_usd    = 5.00
+daily_usd      = 25.00
+on_exceeded    = "prompt"   # prompt | stop
+```
+
+- Local models cost zero, so a local-only configuration is effectively
+  unbounded — which is correct, and is the configuration the single-command
+  default produces.
+- A hosted decision plane's per-turn input tokens count toward the budget.
+  Firing it speculatively on every turn (§1) is cheap, not free, and the budget
+  is where that becomes visible.
+- `on_exceeded = "prompt"` asks before continuing; `stop` fails the turn with a
+  clear error. Neither silently truncates work.
+- Spend is recorded in the decision log so overruns are attributable to the
+  turns that caused them.
+
+## §20 Process model: one engine, many clients
+
+The warm engine in §2 is the design's main performance idea, and it quietly
+assumes one long-lived process. Editors break that assumption: open Zed, Cursor
+and a terminal and you get three forge processes, three engines, three copies of
+35 MB of weights, three 8 s tool-surface installs, and three decision logs that
+§15 cannot calibrate from because none of them sees the whole picture.
+
+### Shape
+
+One **daemon per machine**, holding what is genuinely singular, with clients
+attaching over a local socket:
+
+```
+  forge (REPL) ─┐
+  forge-acp ────┼──▶ unix socket ──▶ forged ──┬── the one needle engine
+  editor ext ───┤    (named pipe            ├── per-project graphs
+  forge serve ──┘     on Windows)            ├── sessions + decision log
+                                             └── supervised sidecars (§14)
+```
+
+The split follows what is scarce. The **engine** is a process-global,
+non-thread-safe singleton (§2), so exactly one may exist per machine. **Graphs**
+are per project, and one daemon holding several is what lets a multi-root editor
+workspace work at all. **Sessions** belong to clients but outlive any single
+connection, so reconnecting an editor resumes rather than restarts.
+
+### Rules
+
+- **Auto-start, never a prerequisite.** The first client to find no daemon
+  starts one. The user still types one command (§16).
+- **Idle shutdown** after a configurable period with no attached clients, so a
+  forgotten daemon does not hold 35 MB and a thread forever.
+- **Degrade to embedded.** If the daemon cannot start or the socket is
+  unavailable, the client runs the core in-process exactly as it does today.
+  This is the same principle as everywhere else in the document: worse, never
+  broken.
+- **Loopback-equivalent only.** A unix socket in the user's runtime directory at
+  mode `0600`; a named pipe with a matching ACL on Windows. No TCP by default —
+  `forge serve` remains the deliberate, separately-configured network surface.
+- **Version-matched.** A client refuses a daemon built from a different version
+  rather than negotiating; `forge update` (§16) stops the old daemon as part of
+  replacing the binary.
+
+### What this makes possible
+
+One decision log across every surface, which is what §15's calibration needs to
+converge in reasonable time. One warm engine, so the second editor window costs
+nothing. One graph watcher (§17) amortised across clients. And one place for
+sidecars to live, so a tinyjev process is started once rather than per editor.
 
 ## Sources
 
