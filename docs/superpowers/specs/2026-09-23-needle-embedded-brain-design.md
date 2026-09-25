@@ -368,6 +368,57 @@ adds `router_name: "needle"` and confidence — no schema change.
     (1 158 184 bytes); `needle.h` =
     `3aa713942528d944598458cecb4a262f2cc49349bec63355f91df0b159964e55`
     (1 187 bytes, committed at `crates/needle-sys/needle.h`).
+
+  **Amendment (2026-09-24, `ffi-default`): resolution step 3 implemented; the
+  feature stays opt-in.** §3's third resolution step — download at build time
+  with checksum verification — now exists in
+  `crates/needle-sys/build_support.rs` (`PINNED_ENGINES` +
+  `ensure_cached_engine`), gated on a `needle-sys/fetch` feature that only
+  `forge-needle/ffi` turns on, so a default build still touches no network.
+  Cache is content-addressed under `$CARGO_HOME/needle-engine/<sha256>/`;
+  `NEEDLE_NO_DOWNLOAD=1` opts out for offline/packaging builds;
+  `NEEDLE_REQUIRE_ENGINE=1` makes an unresolvable engine fatal (release/CI use
+  it so a brain-less binary cannot ship brain-labelled); an unresolvable
+  engine is otherwise a `cargo:warning`, not a failure, so `just lint-ffi`'s
+  link-free coverage of `ffi_backend.rs` keeps working on machines with no
+  engine.
+
+  **Engine checksums, all downloaded and hashed locally 2026-09-24** (each
+  also matches the `x-linked-etag` Hugging Face serves, and macos-arm64
+  matches the value recorded above from the earlier session):
+
+  | folder | sha256 | bytes | wired up |
+  | --- | --- | --- | --- |
+  | `macos-arm64` | `60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a` | 1 158 184 | yes (`aarch64-apple-darwin`) |
+  | `linux-x86_64` | `2581e7d46acd4f66c5839bcfb06b0af11c157c8775636875beb0af5ca35ded54` | 1 675 104 | yes (`x86_64-unknown-linux-gnu`) |
+  | `linux-arm64` | `b36c214437b5230bae89291f684de571dceb0922834a09ceeb09a8e21464a481` | 1 539 978 | yes (`aarch64-unknown-linux-gnu`) |
+  | `windows-x86_64` | `6fb0b9bccfa9f54d46e05a279273c15021570a53a8b3945613d80d299ca1f634` | 1 808 664 | no |
+  | `windows-arm64` | `3a945065225cb383cab9b75333ebe0195d25c7e7c815f032d47857b354056d75` | 1 650 954 | no |
+  | `linux-armv7` | `b1c3cf3ac526cb01314529da2094b8e5b38f41acd5b4a956fc05f22fb4b99346` | 1 334 534 | no (etag only) |
+  | `linux-riscv64` | `11e0eea3d8dff6826171a702f6e741c3cbedde4e42a1ca1959d3712092adbc53` | 1 548 596 | no (etag only) |
+
+  **Why `needle-ffi` is still not a default feature.** Three findings, each
+  independently sufficient:
+
+  1. **Intel macOS has no engine.** The HF `siblings` listing has no
+     `macos-x86_64` folder (only a Python wheel). `x86_64-apple-darwin` is a
+     release target, so a default-on feature would turn "builds, routes
+     statically" into "does not link" on every Intel Mac.
+  2. **Windows is unverified.** Both Windows folders publish `libneedle.a` —
+     an `ar` archive of a COFF `needle.cpp.obj` — not the `needle.lib` an MSVC
+     `-lneedle` resolves. A rename is probably enough, but neither the rename
+     nor the C++ runtime pairing has been link-tested, and an unverified
+     default is not a default.
+  3. **Offline builds would break.** With `ffi` on and nothing cached, the
+     link fails. Today those builds succeed and route statically. Converting
+     graceful degradation into a build failure is a worse default than the
+     bug it would fix.
+
+  The user-visible fix for "the brain doesn't work out of the box" therefore
+  runs through the *release* artifacts (brain-enabled for the three verified
+  targets, `.github/workflows/release.yml`) and through coherent messaging,
+  not through the default feature set. Revisit if Cactus publishes an Intel
+  macOS engine, or once a Windows link is verified on a Windows runner.
   - **It is C++ behind an `extern "C"` facade.** `nm` shows libc++ symbols
     plus `__cxa_*`/`__gxx_personality_v0`, so `build.rs` links the C++
     runtime (`c++` on Apple/FreeBSD, `stdc++` on Linux, `c++_static` +

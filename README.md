@@ -989,65 +989,106 @@ just clean
 
 ### Embedded Needle brain (`ffi`)
 
-`just verify` runs with default features, where the needle router has no
-inference engine and degrades to static routing. Real on-device inference is
-behind a feature flag because it needs a per-platform native engine that this
-repo does not carry:
+Real on-device inference needs a per-platform native engine (`libneedle`) that
+this repo does not carry, so it sits behind one feature flag — **and enabling
+that flag is the whole job**, because the build fetches and checksum-verifies
+the engine for you:
+
+```bash
+cargo build --release -p forge-cli --features needle-ffi
+```
+
+That is the single command. No `curl`, no manual checksum step.
 
 | crate | feature | effect |
 | --- | --- | --- |
-| `forge-needle` | `ffi` | `FfiBackend` over `libneedle` instead of `UnavailableBackend` |
+| `forge-needle` | `ffi` | `FfiBackend` over `libneedle` instead of `UnavailableBackend`; turns on `needle-sys/fetch` |
 | `forge-needle` | `needle-e2e` | enables `tests/e2e.rs` (needs `ffi` + real weights) |
 | `forge-cli` | `needle-ffi` | builds the `forge` binary with the above |
 
+Prebuilt release binaries for the supported platforms below already have the
+engine linked in — see [Installation](#installation). You only need this
+section to build one yourself.
+
+#### How the engine gets there
+
+`crates/needle-sys/build.rs` resolves it in three steps, first hit wins:
+
+1. `NEEDLE_LIB_DIR=/path/to/dir` — an engine you supplied.
+2. `crates/needle-sys/vendor/<target-triple>/` — a vendored engine
+   (gitignored).
+3. **Download, verified against a pinned SHA-256** — only when the `ffi`
+   feature is on. A default build never reaches this step and never touches
+   the network.
+
 The engine ships per platform in the same Apache-2.0 Hugging Face repo as the
 weights, [`Cactus-Compute/needle3`](https://huggingface.co/Cactus-Compute/needle3).
-Fetch `libneedle.a` for your target once:
+Downloads are cached by content hash under `$CARGO_HOME/needle-engine/`
+(override with `NEEDLE_ENGINE_CACHE_DIR`), so it is fetched once per machine,
+not once per build, and a cache entry is re-hashed on every use.
 
-```bash
-TRIPLE=$(rustc -vV | sed -n 's/^host: //p')      # e.g. aarch64-apple-darwin
-mkdir -p crates/needle-sys/vendor/$TRIPLE
-curl -L -o crates/needle-sys/vendor/$TRIPLE/libneedle.a \
-  https://huggingface.co/Cactus-Compute/needle3/resolve/main/macos-arm64/libneedle.a
+Targets forge will fetch automatically — the ones whose checksum has been
+verified and whose link has been exercised:
 
-# Verify against the pinned checksum (macos-arm64; see the spec's §8 for
-# other platforms as they get verified) before trusting the download:
-echo "60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a  crates/needle-sys/vendor/$TRIPLE/libneedle.a" | shasum -a 256 -c -
-```
+| Rust target | artifact folder |
+| --- | --- |
+| `aarch64-apple-darwin` | `macos-arm64` |
+| `x86_64-unknown-linux-gnu` | `linux-x86_64` |
+| `aarch64-unknown-linux-gnu` | `linux-arm64` |
 
-Substitute the platform folder for your target (`macos-arm64`,
-`linux-x86_64`, `linux-arm64`, `linux-armv7`, `linux-riscv64`,
-`linux-mipsel`, `windows-x86_64`, `windows-arm64`, `android-arm64`, ...; the
-full list is in `crates/needle-sys/build.rs`). `NEEDLE_LIB_DIR=/path/to/dir`
-overrides the vendored location. `crates/needle-sys/vendor/` is gitignored;
+The pinned checksums live in `PINNED_ENGINES` in
+`crates/needle-sys/build_support.rs`, together with the collected-but-unwired
+checksums for `windows-{x86_64,arm64}` and `linux-{armv7,riscv64}` and the
+reason each is held back. **Intel macOS has no engine at all** — there is no
+`macos-x86_64` folder in the repo — which is the main reason `needle-ffi` is
+not a default feature: making it one would turn "forge builds and routes
+statically" into "forge does not build" on those machines.
+
+On any other target, `--features needle-ffi` warns that no verified engine
+exists and links nothing; supply one yourself via step 1 or 2 if you have one
+you trust.
+
+Environment knobs:
+
+| variable | effect |
+| --- | --- |
+| `NEEDLE_LIB_DIR` | use the engine in this directory (step 1) |
+| `NEEDLE_NO_DOWNLOAD=1` | never download — offline, air-gapped and packaging builds |
+| `NEEDLE_REQUIRE_ENGINE=1` | fail the build instead of continuing engine-less (CI/release use this) |
+| `NEEDLE_ENGINE_BASE_URL` | fetch from a mirror instead of Hugging Face (same bytes: the checksum is not overridable) |
+| `NEEDLE_ENGINE_CACHE_DIR` | where verified engines are cached |
+
 `needle.h` is committed as the contract of record — `needle-sys` hand-writes
 its six `extern "C"` declarations rather than generating them (no `bindgen`, so
 no libclang needed to build forge), and a unit test fails if the committed
 header ever stops matching those declarations.
 
-Then:
+#### Running it
 
 ```bash
 just verify-ffi   # clippy + unit tests with `ffi` on
 just e2e          # real-weights end-to-end suite (release build)
-
-# build the forge binary itself against the real engine
-cargo build --release -p forge-cli --features needle-ffi
 ```
 
 `just verify` already type- and lint-checks the `ffi` code on every run via
 `just lint-ffi` — `cargo clippy` never links, so that needs no engine binary.
 The recipes above are what additionally *run* it.
 
-**If you enable `ffi` without fetching the engine**, the build gets all the way
-to linking and then fails with undefined symbols — `ld`/`lld` naming
-`_needle_init`, `_needle_decide`, `_needle_embed` and friends (`undefined
-symbol: needle_init` on Linux, `Undefined symbols for architecture arm64` on
-macOS). That is the *only* symptom, and the fix is the `curl` step above (or
-`NEEDLE_LIB_DIR`). A default build — no `ffi` — never links the engine and
-says nothing about it: `needle-sys` prints a note only under `cargo build -vv`,
-deliberately not a `cargo:warning`, because the crate compiles on every
-workspace build whether or not anything needs the engine.
+**If `ffi` is on and no engine could be resolved**, the build prints a
+`cargo:warning` naming the one thing to do next and carries on without link
+flags; a binary that actually calls into the engine then fails at link time
+with undefined `_needle_*` symbols, the warning still visible above it. It
+warns rather than stopping because `just lint-ffi` and CI compile the `ffi`
+code on machines with no engine on purpose, and that coverage is worth more
+than pre-empting a link error whose cause is already on screen. Set
+`NEEDLE_REQUIRE_ENGINE=1` when you would rather it stop — which is exactly
+what the release workflow does, so a brain-less binary can never ship
+labelled brain-enabled.
+
+A default build — no `ffi` — never links the engine and says nothing about it:
+`needle-sys` prints a note only under `cargo build -vv`, deliberately not a
+`cargo:warning`, because the crate compiles on every workspace build whether
+or not anything needs the engine.
 
 `just e2e` needs weights as well as the engine:
 

@@ -25,7 +25,13 @@ lint:
 # ffi_backend.rs (700+ lines, most of the crate's unsafe) and tests/e2e.rs at
 # all. Without it, `ffi` code could stop compiling and `just verify` would
 # still pass.
+#
+# NEEDLE_NO_DOWNLOAD=1 keeps this link-free *and* network-free: `ffi` turns on
+# needle-sys/fetch, and there is no reason to pull an engine binary for a pass
+# that never links one. An unresolvable engine is a warning here, not an
+# error, precisely so this recipe keeps working on machines without one.
 lint-ffi:
+    NEEDLE_NO_DOWNLOAD=1 \
     cargo clippy -p forge-needle --features "ffi needle-e2e" --all-targets -- -D warnings
 
 # unit + integration tests (see `lint` for why not --all-features)
@@ -41,9 +47,12 @@ bdd:
 verify: check lint lint-ffi test bdd
     cargo fmt --all --check
 
-# The libneedle FFI backend. Needs a per-platform engine: set NEEDLE_LIB_DIR,
-# or drop libneedle.a into crates/needle-sys/vendor/<target-triple>/ — see
-# crates/needle-sys/build.rs for the download URL and platform list.
+# The libneedle FFI backend. The engine is fetched and checksum-verified
+# automatically for the targets listed in crates/needle-sys/build_support.rs
+# (cached under $CARGO_HOME/needle-engine, so once per machine). On any other
+# target, supply one: NEEDLE_LIB_DIR=<dir>, or drop libneedle.a into
+# crates/needle-sys/vendor/<target-triple>/. NEEDLE_NO_DOWNLOAD=1 to stay
+# offline.
 verify-ffi:
     cargo clippy -p needle-sys -p forge-needle --all-targets --features "ffi needle-e2e" -- -D warnings
     cargo test -p forge-needle --features ffi
