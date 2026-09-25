@@ -429,4 +429,36 @@ mod tests {
         let c = call("read_file", serde_json::json!({"path": "/etc/passwd"}));
         assert_ne!(minimum_dispatch_risk(&c), Some(RiskLevel::Safe));
     }
+
+    /// `forge-needle`'s `fastpath_latency` test measures how long needle takes
+    /// to pick a tool, and that number is what `needle_fast_path`'s probe budget
+    /// is sized against. The measurement is only meaningful if it runs against
+    /// *this* tool surface — `needle_init` tokenizes the whole tools JSON on
+    /// every call, so a drifted or smaller catalogue would quietly understate
+    /// the real cost and leave the budget mis-sized.
+    ///
+    /// `forge-needle` sits below this crate in the dependency graph and cannot
+    /// import `tool_definitions()`, so it carries a literal copy. This test is
+    /// what keeps the copy honest.
+    #[test]
+    fn needle_fastpath_measurement_uses_this_tool_surface() {
+        const MEASUREMENT_TEST: &str = include_str!("../../forge-needle/tests/fastpath_latency.rs");
+
+        let raw = MEASUREMENT_TEST
+            .split_once("const TOOLS_JSON: &str = r#\"")
+            .and_then(|(_, rest)| rest.split_once("\"#;"))
+            .map(|(json, _)| json)
+            .expect("fastpath_latency.rs no longer defines TOOLS_JSON as a raw string");
+
+        let measured: serde_json::Value =
+            serde_json::from_str(raw).expect("TOOLS_JSON is not valid JSON");
+        let actual = serde_json::to_value(tool_definitions()).expect("serializes");
+
+        assert_eq!(
+            measured, actual,
+            "the tool surface in crates/forge-needle/tests/fastpath_latency.rs has drifted \
+             from tool_definitions(). Update TOOLS_JSON there to match, then re-run the \
+             measurement — the fast-path probe budget was chosen against it."
+        );
+    }
 }
