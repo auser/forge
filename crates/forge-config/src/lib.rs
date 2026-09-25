@@ -642,10 +642,14 @@ fn apply_layer(
                 // they never wrote is the defect this prevents. Recording it
                 // here (rather than in the generic nested-section branch) is
                 // what keeps it refreshed on every layer.
+                //
+                // The recorded value is the entry itself, because this key is
+                // reachable from `forge config explain models.<name>` — a
+                // placeholder there would print where a value belongs.
                 sources.insert(
                     keys::model_entry(name),
                     ConfigSource {
-                        value: format!("model entry {name}"),
+                        value: entry.to_string(),
                         origin,
                     },
                 );

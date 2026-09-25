@@ -110,13 +110,14 @@ impl JevRouter {
 /// `None`/empty-`Vec` arguments would; `timeout` defaults to
 /// [`Duration::ZERO`] (`Duration` has no natural "unset" value), so callers
 /// building for real use always set it explicitly.
+/// `egress` has no default on purpose — see [`JevRouterBuilder::egress`].
 #[derive(Default)]
 pub struct JevRouterBuilder {
     url: Option<String>,
     key_env: Option<String>,
     timeout: Duration,
     registry: Vec<(String, ModelCapabilities)>,
-    egress: EgressPolicy,
+    egress: Option<EgressPolicy>,
 }
 
 impl JevRouterBuilder {
@@ -140,21 +141,25 @@ impl JevRouterBuilder {
         self
     }
 
-    /// See [`EgressPolicy`]; defaults to `Unrestricted`, matching
-    /// `local_only = false`.
+    /// **Required** (see [`EgressPolicy`]). `EgressPolicy::default()` is the
+    /// permissive variant, so a builder that silently defaulted would make
+    /// *forgetting* the confidentiality-relevant choice the unrestricted one.
+    /// [`Self::build`] refuses instead — the direct constructor's required
+    /// parameter with the same effect.
     pub fn egress(mut self, egress: EgressPolicy) -> Self {
-        self.egress = egress;
+        self.egress = Some(egress);
         self
     }
 
     pub fn build(self) -> Result<JevRouter, ForgeError> {
-        JevRouter::new(
-            self.url,
-            self.key_env,
-            self.timeout,
-            self.registry,
-            self.egress,
-        )
+        let egress = self.egress.ok_or_else(|| {
+            ForgeError::router(
+                "JevRouter::builder() requires .egress(EgressPolicy::…): the egress policy \
+                 decides whether local_only applies to this client, and defaulting it would \
+                 default to unrestricted",
+            )
+        })?;
+        JevRouter::new(self.url, self.key_env, self.timeout, self.registry, egress)
     }
 }
 
@@ -559,6 +564,7 @@ mod tests {
             .url(Some(server.uri()))
             .timeout(Duration::from_secs(5))
             .registry(vec![("cheap-a".to_string(), caps(true))])
+            .egress(EgressPolicy::default())
             .build()
             .expect("builder constructs");
 
@@ -570,5 +576,20 @@ mod tests {
 
         assert_eq!(decision.selected_model, "cheap-a");
         assert_eq!(decision.router_name, "jev");
+    }
+
+    /// Forgetting the egress policy must not silently produce an
+    /// unrestricted client: for a confidentiality-relevant knob, omission has
+    /// to fail rather than pick the permissive side.
+    #[test]
+    fn the_builder_refuses_to_construct_without_an_egress_policy() {
+        let err = JevRouter::builder()
+            .url(Some("http://127.0.0.1:9/systemone".to_string()))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .err()
+            .expect("omitting .egress() must fail");
+        assert!(matches!(err, ForgeError::Router(_)), "{err}");
+        assert!(err.to_string().contains("requires .egress("), "{err}");
     }
 }

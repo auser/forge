@@ -463,12 +463,13 @@ impl LayaRouter {
 /// Builder for [`LayaRouter`]. All fields default the same way `new`'s
 /// `None`/zero-length arguments would.
 #[derive(Default)]
+/// `egress` has no default on purpose — see [`LayaRouterBuilder::egress`].
 pub struct LayaRouterBuilder {
     url: Option<String>,
     key_env: Option<String>,
     timeout: Duration,
     criteria: std::collections::HashMap<String, String>,
-    egress: EgressPolicy,
+    egress: Option<EgressPolicy>,
 }
 
 impl LayaRouterBuilder {
@@ -492,21 +493,25 @@ impl LayaRouterBuilder {
         self
     }
 
-    /// See [`EgressPolicy`]; defaults to `Unrestricted`, matching
-    /// `local_only = false`.
+    /// **Required** (see [`EgressPolicy`]). `EgressPolicy::default()` is the
+    /// permissive variant, so a builder that silently defaulted would make
+    /// *forgetting* the confidentiality-relevant choice the unrestricted one.
+    /// [`Self::build`] refuses instead — the direct constructor's required
+    /// parameter with the same effect.
     pub fn egress(mut self, egress: EgressPolicy) -> Self {
-        self.egress = egress;
+        self.egress = Some(egress);
         self
     }
 
     pub fn build(self) -> Result<LayaRouter, ForgeError> {
-        LayaRouter::new(
-            self.url,
-            self.key_env,
-            self.timeout,
-            self.criteria,
-            self.egress,
-        )
+        let egress = self.egress.ok_or_else(|| {
+            ForgeError::router(
+                "LayaRouter::builder() requires .egress(EgressPolicy::…): the egress policy \
+                 decides whether local_only applies to this client, and defaulting it would \
+                 default to unrestricted",
+            )
+        })?;
+        LayaRouter::new(self.url, self.key_env, self.timeout, self.criteria, egress)
     }
 }
 
@@ -879,6 +884,20 @@ fn local_only_block(name: &str, config: &Config) -> Option<String> {
     }
 }
 
+/// The router that will actually run for a configured name: `static` when
+/// `local_only` refuses the configured one (see [`local_only_block`]),
+/// otherwise the name unchanged.
+///
+/// Public so `forge doctor` reports the router a run will use rather than the
+/// one the file names — one report must not give two answers.
+pub fn effective_router_name(configured: &str, config: &Config) -> String {
+    if local_only_block(configured, config).is_some() {
+        "static".to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
 /// The endpoint an `http`/`laya` router will dial, resolved exactly as its
 /// constructor does. `None` for every router that dials nothing, and for
 /// `http` with no `router_url` — `build_http` already errors on that, and a
@@ -932,7 +951,7 @@ impl<'a> RouterStackBuilder<'a> {
                 tracing::warn!(
                     "router = {configured:?} {reason}; --local-only forces static routing instead"
                 );
-                "static".to_string()
+                effective_router_name(configured, self.config)
             }
             None => configured.to_string(),
         }
@@ -1696,15 +1715,25 @@ mod tests {
             model: "mock-local".to_string(),
             ..Config::default()
         };
+        // The substitution itself, asserted directly: with a `static` primary
+        // the fallback is never invoked, so no routing observation can
+        // distinguish "substituted" from "built an HttpRouter that was never
+        // called". Without this line the test would pass if *both* the
+        // substitution and `build_router`'s backstop were removed.
+        assert_eq!(
+            RouterStackBuilder::new(&config, &[]).fallback_name(),
+            "static"
+        );
+        assert_eq!(effective_router_name("http", &config), "static");
+
         let router = router_from_config(&config, &[]).expect("builds, degraded");
         let decision = router
             .route(&RoutingRequest::new("x"))
             .await
             .expect("routes");
         assert_eq!(decision.router_name, "static");
-        // Primary and the effective fallback are both "static", so the
-        // redundant self-fallback hop is skipped — which also proves the
-        // fallback name was substituted rather than left as "http".
+        // Primary and the effective fallback are both `static`, so the
+        // redundant self-fallback hop is skipped.
         assert!(!decision.fallback_used);
     }
 
@@ -2348,6 +2377,7 @@ mod tests {
             .url(Some(format!("{}/decide", server.uri())))
             .timeout(Duration::from_secs(5))
             .criteria(criteria)
+            .egress(EgressPolicy::default())
             .build()
             .expect("builder constructs");
 
@@ -2357,5 +2387,19 @@ mod tests {
             .expect("routes");
         assert_eq!(decision.selected_model, "cheap-a");
         assert_eq!(decision.router_name, "laya");
+    }
+
+    /// Same rule as the jev builder: omission fails rather than defaulting to
+    /// the permissive policy.
+    #[test]
+    fn the_laya_builder_refuses_to_construct_without_an_egress_policy() {
+        let err = LayaRouter::builder()
+            .url(Some("http://127.0.0.1:8788/decide".to_string()))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .err()
+            .expect("omitting .egress() must fail");
+        assert!(matches!(err, ForgeError::Router(_)), "{err}");
+        assert!(err.to_string().contains("requires .egress("), "{err}");
     }
 }

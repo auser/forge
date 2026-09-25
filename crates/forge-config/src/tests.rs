@@ -366,6 +366,16 @@ fn models_override_does_not_leak_stale_dotted_source() {
         resolved.explain("models.qwen3-coder").map(|(_, o)| o),
         Some(Origin::ProjectFile)
     );
+    // The recorded value is the entry, not a placeholder: this key is
+    // reachable from `forge config explain models.<name>`, and it also makes
+    // the stale-*value* half of this regression assertable again.
+    let (value, _) = resolved
+        .explain("models.qwen3-coder")
+        .expect("the dotted key is recorded");
+    assert!(
+        value.contains("999"),
+        "explain must show the value: {value}"
+    );
     assert_eq!(
         resolved.explain("models").map(|(_, o)| o),
         Some(Origin::ProjectFile)

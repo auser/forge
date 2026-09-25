@@ -27,7 +27,7 @@ pub use model::{
 };
 pub use router::{
     CheapestRouter, FallbackRouter, HttpRouter, LayaRouter, MockRouter, StaticRouter,
-    ThresholdRouter, filter_candidates, jev_credential_present, resolved_jev_key_env,
-    resolved_jev_url, router_endpoint, router_from_config,
+    ThresholdRouter, effective_router_name, filter_candidates, jev_credential_present,
+    resolved_jev_key_env, resolved_jev_url, router_endpoint, router_from_config,
 };
 pub use scripted::{ScriptedMockModel, ScriptedReply, scripted_mock_from_path};

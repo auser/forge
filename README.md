@@ -483,7 +483,7 @@ Key settings (all optional):
 | Key | Default | Env var | Meaning |
 |---|---|---|---|
 | `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
-| `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.). **Setting this overrides *every* model's endpoint**, including hosted `[models]` entries like `claude-sonnet` and `gpt-5`, and it is applied verbatim — so an `anthropic`-family entry redirected this way needs an Anthropic-compatible endpoint with no `/v1` suffix (the client appends `/v1/messages`). Per-model endpoints belong in `[models.<name>] base_url`. Setting it to the default value counts as setting it |
+| `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.). **Setting this overrides *every* model's endpoint**, including hosted `[models]` entries like `claude-sonnet` and `gpt-5` — setting it to the default value still counts as setting it. Per-model endpoints belong in `[models.<name>] base_url`. Combinations that cannot work are refused at startup, naming both settings: an `anthropic`-family model whose endpoint ends in `/v1` (the client appends `/v1/messages`, so it would 404), or an entry whose `provider` contradicts the endpoint (`provider = "anthropic"` pointed at `api.openai.com`) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
 | `router` | `needle` | `FORGE_ROUTER` | `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
@@ -536,7 +536,8 @@ decisions are made:
   `Location` elsewhere would otherwise make forge re-POST your prompt, body
   intact, to a host nothing ever checked. Under `local_only` every hop is
   re-checked and a non-local one is refused, naming the host it declined.
-  Loopback-to-loopback redirects still work.
+  Loopback-to-loopback redirects still work, and a local endpoint redirecting
+  in a circle stops after 10 hops exactly as it does with the setting off.
 - **Decision routers.** `router = "jev"` degrades to `static`, and the Jev
   escalation tier behind `needle` is pruned — in both roles, unconditionally,
   since a decision router is handed your task text. `http` and `laya` degrade
@@ -1462,11 +1463,12 @@ go in `specs/adrs/`.
   than quietly picking something else, which is the loud-but-correct behavior
   until candidate pruning lands. See [What `--local-only`
   restricts](#what---local-only-restricts).
-- A global `model_base_url` overrides hosted `[models]` entries too, verbatim:
-  pointing it at a local OpenAI-compatible server while `model` names an
-  `anthropic`-family entry (`claude-sonnet`) sends Anthropic-shaped requests
-  to a server that does not speak them. Use `[models.<name>] base_url` to
-  redirect one model rather than all of them.
+- A global `model_base_url` overrides hosted `[models]` entries too, verbatim.
+  The two combinations that provably cannot work are refused at startup with
+  both settings named — an `anthropic`-family model on a `/v1` endpoint, and a
+  `provider` the endpoint contradicts — but forge cannot tell in general
+  whether a URL speaks the wire protocol a family expects. Use
+  `[models.<name>] base_url` to redirect one model rather than all of them.
 - The needle direct-dispatch fast path is read-only by design (`read_file`,
   `graph_context`, `graph_grep` only); writes, edits, deletes, and commands
   always go through the full agent loop and its approval gating.

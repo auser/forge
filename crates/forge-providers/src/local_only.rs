@@ -120,6 +120,13 @@ fn host_name_is_loopback(host: &str) -> bool {
 /// policy therefore travels with the client and every hop is re-checked with
 /// [`endpoint_is_local`], which also keeps a legitimate loopback-to-loopback
 /// redirect working.
+///
+/// A custom policy **replaces** reqwest's default wholesale, so this one has
+/// to re-impose the hop limit the default provided ([`MAX_REDIRECT_HOPS`]).
+/// Locality alone is not enough: a loopback server that redirects to itself is
+/// entirely local, and without a bound a `local_only` client would spin on it
+/// until the request timeout — 120 s for the model clients — where an
+/// unrestricted one fails in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EgressPolicy {
     /// `local_only` is off: reqwest's defaults apply.
@@ -129,6 +136,11 @@ pub enum EgressPolicy {
     /// machine.
     LocalOnly,
 }
+
+/// Redirect hops allowed before giving up — reqwest's own default
+/// (`Policy::limited(10)`), matched deliberately so switching `local_only` on
+/// changes *where* a request may go and nothing else about it.
+const MAX_REDIRECT_HOPS: usize = 10;
 
 impl EgressPolicy {
     /// The policy this configuration calls for. Every production client is
@@ -150,11 +162,16 @@ impl EgressPolicy {
             Self::Unrestricted => builder,
             Self::LocalOnly => builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
                 let hop = attempt.url().to_string();
-                if endpoint_is_local(&hop) {
-                    attempt.follow()
-                } else {
-                    attempt.error(RedirectRefused { url: hop })
+                if !endpoint_is_local(&hop) {
+                    return attempt.error(RedirectRefused::NotLocal { url: hop });
                 }
+                // Local, but possibly in a circle: bound the chain the way
+                // the replaced default did, and fail fast with a reason
+                // instead of burning the caller's whole timeout.
+                if attempt.previous().len() >= MAX_REDIRECT_HOPS {
+                    return attempt.error(RedirectRefused::TooManyHops { url: hop });
+                }
+                attempt.follow()
             })),
         }
         .build()
@@ -182,19 +199,27 @@ pub(crate) fn error_detail(error: &reqwest::Error) -> String {
 
 /// The error a refused redirect hop carries, so the transport failure names
 /// the host forge declined to follow rather than the one it was configured
-/// with.
+/// with — and says which of the two reasons applied, since the fixes differ
+/// (repoint the endpoint vs. fix a server that redirects in a circle).
 #[derive(Debug)]
-struct RedirectRefused {
-    url: String,
+enum RedirectRefused {
+    NotLocal { url: String },
+    TooManyHops { url: String },
 }
 
 impl fmt::Display for RedirectRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "local_only refused to follow a redirect to {}: not a local endpoint",
-            self.url
-        )
+        match self {
+            Self::NotLocal { url } => write!(
+                f,
+                "local_only refused to follow a redirect to {url}: not a local endpoint"
+            ),
+            Self::TooManyHops { url } => write!(
+                f,
+                "gave up after {MAX_REDIRECT_HOPS} redirects (still local, last hop {url}): \
+                 the endpoint is redirecting in a loop"
+            ),
+        }
     }
 }
 
@@ -292,11 +317,24 @@ mod tests {
 
     #[test]
     fn a_refused_redirect_names_the_host_it_declined() {
-        let refused = RedirectRefused {
+        let refused = RedirectRefused::NotLocal {
             url: "https://evil.example.com/v1/chat/completions".to_string(),
         };
         let message = refused.to_string();
         assert!(message.contains("https://evil.example.com"), "{message}");
         assert!(message.contains("local_only"), "{message}");
+
+        // The other reason is distinguishable: a local loop needs a different
+        // fix than a non-local hop, so it must not read the same.
+        let looping = RedirectRefused::TooManyHops {
+            url: "http://127.0.0.1:8080/v1".to_string(),
+        };
+        let message = looping.to_string();
+        assert!(message.contains("redirecting in a loop"), "{message}");
+        assert!(message.contains("10 redirects"), "{message}");
+        assert!(
+            !message.contains("not a local endpoint"),
+            "a loop is not a locality failure: {message}"
+        );
     }
 }

@@ -259,16 +259,18 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                     // does.
                     Some(url) if local_only_refuses(config, &url) => (
                         Level::Fail,
-                        format!(
-                            "{} will not load: {}",
-                            config.model,
-                            forge_providers::model_from_config(config, &root)
-                                .err()
-                                .map(|e| e.to_string())
-                                .unwrap_or_else(|| format!(
-                                    "local_only is set and {url} is not a local endpoint"
-                                ))
-                        ),
+                        // The provider crate's own wording, so doctor and the
+                        // run cannot give different instructions. Its
+                        // `ForgeError` type prefix is dropped: the label and
+                        // the Fail level already say what kind of problem this
+                        // is, and "will not load: configuration error: …"
+                        // reads as two labels for one thing.
+                        forge_providers::model_from_config(config, &root)
+                            .err()
+                            .map(|e| strip_error_kind(&e.to_string()))
+                            .unwrap_or_else(|| {
+                                format!("local_only is set and {url} is not a local endpoint")
+                            }),
                     ),
                     None => (
                         Level::Warn,
@@ -309,11 +311,25 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                 });
             }
         }
+        // The router that will actually run, not the one the file names: under
+        // `local_only` a refused router degrades to `static`, and reporting the
+        // configured name here while the next line says "local_only forces
+        // static routing" is one report giving two answers.
+        let effective_router = forge_providers::effective_router_name(&config.router, config);
+        let router_detail = if effective_router == config.router {
+            router_note(&effective_router).to_string()
+        } else {
+            format!(
+                "{} — local_only replaced router = {:?}",
+                router_note(&effective_router),
+                config.router
+            )
+        };
         checks.push(mock_aware_check(
             "decision router",
-            &config.router,
-            config.router == "mock",
-            router_note(&config.router),
+            &effective_router,
+            effective_router == "mock",
+            &router_detail,
         ));
 
         checks.extend(needle_checks(config).await);
@@ -776,6 +792,20 @@ async fn probe_brain(config: &forge_config::Config, using_hash_backend: bool) ->
     }
 }
 
+/// Drop a `ForgeError`'s `"<kind> error: "` prefix for use inside a check
+/// detail, where the label and level already carry that information.
+/// Anything without a recognised prefix is returned unchanged — the wording
+/// still has to be the provider crate's, not a paraphrase.
+fn strip_error_kind(message: &str) -> String {
+    const PREFIXES: &[&str] = &["configuration error: ", "model provider error: "];
+    for prefix in PREFIXES {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    message.to_string()
+}
+
 /// Whether `local_only` will refuse this endpoint — the same predicate
 /// `forge-providers` enforces with, so a check can never promise a
 /// restriction the code does not apply (or report one it does).
@@ -902,11 +932,10 @@ fn named_credential_envs(config: &forge_config::Config) -> Vec<(&'static str, St
 
     // The active model's env var: the entry's `key_env` wins over the
     // global `model_key_env`, exactly as `model_from_config` resolves it.
-    // Mocks never authenticate, so naming a var for them is meaningless.
-    if !matches!(
-        config.model.as_str(),
-        "mock" | "mock-local" | "scripted-mock"
-    ) {
+    // Mocks never authenticate, so naming a var for them is meaningless. The
+    // list of mock names lives in the crate that enforces the gate — this was
+    // the second copy.
+    if !forge_providers::is_mock_model(&config.model) {
         let entry_key_env = config
             .models
             .get(&config.model)
@@ -1420,6 +1449,44 @@ mod tests {
         assert!(local_only_refuses(&config, "https://api.anthropic.com"));
     }
 
+    /// One report, one answer: the `decision router` line must name the
+    /// router that will run, not the one the config file names, or it
+    /// contradicts the `router endpoint` warning two lines below it.
+    #[tokio::test]
+    async fn decision_router_check_reports_the_effective_router_under_local_only() {
+        let config = forge_config::Config {
+            local_only: true,
+            router: "laya".to_string(),
+            router_url: Some("https://laya.example.com/decide".to_string()),
+            ..forge_config::Config::default()
+        };
+        let effective = forge_providers::effective_router_name(&config.router, &config);
+        assert_eq!(effective, "static");
+
+        // …and with nothing to degrade, the configured name is reported as-is.
+        let plain = forge_config::Config::default();
+        assert_eq!(
+            forge_providers::effective_router_name(&plain.router, &plain),
+            plain.router
+        );
+    }
+
+    /// A check detail must not label the error kind twice: the label and the
+    /// Fail level already say it is the model provider's configuration.
+    #[test]
+    fn a_check_detail_drops_the_forge_error_type_prefix() {
+        assert_eq!(
+            strip_error_kind("configuration error: local_only is set, but model \"x\" …"),
+            "local_only is set, but model \"x\" …"
+        );
+        // Unrecognised prefixes are left exactly as the provider crate wrote
+        // them — the point is to reuse its wording, not to rewrite it.
+        assert_eq!(
+            strip_error_kind("something else: boom"),
+            "something else: boom"
+        );
+    }
+
     /// The shared predicate: doctor must judge locality exactly the way
     /// `forge-providers` enforces it, or a check would promise something the
     /// code doesn't do.
@@ -1577,6 +1644,37 @@ mod tests {
             "{}",
             checks[0].detail
         );
+    }
+
+    /// A mock model authenticates against nothing, so naming a credential
+    /// variable for it is meaningless — and the set of mock names comes from
+    /// the crate that enforces the gate, not from a second list here.
+    #[test]
+    #[serial]
+    fn credential_envs_are_not_reported_for_mock_models() {
+        unsafe { std::env::set_var("SOME_MODEL_KEY", "x") };
+        for model in ["mock", "mock-local", "scripted-mock"] {
+            let config = forge_config::Config {
+                model: model.to_string(),
+                model_key_env: Some("SOME_MODEL_KEY".to_string()),
+                ..forge_config::Config::default()
+            };
+            assert!(
+                named_credential_envs(&config).is_empty(),
+                "{model} authenticates against nothing"
+            );
+        }
+        // A real model with the same setting is reported.
+        let config = forge_config::Config {
+            model: "qwen3-coder".to_string(),
+            model_key_env: Some("SOME_MODEL_KEY".to_string()),
+            ..forge_config::Config::default()
+        };
+        assert_eq!(
+            named_credential_envs(&config),
+            vec![("model_key_env", "SOME_MODEL_KEY".to_string())]
+        );
+        unsafe { std::env::remove_var("SOME_MODEL_KEY") };
     }
 
     /// Only *active* roles are reported: a leftover `router_key_env` from

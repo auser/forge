@@ -538,6 +538,99 @@ impl ModelEndpoint {
             url = self.url,
         )))
     }
+
+    /// Which setting to name when telling the user where this URL came from.
+    fn setting(&self, model: &str) -> String {
+        match self.source {
+            EndpointSource::GlobalBaseUrl => "model_base_url".to_string(),
+            EndpointSource::EntryBaseUrl | EndpointSource::BuiltInEntry => {
+                format!("[models.{model}] base_url")
+            }
+        }
+    }
+
+    /// Refuse a provider family and an endpoint that cannot work together,
+    /// naming **both** settings — rather than building a client whose only
+    /// diagnostic is a 404 from the user's own server.
+    ///
+    /// Two combinations qualify, and both became easier to hit once an
+    /// explicitly set `model_base_url` started overriding a `[models]` entry's
+    /// own URL (as it must — see [`resolve_endpoint`]):
+    ///
+    /// 1. **A declared family the endpoint contradicts** — an entry saying
+    ///    `provider = "anthropic"` redirected at `api.openai.com`, or the
+    ///    reverse. Only *contradictions* count: a family that cannot be
+    ///    inferred from the URL is not a disagreement, because a local
+    ///    Anthropic-compatible proxy is a legitimate, supported setup.
+    /// 2. **An `anthropic`-family model whose base already ends in `/v1`.**
+    ///    [`crate::AnthropicModel`] appends `/v1/messages`, so the request
+    ///    would go to `…/v1/v1/messages`. This is the exact shape of
+    ///    `model = "claude-sonnet"` plus the `model_base_url` value printed in
+    ///    the README's own Default column — a value someone can copy without
+    ///    ever touching `local_only`.
+    ///
+    /// **Refusal, not a warning.** A warning would leave the 404 in place
+    /// (and stderr is easy to miss), and "ignore the global for this family"
+    /// is worse still: silently discarding an explicit setting is the bug
+    /// this round removed, and it would put the checked URL and the used URL
+    /// back out of step — the shape of the `local_only` bypass. This refusal
+    /// costs nothing that works today: on this branch the combination already
+    /// fails, just later and less legibly.
+    fn ensure_suits_provider(
+        &self,
+        model: &str,
+        family: ProviderFamily<'_>,
+    ) -> Result<(), ForgeError> {
+        let setting = self.setting(model);
+        // Outright contradiction first: it is the more specific diagnosis, and
+        // an endpoint that belongs to a different vendor entirely would also
+        // trip the /v1 test below with a less useful message.
+        if let (Some(declared), Some(inferred)) = (
+            family.declared,
+            infer_provider_hint(&self.url).as_deref().map(str::to_owned),
+        ) && declared != inferred
+        {
+            return Err(ForgeError::config(format!(
+                "model {model:?} declares provider = {declared:?} in its [models.{model}] entry, \
+                 but {setting} is {url:?}, which is a {inferred:?} endpoint — those speak \
+                 different wire protocols, so requests would fail. hint: point {setting} at a \
+                 {declared:?} endpoint, or change the entry's provider to {inferred:?}",
+                url = self.url,
+            )));
+        }
+        if family.effective == Some("anthropic") && anthropic_base_would_double(&self.url) {
+            return Err(ForgeError::config(format!(
+                "model {model:?} is in the anthropic provider family, but {setting} is {url:?}, \
+                 which already ends in /v1 — the Anthropic client appends /v1/messages, so \
+                 requests would go to {url}/v1/messages and 404. hint: if that endpoint really \
+                 speaks the Anthropic API, drop the /v1 suffix; if it is an OpenAI-compatible \
+                 server, set model to an OpenAI-compatible entry (a global model_base_url \
+                 applies to every model, {model} included) or give it \
+                 [models.<name>] base_url instead",
+                url = self.url,
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The provider family in play for a model: what its `[models]` entry
+/// declared (if anything) and what forge will actually use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderFamily<'a> {
+    /// `[models.<name>] provider`, if the entry declares one. Only a declared
+    /// family can *contradict* an endpoint; an inferred one came from the URL
+    /// and so can never disagree with it.
+    declared: Option<&'a str>,
+    /// The family forge will use: declared, else inferred from the endpoint.
+    effective: Option<&'a str>,
+}
+
+/// Whether an `anthropic`-family base URL would produce a doubled path once
+/// [`crate::AnthropicModel`] appends `/v1/messages` to it.
+fn anthropic_base_would_double(base: &str) -> bool {
+    let path = base.trim_end_matches('/');
+    path.ends_with("/v1") || path.ends_with("/v1/messages")
 }
 
 /// Resolve the endpoint for `model` exactly as [`model_from_config`] does.
@@ -648,11 +741,12 @@ pub fn model_from_config(
             // below travels with the client so a redirect cannot carry the
             // request somewhere this check never saw.
             let egress = EgressPolicy::from_config(config);
-            let base_url = match resolve_endpoint(config, name) {
-                Some(endpoint) => {
-                    endpoint.ensure_local_only_allows(name, config.local_only)?;
-                    endpoint.url
-                }
+            let endpoint = resolve_endpoint(config, name);
+            if let Some(endpoint) = &endpoint {
+                endpoint.ensure_local_only_allows(name, config.local_only)?;
+            }
+            let base_url = match &endpoint {
+                Some(endpoint) => endpoint.url.clone(),
                 None => {
                     tracing::warn!(
                         model = name,
@@ -688,9 +782,20 @@ pub fn model_from_config(
             }
             // Provider family: explicit entry.provider wins, else infer
             // from the endpoint host.
-            let hint = entry
-                .and_then(|e| e.provider.clone())
-                .or_else(|| infer_provider_hint(&base_url));
+            let declared = entry.and_then(|e| e.provider.clone());
+            let hint = declared.clone().or_else(|| infer_provider_hint(&base_url));
+            // A family and an endpoint that cannot work together are refused
+            // here, before a client exists: the alternative is a 404 from the
+            // user's own server with no clue which two settings disagree.
+            if let Some(endpoint) = &endpoint {
+                endpoint.ensure_suits_provider(
+                    name,
+                    ProviderFamily {
+                        declared: declared.as_deref(),
+                        effective: hint.as_deref(),
+                    },
+                )?;
+            }
             // Which config line named the key env var, so credential hints
             // can tell the user what to delete without sending them after a
             // line that isn't in their file.
@@ -1678,6 +1783,135 @@ mod tests {
         );
     }
 
+    // --- N2: a family and an endpoint that cannot work together ---
+
+    /// The regression the C2 fix made reachable, and it has nothing to do with
+    /// `local_only`: a project config of exactly `model = "claude-sonnet"` plus
+    /// the `model_base_url` value printed in the README's own Default column.
+    /// The global (rightly) wins, the family stays `anthropic` because it comes
+    /// from the entry's `provider`, and the request would go to
+    /// `…/v1/v1/messages` — a 404 from the user's own server. Refuse instead,
+    /// naming both settings.
+    #[test]
+    fn an_anthropic_family_model_on_a_v1_endpoint_is_refused_not_double_pathed() {
+        let config = Config {
+            model: "claude-sonnet".to_string(),
+            model_base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+            // Deliberately absent: this is not a local_only defect.
+            ..Config::default()
+        }
+        .with_explicit([forge_config::keys::MODEL_BASE_URL]);
+        assert!(!config.local_only);
+
+        let err = model_from_config(&config, std::path::Path::new("."))
+            .err()
+            .expect("the doubled-/v1 combination must be refused");
+        let message = err.to_string();
+        assert!(matches!(err, ForgeError::Config(_)), "{message}");
+        // Both settings named, and the actual failing path shown.
+        assert!(message.contains("model_base_url"), "{message}");
+        assert!(message.contains("claude-sonnet"), "{message}");
+        assert!(message.contains("anthropic"), "{message}");
+        assert!(
+            message.contains("http://127.0.0.1:8080/v1/v1/messages"),
+            "must show the doubled path the user would see: {message}"
+        );
+        assert!(message.contains("404"), "{message}");
+        // And it is not mistaken for a credential problem.
+        assert!(!message.contains("no credential"), "{message}");
+    }
+
+    /// A declared family the endpoint flatly contradicts is refused too, in
+    /// either direction.
+    #[test]
+    fn a_declared_family_contradicted_by_the_endpoint_is_refused() {
+        let mut config = Config {
+            model: "confused".to_string(),
+            model_base_url: Some("https://api.openai.com/v1".to_string()),
+            ..Config::default()
+        }
+        .with_explicit([forge_config::keys::MODEL_BASE_URL]);
+        config.models.insert(
+            "confused".to_string(),
+            forge_config::ModelEntry {
+                provider: Some("anthropic".to_string()),
+                base_url: Some("https://api.anthropic.com".to_string()),
+                ..Default::default()
+            },
+        );
+        let err = model_from_config(&config, std::path::Path::new("."))
+            .err()
+            .expect("anthropic entry + openai endpoint must be refused");
+        let message = err.to_string();
+        assert!(message.contains("provider = \"anthropic\""), "{message}");
+        assert!(message.contains("model_base_url"), "{message}");
+        assert!(message.contains("openai"), "{message}");
+    }
+
+    /// The supported case must survive: an Anthropic-compatible proxy on
+    /// loopback, with no `/v1` suffix, is a legitimate setup — and the reason
+    /// this check tests the *endpoint* rather than banning redirection of
+    /// hosted families outright.
+    #[test]
+    #[serial_test::serial]
+    fn an_anthropic_family_model_on_a_local_proxy_still_builds() {
+        // SAFETY: test-only env mutation, serialized via #[serial].
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key-not-a-real-secret") };
+        let config = Config {
+            model: "claude-sonnet".to_string(),
+            model_base_url: Some("http://127.0.0.1:11434".to_string()),
+            local_only: true,
+            ..Config::default()
+        }
+        .with_explicit([forge_config::keys::MODEL_BASE_URL]);
+        let built = model_from_config(&config, std::path::Path::new("."));
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+
+        let model = built.expect("a loopback Anthropic-compatible proxy is a supported setup");
+        assert_eq!(model.name(), "claude-sonnet");
+    }
+
+    /// An inferable-from-nothing family is not a contradiction: a local
+    /// OpenAI-compatible server for an `openai`-family entry is ordinary.
+    #[test]
+    fn an_unrecognisable_endpoint_is_not_treated_as_a_contradiction() {
+        let config = Config {
+            model: "gpt-5".to_string(),
+            model_base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+            ..Config::default()
+        }
+        .with_explicit([forge_config::keys::MODEL_BASE_URL]);
+        assert!(model_from_config(&config, std::path::Path::new(".")).is_ok());
+    }
+
+    #[test]
+    fn anthropic_base_doubling_is_detected_by_path_not_by_guesswork() {
+        for doubled in [
+            "http://127.0.0.1:8080/v1",
+            "http://127.0.0.1:8080/v1/",
+            "https://proxy.example.com/anthropic/v1",
+            "http://127.0.0.1:8080/v1/messages",
+        ] {
+            assert!(
+                anthropic_base_would_double(doubled),
+                "must be caught: {doubled}"
+            );
+        }
+        for fine in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "http://127.0.0.1:11434",
+            "http://127.0.0.1:8080/anthropic",
+            // `/v1x` is not a `/v1` path segment.
+            "http://127.0.0.1:8080/v1x",
+        ] {
+            assert!(
+                !anthropic_base_would_double(fine),
+                "must be allowed: {fine}"
+            );
+        }
+    }
+
     // --- C1: the check has to hold on what leaves, not on what was typed ---
 
     /// The demonstrated bypass: an approved loopback endpoint answers `307`
@@ -1803,6 +2037,60 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(body, "arrived");
+    }
+
+    /// A loopback server that redirects to *itself* is entirely local, so the
+    /// locality check alone would follow it forever: a custom policy replaces
+    /// reqwest's `limited(10)` wholesale, and without re-imposing the bound a
+    /// `local_only` client burns its whole timeout (120 s on the model path)
+    /// where an unrestricted one fails in milliseconds. Turning on a
+    /// confidentiality setting must not turn a misconfigured local proxy into
+    /// a two-minute hang.
+    #[tokio::test]
+    async fn a_local_redirect_loop_fails_fast_instead_of_burning_the_timeout() {
+        let looping = MockServer::start().await;
+        // `Location: /` against itself — every hop is loopback and allowed.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/"))
+            .mount(&looping)
+            .await;
+
+        // A timeout long enough that hitting it would be unmistakable, and a
+        // budget far below it: the bound must be what stops the request.
+        let timeout = Duration::from_secs(20);
+        let budget = Duration::from_secs(5);
+
+        let started = std::time::Instant::now();
+        let err = EgressPolicy::LocalOnly
+            .client(timeout)
+            .expect("client")
+            .get(looping.uri())
+            .send()
+            .await
+            .expect_err("a redirect loop must fail");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.is_redirect() && !err.is_timeout(),
+            "must fail as a redirect limit, not as a timeout: {err}"
+        );
+        assert!(
+            elapsed < budget,
+            "took {elapsed:?} — the hop limit did not apply"
+        );
+        let detail = crate::local_only::error_detail(&err);
+        assert!(detail.contains("redirecting in a loop"), "{detail}");
+        // Same shape as the policy it replaced: an unrestricted client also
+        // stops, so `local_only` changes where a request may go and nothing
+        // else about it.
+        let unrestricted = EgressPolicy::Unrestricted
+            .client(timeout)
+            .expect("client")
+            .get(looping.uri())
+            .send()
+            .await
+            .expect_err("reqwest's own limit also stops");
+        assert!(unrestricted.is_redirect(), "{unrestricted}");
     }
 
     #[tokio::test]

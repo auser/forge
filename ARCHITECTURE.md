@@ -183,7 +183,15 @@ Checking the configured string is necessary but not sufficient, so an
 `local_only` its redirect policy re-checks each hop, because reqwest's
 default (`Policy::limited(10)`) has no host restriction and a `307` from an
 approved loopback endpoint would otherwise re-POST the prompt verbatim to an
-authority nothing inspected. The decision plane uses the same
+authority nothing inspected. A custom policy replaces that default whole, so
+it re-imposes the 10-hop bound too: locality alone would follow a loopback
+server that redirects to itself until the request timed out.
+
+Provider construction also refuses combinations that cannot work at all — an
+`anthropic`-family model whose endpoint already ends in `/v1` (the client
+appends `/v1/messages`), or an entry whose declared `provider` the endpoint
+contradicts — naming both settings rather than building a client whose only
+symptom is a 404. The decision plane uses the same
 `endpoint_is_local` predicate to prune off-device routers, so "local" has one
 definition (`forge_providers::local_only`) and `forge doctor` reports it
 rather than restating it.
