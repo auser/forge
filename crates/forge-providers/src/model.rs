@@ -8,7 +8,7 @@ use forge_core::{
 };
 use serde::Serialize;
 
-use crate::local_only::ModelEndpoint;
+use crate::local_only::EgressPolicy;
 use crate::scripted::ScriptedMockModel;
 
 /// Env var that turns the mock's system-context echo back on.
@@ -156,15 +156,6 @@ pub(crate) fn reject_tools_without_capability(
 pub(crate) const FIELD_MODEL_KEY_ENV: &str = "model_key_env";
 /// `[models.<name>] key_env` named it, not the top-level `model_key_env`.
 pub(crate) const FIELD_ENTRY_KEY_ENV: &str = "the model entry's key_env";
-/// Same idea for the endpoint: which line set the URL a `local_only`
-/// refusal is complaining about.
-pub(crate) const FIELD_MODEL_BASE_URL: &str = "model_base_url";
-/// `[models.<name>] base_url` set it, not the top-level `model_base_url`.
-pub(crate) const FIELD_ENTRY_BASE_URL: &str = "the model entry's base_url";
-
-/// The built-in `model_base_url`. An entry's own URL loses to the global
-/// one only when the global was *changed* from this default.
-const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 /// Stand-in when nothing configured an endpoint: a guaranteed-unroutable
 /// loopback address, so construction succeeds (routing decisions are still
 /// recorded) and the failure surfaces as a typed provider error at request
@@ -210,16 +201,20 @@ pub struct OpenAiCompatibleModel {
 }
 
 impl OpenAiCompatibleModel {
+    /// `egress` decides how far this client may travel, redirects included
+    /// (see [`EgressPolicy`]) — it is a parameter rather than a default
+    /// because a client that silently opts out of `local_only` is the bug
+    /// this type must not be able to have.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
         credential: Option<crate::credentials::ResolvedCredential>,
         capabilities: ModelCapabilities,
         timeout: Duration,
+        egress: EgressPolicy,
     ) -> Result<Self, ForgeError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
+        let client = egress
+            .client(timeout)
             .map_err(|e| ForgeError::provider(format!("building HTTP client: {e}")))?;
         Ok(Self {
             client,
@@ -373,13 +368,25 @@ impl ModelProvider for OpenAiCompatibleModel {
         let response = http.send().await.map_err(|e| {
             if e.is_timeout() {
                 ForgeError::provider(format!("model request to {url} timed out"))
+            } else if e.is_redirect() {
+                // `local_only` refusing a hop lands here. The reason (and the
+                // host declined) is in the source chain, not in reqwest's own
+                // Display — without it this reads as an unexplained failure
+                // against the endpoint the user configured.
+                ForgeError::provider(format!(
+                    "model request to {url} was not completed: {}",
+                    crate::local_only::error_detail(&e)
+                ))
             } else if e.is_connect() {
                 ForgeError::provider(format!(
                     "cannot reach OpenAI-compatible server at {url} (connection refused); \
                      start your model server (e.g. oMLX) or set model = \"mock-local\" for offline use"
                 ))
             } else {
-                ForgeError::provider(format!("model request to {url} failed: {e}"))
+                ForgeError::provider(format!(
+                    "model request to {url} failed: {}",
+                    crate::local_only::error_detail(&e)
+                ))
             }
         })?;
 
@@ -460,27 +467,117 @@ impl ModelProvider for OpenAiCompatibleModel {
 }
 
 /// Whether a model name selects one of the test-only mocks, which have no
-/// endpoint at all (see [`model_from_config`]'s gate).
-fn is_mock_model(name: &str) -> bool {
+/// endpoint at all (see [`model_from_config`]'s gate). Public so `forge
+/// doctor` reports the same set rather than keeping its own copy.
+pub fn is_mock_model(name: &str) -> bool {
     matches!(name, "mock" | "mock-local" | "scripted-mock")
 }
 
-/// Resolve the endpoint for `model` exactly as [`model_from_config`] does,
-/// paired with the config field that produced it. `None` means nothing
-/// configured one.
+/// Where a model's endpoint came from — which is what decides whether a
+/// refusal can honestly tell the user to edit a line, and which line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointSource {
+    /// The top-level `model_base_url`.
+    GlobalBaseUrl,
+    /// A `[models.<name>] base_url` line in one of the user's config files.
+    EntryBaseUrl,
+    /// A **compiled-in** `[models.<name>]` default (`claude-sonnet`, `gpt-5`,
+    /// …). There is no line in the user's file to edit, so a hint that says
+    /// "point the model entry's base_url at a local server" sends them
+    /// hunting for a section that does not exist.
+    BuiltInEntry,
+}
+
+/// A model's resolved endpoint plus where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelEndpoint {
+    pub(crate) url: String,
+    pub(crate) source: EndpointSource,
+}
+
+impl ModelEndpoint {
+    fn new(url: impl Into<String>, source: EndpointSource) -> Self {
+        Self {
+            url: url.into(),
+            source,
+        }
+    }
+
+    /// Refuse, before any client is built, to point a provider at an
+    /// endpoint that would carry the user's code off this machine.
+    ///
+    /// A typed config error rather than a provider error: nothing failed at
+    /// the transport layer, the configuration asks for two things that
+    /// cannot both be true. The message carries both honest ways forward,
+    /// because either can be the real intent — the endpoint is wrong, or
+    /// `local_only` is — and the "change the endpoint" half names something
+    /// the user can actually act on (see [`EndpointSource`]).
+    fn ensure_local_only_allows(&self, model: &str, local_only: bool) -> Result<(), ForgeError> {
+        if !local_only || crate::local_only::endpoint_is_local(&self.url) {
+            return Ok(());
+        }
+        let fix = match self.source {
+            EndpointSource::GlobalBaseUrl => {
+                "point model_base_url at a local server (e.g. \"http://127.0.0.1:8080/v1\")"
+                    .to_string()
+            }
+            EndpointSource::EntryBaseUrl => "point the model entry's base_url at a local server \
+                 (e.g. \"http://127.0.0.1:8080/v1\")"
+                .to_string(),
+            EndpointSource::BuiltInEntry => format!(
+                "{model} is a built-in hosted entry, so there is no line in your config to \
+                 edit — set model to a local one, or add [models.{model}] with \
+                 base_url = \"http://127.0.0.1:8080/v1\" to serve it locally"
+            ),
+        };
+        Err(ForgeError::config(format!(
+            "local_only is set, but model {model:?} would send requests to {url}, which is \
+             not a local endpoint — refusing to build it rather than send your code off \
+             this machine; hint: {fix}, or unset local_only / FORGE_LOCAL_ONLY to allow \
+             remote endpoints",
+            url = self.url,
+        )))
+    }
+}
+
+/// Resolve the endpoint for `model` exactly as [`model_from_config`] does.
+/// `None` means nothing configured one.
 ///
-/// A `[models.<name>]` entry resolves the endpoint; an explicitly changed
-/// global `model_base_url` (different from the built-in default) wins over
-/// the entry's URL so env/CLI/file overrides always work.
+/// A `[models.<name>]` entry resolves the endpoint, **unless** the global
+/// `model_base_url` was explicitly set by a real config layer (user file,
+/// project file, env var, CLI flag), in which case the override wins so
+/// env/CLI/file overrides always work.
+///
+/// "Explicitly set" is asked of [`forge_config::Config::explicit`], not
+/// guessed by comparing the value against the compiled-in default. The old
+/// comparison silently discarded a `model_base_url` that happened to equal
+/// the default — so `http://127.0.0.1:8080/v1` was the one local value a
+/// user could not use to redirect a hosted entry, while `:8081` worked, and
+/// under `local_only` that turned a working setup into a refusal whose hint
+/// recommended the value being discarded.
 fn resolve_endpoint(config: &Config, model: &str) -> Option<ModelEndpoint> {
     let entry_url = config.models.get(model).and_then(|e| e.base_url.clone());
+    let global_is_explicit = config.explicit.contains(forge_config::keys::MODEL_BASE_URL);
     match (entry_url, &config.model_base_url) {
-        (Some(_), Some(global)) if global != DEFAULT_MODEL_BASE_URL => {
-            Some(ModelEndpoint::new(global, FIELD_MODEL_BASE_URL))
+        (Some(_), Some(global)) if global_is_explicit => {
+            Some(ModelEndpoint::new(global, EndpointSource::GlobalBaseUrl))
         }
-        (Some(entry_url), _) => Some(ModelEndpoint::new(entry_url, FIELD_ENTRY_BASE_URL)),
-        (None, Some(global)) => Some(ModelEndpoint::new(global, FIELD_MODEL_BASE_URL)),
+        (Some(entry_url), _) => Some(ModelEndpoint::new(entry_url, entry_source(config, model))),
+        (None, Some(global)) => Some(ModelEndpoint::new(global, EndpointSource::GlobalBaseUrl)),
         (None, None) => None,
+    }
+}
+
+/// Whether this model's `[models]` entry is a line in the user's file or a
+/// compiled-in default.
+fn entry_source(config: &Config, model: &str) -> EndpointSource {
+    if config
+        .explicit
+        .contains(&forge_config::keys::model_entry(model))
+    {
+        EndpointSource::EntryBaseUrl
+    } else {
+        EndpointSource::BuiltInEntry
     }
 }
 
@@ -547,6 +644,10 @@ pub fn model_from_config(
             // remote model would complain about a missing API key instead of
             // about the setting that actually stopped it.
             let entry = config.models.get(name);
+            // Checking the configured URL is only half of it: the policy
+            // below travels with the client so a redirect cannot carry the
+            // request somewhere this check never saw.
+            let egress = EgressPolicy::from_config(config);
             let base_url = match resolve_endpoint(config, name) {
                 Some(endpoint) => {
                     endpoint.ensure_local_only_allows(name, config.local_only)?;
@@ -623,6 +724,7 @@ pub fn model_from_config(
                     capabilities,
                     entry.and_then(|e| e.max_output_tokens),
                     Duration::from_secs(120),
+                    egress,
                 )?));
             }
 
@@ -642,6 +744,7 @@ pub fn model_from_config(
                     credential,
                     capabilities,
                     Duration::from_secs(120),
+                    egress,
                 )?
                 .with_key_env(key_env, key_env_field),
             ))
@@ -787,6 +890,7 @@ mod tests {
             None,
             ModelCapabilities::default(),
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let response = model
@@ -827,6 +931,7 @@ mod tests {
             )),
             ModelCapabilities::default(),
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let response = model
@@ -851,6 +956,7 @@ mod tests {
             None,
             ModelCapabilities::default(),
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let err = model
@@ -886,6 +992,7 @@ mod tests {
             None,
             ModelCapabilities::default(),
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct")
         .with_key_env(Some("OMLX_API_KEY".to_string()), FIELD_MODEL_KEY_ENV);
@@ -918,6 +1025,7 @@ mod tests {
             None,
             ModelCapabilities::default(),
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let err = model
@@ -946,6 +1054,7 @@ mod tests {
             None,
             ModelCapabilities::default(),
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct")
         .with_key_env(Some("OMLX_API_KEY".to_string()), FIELD_MODEL_KEY_ENV);
@@ -1120,6 +1229,7 @@ mod tests {
                 ..ModelCapabilities::default()
             },
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
 
@@ -1169,6 +1279,7 @@ mod tests {
             None,
             ModelCapabilities::default(),
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
         assert!(!model.capabilities().tools);
@@ -1236,12 +1347,16 @@ mod tests {
             .await;
 
         // qwen3-coder's entry URL is 127.0.0.1:8080 — unreachable here. An
-        // explicitly changed global base_url must win and reach the mock.
+        // explicitly set global base_url must win and reach the mock.
+        // `with_explicit` is what `Config::load` would record for a
+        // `model_base_url` line in a config file, env var or CLI flag; a
+        // `Config` built in code has to say so (see `ExplicitKeys`).
         let config = Config {
             model: "qwen3-coder".to_string(),
             model_base_url: Some(server.uri()),
             ..Config::default()
-        };
+        }
+        .with_explicit([forge_config::keys::MODEL_BASE_URL]);
         let model = model_from_config(&config, std::path::Path::new(".")).expect("builds");
         let response = model
             .complete(CompletionRequest::new(
@@ -1270,6 +1385,7 @@ mod tests {
             None,
             ModelCapabilities::default(),
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let response = model
@@ -1290,6 +1406,9 @@ mod tests {
 
     // --- local_only (see `crate::local_only` for where the line is drawn) ---
 
+    /// A `local_only` config whose endpoint came from an explicitly set
+    /// global `model_base_url` — what a `.forge/config.toml` line, a
+    /// `FORGE_MODEL_BASE_URL`, or `--model` would produce.
     fn local_only_config(model: &str, base_url: &str) -> Config {
         Config {
             model: model.to_string(),
@@ -1297,6 +1416,7 @@ mod tests {
             local_only: true,
             ..Config::default()
         }
+        .with_explicit([forge_config::keys::MODEL_BASE_URL])
     }
 
     /// The README's promise, at the one place a configured model becomes a
@@ -1304,16 +1424,16 @@ mod tests {
     /// refusal says which model, which URL, and both ways forward.
     #[test]
     fn local_only_refuses_a_remote_model_endpoint() {
-        let config = local_only_config("gpt-5", "https://api.openai.com/v1");
+        let config = local_only_config("gpt-ish", "https://api.openai.com/v1");
         let err = model_from_config(&config, std::path::Path::new("."))
             .err()
             .expect("a remote endpoint must be refused under local_only");
         let ForgeError::Config(message) = err else {
             panic!("local_only refusals are config errors, not provider errors");
         };
-        assert!(message.contains("gpt-5"), "{message}");
+        assert!(message.contains("gpt-ish"), "{message}");
         assert!(message.contains("https://api.openai.com/v1"), "{message}");
-        assert!(message.contains("model_base_url"), "{message}");
+        assert!(message.contains("point model_base_url"), "{message}");
         assert!(message.contains("unset local_only"), "{message}");
     }
 
@@ -1380,8 +1500,9 @@ mod tests {
         );
     }
 
-    /// Entry-supplied URLs get the entry named, so the hint points at a line
-    /// that exists in the user's file (same rule as `credential_hint`).
+    /// A URL from an entry the user wrote gets the entry named, so the hint
+    /// points at a line that exists in their file (same rule as
+    /// `credential_hint`).
     #[test]
     fn local_only_refusal_names_the_entry_that_carried_the_url() {
         let mut config = Config {
@@ -1396,12 +1517,82 @@ mod tests {
                 ..Default::default()
             },
         );
+        // What `Config::load` records for a `[models.hosted-thing]` section
+        // in a real config file.
+        let config = config.with_explicit([forge_config::keys::model_entry("hosted-thing")]);
         let err = model_from_config(&config, std::path::Path::new("."))
             .err()
             .expect("refused");
         let message = err.to_string();
         assert!(message.contains("the model entry's base_url"), "{message}");
         assert!(!message.contains("point model_base_url"), "{message}");
+    }
+
+    /// …but a **compiled-in** entry has no line to edit, and telling someone
+    /// to "point the model entry's base_url at a local server" sends them
+    /// hunting for a `[models.gpt-5]` section they never wrote. All four
+    /// hosted defaults are in this case, which is the common one.
+    #[test]
+    fn local_only_refusal_for_a_built_in_entry_does_not_invent_a_config_line() {
+        for model in ["gpt-5", "claude-sonnet", "deepseek-chat", "kimi-k2.7-code"] {
+            let config = Config {
+                model: model.to_string(),
+                local_only: true,
+                ..Config::default()
+            };
+            let err = model_from_config(&config, std::path::Path::new("."))
+                .err()
+                .unwrap_or_else(|| panic!("{model} is hosted and must be refused"));
+            let message = err.to_string();
+            assert!(
+                message.contains("built-in hosted entry"),
+                "{model}: {message}"
+            );
+            assert!(
+                !message.contains("point the model entry's base_url"),
+                "{model} has no such line to point: {message}"
+            );
+            // It still names something the user can do.
+            assert!(
+                message.contains(&format!("[models.{model}]")),
+                "{model}: {message}"
+            );
+            assert!(message.contains("set model to a local one"), "{message}");
+        }
+    }
+
+    /// C2: `model_base_url` set to the compiled-in default *value* is still a
+    /// choice, and it must take effect. The old "differs from the default"
+    /// heuristic discarded it — so a hosted entry served by a local proxy on
+    /// port 8080 was unexpressible (8081 worked), and under `local_only` the
+    /// refusal then recommended the exact value it was throwing away.
+    #[test]
+    fn an_explicit_global_base_url_equal_to_the_default_still_wins() {
+        const DEFAULT: &str = "http://127.0.0.1:8080/v1";
+        let config = Config {
+            model: "gpt-5".to_string(),
+            model_base_url: Some(DEFAULT.to_string()),
+            local_only: true,
+            ..Config::default()
+        }
+        .with_explicit([forge_config::keys::MODEL_BASE_URL]);
+
+        assert_eq!(model_endpoint(&config).as_deref(), Some(DEFAULT));
+        // And it builds: the endpoint is local, so `local_only` is satisfied
+        // even though `gpt-5`'s own entry points at api.openai.com.
+        let model = model_from_config(&config, std::path::Path::new("."))
+            .expect("a local endpoint for a hosted entry must be usable under local_only");
+        assert_eq!(model.name(), "gpt-5");
+
+        // Untouched (defaults only), the entry's own URL still wins.
+        let untouched = Config {
+            model: "gpt-5".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(
+            model_endpoint(&untouched).as_deref(),
+            Some("https://api.openai.com/v1")
+        );
     }
 
     /// `mock-local` is, by nature, local: the two gates constrain different
@@ -1422,8 +1613,13 @@ mod tests {
     }
 
     /// An unconfigured endpoint is not a `local_only` violation: the
-    /// placeholder is loopback, so the failure stays a request-time
-    /// transport error rather than becoming a confidentiality error.
+    /// placeholder is loopback, so the failure stays a request-time transport
+    /// error rather than becoming a confidentiality error.
+    ///
+    /// Defensive rather than user-reachable: the defaults layer always
+    /// supplies `model_base_url`, and TOML cannot unset it, so `Config::load`
+    /// never produces `None` — only a `Config` built in code (like this one)
+    /// gets here. The branch stays because the type permits it.
     #[test]
     fn local_only_tolerates_a_model_with_no_endpoint_configured() {
         let config = Config {
@@ -1480,6 +1676,133 @@ mod tests {
             refused >= 3,
             "the built-in hosted entries must be refused under local_only"
         );
+    }
+
+    // --- C1: the check has to hold on what leaves, not on what was typed ---
+
+    /// The demonstrated bypass: an approved loopback endpoint answers `307`
+    /// with a `Location` pointing at another authority, and reqwest's default
+    /// policy re-POSTs the prompt there — method and body preserved — to a
+    /// host `local_only` never inspected.
+    ///
+    /// A hermetic test cannot reach a real off-device host, so the second
+    /// server is addressed by a name the predicate calls remote but the
+    /// resolver still points at loopback: `api.localhost` (a `*.localhost`
+    /// subdomain — see `endpoint_is_local`). Refusing it is therefore a
+    /// decision this code made, not a network failure: with the locality
+    /// check disabled, the hop is followed and `exfiltrated` comes back.
+    #[tokio::test]
+    async fn under_local_only_a_redirect_never_carries_the_prompt_onward() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "exfiltrated" } }]
+            })))
+            // The whole point: this server must never be reached.
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let elsewhere_url = format!(
+            "http://api.localhost:{}/chat/completions",
+            elsewhere.address().port()
+        );
+
+        let approved = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", elsewhere_url.as_str()),
+            )
+            .mount(&approved)
+            .await;
+
+        // A configuration `local_only` approves: the endpoint is loopback.
+        let config = local_only_config("local-model", &approved.uri());
+        let model = model_from_config(&config, std::path::Path::new("."))
+            .expect("a loopback endpoint is allowed");
+
+        let err = model
+            .complete(CompletionRequest::new(
+                "local-model",
+                vec![Message::user("SECRET SOURCE CODE")],
+            ))
+            .await
+            .expect_err("the redirect must not be followed off the approved endpoint");
+        let message = err.to_string();
+        assert!(
+            message.contains("local_only refused to follow a redirect"),
+            "the failure must name the refusal, not look like a transport fluke: {message}"
+        );
+        assert!(
+            message.contains("api.localhost"),
+            "and it must name the host it declined: {message}"
+        );
+        assert!(
+            elsewhere
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty(),
+            "the prompt reached the other authority"
+        );
+    }
+
+    /// The policy judges each hop with the same predicate, so an off-device
+    /// `Location` is refused…
+    #[tokio::test]
+    async fn the_local_only_client_refuses_an_off_device_redirect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "https://evil.example.com/x"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = EgressPolicy::LocalOnly
+            .client(Duration::from_secs(5))
+            .expect("client");
+        let err = client
+            .get(server.uri())
+            .send()
+            .await
+            .expect_err("off-device hop must be refused");
+        assert!(err.is_redirect(), "{err}");
+        let detail = crate::local_only::error_detail(&err);
+        assert!(detail.contains("evil.example.com"), "{detail}");
+        assert!(detail.contains("local_only refused"), "{detail}");
+    }
+
+    /// …and a loopback-to-loopback redirect still works, because
+    /// over-blocking a machine-local hop would be a different bug.
+    #[tokio::test]
+    async fn redirects_to_another_loopback_port_are_followed() {
+        let second = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("arrived"))
+            .expect(1)
+            .mount(&second)
+            .await;
+
+        let first = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", second.uri().as_str()),
+            )
+            .mount(&first)
+            .await;
+
+        let client = EgressPolicy::LocalOnly
+            .client(Duration::from_secs(5))
+            .expect("client");
+        let body = client
+            .get(first.uri())
+            .send()
+            .await
+            .expect("loopback hop is fine")
+            .text()
+            .await
+            .expect("body");
+        assert_eq!(body, "arrived");
     }
 
     #[tokio::test]

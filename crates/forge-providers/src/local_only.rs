@@ -2,21 +2,24 @@
 //!
 //! `local_only` (`FORGE_LOCAL_ONLY`, `--local-only`) is documented as
 //! "restrict to local providers". That is a confidentiality promise, so it
-//! has to be enforced where a configured endpoint becomes an HTTP client,
-//! not only where routing decisions are made:
+//! has to be enforced on what actually leaves the process:
 //!
 //! - generation plane: [`crate::model_from_config`] refuses to build a
 //!   provider whose endpoint is not local;
 //! - decision plane: `RouterStackBuilder` degrades a network decision
-//!   router (which is handed the user's task text) to `static`.
+//!   router (which is handed the user's task text) to `static`;
+//! - **every hop**: [`EgressPolicy`] travels with the HTTP client, so a
+//!   redirect cannot carry a request somewhere the check never saw.
 //!
-//! Both consult [`endpoint_is_local`], so there is exactly one definition
-//! of "local" in the workspace and `forge doctor` can report it without
-//! guessing.
+//! All three consult [`endpoint_is_local`], so there is exactly one
+//! definition of "local" in the workspace and `forge doctor` can report it
+//! without guessing.
 
+use std::fmt;
 use std::net::IpAddr;
+use std::time::Duration;
 
-use forge_core::ForgeError;
+use forge_config::Config;
 
 /// Where forge draws the line for `local_only`: **this machine only**.
 ///
@@ -26,10 +29,15 @@ use forge_core::ForgeError;
 /// - the unspecified addresses `0.0.0.0` / `::`, which people do write in a
 ///   `model_base_url`; connecting to them reaches this host's loopback
 ///   rather than leaving it;
-/// - the exact name `localhost` (case-insensitive, trailing dot allowed);
-/// - `unix:`/`file:` endpoints — a socket path cannot leave the machine. No
-///   client in this crate speaks one yet, so such an endpoint still fails,
-///   but it fails as a transport error, which is the honest failure for it.
+/// - the exact name `localhost` (case-insensitive, trailing dot allowed) —
+///   see the honesty note below;
+/// - a hostless `unix:`/`file:` endpoint, i.e. a socket path. No client in
+///   this crate speaks one yet, so such an endpoint still fails, but it
+///   fails as a transport error, which is the honest failure for it. A
+///   `file://host/...` URL carries an authority and is **not** local: this
+///   predicate is the crate's single answer to "is this local", and
+///   answering `true` for a URL with a remote host would be wrong even
+///   while no client can dial it.
 ///
 /// Remote — deliberately, including the judgment calls:
 /// - **private-range LAN addresses** (`10/8`, `172.16/12`, `192.168/16`,
@@ -41,8 +49,8 @@ use forge_core::ForgeError;
 ///   want the GPU box down the hall has an explicit way to say so: leave
 ///   `local_only` off.
 /// - **subdomains of `localhost`** (`api.localhost`). RFC 6761 reserves the
-///   whole tree for loopback, but resolvers do not all honour it, and a name
-///   forge cannot verify resolves to loopback is not a guarantee.
+///   whole tree for loopback, but it is an unbounded namespace forge would
+///   be trusting without checking, and nothing needs it.
 /// - **anything that does not parse as a URL with a host**, including a bare
 ///   `api.example.com/v1` with no scheme. An unparseable endpoint is exactly
 ///   where a wrong guess must fail safe: refusing costs an env var, allowing
@@ -50,12 +58,21 @@ use forge_core::ForgeError;
 ///
 /// The host is parsed, never substring-matched: `localhost` is a hostname
 /// and `http://localhost.example.com/` is not local.
+///
+/// **What this does not verify:** `localhost` is trusted *by name*. Forge
+/// does not resolve it, so a modified `/etc/hosts`, `HOSTALIASES`, or NSS
+/// resolver module can point it off-device and this predicate will not
+/// notice. Accepting the name is a deliberate usability call (it is what
+/// people write, and editing the hosts file needs root); anyone who needs
+/// the guarantee to survive a hostile resolver should configure
+/// `127.0.0.1` instead. The README says so too.
 pub fn endpoint_is_local(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint.trim()) else {
         return false;
     };
+    // A socket path, but only if there really is no authority (see above).
     if matches!(url.scheme(), "unix" | "file") {
-        return true;
+        return url.host().is_none() || url.host_str() == Some("");
     }
     let Some(host) = url.host_str() else {
         return false;
@@ -93,51 +110,95 @@ fn host_name_is_loopback(host: &str) -> bool {
     host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
 }
 
-/// A model's resolved endpoint plus which config field produced it, so a
-/// refusal can name the line to edit (same reasoning as
-/// [`crate::model::credential_hint`]: a hint pointing at a setting that
-/// isn't in the user's file sends them hunting).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModelEndpoint {
-    pub(crate) url: String,
-    pub(crate) config_field: &'static str,
+/// How far a client forge builds is allowed to travel.
+///
+/// Checking the *configured* URL is not enough. reqwest's default redirect
+/// policy is `redirect::Policy::limited(10)` with **no host restriction**, so
+/// a `local_only`-approved loopback endpoint answering
+/// `307 Location: https://elsewhere/` would make forge re-POST the prompt —
+/// method and body preserved — to an authority nothing ever checked. The
+/// policy therefore travels with the client and every hop is re-checked with
+/// [`endpoint_is_local`], which also keeps a legitimate loopback-to-loopback
+/// redirect working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EgressPolicy {
+    /// `local_only` is off: reqwest's defaults apply.
+    #[default]
+    Unrestricted,
+    /// Every request, including every redirect hop, must stay on this
+    /// machine.
+    LocalOnly,
 }
 
-impl ModelEndpoint {
-    pub(crate) fn new(url: impl Into<String>, config_field: &'static str) -> Self {
-        Self {
-            url: url.into(),
-            config_field,
+impl EgressPolicy {
+    /// The policy this configuration calls for. Every production client is
+    /// built through this, so a new client cannot quietly opt out.
+    pub fn from_config(config: &Config) -> Self {
+        if config.local_only {
+            Self::LocalOnly
+        } else {
+            Self::Unrestricted
         }
     }
 
-    /// Refuse, before any client is built, to point a provider at an
-    /// endpoint that would carry the user's code off this machine.
-    ///
-    /// A typed config error rather than a provider error: nothing failed at
-    /// the transport layer, the configuration asks for two things that
-    /// cannot both be true. The message carries both honest ways forward,
-    /// because either can be the real intent — the endpoint is wrong, or
-    /// `local_only` is.
-    pub(crate) fn ensure_local_only_allows(
-        &self,
-        model: &str,
-        local_only: bool,
-    ) -> Result<(), ForgeError> {
-        if !local_only || endpoint_is_local(&self.url) {
-            return Ok(());
+    /// An HTTP client honouring this policy. The caller maps the build
+    /// error, because "building HTTP client" is a provider error in the
+    /// generation plane and a router error in the decision plane.
+    pub fn client(self, timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+        let builder = reqwest::Client::builder().timeout(timeout);
+        match self {
+            Self::Unrestricted => builder,
+            Self::LocalOnly => builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let hop = attempt.url().to_string();
+                if endpoint_is_local(&hop) {
+                    attempt.follow()
+                } else {
+                    attempt.error(RedirectRefused { url: hop })
+                }
+            })),
         }
-        Err(ForgeError::config(format!(
-            "local_only is set, but model {model:?} would send requests to {url}, which is \
-             not a local endpoint — refusing to build it rather than send your code off \
-             this machine; hint: point {field} at a local server \
-             (e.g. \"http://127.0.0.1:8080/v1\"), or unset local_only / FORGE_LOCAL_ONLY \
-             to allow remote endpoints",
-            url = self.url,
-            field = self.config_field,
-        )))
+        .build()
     }
 }
+
+/// A reqwest error plus its source chain.
+///
+/// `reqwest::Error`'s own `Display` for a refused redirect is only "error
+/// following redirect for url (<the configured one>)" — the reason, and the
+/// host that was declined, live in the source. Printing just the top level
+/// would report a `local_only` refusal as an unexplained transport failure
+/// against the endpoint the user configured, which is the opposite of
+/// honest.
+pub(crate) fn error_detail(error: &reqwest::Error) -> String {
+    let mut out = error.to_string();
+    let mut cause = std::error::Error::source(error);
+    while let Some(source) = cause {
+        out.push_str(": ");
+        out.push_str(&source.to_string());
+        cause = source.source();
+    }
+    out
+}
+
+/// The error a refused redirect hop carries, so the transport failure names
+/// the host forge declined to follow rather than the one it was configured
+/// with.
+#[derive(Debug)]
+struct RedirectRefused {
+    url: String,
+}
+
+impl fmt::Display for RedirectRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "local_only refused to follow a redirect to {}: not a local endpoint",
+            self.url
+        )
+    }
+}
+
+impl std::error::Error for RedirectRefused {}
 
 #[cfg(test)]
 mod tests {
@@ -183,6 +244,11 @@ mod tests {
             "http://api.localhost/v1",
             "http://notlocalhost/v1",
             "http://127.0.0.1.example.com/v1",
+            // A socket-path scheme carrying a remote authority is not a
+            // socket path.
+            "file://evil.example.com/share/x",
+            "FILE://evil.example.com/x",
+            "unix://evil.example.com/sock",
             // Unparseable / hostless: fail safe.
             "api.openai.com/v1",
             "",
@@ -194,27 +260,43 @@ mod tests {
     }
 
     #[test]
-    fn refusal_names_the_model_the_url_and_both_ways_forward() {
-        let endpoint = ModelEndpoint::new("https://api.openai.com/v1", "model_base_url");
-        let err = endpoint
-            .ensure_local_only_allows("gpt-5", true)
-            .expect_err("remote endpoint must be refused");
-        let ForgeError::Config(message) = err else {
-            panic!("local_only refusals are config errors");
+    fn egress_policy_comes_from_the_setting() {
+        let on = Config {
+            local_only: true,
+            ..Config::default()
         };
-        assert!(message.contains("gpt-5"), "{message}");
-        assert!(message.contains("https://api.openai.com/v1"), "{message}");
-        assert!(message.contains("model_base_url"), "{message}");
-        assert!(message.contains("unset local_only"), "{message}");
-        assert!(message.contains("FORGE_LOCAL_ONLY"), "{message}");
+        assert_eq!(EgressPolicy::from_config(&on), EgressPolicy::LocalOnly);
+        assert_eq!(
+            EgressPolicy::from_config(&Config::default()),
+            EgressPolicy::Unrestricted
+        );
+        // The default must be the permissive one: it mirrors
+        // `local_only = false`, and every production client resolves the
+        // policy from configuration rather than relying on this.
+        assert_eq!(EgressPolicy::default(), EgressPolicy::Unrestricted);
     }
 
     #[test]
-    fn a_local_endpoint_and_a_disabled_setting_refuse_nothing() {
-        let local = ModelEndpoint::new("http://127.0.0.1:8080/v1", "model_base_url");
-        assert!(local.ensure_local_only_allows("m", true).is_ok());
+    fn both_policies_build_a_client() {
+        assert!(
+            EgressPolicy::LocalOnly
+                .client(Duration::from_secs(1))
+                .is_ok()
+        );
+        assert!(
+            EgressPolicy::Unrestricted
+                .client(Duration::from_secs(1))
+                .is_ok()
+        );
+    }
 
-        let remote = ModelEndpoint::new("https://api.openai.com/v1", "model_base_url");
-        assert!(remote.ensure_local_only_allows("m", false).is_ok());
+    #[test]
+    fn a_refused_redirect_names_the_host_it_declined() {
+        let refused = RedirectRefused {
+            url: "https://evil.example.com/v1/chat/completions".to_string(),
+        };
+        let message = refused.to_string();
+        assert!(message.contains("https://evil.example.com"), "{message}");
+        assert!(message.contains("local_only"), "{message}");
     }
 }

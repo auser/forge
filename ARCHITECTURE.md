@@ -174,12 +174,19 @@ tool support.
 `model_from_config` is the one place a configured (or *routed*) model name
 becomes a client, so it is the one place the restriction can actually hold:
 with `local_only` set, an endpoint that is not on this machine — loopback,
-`localhost`, or a `unix:`/`file:` socket path; deliberately not private-range
-LAN addresses — yields a typed `ForgeError::Config` naming the model, the URL
-and the config field that set it, and no client is built. The decision plane
-uses the same `endpoint_is_local` predicate to prune network routers
-(`forge_providers::local_only`), so "local" has one definition and
-`forge doctor` reports it rather than restating it.
+`localhost`, or a hostless `unix:`/`file:` socket path; deliberately not
+private-range LAN addresses — yields a typed `ForgeError::Config` naming the
+model, the URL and the config field that set it, and no client is built.
+
+Checking the configured string is necessary but not sufficient, so an
+`EgressPolicy` travels with every HTTP client forge builds: under
+`local_only` its redirect policy re-checks each hop, because reqwest's
+default (`Policy::limited(10)`) has no host restriction and a `307` from an
+approved loopback endpoint would otherwise re-POST the prompt verbatim to an
+authority nothing inspected. The decision plane uses the same
+`endpoint_is_local` predicate to prune off-device routers, so "local" has one
+definition (`forge_providers::local_only`) and `forge doctor` reports it
+rather than restating it.
 
 ## The direct-dispatch fast path
 
@@ -374,7 +381,7 @@ adapters classify a run's ending by.
 | Jev unreachable / no key     | static routing, recorded, run proceeds              |
 | Local model server down      | typed error with doctor-style hint                  |
 | Cloud credential absent      | cloud candidates simply don't exist                 |
-| `--local-only`               | network routers pruned, non-local providers refused |
+| `--local-only`               | off-device routers degrade, non-local providers refused |
 | Engine panic / hung call     | contained; timeout-bounded; degrade to fallback     |
 
 `forge doctor` reports each layer's actual state (weights, backend presence,

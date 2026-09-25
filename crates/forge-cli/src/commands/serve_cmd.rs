@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use forge_core::{ForgeError, RunningProcess};
+use forge_providers::EgressPolicy;
 
 use crate::commands::Context;
 use crate::commands::router_cmd::spawn_adapter;
@@ -70,15 +71,22 @@ async fn maybe_autostart_laya(
     if config.router != "laya" {
         return None;
     }
-    let url = config
-        .router_url
-        .clone()
-        .unwrap_or_else(|| "http://127.0.0.1:8788/decide".to_string());
+    // Resolved by `forge-providers` rather than re-derived here, so the
+    // adapter is probed at the URL the router would actually dial.
+    let url = forge_providers::router_endpoint("laya", config)?;
+    if local_only_blocks_adapter(config, &url) {
+        tracing::warn!(
+            "router = \"laya\" endpoint {url} is not local; --local-only pruned it from the \
+             router stack, so no adapter is started and static routing applies"
+        );
+        return None;
+    }
     let (host, port) = host_port_of(&url);
     let base = format!("http://{host}:{port}");
+    let egress = EgressPolicy::from_config(config);
 
     if !config.router_autostart {
-        if !probe_http(&base, Duration::from_millis(500)).await {
+        if !probe_http(&base, Duration::from_millis(500), egress).await {
             tracing::warn!(
                 "laya router endpoint {base} unreachable and router_autostart is off; \
                  static fallback routing applies"
@@ -87,7 +95,7 @@ async fn maybe_autostart_laya(
         return None;
     }
 
-    if probe_http(&base, Duration::from_millis(500)).await {
+    if probe_http(&base, Duration::from_millis(500), egress).await {
         tracing::debug!(url = %base, "laya router already reachable; not autostarting");
         return None;
     }
@@ -101,7 +109,7 @@ async fn maybe_autostart_laya(
         }
     };
 
-    if wait_until_ready(&base, ADAPTER_READY_BUDGET).await {
+    if wait_until_ready(&base, ADAPTER_READY_BUDGET, egress).await {
         Some((child, base))
     } else {
         let _ = child.kill().await;
@@ -111,6 +119,17 @@ async fn maybe_autostart_laya(
         );
         None
     }
+}
+
+/// Whether `local_only` rules out autostarting an adapter for this endpoint.
+///
+/// `router_from_config` has already pruned an off-device laya router from the
+/// stack, so there is nothing to start — and probing the address anyway would
+/// be forge originating a request to exactly the host the setting forbids,
+/// the same reason `forge doctor` skips its probe. Worse, `spawn_adapter`
+/// would then try to bind a local adapter to a remote hostname.
+fn local_only_blocks_adapter(config: &forge_config::Config, url: &str) -> bool {
+    config.local_only && !forge_providers::endpoint_is_local(url)
 }
 
 /// Parse `http(s)://host[:port]/...` (default port 8788, matching the
@@ -132,17 +151,21 @@ fn host_port_of(url: &str) -> (String, u16) {
 
 /// Any HTTP response counts as reachable (the adapter serves liveness on
 /// every GET); connection/timeout errors mean "down".
-async fn probe_http(base: &str, timeout: Duration) -> bool {
-    let Ok(client) = reqwest::Client::builder().timeout(timeout).build() else {
+///
+/// `egress` keeps even this probe inside `local_only`'s promise: the caller
+/// has already established the base is local, and a redirect must not take
+/// the probe anywhere else.
+async fn probe_http(base: &str, timeout: Duration, egress: EgressPolicy) -> bool {
+    let Ok(client) = egress.client(timeout) else {
         return false;
     };
     client.get(format!("{base}/")).send().await.is_ok()
 }
 
-async fn wait_until_ready(base: &str, budget: Duration) -> bool {
+async fn wait_until_ready(base: &str, budget: Duration, egress: EgressPolicy) -> bool {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
-        if probe_http(base, Duration::from_secs(2)).await {
+        if probe_http(base, Duration::from_secs(2), egress).await {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -172,5 +195,34 @@ mod tests {
             host_port_of("http://[::1]:8788/"),
             ("[::1]".to_string(), 8788)
         );
+    }
+
+    /// `forge serve` must not probe — or try to bind an adapter to — a host
+    /// `local_only` forbids. The loopback default keeps working.
+    #[test]
+    fn local_only_blocks_autostart_only_for_an_off_device_endpoint() {
+        let on = forge_config::Config {
+            local_only: true,
+            ..forge_config::Config::default()
+        };
+        assert!(local_only_blocks_adapter(
+            &on,
+            "https://laya.example.com/decide"
+        ));
+        assert!(local_only_blocks_adapter(
+            &on,
+            "http://192.168.1.9:8788/decide"
+        ));
+        assert!(!local_only_blocks_adapter(
+            &on,
+            "http://127.0.0.1:8788/decide"
+        ));
+
+        // Off, nothing is blocked.
+        let off = forge_config::Config::default();
+        assert!(!local_only_blocks_adapter(
+            &off,
+            "https://laya.example.com/decide"
+        ));
     }
 }

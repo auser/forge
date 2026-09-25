@@ -9,6 +9,8 @@ use forge_core::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::local_only::EgressPolicy;
+
 /// Drop candidates that lack any required capability.
 pub fn filter_candidates(
     candidates: &[(String, ModelCapabilities)],
@@ -221,14 +223,17 @@ struct RouteResponse {
 }
 
 impl HttpRouter {
+    /// `egress` decides how far this client may travel, redirects included
+    /// (see [`EgressPolicy`]): a decision router is handed the user's task
+    /// text, so a redirect off this machine is a disclosure.
     pub fn new(
         url: impl Into<String>,
         key_env: Option<String>,
         timeout: Duration,
+        egress: EgressPolicy,
     ) -> Result<Self, ForgeError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
+        let client = egress
+            .client(timeout)
             .map_err(|e| ForgeError::router(format!("building HTTP client: {e}")))?;
         Ok(Self {
             client,
@@ -259,7 +264,13 @@ impl DecisionRouter for HttpRouter {
             if e.is_timeout() {
                 ForgeError::router(format!("router request to {} timed out", self.url))
             } else {
-                ForgeError::router(format!("router request to {} failed: {e}", self.url))
+                // Source chain included so a `local_only` redirect refusal
+                // explains itself (see `local_only::error_detail`).
+                ForgeError::router(format!(
+                    "router request to {} failed: {}",
+                    self.url,
+                    crate::local_only::error_detail(&e)
+                ))
             }
         })?;
 
@@ -421,15 +432,17 @@ pub struct LayaRouter {
 impl LayaRouter {
     pub const DEFAULT_URL: &'static str = "http://127.0.0.1:8788/decide";
 
+    /// `egress` decides how far this client may travel, redirects included
+    /// (see [`EgressPolicy`]).
     pub fn new(
         url: Option<String>,
         key_env: Option<String>,
         timeout: Duration,
         criteria: std::collections::HashMap<String, String>,
+        egress: EgressPolicy,
     ) -> Result<Self, ForgeError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
+        let client = egress
+            .client(timeout)
             .map_err(|e| ForgeError::router(format!("building HTTP client: {e}")))?;
         Ok(Self {
             client,
@@ -455,6 +468,7 @@ pub struct LayaRouterBuilder {
     key_env: Option<String>,
     timeout: Duration,
     criteria: std::collections::HashMap<String, String>,
+    egress: EgressPolicy,
 }
 
 impl LayaRouterBuilder {
@@ -478,8 +492,21 @@ impl LayaRouterBuilder {
         self
     }
 
+    /// See [`EgressPolicy`]; defaults to `Unrestricted`, matching
+    /// `local_only = false`.
+    pub fn egress(mut self, egress: EgressPolicy) -> Self {
+        self.egress = egress;
+        self
+    }
+
     pub fn build(self) -> Result<LayaRouter, ForgeError> {
-        LayaRouter::new(self.url, self.key_env, self.timeout, self.criteria)
+        LayaRouter::new(
+            self.url,
+            self.key_env,
+            self.timeout,
+            self.criteria,
+            self.egress,
+        )
     }
 }
 
@@ -531,8 +558,9 @@ impl DecisionRouter for LayaRouter {
                 ))
             } else {
                 ForgeError::router(format!(
-                    "laya router request to {} failed: {e} — {LAYA_LEGACY_HINT}",
-                    self.url
+                    "laya router request to {} failed: {} — {LAYA_LEGACY_HINT}",
+                    self.url,
+                    crate::local_only::error_detail(&e)
                 ))
             }
         })?;
@@ -629,11 +657,11 @@ fn build_router(
     config: &Config,
     registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
-    // The backstop for every role a router name can appear in. The primary
-    // role degrades before reaching here (see
-    // [`RouterStackBuilder::resolve_primary`]); a `router_fallback` — or any
-    // future role — pointed at a remote decision service is a genuine config
-    // error, because there is nothing left to degrade to.
+    // Unreachable from `RouterStackBuilder`, which substitutes `static` for
+    // every role a blocked name can appear in
+    // ([`RouterStackBuilder::local_only_name`]) — and deliberately kept as
+    // the backstop, so a future caller that builds a router by name without
+    // going through that substitution fails loudly instead of calling out.
     if let Some(reason) = local_only_block(name, config) {
         return Err(ForgeError::router(format!(
             "router = {name:?} {reason}, but local_only is set; hint: use \
@@ -695,6 +723,7 @@ fn build_http(
         url,
         config.router_key_env.clone(),
         Duration::from_millis(config.router_timeout_ms),
+        EgressPolicy::from_config(config),
     )?))
 }
 
@@ -721,6 +750,7 @@ fn build_laya(
             .key_env(config.router_key_env.clone())
             .timeout(Duration::from_millis(config.router_timeout_ms))
             .criteria(criteria)
+            .egress(EgressPolicy::from_config(config))
             .build()?,
     ))
 }
@@ -807,6 +837,7 @@ fn build_jev(
             .key_env(Some(resolved_jev_key_env(config, escalation)))
             .timeout(Duration::from_millis(config.router_timeout_ms))
             .registry(registry.to_vec())
+            .egress(EgressPolicy::from_config(config))
             .build()?,
     ))
 }
@@ -849,9 +880,13 @@ fn local_only_block(name: &str, config: &Config) -> Option<String> {
 }
 
 /// The endpoint an `http`/`laya` router will dial, resolved exactly as its
-/// constructor does. `None` for `http` with no `router_url` — `build_http`
-/// already errors on that, and a router that cannot be built cannot leak.
-fn router_endpoint(name: &str, config: &Config) -> Option<String> {
+/// constructor does. `None` for every router that dials nothing, and for
+/// `http` with no `router_url` — `build_http` already errors on that, and a
+/// router that cannot be built cannot leak.
+///
+/// Public so `forge doctor` probes and reports the URL this crate will
+/// actually use instead of hardcoding a default that can drift.
+pub fn router_endpoint(name: &str, config: &Config) -> Option<String> {
     match name {
         "http" => config.router_url.clone(),
         "laya" => Some(
@@ -878,30 +913,43 @@ impl<'a> RouterStackBuilder<'a> {
         Self { config, registry }
     }
 
-    /// The effective primary router name and its freshly-built instance
-    /// (unwrapped — no threshold gate yet, see [`Self::threshold_wrap`]).
+    /// The router name `local_only` will actually allow in place of
+    /// `configured`: `static` (with a warning) when the configured one is
+    /// refused, otherwise `configured` unchanged.
     ///
-    /// **`local_only`**: a primary router that `local_only` refuses (see
-    /// [`local_only_block`] — `jev` always, `http`/`laya` when their
-    /// endpoint is off-device) degrades to `static` with a warning rather
-    /// than erroring the whole build: the same "prefer a working,
-    /// less-capable router over refusing to run" philosophy `needle`'s
-    /// no-weights fallback already uses. The escalation role is pruned the
-    /// same way, in [`Self::escalation_tier`]; every other role hard-errors
-    /// in [`build_router`], which has nothing left to degrade to.
-    fn resolve_primary(&self) -> Result<(String, Arc<dyn DecisionRouter>), ForgeError> {
-        let configured = &self.config.router;
-        let name = match local_only_block(configured, self.config) {
+    /// Every role that names a router goes through this — primary,
+    /// `router_fallback`, the escalation tier's base fallback — so
+    /// `--local-only` degrades a configuration uniformly instead of degrading
+    /// one role and erroring on another. `router_fallback` is not validated
+    /// anywhere (`router_fallback = "http"` loads fine), so hard-erroring
+    /// there would make `--local-only` unusable for a config forge itself
+    /// accepted, and `static` is always constructible — the same "prefer a
+    /// working, less-capable router over refusing to run" philosophy
+    /// `needle`'s no-weights fallback uses.
+    fn local_only_name(&self, configured: &str) -> String {
+        match local_only_block(configured, self.config) {
             Some(reason) => {
                 tracing::warn!(
                     "router = {configured:?} {reason}; --local-only forces static routing instead"
                 );
                 "static".to_string()
             }
-            None => configured.clone(),
-        };
+            None => configured.to_string(),
+        }
+    }
+
+    /// The effective primary router name and its freshly-built instance
+    /// (unwrapped — no threshold gate yet, see [`Self::threshold_wrap`]).
+    /// `local_only` substitution happens in [`Self::local_only_name`].
+    fn resolve_primary(&self) -> Result<(String, Arc<dyn DecisionRouter>), ForgeError> {
+        let name = self.local_only_name(&self.config.router);
         let router = build_router(&name, self.config, self.registry)?;
         Ok((name, router))
+    }
+
+    /// The effective `router_fallback` name, degraded like every other role.
+    fn fallback_name(&self) -> String {
+        self.local_only_name(&self.config.router_fallback)
     }
 
     /// Reject-below-threshold gate for the router classes that report a
@@ -966,22 +1014,23 @@ impl<'a> RouterStackBuilder<'a> {
             }
         };
         let jev = self.threshold_wrap("jev", jev);
-        let base_fallback = build_router(&self.config.router_fallback, self.config, self.registry)?;
+        let base_fallback = build_router(&self.fallback_name(), self.config, self.registry)?;
         Ok(Some(Arc::new(FallbackRouter::new(jev, base_fallback))))
     }
 
-    /// The outer fallback wrap: `primary` unwrapped when it already *is*
-    /// `router_fallback` (avoids a redundant self-fallback hop), else
-    /// `Fallback(primary, router_fallback)`.
+    /// The outer fallback wrap: `primary` unwrapped when it already *is* the
+    /// effective `router_fallback` (avoids a redundant self-fallback hop),
+    /// else `Fallback(primary, router_fallback)`.
     fn fallback_chain(
         &self,
         primary_name: &str,
         primary: Arc<dyn DecisionRouter>,
     ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
-        if primary_name == self.config.router_fallback {
+        let fallback_name = self.fallback_name();
+        if primary_name == fallback_name {
             return Ok(primary);
         }
-        let fallback = build_router(&self.config.router_fallback, self.config, self.registry)?;
+        let fallback = build_router(&fallback_name, self.config, self.registry)?;
         Ok(Arc::new(FallbackRouter::new(primary, fallback)))
     }
 
@@ -1122,6 +1171,7 @@ mod tests {
             format!("{}/route", server.uri()),
             None,
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let decision = router
@@ -1146,6 +1196,7 @@ mod tests {
             format!("{}/route", server.uri()),
             None,
             Duration::from_millis(50),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let err = router
@@ -1170,6 +1221,7 @@ mod tests {
             format!("{}/route", server.uri()),
             None,
             Duration::from_secs(5),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let err = router
@@ -1186,8 +1238,13 @@ mod tests {
     async fn fallback_router_marks_fallback_used_when_primary_fails() {
         // Nothing listens on this port; the primary always fails fast.
         let primary: Arc<dyn DecisionRouter> = Arc::new(
-            HttpRouter::new("http://127.0.0.1:9/route", None, Duration::from_millis(200))
-                .expect("construct"),
+            HttpRouter::new(
+                "http://127.0.0.1:9/route",
+                None,
+                Duration::from_millis(200),
+                EgressPolicy::default(),
+            )
+            .expect("construct"),
         );
         let fallback: Arc<dyn DecisionRouter> = Arc::new(StaticRouter::new("mock-local"));
         let router = FallbackRouter::new(primary, fallback);
@@ -1594,6 +1651,14 @@ mod tests {
     }
 
     /// A remote laya endpoint gets the same treatment as a remote http one.
+    ///
+    /// `!fallback_used` is the assertion that makes this test mean anything:
+    /// without it, a build that *did* wire up the remote laya router still
+    /// reports `router_name == "static"` once its POST fails and
+    /// `FallbackRouter` takes over — so the test passed with the locality
+    /// predicate disabled, while quietly making a real request to a domain
+    /// nobody here controls. Degraded-at-construction means static was
+    /// chosen, not fallen back to.
     #[tokio::test]
     async fn router_from_config_remote_laya_under_local_only_falls_back_to_static() {
         let config = Config {
@@ -1609,23 +1674,52 @@ mod tests {
             .await
             .expect("routes");
         assert_eq!(decision.router_name, "static");
+        assert!(
+            !decision.fallback_used,
+            "static must be the router that was built, not the one recovered to"
+        );
     }
 
-    /// The roles a degrade cannot rescue hard-error instead: there is no
-    /// fallback behind `router_fallback`, so a remote one under `local_only`
-    /// is a config error rather than a silent network call.
-    #[test]
-    fn remote_router_as_the_fallback_is_refused_under_local_only() {
+    /// `router_fallback` degrades exactly like the primary rather than
+    /// erroring the build. `router_fallback` is not validated anywhere, so
+    /// `"http"` loads fine — hard-erroring here would mean adding
+    /// `--local-only` bricks every command (`run`, `serve`, `mcp`, `acp`,
+    /// `session`) for a configuration forge itself accepted, and `static` is
+    /// always available to degrade to.
+    #[tokio::test]
+    async fn a_remote_router_as_the_fallback_degrades_to_static_under_local_only() {
         let config = Config {
             router: "static".to_string(),
             router_fallback: "http".to_string(),
             router_url: Some("https://router.example.com/route".to_string()),
             local_only: true,
+            model: "mock-local".to_string(),
             ..Config::default()
         };
-        let err = router_from_config(&config, &[])
+        let router = router_from_config(&config, &[]).expect("builds, degraded");
+        let decision = router
+            .route(&RoutingRequest::new("x"))
+            .await
+            .expect("routes");
+        assert_eq!(decision.router_name, "static");
+        // Primary and the effective fallback are both "static", so the
+        // redundant self-fallback hop is skipped — which also proves the
+        // fallback name was substituted rather than left as "http".
+        assert!(!decision.fallback_used);
+    }
+
+    /// The backstop is still there for any future role that builds a router
+    /// by name without going through the substitution.
+    #[test]
+    fn build_router_directly_still_refuses_a_remote_router_under_local_only() {
+        let config = Config {
+            local_only: true,
+            router_url: Some("https://router.example.com/route".to_string()),
+            ..Config::default()
+        };
+        let err = build_router("http", &config, &[])
             .err()
-            .expect("a remote fallback router must be refused");
+            .expect("a remote router must be refused when built by name");
         let message = err.to_string();
         assert!(matches!(err, ForgeError::Router(_)), "{message}");
         assert!(message.contains("local_only"), "{message}");
@@ -2076,6 +2170,7 @@ mod tests {
             None,
             Duration::from_secs(5),
             criteria,
+            EgressPolicy::default(),
         )
         .expect("construct");
 
@@ -2114,6 +2209,7 @@ mod tests {
             None,
             Duration::from_secs(5),
             std::collections::HashMap::new(),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let request = RoutingRequest {
@@ -2150,6 +2246,7 @@ mod tests {
             None,
             Duration::from_secs(5),
             std::collections::HashMap::new(),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let request = RoutingRequest::new("x");
@@ -2167,6 +2264,7 @@ mod tests {
             None,
             Duration::from_millis(200),
             std::collections::HashMap::new(),
+            EgressPolicy::default(),
         )
         .expect("construct");
         let err = dead.route(&request).await.expect_err("unreachable fails");

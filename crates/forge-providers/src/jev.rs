@@ -45,6 +45,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use forge_core::{DecisionRouter, ForgeError, ModelCapabilities, RoutingDecision, RoutingRequest};
 
+use crate::local_only::EgressPolicy;
 use crate::router::{filter_candidates, optimistic_caps};
 
 /// System One-compatible router speaking the verified Jev/OpenJev wire
@@ -75,15 +76,19 @@ impl JevRouter {
     /// either backend without extra configuration.
     const MODEL_ALIAS: &'static str = "jev-latest";
 
+    /// `egress` decides how far this client may travel, redirects included
+    /// (see [`EgressPolicy`]). `local_only` prunes this router entirely, so
+    /// in practice it is only ever built unrestricted — the parameter exists
+    /// so that stays a choice the code makes rather than one it forgets.
     pub fn new(
         url: Option<String>,
         key_env: Option<String>,
         timeout: Duration,
         registry: Vec<(String, ModelCapabilities)>,
+        egress: EgressPolicy,
     ) -> Result<Self, ForgeError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
+        let client = egress
+            .client(timeout)
             .map_err(|e| ForgeError::router(format!("building HTTP client: {e}")))?;
         Ok(Self {
             client,
@@ -111,6 +116,7 @@ pub struct JevRouterBuilder {
     key_env: Option<String>,
     timeout: Duration,
     registry: Vec<(String, ModelCapabilities)>,
+    egress: EgressPolicy,
 }
 
 impl JevRouterBuilder {
@@ -134,8 +140,21 @@ impl JevRouterBuilder {
         self
     }
 
+    /// See [`EgressPolicy`]; defaults to `Unrestricted`, matching
+    /// `local_only = false`.
+    pub fn egress(mut self, egress: EgressPolicy) -> Self {
+        self.egress = egress;
+        self
+    }
+
     pub fn build(self) -> Result<JevRouter, ForgeError> {
-        JevRouter::new(self.url, self.key_env, self.timeout, self.registry)
+        JevRouter::new(
+            self.url,
+            self.key_env,
+            self.timeout,
+            self.registry,
+            self.egress,
+        )
     }
 }
 
@@ -215,7 +234,14 @@ impl DecisionRouter for JevRouter {
                 if e.is_timeout() {
                     ForgeError::router(format!("jev router request to {} timed out", self.url))
                 } else {
-                    ForgeError::router(format!("jev router request to {} failed: {e}", self.url))
+                    // Source chain included so a `local_only` redirect
+                    // refusal explains itself (see
+                    // `local_only::error_detail`).
+                    ForgeError::router(format!(
+                        "jev router request to {} failed: {}",
+                        self.url,
+                        crate::local_only::error_detail(&e)
+                    ))
                 }
             })?;
 
@@ -309,6 +335,7 @@ mod tests {
                 ("cheap-a".to_string(), caps(true)),
                 ("pricey-b".to_string(), caps(true)),
             ],
+            EgressPolicy::default(),
         )
         .expect("construct");
 
@@ -354,6 +381,7 @@ mod tests {
             None,
             Duration::from_secs(5),
             vec![("cheap-a".to_string(), caps(true))],
+            EgressPolicy::default(),
         )
         .expect("construct");
         let request = RoutingRequest {
@@ -386,6 +414,7 @@ mod tests {
             None,
             Duration::from_secs(5),
             vec![("cheap-a".to_string(), caps(true))],
+            EgressPolicy::default(),
         )
         .expect("construct");
         let request = RoutingRequest {
@@ -424,6 +453,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             vec![("cheap-a".to_string(), caps(true))],
+            EgressPolicy::default(),
         )
         .expect("construct");
         let request = RoutingRequest {
@@ -458,6 +488,7 @@ mod tests {
                 ("weak".to_string(), caps(false)),
                 ("strong".to_string(), caps(true)),
             ],
+            EgressPolicy::default(),
         )
         .expect("construct");
         let request = RoutingRequest {
@@ -492,6 +523,7 @@ mod tests {
             None,
             Duration::from_secs(5),
             vec![("weak".to_string(), caps(false))],
+            EgressPolicy::default(),
         )
         .expect("construct");
         let request = RoutingRequest {

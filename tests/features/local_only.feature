@@ -16,6 +16,13 @@ Feature: Local-only enforcement
     When I run forge with prompt "explain this project" and model "mock-local"
     Then the run completes successfully
 
+  Scenario: An approved local endpoint cannot redirect the prompt elsewhere
+    Given a fresh project directory
+    And a local model endpoint that redirects to another authority
+    When I run forge with prompt "SECRET SOURCE CODE" and --local-only
+    Then the command fails mentioning "refused to follow a redirect"
+    And the redirect target never received the prompt
+
   Scenario: Doctor reports what local_only enforces
     Given a fresh project directory
     And a project config enables local_only

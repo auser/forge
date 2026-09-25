@@ -207,10 +207,8 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
         // forge say mock response to:" is exactly the confusion the gate
         // exists to prevent). Anything else gets a reachability probe of
         // its endpoint (warn, never fail).
-        let mock_model = matches!(
-            config.model.as_str(),
-            "mock" | "mock-local" | "scripted-mock"
-        );
+        // One list of mock names, owned by the crate that enforces the gate.
+        let mock_model = forge_providers::is_mock_model(&config.model);
         let model_detail = if mock_model {
             Some(if forge_config::test_mocks_allowed() {
                 (
@@ -252,13 +250,24 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                     // every run fails: Fail, and no network probe — reaching
                     // out to the very host the setting forbids would be the
                     // check contradicting the guarantee it reports on.
+                    // The provider crate refuses this at construction, so
+                    // every run fails: Fail, and no probe — reaching out to
+                    // the host the setting forbids would be this check
+                    // contradicting the guarantee it reports on. The wording
+                    // comes from the same place as the refusal so doctor
+                    // cannot give a different instruction than the error
+                    // does.
                     Some(url) if local_only_refuses(config, &url) => (
                         Level::Fail,
                         format!(
-                            "{} will not load: local_only is set and {url} is not a local \
-                             endpoint; point model_base_url at a local server, or unset \
-                             local_only / FORGE_LOCAL_ONLY",
-                            config.model
+                            "{} will not load: {}",
+                            config.model,
+                            forge_providers::model_from_config(config, &root)
+                                .err()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| format!(
+                                    "local_only is set and {url} is not a local endpoint"
+                                ))
                         ),
                     ),
                     None => (
@@ -266,9 +275,8 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                         format!("{} (no base URL configured)", config.model),
                     ),
                     Some(url) => {
-                        let probe = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_millis(1_500))
-                            .build()
+                        let probe = forge_providers::EgressPolicy::from_config(config)
+                            .client(std::time::Duration::from_millis(1_500))
                             .ok();
                         match probe {
                             Some(client) => {
@@ -315,12 +323,12 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
             checks.push(check);
         }
 
-        // Reachability of http/laya routers (warn, never fail).
-        if matches!(config.router.as_str(), "http" | "laya") {
-            let url = config
-                .router_url
-                .clone()
-                .unwrap_or_else(|| "http://127.0.0.1:8788/decide".to_string());
+        // Reachability of the active router's endpoint (warn, never fail),
+        // resolved by `forge-providers` so this cannot drift from the URL the
+        // router will dial — and `None` for a router that dials nothing, or
+        // for `http` with no `router_url` (which cannot be built at all, so
+        // probing laya's default in its place would just be wrong).
+        if let Some(url) = forge_providers::router_endpoint(&config.router, config) {
             // A router `local_only` prunes is never contacted at all (see
             // `router_from_config`), so probing it would be both pointless
             // and a request to exactly the host the setting forbids.
@@ -335,9 +343,8 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                     ),
                 });
             } else {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_millis(1_500))
-                    .build()
+                let client = forge_providers::EgressPolicy::from_config(config)
+                    .client(std::time::Duration::from_millis(1_500))
                     .ok();
                 let check = match client {
                     Some(client) => match client.get(&url).send().await {
@@ -778,37 +785,29 @@ fn local_only_refuses(config: &forge_config::Config, url: &str) -> bool {
 
 /// What `local_only` is actually doing, for the run this configuration
 /// describes — reported only when it is on, and only in terms of what the
-/// code enforces: model providers refuse a non-local endpoint at
-/// construction, network decision routers are pruned, `forge init` skips the
-/// weights fetch. It says nothing about traffic forge does not originate
-/// (a tool, hook or MCP server the user runs can still reach the network),
-/// because nothing here stops that.
+/// code enforces: providers refuse a non-local endpoint at construction
+/// (redirects included), network decision routers are pruned, `forge init`
+/// skips the weights fetch.
+///
+/// Deliberately `Ok` even when the configured model contradicts the setting:
+/// the `model provider` check below owns that verdict, and two `Fail` lines
+/// for one defect reads as if something else is also broken. What it does
+/// carry are the two limits a user cannot see from the setting's name — that
+/// tools and hooks are not sandboxed, and that a router may still *select* a
+/// hosted entry, whose construction then fails the run.
 fn local_only_check(config: &forge_config::Config) -> Option<Check> {
     if !config.local_only {
         return None;
     }
-    let endpoint = forge_providers::model_endpoint(config);
-    let (level, detail) = match endpoint {
-        Some(url) if !forge_providers::endpoint_is_local(&url) => (
-            Level::Fail,
-            format!(
-                "enforced, and it refuses the configured model: {url} is not local \
-                 (loopback, localhost or a socket path). Tools and hooks you run are \
-                 not restricted."
-            ),
-        ),
-        _ => (
-            Level::Ok,
-            "enforced: providers must resolve to a local endpoint (loopback, localhost \
-             or a socket path), jev and remote decision routers are pruned. Tools and \
-             hooks you run are not restricted."
-                .to_string(),
-        ),
-    };
     Some(Check {
-        level,
+        level: Level::Ok,
         label: "local only".into(),
-        detail,
+        detail: "enforced at provider construction (endpoint and every redirect must be \
+                 loopback, localhost or a socket path); jev and off-device decision routers \
+                 are pruned. Not a sandbox: tools and hooks you run are unrestricted, and a \
+                 router that selects a hosted [models] entry fails that run rather than \
+                 silently picking another."
+            .into(),
     })
 }
 
@@ -1376,9 +1375,10 @@ mod tests {
         assert!(local_only_check(&forge_config::Config::default()).is_none());
     }
 
-    /// On, and satisfiable: the detail may only claim what the code enforces
-    /// — provider construction and router pruning — and must not imply that
-    /// tools or hooks are sandboxed, because they are not.
+    /// The detail may only claim what the code enforces — provider
+    /// construction including redirects, and router pruning — and must state
+    /// the two limits the setting's name hides: tools and hooks are not
+    /// sandboxed, and a router selecting a hosted entry fails the run.
     #[test]
     fn local_only_check_reports_what_is_actually_enforced() {
         let config = forge_config::Config {
@@ -1389,32 +1389,35 @@ mod tests {
         };
         let check = local_only_check(&config).expect("reported when on");
         assert_eq!(check.level, Level::Ok);
-        assert!(check.detail.contains("local endpoint"), "{}", check.detail);
+        assert!(check.detail.contains("redirect"), "{}", check.detail);
+        assert!(check.detail.contains("Not a sandbox"), "{}", check.detail);
         assert!(
-            check
-                .detail
-                .contains("Tools and hooks you run are not restricted"),
-            "{}",
+            check.detail.contains("fails that run"),
+            "the candidate-selection limit must be stated: {}",
             check.detail
         );
     }
 
-    /// On, and contradicted by the configured model: that is a Fail, because
-    /// every run will refuse at provider construction.
+    /// One defect, one failure: a model that contradicts `local_only` is
+    /// reported by the `model provider` check, so this line stays `Ok`
+    /// instead of making the report look like two things are broken.
     #[test]
-    fn local_only_check_fails_when_the_configured_model_is_remote() {
+    fn local_only_check_does_not_duplicate_the_model_provider_verdict() {
         let config = forge_config::Config {
             local_only: true,
             model: "claude-sonnet".to_string(),
             ..forge_config::Config::default()
         };
         let check = local_only_check(&config).expect("reported when on");
-        assert_eq!(check.level, Level::Fail);
+        assert_eq!(check.level, Level::Ok);
         assert!(
-            check.detail.contains("api.anthropic.com"),
-            "{}",
+            !check.detail.contains("api.anthropic.com"),
+            "the model verdict belongs to the model provider check: {}",
             check.detail
         );
+        // …and that check does refuse it, with the provider crate's own
+        // wording (so doctor cannot give a different instruction).
+        assert!(local_only_refuses(&config, "https://api.anthropic.com"));
     }
 
     /// The shared predicate: doctor must judge locality exactly the way

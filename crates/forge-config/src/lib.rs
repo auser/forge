@@ -6,7 +6,7 @@
 //! CLI flag overrides. Every key records its winning value and origin so
 //! `forge config explain <key>` can report provenance.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -181,9 +181,76 @@ pub struct Config {
     /// `router = "needle"`. Weights resolution lands in a later phase;
     /// until then, routing built on it degrades to `router_fallback`.
     pub needle: NeedleConfig,
+    /// Which keys a real configuration layer set, rather than the
+    /// compiled-in defaults (see [`ExplicitKeys`]). Deliberately not part of
+    /// the serialized configuration: it records *where* values came from,
+    /// while the serialized form is the values themselves.
+    #[serde(skip)]
+    pub explicit: ExplicitKeys,
     /// Unknown keys are tolerated and preserved.
     #[serde(flatten)]
     pub extra: toml::Table,
+}
+
+/// Config keys that a **real** layer set — a user or project config file, an
+/// env var, or a CLI flag — as opposed to the compiled-in defaults.
+///
+/// Two decisions genuinely depend on *who* set a value rather than on what
+/// the value is: whether the global `model_base_url` overrides a model
+/// entry's own `base_url` (it should, but only if somebody actually asked
+/// for it), and whether a `[models.<name>]` entry is a line in the user's
+/// file or a built-in default — which changes what an error message can
+/// honestly tell them to edit. Comparing a value against the default cannot
+/// answer either question: setting a value that happens to equal the default
+/// is a real choice, and forge used to discard it.
+///
+/// [`Config::load`] fills this in from the same source map `forge config
+/// explain` reads. A `Config` built directly in code (tests, internal
+/// clones) carries none, which reads as "nothing was explicitly configured";
+/// [`Config::with_explicit`] is how such a caller says otherwise.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExplicitKeys(BTreeSet<String>);
+
+impl ExplicitKeys {
+    /// Whether `key` (e.g. `model_base_url`, `models.gpt-5`) was set by a
+    /// real layer.
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains(key)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+
+    /// Every key whose winning value came from something other than the
+    /// compiled-in defaults.
+    pub fn from_sources(sources: &BTreeMap<String, ConfigSource>) -> Self {
+        Self(
+            sources
+                .iter()
+                .filter(|(_, source)| source.origin != Origin::Default)
+                .map(|(key, _)| key.clone())
+                .collect(),
+        )
+    }
+}
+
+impl<S: Into<String>> FromIterator<S> for ExplicitKeys {
+    fn from_iter<I: IntoIterator<Item = S>>(keys: I) -> Self {
+        Self(keys.into_iter().map(Into::into).collect())
+    }
+}
+
+/// Config key names that code has to reason about by name (see
+/// [`ExplicitKeys`]), kept in one place so a rename cannot silently turn a
+/// lookup into a no-op.
+pub mod keys {
+    pub const MODEL_BASE_URL: &str = "model_base_url";
+
+    /// Source-map key for one `[models.<name>]` entry.
+    pub fn model_entry(name: &str) -> String {
+        format!("models.{name}")
+    }
 }
 
 impl Default for Config {
@@ -310,6 +377,9 @@ impl Default for Config {
             .into_iter()
             .collect(),
             needle: NeedleConfig::default(),
+            // Nothing here was explicitly configured — this *is* the
+            // defaults layer.
+            explicit: ExplicitKeys::default(),
             extra: toml::Table::new(),
         }
     }
@@ -516,12 +586,29 @@ impl Config {
             Origin::CliFlag,
         );
 
-        let config: Config = toml::Value::Table(merged)
+        let mut config: Config = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| ForgeError::config(format!("invalid configuration: {e}")))?;
+        // Carry "who set this" into the `Config` itself: consumers get a
+        // plain `&Config`, and two of them cannot be correct without it
+        // (see `ExplicitKeys`).
+        config.explicit = ExplicitKeys::from_sources(&sources);
         config.validate()?;
 
         Ok(ResolvedConfig { config, sources })
+    }
+
+    /// Declare that `keys` came from a real configuration layer — for
+    /// callers that build a `Config` in code instead of through
+    /// [`Config::load`] (tests, and anything reconstructing a config).
+    /// Without this, such a `Config` reads as "nothing was explicitly set".
+    pub fn with_explicit<I, S>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.explicit = keys.into_iter().collect();
+        self
     }
 }
 
@@ -548,6 +635,20 @@ fn apply_layer(
             };
             for (name, entry) in new_entries {
                 combined.insert(name.clone(), entry.clone());
+                // Per-entry origin as well as the table's: code that must
+                // know whether `[models.claude-sonnet]` is a line in the
+                // user's file or a compiled-in default asks `ExplicitKeys`,
+                // and an error message that tells someone to edit a section
+                // they never wrote is the defect this prevents. Recording it
+                // here (rather than in the generic nested-section branch) is
+                // what keeps it refreshed on every layer.
+                sources.insert(
+                    keys::model_entry(name),
+                    ConfigSource {
+                        value: format!("model entry {name}"),
+                        origin,
+                    },
+                );
             }
             sources.insert(
                 key.clone(),
