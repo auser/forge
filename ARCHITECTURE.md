@@ -59,6 +59,14 @@ generate text — which is exactly why it is safe to run on every request.
   `NEEDLE_REQUIRE_ENGINE=1` turns "no engine" from a warning into a build
   failure, which is how release builds guarantee a brain-labelled binary has
   one. Linked only with the `ffi` feature.
+- The engine's C++ runtime is chosen from the **artifact**, not the OS: every
+  published `libneedle.a` is clang/libc++ (`_ZNSt3__1…` undefined symbols, no
+  libstdc++ `__cxx11`), so Linux links libc++ — statically, plus the `-L` that
+  `rustc`'s `static=` lookup needs, so a release asset keeps the same runtime
+  dependencies as a brain-less build. `NEEDLE_CXX_RUNTIME` overrides it.
+  Choosing by OS instead is what broke the first brain-enabled Linux build.
+  Linkability is per *architecture*, not per OS: the x86_64 archives need a
+  libc++ symbol no distribution ships, so only the arm64 engines are pinned.
 - `forge-needle` — the safe layer. `NeedleEngine` owns the model on one
   dedicated OS thread (mpsc jobs, oneshot replies): lazy load, panic
   containment (`catch_unwind`), abandoned-job skip (a caller that timed out

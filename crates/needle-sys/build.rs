@@ -73,9 +73,21 @@ fn main() {
         println!("cargo:rerun-if-env-changed={key}");
     }
 
+    // A typo here would otherwise silently fall through to the default and
+    // link a runtime the operator did not ask for.
+    if let Ok(value) = std::env::var(CXX_RUNTIME_ENV)
+        && !known_cxx_runtime(&value)
+    {
+        println!(
+            "cargo:warning=needle-sys: {CXX_RUNTIME_ENV}={value:?} is not a value I know \
+             (static-libc++ | libc++ | libstdc++); using this target's default instead."
+        );
+    }
+
     let manifest = PathBuf::from(env("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env("OUT_DIR"));
     let target = env("TARGET");
+    let host = env("HOST");
     let vendor = manifest.join("vendor").join(&target);
 
     let configured = std::env::var(LIB_DIR_ENV)
@@ -153,7 +165,7 @@ fn main() {
     }
 
     match &lib_dir {
-        Some(dir) => emit_link_flags(dir, &target),
+        Some(dir) => emit_link_flags(dir, &target, &host),
         // Deliberately NOT `cargo:warning=` — see the module docs. This is
         // a note for someone reading `cargo build -vv`, not a diagnostic
         // for every user of a default build. The `fetch`-on case already
@@ -188,22 +200,25 @@ fn env(key: &str) -> String {
     }
 }
 
-fn emit_link_flags(dir: &Path, target: &str) {
+/// Emit the link flags for a resolved engine: the engine itself, then the C++
+/// standard library it needs.
+///
+/// The C++ half is only probed here, once an engine actually exists — there is
+/// no point telling someone to install libc++ for a build that was never going
+/// to link anything.
+fn emit_link_flags(dir: &Path, target: &str, host: &str) {
     println!("cargo:rustc-link-search=native={}", dir.display());
     println!("cargo:rustc-link-lib=static=needle");
 
-    // libneedle is a C++ translation unit behind an `extern "C"` facade:
-    // `nm libneedle.a` shows libc++ symbols plus `__cxa_*` /
-    // `__gxx_personality_v0`, so the C++ runtime has to be linked too.
-    // MSVC links its runtime automatically from object-file directives.
-    if target.contains("apple") || target.contains("freebsd") {
-        println!("cargo:rustc-link-lib=dylib=c++");
-    } else if target.contains("msvc") {
-        // nothing to add
-    } else if target.contains("android") {
-        println!("cargo:rustc-link-lib=static=c++_static");
-        println!("cargo:rustc-link-lib=static=c++abi");
-    } else {
-        println!("cargo:rustc-link-lib=dylib=stdc++");
+    let requested = requested_cxx_runtime();
+    let plan = cxx_plan(target, requested.as_deref(), &probe_cxx(target, host));
+    for dir in &plan.search_dirs {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+    for flag in &plan.flags {
+        println!("cargo:rustc-link-lib={flag}");
+    }
+    if let Some(warning) = &plan.warning {
+        println!("cargo:warning=needle-sys: {}", one_line(warning));
     }
 }

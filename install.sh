@@ -168,10 +168,15 @@ if [[ -z "$INSTALLED" ]]; then
     # way to know why the headline feature is inert. The engine is fetched and
     # checksum-verified by needle-sys's build script; the list is the one in
     # crates/needle-sys/build_support.rs, and anything not on it has no
-    # published engine (Intel macOS) or an unverified one (Windows).
+    # published engine (Intel macOS), an unlinkable one (x86_64: its archive
+    # needs a libc++ nobody distributes), or an unverified one (Windows).
+    #
+    # Linux additionally needs libc++'s development files at build time
+    # (libc++-dev + libc++abi-dev on Debian/Ubuntu); if they are missing the
+    # build falls back below rather than failing.
     NEEDLE_FEATURES=()
     case "$TRIPLE" in
-        aarch64-apple-darwin|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
+        aarch64-apple-darwin|aarch64-unknown-linux-gnu)
             NEEDLE_FEATURES=(--features needle-ffi) ;;
     esac
 

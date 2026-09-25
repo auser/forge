@@ -451,8 +451,87 @@ adds `router_name: "needle"` and confidence — no schema change.
     `NEEDLE_NO_DOWNLOAD=1`, so it stays network-free as well as link-free);
     the new job is what would catch a pinned checksum going stale or the
     engine ceasing to link — neither of which a type-check can see.
-  - Brain-enabled Linux assets now link `libstdc++.so.6` (libneedle is C++).
-    Noted in the workflow; minimal containers may need `libstdc++6`.
+  - Brain-enabled assets add no runtime dependency at all: libc++ is linked
+    statically on Linux, so the asset still needs only glibc, libgcc_s and
+    libm. (An earlier draft of this amendment said `libstdc++.so.6`, which was
+    wrong twice over — see the C++ runtime amendment below.)
+
+  **Amendment (2026-09-24, fix round 1): the engine is libc++, everywhere.**
+  The first brain-enabled Linux build failed to link —
+  `undefined symbol: std::__1::basic_string<…>::append(char const*)` — because
+  `build.rs` chose the C++ runtime from the *operating system* (`stdc++` on
+  Linux, the platform default) instead of from the *artifact*. `std::__1` is
+  libc++'s inline namespace, so the name was simply wrong.
+
+  Measured with `nm --undefined-only` over every published `libneedle.a`:
+
+  | artifact | `_ZNSt3__1…` (libc++) | `__cxx11` (libstdc++) |
+  | --- | --- | --- |
+  | `macos-arm64` | 44 | 0 |
+  | `linux-x86_64` | 45 | 0 |
+  | `linux-arm64` | 43 | 0 |
+  | `windows-x86_64` | 45 | 0 |
+  | `windows-arm64` | 43 | 0 |
+
+  Cactus builds every platform with clang against libc++. macOS had been
+  accidentally right; Linux was wrong; and this is a *third* independent reason
+  Windows is not wired up — an MSVC toolchain does not provide libc++ at all.
+
+  Resolution, verified by building and running in an `ubuntu:24.04` container:
+
+  - Linux links libc++ **statically** (`libc++.a` + `libc++abi.a`). Dynamic
+    also links and runs, but adds `libc++.so.1`, `libc++abi.so.1` and
+    `libunwind.so.1` to the binary — libraries a normal distro does not ship,
+    which would make a downloaded release asset fail to start. Static keeps the
+    runtime profile identical to a brain-less build (`libm`, `libgcc_s`,
+    `libc`), which is what lets Linux stay in the brain-enabled release set.
+  - `rustc`'s `static=` kind does its own file lookup and does **not** inherit
+    the C compiler's search path, so the plan also emits `-L` directories. Two
+    discovery strategies are needed: `cc -print-file-name=libc++.a` resolves on
+    Ubuntu 24.04 but `libc++abi.a` does not (that package installs it only
+    under `/usr/lib/llvm-<N>/lib`, which gcc never searches), so a scan of the
+    conventional directories backs it up.
+  - `-lm` is explicit: the engine calls `powf`/`sincosf`/`expf` directly, which
+    macOS folds into libSystem and Linux does not.
+  - `NEEDLE_CXX_RUNTIME=static-libc++|libc++|libstdc++` overrides the choice,
+    for distro packagers who must link the shared system runtime.
+  - CI and release install `libc++-dev` + `libc++abi-dev`, and the release job
+    asserts via `ldd` that no `libc++`/`libunwind` dependency reached the
+    published asset — so the dynamic fallback can never ship.
+
+  Evidence: `needle brain: active (model needle3, decide 98 ms)` from a
+  statically-linked binary in the container, with `ldd` showing only
+  `libm`/`libgcc_s`/`libc`.
+
+  **And x86_64 Linux had to be dropped from the brain-enabled set.** Probing the
+  x86_64 archive in the same container turned up a harder problem than the
+  runtime name: `linux-x86_64` (and `windows-x86_64`) leave
+  `std::__1::__hash_memory(void const*, unsigned long)`
+  (`_ZNSt3__113__hash_memoryEPKvm`) undefined, while the arm64 archives do not —
+  Cactus built the two architectures against different libc++ versions.
+
+  No distributed libc++ defines that symbol. Checked on Ubuntu 24.04: libc++ 18
+  and 20, dev and runtime packages, every `libc++*.a` and `libc++*.so*` on the
+  system — zero definitions, so neither a static nor a dynamic link can succeed.
+  The symbol exists only inside Cactus's own libc++ build, and they do not
+  publish it: their `manylinux2014_x86_64` wheel ships `libneedle3.so` with that
+  runtime already linked in (`objdump -p` shows only
+  libm/libc/libpthread/libdl, and no undefined `__hash_memory`). The published
+  `.a` for x86_64 is therefore incomplete for external linking.
+
+  So `x86_64-unknown-linux-gnu` is out of `PINNED_ENGINES`, out of the
+  brain-enabled release matrix, and out of `install.sh`'s feature list; its
+  checksum stays recorded against the day it becomes linkable. CI's advisory
+  `verify-ffi` job moved to `ubuntu-24.04-arm`, because a job that is *expected*
+  to fail is noise rather than signal. The brain-enabled set is now
+  `aarch64-apple-darwin` + `aarch64-unknown-linux-gnu`, both verified end to end
+  with real inference.
+
+  This is a real gap — x86_64 is the most common server platform. Two ways out,
+  neither in scope here: Cactus publishing an x86_64 archive that links against
+  a stock libc++, or forge learning to link their self-contained `.so` instead
+  of the `.a` (which would be a dylib linkage model, and would need the library
+  shipped alongside the binary).
   - **It is C++ behind an `extern "C"` facade.** `nm` shows libc++ symbols
     plus `__cxa_*`/`__gxx_personality_v0`, so `build.rs` links the C++
     runtime (`c++` on Apple/FreeBSD, `stdc++` on Linux, `c++_static` +

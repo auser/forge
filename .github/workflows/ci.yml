@@ -58,12 +58,18 @@ jobs:
   # engine that stops linking, or an ffi unit test that starts failing for
   # real rather than merely compiling.
   #
-  # x86_64-unknown-linux-gnu is one of the three targets with a verified
-  # engine, so NEEDLE_REQUIRE_ENGINE is safe to set here: "could not get an
-  # engine" should fail this job loudly rather than silently degrade it into a
-  # second, weaker copy of the link-free pass.
+  # **arm64, not x86_64.** The only Linux engine forge can link is
+  # `linux-arm64`: the x86_64 archive leaves `std::__1::__hash_memory`
+  # undefined and no distributed libc++ defines it (see PINNED_ENGINES in
+  # crates/needle-sys/build_support.rs). Running this on `ubuntu-latest` would
+  # be a job that is *expected* to fail, which is just noise.
+  #
+  # aarch64-unknown-linux-gnu is a pinned, link-verified target, so
+  # NEEDLE_REQUIRE_ENGINE is safe to set: "could not get an engine" should fail
+  # this job loudly rather than silently degrade it into a second, weaker copy
+  # of the link-free pass.
   verify-ffi:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -73,13 +79,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The engine is built with clang against **libc++**, on Linux as well as
+      # macOS — `nm --undefined-only` over every published artifact shows
+      # `_ZNSt3__1…` (libc++'s inline namespace) and zero `__cxx11`
+      # (libstdc++'s). Linking it against libstdc++ is what made the first
+      # version of this job fail on `std::__1::basic_string<…>::append`.
+      # `libc++abi-dev` is separate on Debian/Ubuntu, and the static archives
+      # are what keep the link self-contained.
+      - name: Install the C++ runtime the engine needs
+        run: sudo apt-get update -qq && sudo apt-get install -y libc++-dev libc++abi-dev
+
       # Content-addressed cache: a new pin is a new directory, so the key
       # never needs bumping and a stale entry is simply never read.
       - name: Cache the needle engine
         uses: actions/cache@v4
         with:
           path: ~/.cargo/needle-engine
-          key: needle-engine-x86_64-unknown-linux-gnu
+          key: needle-engine-aarch64-unknown-linux-gnu
 
       - name: Clippy (ffi, linked)
         env:

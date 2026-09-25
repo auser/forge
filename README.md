@@ -60,10 +60,10 @@ descriptions, not a needle decision. See [Skills](#skills).)
 
 **Whether you actually have a brain depends on the build.** Real on-device
 inference needs the native engine, which sits behind the `needle-ffi` cargo
-feature: the prebuilt release binaries for `aarch64-apple-darwin`,
-`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` are built with it
-(so the installed default on those platforms is a working brain), while a
-plain `cargo build`, Intel macOS and Windows get a statically-routing binary.
+feature: the prebuilt release binaries for `aarch64-apple-darwin` and
+`aarch64-unknown-linux-gnu` are built with it (so the installed default on those
+platforms is a working brain), while a plain `cargo build`, Intel macOS, x86_64
+Linux and Windows get a statically-routing binary.
 That is a supported configuration and fully usable, not a degraded one: you
 get deterministic static routing instead of the on-device model, and you give
 up the direct-dispatch fast path and the local semantic index
@@ -152,15 +152,20 @@ on your `PATH`, and respects `NO_COLOR` and non-interactive terminals.
 Release assets are built by CI for every `v*` tag (see
 `.github/workflows/release.yml`).
 
-**The embedded brain comes with it** on `aarch64-apple-darwin`,
-`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` — the three
-platforms whose on-device engine has a verified checksum. Release assets for
-those targets are built with `needle-ffi`, CI asserts each one really has the
-engine before publishing, and the `cargo install` fallback adds the feature
-too (retrying without it if the engine cannot be fetched, so a bad network
-never costs you the install). Intel macOS and Windows get a statically-routing
-binary, because no verified engine exists for them yet; `forge doctor` says
-which one you have on its `needle engine` line. Full detail:
+**The embedded brain comes with it** on `aarch64-apple-darwin` and
+`aarch64-unknown-linux-gnu` — the two platforms whose on-device engine forge has
+both checksum-verified *and* link-verified. Release assets for those targets are
+built with `needle-ffi`, CI asserts each one really has the engine before
+publishing, and the `cargo install` fallback adds the feature too (retrying
+without it if the engine cannot be fetched, so a bad network never costs you the
+install). Intel macOS, x86_64 Linux and Windows get a statically-routing binary,
+because no linkable engine exists for them yet (see [Embedded Needle brain
+(`ffi`)](#embedded-needle-brain-ffi) for exactly why each); `forge doctor` says
+which one you have on its `needle engine` line.
+
+Brain-enabled assets need nothing extra installed to run — the C++ runtime is
+linked statically on Linux and ships with the OS on macOS, so they depend on
+exactly what a brain-less build does. Full detail:
 [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi).
 
 ## Quickstart
@@ -184,7 +189,7 @@ What each does:
    model + embedded on-device router), builds the project graph at
    `.forge/graph/` (deterministic, no model calls), adds `.forge/` to
    `.gitignore`, and — on a build that has the inference backend, which the
-   release binaries for macOS arm64 and Linux x86-64/arm64 do — fetches +
+   release binaries for macOS arm64 and Linux arm64 do — fetches +
    checksum-verifies the ~35 MB brain weights into `~/.cache/forge/models/`.
    On a build without the backend it skips that fetch (nothing could use the
    weights) and prints the one command that gets you one. Idempotent — safe
@@ -1175,20 +1180,50 @@ verified and whose link has been exercised:
 | Rust target | artifact folder |
 | --- | --- |
 | `aarch64-apple-darwin` | `macos-arm64` |
-| `x86_64-unknown-linux-gnu` | `linux-x86_64` |
 | `aarch64-unknown-linux-gnu` | `linux-arm64` |
 
 The pinned checksums live in `PINNED_ENGINES` in
 `crates/needle-sys/build_support.rs`, together with the collected-but-unwired
-checksums for `windows-{x86_64,arm64}` and `linux-{armv7,riscv64}` and the
-reason each is held back. **Intel macOS has no engine at all** — there is no
-`macos-x86_64` folder in the repo — which is the main reason `needle-ffi` is
-not a default feature: making it one would turn "forge builds and routes
-statically" into "forge does not build" on those machines.
+checksums for the rest and the reason each is held back:
+
+- **Intel macOS: no engine exists.** There is no `macos-x86_64` folder in the
+  repo at all. This is the main reason `needle-ffi` is not a default feature —
+  making it one would turn "forge builds and routes statically" into "forge does
+  not build" on those machines.
+- **x86_64 Linux and x86_64 Windows: the archive cannot be linked.** Both leave
+  `std::__1::__hash_memory` undefined, and no distributed libc++ defines it
+  (checked across libc++ 18 and 20, dev and runtime, static and shared). That
+  symbol lives only inside Cactus's own libc++ build, which they ship
+  pre-linked inside their Python wheel's `.so` and do not publish separately.
+  The arm64 archives have no such problem.
+- **Windows also** publishes `libneedle.a` (a COFF `ar` archive) rather than the
+  `needle.lib` an MSVC `-lneedle` resolves, and needs a libc++ MSVC has not got.
+- **armv7/riscv64:** no forge target builds them, so the link is unexercised.
 
 On any other target, `--features needle-ffi` warns that no verified engine
 exists and links nothing; supply one yourself via step 1 or 2 if you have one
 you trust.
+
+#### The C++ runtime (Linux build prerequisite)
+
+`libneedle` is C++ built with clang against **libc++** — on every platform, not
+just macOS. (`nm --undefined-only` over each published artifact shows
+`_ZNSt3__1…`, libc++'s inline namespace, and zero libstdc++ `__cxx11` symbols.)
+So on Linux, building with `needle-ffi` needs libc++'s development files:
+
+```bash
+sudo apt-get install libc++-dev libc++abi-dev     # Debian/Ubuntu
+sudo dnf install libcxx-devel libcxxabi-devel     # Fedora
+```
+
+forge links them **statically**, so the binary you get has no libc++ runtime
+dependency — it needs only glibc, `libgcc_s` and `libm`, exactly like a
+brain-less build. That is what makes a downloaded release asset work on a
+machine that has never heard of libc++. If the static archives are missing the
+build falls back to a dynamic link and says so loudly; the release workflow
+additionally asserts with `ldd` that no published asset was built that way.
+
+macOS needs nothing installed: `libc++.1.dylib` is part of the OS.
 
 Environment knobs:
 
@@ -1199,6 +1234,7 @@ Environment knobs:
 | `NEEDLE_REQUIRE_ENGINE=1` | fail the build instead of continuing engine-less (CI/release use this) |
 | `NEEDLE_ENGINE_BASE_URL` | fetch from a mirror instead of Hugging Face (same bytes: the checksum is not overridable) |
 | `NEEDLE_ENGINE_CACHE_DIR` | where verified engines are cached |
+| `NEEDLE_CXX_RUNTIME` | `static-libc++` (default), `libc++` (dynamic — for distro packages that must share the system runtime), `libstdc++` (escape hatch for a rebuilt engine) |
 
 `needle.h` is committed as the contract of record — `needle-sys` hand-writes
 its six `extern "C"` declarations rather than generating them (no `bindgen`, so
@@ -1364,14 +1400,18 @@ go in `specs/adrs/`.
   produces a brain-less binary that routes statically (and `forge init` skips
   the weights fetch in it, since there would be no backend to use them). It
   cannot be a default: Cactus publishes no engine for Intel macOS at all, the
-  Windows artifact is link-untested, and offline builds would fail to link
-  rather than degrade. **Prebuilt release binaries for `aarch64-apple-darwin`,
-  `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` do have the
-  engine**, so the installed default on those platforms is a working brain;
-  building it yourself is one flag (see [Embedded Needle brain
-  (`ffi`)](#embedded-needle-brain-ffi)). Whichever build you have, `forge
-  doctor`'s `needle engine` / `needle brain` line-pair states the backend, the
-  weights, the verdict and the one command that changes it.
+  x86_64 archives need a libc++ nobody distributes, the Windows one is
+  link-untested, and offline builds would fail to link rather than degrade.
+  **Prebuilt release binaries for `aarch64-apple-darwin` and
+  `aarch64-unknown-linux-gnu` do have the engine**, so the installed default on
+  those platforms is a working brain; building it yourself is one flag (see
+  [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi)). Whichever build
+  you have, `forge doctor`'s `needle engine` / `needle brain` line-pair states
+  the backend, the weights, the verdict and the one command that changes it.
+  **x86_64 Linux is the notable gap** — the most common server platform, and it
+  stays brain-less until Cactus publishes an archive that links against a stock
+  libc++ (or forge learns to link their self-contained `.so` instead of the
+  `.a`).
 - `POST /v1/project/context` is lexical-only: the semantic blend that
   `forge graph context`/`graph grep --semantic` apply (needle engine +
   embedding index, when both exist) has not been ported to the server
