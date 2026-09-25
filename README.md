@@ -1,19 +1,110 @@
 # Forge
 
-Forge is a lightweight, single-binary Rust agentic coding harness. It combines a fast
-interactive coding agent core, provider-neutral model access, configurable decision
-routing, progressive-disclosure skills, a deterministic incremental project graph,
-pluggable execution, and both CLI and REST/SSE interfaces over one shared runtime.
+Forge is a single-binary Rust coding agent that separates **deciding** from
+**generating**. The fast, cheap, typed decisions — which model should handle
+this task, which tool to call and with what arguments, whether that call is
+safe to run — are made by a small calibrated decision model running
+on-device; a general language model is asked only for the work that actually
+needs one. No Node.js, no database, no daemon: one binary, one config file,
+and whatever model endpoints you already have.
 
-No Node.js, database, or daemon is required. The default stack is an embedded
-Needle 3 decision router (on-device, no network calls) in front of a local
-oMLX coding model — nothing mocked, no hosted account needed.
-When needle declines or fails, forge can escalate to Jev (TypeSafe's hosted
-System One API, or a self-hosted OpenJev server) before falling all the way
-back to deterministic static routing — opt-in only when a Jev credential is
-configured (`router_escalate = "auto"`, the default, is a no-op without one)
-and always skipped under `--local-only`. Laya (open-source System One) and
-other HTTP-style routers remain available as alternates.
+Splitting the two is the whole point. A chat model asked to choose is slow,
+expensive, and unaccountable about its own uncertainty; a decision model
+returns a typed choice with a confidence score in milliseconds, for free,
+without leaving the machine.
+
+## The decision plane: Needle 3, then Jev, then rules
+
+Every routing and guardrail question forge asks is a System One decision — a
+choice from a fixed set, with a confidence, never generated prose. Three tiers
+answer, cheapest first:
+
+1. **Needle 3, on-device.** The default (`router = "needle"`): an embedded
+   decision model from [Cactus Compute](https://huggingface.co/Cactus-Compute/needle3)
+   (Apache-2.0, ~35 MB of weights) running inside the forge process, with no
+   network calls once its weights are on disk. Free, and fast enough to be
+   invisible — the end-to-end suite's reference for a warm route round-trip is
+   ~47 ms in a release build on an idle macos-arm64 machine. Needle is also
+   what *fills* tool calls: name and arguments, against the same tool schemas
+   the language model would have been handed.
+2. **Jev**, when the on-device brain is unsure. TypeSafe's hosted System One
+   API, or a self-hosted [OpenJev](https://github.com/razorback16/openjev)
+   speaking the same wire protocol. It is consulted only when needle declines,
+   errors, or lands below `router_confidence_threshold` **and** a Jev
+   credential (`TYPESAFE_API_KEY`, or `jev_key_env`) is actually present and
+   `--local-only` is off. With no credential, `router_escalate = "auto"` — the
+   default — is a no-op and nothing leaves the machine.
+3. **Deterministic static rules**, as the floor that cannot fail. They need no
+   model, no weights, and no network. So an absent, unloaded, unreachable or
+   unconfident brain degrades to rules (`fallback_used: true` in the event log)
+   and the run continues. Laya and any other System One-compatible HTTP router
+   remain available as alternates.
+
+What this buys is two things you can point at:
+
+**Faster answers.** A well-defined read-only request is answered with *no LLM
+call at all*. Needle picks the tool and fills its arguments, a second
+on-device check confirms the call is non-destructive, and forge dispatches it
+directly through the normal approval-gated execution path — the run records
+`router: "needle-dispatch"` with `turns: 0`. The exact gates are in
+[Usage](#usage); the path is read-only by construction, so it can never
+prompt you and can never do something a normal run could not.
+
+**Better choices.** Which model runs, and whether a tool call is safe, are
+decided by a model calibrated to emit a choice plus a confidence — not by a
+chat model guessing in prose. Anything under the threshold is rejected and
+escalated rather than acted on.
+
+(Skill activation is still lexical matching over skill names and
+descriptions, not a needle decision. See [Skills](#skills).)
+
+**Whether you actually have a brain depends on the build.** Real on-device
+inference needs the native engine, which sits behind the `needle-ffi` cargo
+feature: the prebuilt release binaries for `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` are built with it
+(so the installed default on those platforms is a working brain), while a
+plain `cargo build`, Intel macOS and Windows get a statically-routing binary.
+That is a supported configuration and fully usable, not a degraded one: you
+get deterministic static routing instead of the on-device model, and you give
+up the direct-dispatch fast path and the local semantic index
+(`graph grep --semantic`) — the agent loop, tools, approvals and sessions are
+unchanged. `forge doctor` tells you which you have on its
+`needle engine` / `needle brain` lines, and names the one command that
+changes it. Details: [Installation](#installation) and [Embedded Needle brain
+(`ffi`)](#embedded-needle-brain-ffi).
+
+## The generation plane: local first, cloud when it is earned
+
+Generation goes to any OpenAI-compatible server you already run — oMLX,
+llama.cpp, Ollama, LM Studio — and that is the default out of the box
+(`qwen3-coder` at `http://127.0.0.1:8080/v1`). Cloud models sit in the
+candidate registry but are **never called implicitly**: one runs only when the
+decision plane selects it or you name it with `--model`, and only when a
+credential for it actually exists.
+
+Those credentials are taken from where they already live: API-key environment
+variables, including ones loaded from `.env`/`.env.local` (`DEEPSEEK_API_KEY`,
+`MOONSHOT_API_KEY`/`KIMI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`), and
+the CLI credential stores — `~/.claude/.credentials.json` for a Claude
+subscription you logged into with `claude login`, and `~/.codex/auth.json`
+when it holds an API key. See [Authentication](#authentication) for the full
+order and the caveats (OAuth-only Codex subscriptions are not usable yet).
+
+`--local-only` is narrower than its name suggests today, and worth stating
+plainly: it prunes the Jev tier from the decision plane in both roles, and
+`forge init` skips the weights fetch under it. It does **not** currently prune
+the `http`/`laya` routers, nor a hosted model you configured explicitly — a
+recorded discrepancy against the design docs rather than a fixed behaviour.
+
+## Where it runs
+
+One shared runtime, four front ends: the `forge` CLI, a REST/SSE server
+(`forge serve`), an MCP tool server (`forge mcp` — Claude Code, VS Code,
+Cursor), and a native in-editor agent over the Agent Client Protocol
+(`forge acp` — Zed). Same routing, same approval policy, same session log,
+whichever one you use.
+
+## Where to read more
 
 - **How it all fits together** — the decision plane (Needle → Jev/OpenJev →
   static), the generation plane (local → subscription → API-key cloud), the
@@ -73,6 +164,9 @@ which one you have on its `needle engine` line. Full detail:
 [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi).
 
 ## Quickstart
+
+Both planes have working defaults, so setting forge up is picking a
+generation model and nothing else.
 
 ### Three commands to a working agent
 
