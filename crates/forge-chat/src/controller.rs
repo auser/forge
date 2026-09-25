@@ -43,9 +43,12 @@ const EXIT_HINT: &str = "(press Ctrl-C again, or Ctrl-D, or /quit, to exit)";
 const REBUILD_REFUSAL: &str =
     "finish or cancel the running turn first (/jobs, /attach <id>, Ctrl-C)";
 
-/// §11, verbatim: the live run belongs to the source session, so its
-/// remaining events would land in a log the chat had stopped following.
-const FORK_REFUSAL: &str =
+/// §11, verbatim. Shared by every command that moves the conversation to
+/// another session — `/fork`, `/session new`, `/session <id>` — because they
+/// share the hazard: the live run belongs to the session being left, so its
+/// remaining events would land in a log the chat had stopped following. One
+/// message, so a user learns one rule rather than three.
+const SESSION_MOVE_REFUSAL: &str =
     "a turn is still running - /bg detaches it and continues in a fork, or Ctrl-C cancels it";
 
 /// Where the conversation is. Derived from one field, so there is no way for
@@ -239,17 +242,11 @@ impl Controller {
             Parsed::Config(key) => vec![Action::ShowConfig(key)],
             Parsed::Skills => vec![Action::ListSkills],
             Parsed::Graph(query) => vec![Action::Graph(query)],
+            // Read-only, so it answers in every state, mid-turn included.
             Parsed::Session => vec![Action::ShowSession],
-            Parsed::SessionNew => vec![Action::NewSession],
-            Parsed::SessionSwitch(id) => vec![Action::SwitchSession(id)],
-            Parsed::Fork(at) => {
-                // Refused only while *attached* (§11): a detached job is in
-                // another session already, so forking cannot strand it.
-                if self.attached.is_some() {
-                    return vec![Action::Write(Line::bad(FORK_REFUSAL))];
-                }
-                vec![Action::Fork(at)]
-            }
+            Parsed::SessionNew => self.move_session(Action::NewSession),
+            Parsed::SessionSwitch(id) => self.move_session(Action::SwitchSession(id)),
+            Parsed::Fork(at) => self.move_session(Action::Fork(at)),
             Parsed::Background => self.on_background(),
             Parsed::Jobs => vec![Action::ListJobs],
             Parsed::Attach(run_id) => {
@@ -351,6 +348,28 @@ impl Controller {
             return vec![Action::Write(Line::bad(REBUILD_REFUSAL))];
         }
         vec![Action::Host(change)]
+    }
+
+    /// `/fork`, `/session new` and `/session <id>`: every command that moves
+    /// the conversation to another session, refused while a turn is
+    /// **attached**.
+    ///
+    /// §11 states the reason for `/fork` and the reason is general — the live
+    /// run belongs to the session being left, so its remaining events would
+    /// land in a log the chat had stopped following. The two switching
+    /// `/session` forms move the session by the identical mechanism and carry
+    /// the identical hazard, so §6.5's table listing `/session` as immediate
+    /// is read as an oversight: a stated rationale outweighs a table entry
+    /// (coordinator ruling, spec text corrected in the Task 11 doc sweep).
+    /// Bare `/session` is read-only and is not routed through here.
+    ///
+    /// Detached jobs are no obstacle: `/bg` already moved them to their own
+    /// session, which is exactly why the refusal can point at it.
+    fn move_session(&mut self, action: Action) -> Vec<Action> {
+        if self.attached.is_some() {
+            return vec![Action::Write(Line::bad(SESSION_MOVE_REFUSAL))];
+        }
+        vec![action]
     }
 
     fn on_interrupt(&mut self) -> Vec<Action> {
@@ -777,6 +796,57 @@ mod tests {
         assert!(msg.contains("/bg"), "{msg}");
         c.on_line("/bg");
         assert_eq!(c.on_line("/fork"), vec![Action::Fork(None)]);
+    }
+
+    /// Switching the session while a turn is attached would leave that run's
+    /// remaining events in a log the chat had stopped following — the
+    /// identical hazard §11 refuses `/fork` for, by the identical mechanism.
+    /// Bare `/session` only reports, so it answers mid-turn.
+    #[test]
+    fn switching_session_is_refused_while_a_turn_is_attached() {
+        let mut c = idle();
+        c.on_line("something long");
+        for line in ["/session new", "/session 01JCF3XYZ"] {
+            let refused = c.on_line(line);
+            assert!(
+                !refused
+                    .iter()
+                    .any(|a| matches!(a, Action::NewSession | Action::SwitchSession(_))),
+                "{line}: {refused:?}"
+            );
+            let msg = refused
+                .iter()
+                .find_map(|a| match a {
+                    Action::Write(line) => Some(line.text.clone()),
+                    _ => None,
+                })
+                .expect("an explanation is printed");
+            assert!(msg.contains("/bg"), "{line}: {msg}");
+            assert!(msg.contains("Ctrl-C"), "{line}: {msg}");
+        }
+        // Read-only: reporting where you are is always allowed.
+        assert_eq!(c.on_line("/session"), vec![Action::ShowSession]);
+        // And `/bg` is the way forward the refusal names: it moves the run to
+        // its own session, after which switching strands nothing.
+        c.on_line("/bg");
+        assert_eq!(c.on_line("/session new"), vec![Action::NewSession]);
+        assert_eq!(
+            c.on_line("/session 01JCF3XYZ"),
+            vec![Action::SwitchSession("01JCF3XYZ".into())]
+        );
+    }
+
+    /// One rule, one message: the three commands that move the conversation
+    /// to another session are refused identically, so a user learns the rule
+    /// once instead of three times.
+    #[test]
+    fn moving_the_conversation_is_refused_with_one_message() {
+        let mut c = idle();
+        c.on_line("something long");
+        let fork = c.on_line("/fork");
+        assert!(matches!(fork.as_slice(), [Action::Write(_)]), "{fork:?}");
+        assert_eq!(c.on_line("/session new"), fork);
+        assert_eq!(c.on_line("/session 01JCF3XYZ"), fork);
     }
 
     #[test]
