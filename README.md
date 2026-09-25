@@ -1234,7 +1234,7 @@ Environment knobs:
 | `NEEDLE_REQUIRE_ENGINE=1` | fail the build instead of continuing engine-less (CI/release use this) |
 | `NEEDLE_ENGINE_BASE_URL` | fetch from a mirror instead of Hugging Face (same bytes: the checksum is not overridable) |
 | `NEEDLE_ENGINE_CACHE_DIR` | where verified engines are cached |
-| `NEEDLE_CXX_RUNTIME` | `static-libc++` (default), `libc++` (dynamic — for distro packages that must share the system runtime), `libstdc++` (escape hatch for a rebuilt engine) |
+| `NEEDLE_CXX_RUNTIME` | `static-libc++` (default), `libc++` (dynamic — for distro packages that must share the system runtime), `libstdc++` (escape hatch for a rebuilt engine), `none` (add no C++ runtime — for an engine that already carries its own) |
 
 `needle.h` is committed as the contract of record — `needle-sys` hand-writes
 its six `extern "C"` declarations rather than generating them (no `bindgen`, so

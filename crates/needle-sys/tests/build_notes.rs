@@ -21,9 +21,28 @@
 //! `engine_resolution.rs` instead; these runs only assert what cargo shows a
 //! *user*, and every one of them sets `NEEDLE_NO_DOWNLOAD=1` so no test in
 //! this file can reach the network.
+//!
+//! **Two environment assumptions these tests must never make again**, both
+//! learned by having them pass locally and fail in CI:
+//!
+//! 1. *That the host is a pinned target.* Only arm64 macOS and arm64 Linux are
+//!    in `PINNED_ENGINES`, so on x86_64 Linux the build script reports "no
+//!    verified engine is published" and never reaches the download branch at
+//!    all. Any test about download behaviour has to ask [`pinned_engine`] which
+//!    situation it is in — hence the `include!` below, which shares the real
+//!    table rather than duplicating it.
+//! 2. *That a C++ runtime is installed.* Resolving an engine makes `build.rs`
+//!    emit `cargo:rustc-link-lib=static=c++`, and `rustc` resolves `static=`
+//!    libraries even for a lib-only build. The required `verify` CI job
+//!    deliberately installs no C++ packages, so a fixture that resolves an
+//!    engine must set `NEEDLE_CXX_RUNTIME=none` to keep runtime selection out
+//!    of a test about engine resolution.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+#![allow(dead_code)]
+
+// The real pinned table and helpers, shared with `build.rs` itself. This also
+// provides the `std::path`/`std::process` imports these tests use.
+include!("../build_support.rs");
 
 fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -86,17 +105,24 @@ fn standalone_copy(dir: &Path) -> PathBuf {
 /// Build the standalone copy, with `NEEDLE_LIB_DIR` removed unless given.
 /// Returns (success, stdout+stderr).
 fn build(root: &Path, lib_dir: Option<&Path>) -> (bool, String) {
-    build_with(root, lib_dir, &[])
+    build_with(root, lib_dir, &[], &[])
 }
 
-/// As [`build`], plus extra cargo arguments (`--features fetch`).
+/// As [`build`], plus extra cargo arguments (`--features fetch`) and extra
+/// environment variables.
 ///
 /// `NEEDLE_NO_DOWNLOAD=1` is always set: these tests assert messages, and a
 /// real download would make them depend on the network and on Hugging Face
 /// being up. `NEEDLE_ENGINE_CACHE_DIR` points inside the temp dir so a
 /// developer's primed `$CARGO_HOME/needle-engine` cannot turn the
-/// engine-absent assertions vacuous.
-fn build_with(root: &Path, lib_dir: Option<&Path>, extra: &[&str]) -> (bool, String) {
+/// engine-absent assertions vacuous. `NEEDLE_CXX_RUNTIME` is scrubbed so a
+/// developer's shell cannot change what a fixture links.
+fn build_with(
+    root: &Path,
+    lib_dir: Option<&Path>,
+    extra: &[&str],
+    envs: &[(&str, &str)],
+) -> (bool, String) {
     let manifest = standalone_copy(root);
     let mut cmd = Command::new(env!("CARGO"));
     cmd.arg("build")
@@ -107,10 +133,14 @@ fn build_with(root: &Path, lib_dir: Option<&Path>, extra: &[&str]) -> (bool, Str
         .args(extra)
         .env_remove("NEEDLE_LIB_DIR")
         .env_remove("NEEDLE_REQUIRE_ENGINE")
+        .env_remove("NEEDLE_CXX_RUNTIME")
         .env("NEEDLE_NO_DOWNLOAD", "1")
         .env("NEEDLE_ENGINE_CACHE_DIR", root.join("engine-cache"))
         // Colour codes would make the string assertions brittle.
         .env("CARGO_TERM_COLOR", "never");
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
     if let Some(dir) = lib_dir {
         cmd.env("NEEDLE_LIB_DIR", dir);
     }
@@ -210,7 +240,7 @@ fn a_wrong_needle_lib_dir_fails_loudly() {
 #[test]
 fn with_fetch_enabled_an_unresolvable_engine_warns_with_the_one_remedy() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (ok, output) = build_with(tmp.path(), None, &["--features", "fetch"]);
+    let (ok, output) = build_with(tmp.path(), None, &["--features", "fetch"], &[]);
     assert!(
         ok,
         "an unresolvable engine must not fail the build (lint-ffi depends on it):\n{output}"
@@ -241,6 +271,7 @@ fn require_engine_turns_an_unresolvable_engine_into_a_build_failure() {
         .arg(shared_target_dir())
         .args(["--features", "fetch"])
         .env_remove("NEEDLE_LIB_DIR")
+        .env_remove("NEEDLE_CXX_RUNTIME")
         .env("NEEDLE_NO_DOWNLOAD", "1")
         .env("NEEDLE_REQUIRE_ENGINE", "1")
         .env("NEEDLE_ENGINE_CACHE_DIR", tmp.path().join("engine-cache"))
@@ -267,31 +298,78 @@ fn require_engine_turns_an_unresolvable_engine_into_a_build_failure() {
     );
 }
 
-/// The offline opt-out must be honoured with `fetch` on *and* stay quiet about
-/// the network: an air-gapped build should see no mention of a download
-/// attempt, only what to do instead.
+/// With `fetch` on and no engine available, nothing may touch the network and
+/// no cache may appear — and the warning must name the *actual* reason.
+///
+/// Which reason that is depends on the host, and the assertion is deliberately
+/// target-aware rather than forcing a pinned target into the fixture. Forcing
+/// one would mean `cargo build --target <pinned triple>`, which needs that
+/// target's std installed via rustup — an environment assumption at least as
+/// fragile as the one that broke this test in the first place, and it would
+/// stop exercising the path a real user on this machine actually takes.
+///
+/// So: on a pinned host the opt-out is what suppressed the fetch and the
+/// message must say so; on an unpinned host resolution stops earlier, at "no
+/// verified engine is published for this target", and claiming the opt-out did
+/// it would be a lie. Both branches still assert the two things this test
+/// exists for — no attempt, no cache — and the opt-out's own wording and
+/// semantics are covered unconditionally, on every platform, by
+/// `engine_resolution.rs`'s `no_download_opts_out_of_the_network_entirely`,
+/// which drives `ensure_cached_engine` directly with a pinned engine it builds
+/// itself. Nothing is lost on an unpinned host.
 #[test]
 fn no_download_is_honoured_when_fetch_is_enabled() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (ok, output) = build_with(tmp.path(), None, &["--features", "fetch"]);
+    let host = host_target();
+    let (ok, output) = build_with(tmp.path(), None, &["--features", "fetch"], &[]);
     assert!(ok, "{output}");
-    assert!(
-        output.contains("NEEDLE_NO_DOWNLOAD is set"),
-        "the warning must name the opt-out that suppressed the fetch:\n{output}"
-    );
+
+    if pinned_engine(&host).is_some() {
+        assert!(
+            output.contains("NEEDLE_NO_DOWNLOAD is set"),
+            "{host} has a pinned engine, so the opt-out is what suppressed the fetch and the \
+             warning must say so:\n{output}"
+        );
+    } else {
+        assert!(
+            output.contains("no verified libneedle engine is published"),
+            "{host} has no pinned engine, so that is the reason the warning must give — not the \
+             opt-out, which was never reached:\n{output}"
+        );
+    }
+
+    // True on every host, and the reason this test exists.
     assert!(
         !output.contains("could not download"),
         "nothing should have been attempted:\n{output}"
     );
     assert!(
         !tmp.path().join("engine-cache").exists(),
-        "an opted-out build must not create the engine cache"
+        "an engine-less build must not create the engine cache"
     );
 }
 
-/// A vendored engine short-circuits resolution: no warning, no download, and
-/// the link flags are emitted. (The fixture is not a real archive — nothing
-/// links here, only `needle-sys`'s own lib is built.)
+/// A vendored engine short-circuits resolution: no warning, no download.
+///
+/// `NEEDLE_CXX_RUNTIME=none` is load-bearing, and not a weakening. Resolving an
+/// engine makes `build.rs` also emit `cargo:rustc-link-lib=static=c++`, and
+/// `rustc` resolves `static=` libraries even for a lib-only build — so without
+/// this the fixture fails on any machine with no libc++, which includes the
+/// required `verify` CI job (stock Ubuntu: neither `libc++.a` nor `libc++.so`).
+///
+/// The alternative was installing `libc++-dev` into that gate. Rejected: the
+/// gate builds with default features, where `fetch` is off, no engine resolves
+/// and no C++ runtime is ever named — so nothing in the *product* needs libc++
+/// there, and adding a system package to the required gate to satisfy one
+/// fixture would change what the gate assumes in order to avoid fixing the
+/// fixture. `libstdc++` was the other option and is wrong twice: it is the
+/// runtime this whole round proved the engine does *not* use, and it does not
+/// exist on macOS.
+///
+/// Runtime selection is a separate concern from engine resolution, and it keeps
+/// its own coverage: seven tests in `engine_resolution.rs` pin the choice per
+/// target and per machine state, and CI's `verify-ffi` job links it for real.
+/// This test is about resolution, so it holds the other axis still.
 #[test]
 fn a_vendored_engine_is_used_without_any_download() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -308,7 +386,12 @@ fn a_vendored_engine_is_used_without_any_download() {
     // any native library it is pointed at, even for a build that never links.
     std::fs::write(vendor.join(name), b"!<arch>\n").expect("write engine");
 
-    let (ok, output) = build_with(&root, None, &["--features", "fetch"]);
+    let (ok, output) = build_with(
+        &root,
+        None,
+        &["--features", "fetch"],
+        &[("NEEDLE_CXX_RUNTIME", "none")],
+    );
     assert!(ok, "{output}");
     assert!(
         !output.contains("warning:"),
@@ -317,6 +400,10 @@ fn a_vendored_engine_is_used_without_any_download() {
     assert!(
         !output.contains("could not download"),
         "a vendored engine must short-circuit the download:\n{output}"
+    );
+    assert!(
+        !output.contains("no verified libneedle engine is published"),
+        "a vendored engine must be used even on a target with no pinned one:\n{output}"
     );
 }
 

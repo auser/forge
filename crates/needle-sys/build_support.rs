@@ -477,7 +477,8 @@ fn one_line(message: &str) -> String {
 /// `static-libc++` (the default wherever the archives can be found), `libc++`
 /// (dynamic — what a distro package build wants, so the system runtime is
 /// shared), `libstdc++` (an escape hatch, correct only for an engine somebody
-/// rebuilt against GNU libstdc++).
+/// rebuilt against GNU libstdc++), `none` (add no C++ runtime at all — for an
+/// engine that already carries its own).
 const CXX_RUNTIME_ENV: &str = "NEEDLE_CXX_RUNTIME";
 
 /// How to link the C++ standard library the *engine artifact* needs.
@@ -547,6 +548,14 @@ fn cxx_plan(target: &str, requested: Option<&str>, have: &CxxAvailability) -> Cx
     };
 
     match requested {
+        // "I have handled the C++ runtime myself — add nothing." For an engine
+        // rebuilt with its runtime already baked in (which is exactly how
+        // Cactus ships their own `.so`), or a platform where it arrives by
+        // another route. Also the honest way for a *test* to isolate engine
+        // resolution from runtime selection: the two are independent
+        // decisions, and a fixture for one should not have to satisfy the
+        // other's system prerequisites.
+        Some("none") => return plain(&[]),
         Some("libstdc++") => return plain(&["dylib=stdc++"]),
         Some("libc++") if target.contains("apple") => return plain(&["dylib=c++"]),
         Some("libc++") => return plain(&["dylib=c++", "dylib=c++abi", "dylib=m"]),
@@ -621,7 +630,7 @@ fn cxx_plan(target: &str, requested: Option<&str>, have: &CxxAvailability) -> Cx
 fn known_cxx_runtime(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "" | "static-libc++" | "libc++" | "libstdc++"
+        "" | "static-libc++" | "libc++" | "libstdc++" | "none"
     )
 }
 

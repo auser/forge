@@ -495,6 +495,27 @@ fn the_cxx_runtime_is_overridable_for_packagers() {
         cxx_plan(target, None, &have).flags
     );
 
+    // "I have handled it myself": no flags, no search dirs, no warning. Used by
+    // an engine that already carries its runtime — and by `build_notes.rs`'s
+    // vendored-engine fixture, so a test about engine resolution does not need
+    // a C++ runtime installed to run.
+    let none = cxx_plan(target, Some("none"), &have);
+    assert!(none.flags.is_empty(), "{none:?}");
+    assert!(none.search_dirs.is_empty(), "{none:?}");
+    assert!(none.warning.is_none(), "{none:?}");
+    // Including on a machine with nothing installed — it must not fall through
+    // to the warn-and-ask-for-static branch.
+    let none_bare = cxx_plan(target, Some("none"), &CxxAvailability::default());
+    assert!(none_bare.flags.is_empty(), "{none_bare:?}");
+    assert!(none_bare.warning.is_none(), "{none_bare:?}");
+    // And on macOS, where the default is dynamic libc++.
+    assert!(
+        cxx_plan("aarch64-apple-darwin", Some("none"), &have)
+            .flags
+            .is_empty()
+    );
+
+    assert!(known_cxx_runtime("none"));
     assert!(known_cxx_runtime("static-libc++"));
     assert!(known_cxx_runtime("libc++"));
     assert!(known_cxx_runtime("libstdc++"));
