@@ -145,7 +145,55 @@ Each sub-project gets its own spec → plan → implementation cycle:
      cancellation readable from the type. Both adapters' existing test
      suites pass unmodified.
 
-   Phase B (the interactive UI itself) still needs its own design.
+   **Phase B (the interactive UI itself): designed** (sub-project 6b) —
+   [`2026-09-24-interactive-chat-ui-design.md`](2026-09-24-interactive-chat-ui-design.md),
+   with the implementation plan at
+   [`../plans/2026-09-24-interactive-chat-ui.md`](../plans/2026-09-24-interactive-chat-ui.md).
+   That document is the authority on everything this item left open; the
+   headline decisions, so the two specs cannot drift:
+
+   - **An inline transcript, not a full-screen TUI.** Normal scrollback, a
+     rich input line at the bottom. `rustyline` 18 is the line editor
+     (`default-features = false`, features `custom-bindings` +
+     `with-file-history`): **8 new transitive packages** for this
+     workspace, measured the way `rmcp` (13, accepted) and
+     `agent-client-protocol` (52, rejected) were. `reedline` measured 23 —
+     a second terminal stack and a second signal stack beside tokio's —
+     and was rejected on cost, not capability; `ratatui` was rejected on
+     shape first.
+   - **A new pure crate `forge-chat`** holds slash parsing/completion, the
+     `Event → Vec<Line>` mapping and the input state machine, with the
+     terminal behind a `ChatIo` seam and everything config-shaped behind a
+     `ChatHost` seam — `forge-acp`'s pure-`dispatch`/impure-`server` split,
+     with the impure half moved out of the crate entirely, so
+     `cargo test -p forge-chat` can never need a TTY. The turn driver is a
+     copy of `forge-acp::server::run_turn` (subscribe-before-start →
+     `select!` → flush → settle).
+   - **Approvals reuse the parked-run round trip** MCP and ACP already
+     use (`ApprovalRequested` → `send_input("y"/"n")`), which required
+     making the approval channel explicit in `forge-execution`
+     (`ApprovalChannel::{InlineTty, Parked}`) instead of inferred from
+     `is_terminal()`: a provider that reads stdin itself would fight the
+     chat's raw-mode line editor for the same file descriptor.
+   - **Ctrl-C cancels the turn and never quits**; a second Ctrl-C at an
+     empty idle prompt exits 130; Ctrl-D on an empty line and `/quit` exit
+     0; Ctrl-C mid-approval cancels the turn without running the
+     operation. A failed turn is one line in the transcript, never the end
+     of the session.
+   - **A fresh session per entry** (`--continue` / `--session <id>` /
+     `/session <id>` to resume), because a prompt landing in an existing
+     session replays that conversation into the model's context — right
+     when asked for, wrong when silent. Phase A's replay is what makes a
+     resumed conversation real; the UI re-renders the session's transcript
+     through the same renderer it uses live.
+   - **`/bg`, `/jobs`, `/attach`** over Phase A's `attach`/`list_runs`:
+     in-process only, stated as such. Runs die with the process, a
+     detached run's approval must be answered by attaching, and `/attach`
+     on another process's run shows recorded history only
+     (`Attachment::is_live()`).
+   - **No fake token streaming**, no pty in dev-dependencies (the
+     interrupt path is tested with a real `SIGINT` against the real
+     binary), and no user-facing mention of mocks anywhere.
 
 Parallel track (in progress on main): **cloud subscription support** —
 credential detection for Claude Code OAuth, Codex, Kimi/Moonshot and
