@@ -123,8 +123,14 @@ fn forge(tmp: &Path, project: &Path) -> Command {
 /// written up front rather than interleaved with reads: the amounts here
 /// are tiny (a handful of short lines), well under a pipe buffer, so this
 /// cannot deadlock the way an interleaved read/write over a full pipe
-/// could — `child.wait_with_output()` itself drains stdout/stderr
-/// concurrently on separate threads, which is what makes this safe at all.
+/// could.
+///
+/// Stdout/stderr are drained concurrently via [`tail_stream`] (not a plain
+/// `child.wait_with_output()`) and the exit itself is bounded via
+/// [`wait_for_exit`], not a plain `child.wait()`: a regression that eats
+/// one of the submitted lines (Bug 1 — an answer lost to `App::drive`'s
+/// `select!` race) leaves the chat blocked on a read nothing will ever
+/// answer, and this must fail that case rather than hang the suite on it.
 fn chat(tmp: &Path, project: &Path, lines: &[&str]) -> std::process::Output {
     let mut child = forge(tmp, project)
         .stdin(Stdio::piped())
@@ -132,13 +138,30 @@ fn chat(tmp: &Path, project: &Path, lines: &[&str]) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn forge");
+    let (stdout_buf, stdout_thread) = tail_stream(child.stdout.take().expect("stdout"));
+    let (stderr_buf, stderr_thread) = tail_stream(child.stderr.take().expect("stderr"));
     {
         let mut stdin = child.stdin.take().expect("stdin");
         for line in lines {
             writeln!(stdin, "{line}").expect("write");
         }
     } // dropping stdin is EOF, which ends the chat (§12.3)
-    child.wait_with_output().expect("wait")
+    let status = wait_for_exit(&mut child, Duration::from_secs(20));
+    stdout_thread.join().expect("stdout reader thread");
+    stderr_thread.join().expect("stderr reader thread");
+    std::process::Output {
+        status,
+        stdout: stdout_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .into_bytes(),
+        stderr: stderr_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .into_bytes(),
+    }
 }
 
 /// A project scaffolded for chat tests: a scripted-mock model, offline, and
@@ -291,6 +314,28 @@ fn wait_for(buffer: &Mutex<String>, marker: &str, timeout: Duration) -> String {
     }
 }
 
+/// Poll `child` until it exits, or force-kill it and panic once `timeout`
+/// elapses — the bounded analogue of `child.wait()`/`wait_with_output()`,
+/// same shape as [`wait_for`]. Load-bearing for exactly the failure class
+/// Bug 1 was: an answer eaten by `App::drive`'s `select!` race leaves the
+/// chat blocked on a read nobody will ever answer, so the process never
+/// exits — an unbounded `wait()` on a test guarding that regression would
+/// hang the suite instead of failing it.
+fn wait_for_exit(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            let _ = child.wait();
+            panic!("timed out after {timeout:?} waiting for the chat to exit");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Submit `prompt`, wait for it to actually raise the approval question,
 /// then answer it — never send the answer up front.
 ///
@@ -318,7 +363,11 @@ fn answer_one_approval(tmp: &Path, project: &Path, prompt: &str, answer: &str) -
     writeln!(stdin, "{answer}").expect("write answer");
     drop(stdin); // EOF right after the answer; nothing else to say
 
-    let status = child.wait().expect("wait");
+    // Bounded (`wait_for_exit`, not a plain `child.wait()`): if the answer
+    // just written above is instead the one Bug 1 would eat, the run stays
+    // parked on the approval forever and this must fail that, not hang on
+    // it.
+    let status = wait_for_exit(&mut child, Duration::from_secs(10));
     stdout_thread.join().expect("stdout reader thread");
     stderr_thread.join().expect("stderr reader thread");
     let stdout = stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -494,11 +543,31 @@ fn stdout_carries_the_transcript_and_stderr_carries_diagnostics() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn");
+    let (stdout_buf, stdout_thread) = tail_stream(child.stdout.take().expect("stdout"));
+    let (stderr_buf, stderr_thread) = tail_stream(child.stderr.take().expect("stderr"));
     {
         let mut stdin = child.stdin.take().expect("stdin");
         writeln!(stdin, "explain alpha.rs").expect("write");
     }
-    let out = child.wait_with_output().expect("wait");
+    // Bounded (`wait_for_exit`, not a plain `child.wait_with_output()`): a
+    // regression that eats this line (Bug 1) leaves the chat blocked on a
+    // read nothing will ever answer.
+    let status = wait_for_exit(&mut child, Duration::from_secs(10));
+    stdout_thread.join().expect("stdout reader thread");
+    stderr_thread.join().expect("stderr reader thread");
+    let out = std::process::Output {
+        status,
+        stdout: stdout_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .into_bytes(),
+        stderr: stderr_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .into_bytes(),
+    };
     assert!(
         out.status.success(),
         "{}",

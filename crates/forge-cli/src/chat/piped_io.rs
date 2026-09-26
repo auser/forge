@@ -132,6 +132,16 @@ pub struct PipedIo {
 
 impl PipedIo {
     pub fn new(palette: Palette) -> Result<Self, ForgeError> {
+        // Unbounded, but not actually unbounded in practice: the producer
+        // thread below blocks inside `read_one_line` (a synchronous,
+        // line-buffered stdin read) between every `send`, so it can never
+        // race ahead and pile up more than the one line it just read
+        // while waiting for `read()` to drain the previous one. What makes
+        // `recv` cancel-safe to drop mid-`select!` (the module doc above)
+        // is a property of the channel type regardless of bound; the
+        // choice of `unbounded` over `channel(1)` here is just this
+        // natural one-line-at-a-time backpressure, not a claim that
+        // arbitrarily much stdin can queue up unread.
         let (tx, rx) = mpsc::unbounded_channel();
         std::thread::spawn(move || {
             loop {
