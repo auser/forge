@@ -256,10 +256,58 @@ forge-mcp         Model Context Protocol (stdio) adapter over the same
 forge-acp         Agent Client Protocol (stdio) adapter over the same
                   AgentService: forge *as the agent* — v1 wire types,
                   pure event→update dispatch, prompt-turn driver
+forge-chat        interactive chat: pure slash parsing, event->transcript
+                  rendering and the input state machine, over ChatIo /
+                  ChatHost seams the CLI implements (no terminal here)
 forge-cli         clap command tree, doctor, init, the forge binary
 ```
 
 ## Editors and harnesses
+
+Five front ends sit over the one `AgentService` now: `forge` (batch
+commands like `run`/`serve`/`session`), the interactive chat (`forge chat`,
+and what bare `forge` runs), `forge serve`, `forge mcp`, and `forge acp`.
+The chat is the fourth *adapter* in the sense the rest of this section
+uses the word — `forge-server`, `forge-mcp` and `forge-acp` are the first
+three, each wrapping the same `build_run_service`/`build_run_service_with`
+construction behind a different protocol — and it repeats three patterns
+already established by the others rather than inventing new ones:
+
+- **Pure core, thin shell.** `forge-chat` holds slash parsing, the
+  input/signal state machine and event→transcript rendering as plain
+  functions with no terminal dependency (its driver does reach the
+  filesystem, but only through `AgentService` — see the crate doc) — the same
+  split `forge-acp::dispatch` keeps pure while `forge-acp`'s stdio loop
+  stays outside it. `forge-cli::chat` (the `ChatIo`/`ChatHost`
+  implementations: `TerminalIo`, `PipedIo`, `CliHost`) is the thin shell
+  that is not unit-testable without a process, the same shape as
+  `forge-acp`'s own protocol-vs-transport split.
+- **A dedicated thread for a non-async, non-`Send`-friendly resource.**
+  `TerminalIo` owns `rustyline::Editor` on one dedicated OS thread, fed by
+  an mpsc job channel and answered on oneshots — `NeedleEngine`'s pattern
+  for `libneedle`'s FFI handle, applied to a second resource that cannot
+  be shared behind an `&mut` across an await either.
+- **The parked approval channel is now explicit, not inferred.**
+  `ApprovalChannel::{InlineTty, Parked}` on `NativeExecution` replaces an
+  `is_terminal()` guess: `forge mcp` and `forge acp` already got `Parked`
+  for free because their stdin is a protocol channel, but the chat *has* a
+  TTY and still needs it, because stdin there belongs to the line editor,
+  not to `NativeExecution::prompt_for_approval`'s own
+  `std::io::stdin().lock()`. Naming the channel per front end, instead of
+  reading it off `is_terminal()`, is what makes that explicit for every
+  stdin-owning front end at once rather than only the two that happened to
+  need it first.
+
+The turn driver itself (`forge-chat::app::run`) is a fourth repetition, of
+`forge-acp::server::run_turn`'s ordering — subscribe to the run's events
+before starting it, drain `try_recv` once it settles, print the answer
+once — with exactly two arms ACP's driver does not need: an outstanding
+`io.read` (so `/bg` is reachable mid-turn) and `io.interrupted()`. Session
+continuity, forking and background/reattach are not new mechanisms either:
+`/fork` is `AgentService::fork_session`, `/bg` is the same call plus a
+watcher task, `/attach` is `AgentService::attach()` — the primitives
+[Attaching to a run](README.md#attaching-to-a-run) already documents for
+every front end.
 
 `forge mcp` is the stdio sibling of `forge serve`: the same `AgentService`,
 built by the same `build_run_service` path (needle seam included), exposed as

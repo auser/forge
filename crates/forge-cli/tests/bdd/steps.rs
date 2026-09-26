@@ -1889,3 +1889,186 @@ fn acp_stdout_is_pure_protocol(world: &mut BddWorld) {
         assert_eq!(value["jsonrpc"], "2.0", "not a JSON-RPC message: {line}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// chat.feature
+// ---------------------------------------------------------------------------
+
+/// An offline model wired through a local `wiremock` server rather than
+/// `model = "mock-local"`/`"scripted-mock"`: the chat's entry banner and
+/// `/model` report the *active* model honestly even when it is a
+/// test-only mock (`CliHost::environment`'s documented contract in
+/// `forge-cli/src/chat/host.rs` — hiding it there would be a lie about
+/// what is running), so a scenario that must never see the word "mock" in
+/// chat output needs an offline model whose name does not say so, even
+/// though this wiremock server plays exactly the role a literal mock
+/// config would. `router = "static"` keeps the default `router = "needle"`
+/// out of the way (no autofetch, no engine, nothing to build).
+#[given("an initialized project with a mock model")]
+async fn initialized_project_with_a_mock_model(world: &mut BddWorld) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "the answer" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    world.set_config("model", "\"chat-test\"");
+    world.set_config("router", "\"static\"");
+    world.add_config_block(format!(
+        "[models.chat-test]\nbase_url = \"{}\"",
+        server.uri()
+    ));
+    world.chat_mock = Some(server);
+}
+
+/// Same shape as `approval.feature`'s "a scripted mock model that writes"
+/// (a two-entry script: a `write_file` tool call, then a closing text
+/// reply), under the wording this feature's Given uses.
+#[given(expr = "an initialized project with a scripted mock model that writes {string}")]
+fn initialized_project_with_scripted_mock_writes(world: &mut BddWorld, path: String) {
+    let script = format!(
+        r#"[
+            {{"tool_calls": [{{"id": "call_1", "name": "write_file", "arguments": {{"path": "{path}", "content": "scripted content"}}}}]}},
+            {{"text": "all done"}}
+        ]"#
+    );
+    world.write_file("script.json", &script);
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+    world.set_config("router", "\"static\"");
+}
+
+#[when(expr = "I chat with the lines {string} and {string}")]
+async fn i_chat_with_two_lines(world: &mut BddWorld, first: String, second: String) {
+    world
+        .run_forge_with_stdin(&["chat"], &[&first, &second])
+        .await;
+}
+
+#[when(expr = "I chat with the lines {string} and {string} and {string}")]
+async fn i_chat_with_three_lines(
+    world: &mut BddWorld,
+    first: String,
+    second: String,
+    third: String,
+) {
+    world
+        .run_forge_with_stdin(&["chat"], &[&first, &second, &third])
+        .await;
+}
+
+#[then("the chat exits successfully")]
+fn the_chat_exits_successfully(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+}
+
+#[then("one session holds both runs")]
+fn one_session_holds_both_runs(world: &mut BddWorld) {
+    let dir = world.project().join(".forge").join("sessions");
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("sessions dir")
+        .flatten()
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "expected exactly one session file: {files:?}"
+    );
+    let log = world.session_log();
+    let run_starts = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["type"] == "run_started")
+        .count();
+    assert_eq!(run_starts, 2, "expected two runs in the one session: {log}");
+}
+
+#[then("the chat output lists the chat commands")]
+fn chat_output_lists_chat_commands(world: &mut BddWorld) {
+    for expected in [
+        "/help",
+        "/model",
+        "/approval",
+        "/session",
+        "/fork",
+        "/bg",
+        "/jobs",
+        "/attach",
+        "/quit",
+    ] {
+        assert!(
+            world.last_stdout.contains(expected),
+            "/help must list {expected}:\n{}",
+            world.last_stdout
+        );
+    }
+}
+
+/// Every non-echoed line (echoed input is prefixed `> `, piped mode's own
+/// rendering) must be free of the word "mock" — the same check
+/// `forge-cli`'s process-level `slash_commands_answer_and_never_name_a_mock`
+/// makes, here over the BDD harness's hermetic wiremock-backed model.
+#[then("the chat output never mentions a mock")]
+fn chat_output_never_mentions_a_mock(world: &mut BddWorld) {
+    for line in world.last_stdout.lines().filter(|l| !l.starts_with("> ")) {
+        assert!(!line.to_lowercase().contains("mock"), "mock leaked: {line}");
+    }
+}
+
+#[then("the session events include an approval decision that was denied")]
+fn session_events_include_a_denied_approval(world: &mut BddWorld) {
+    let log = world.session_log();
+    let denied = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "approval_decided" && e["approved"] == false);
+    assert!(
+        denied.is_some(),
+        "no denied approval_decided event in: {log}"
+    );
+}
+
+/// Without this, the scenario passes whether or not the feature works: if
+/// the `"n"` is eaten before it reaches the parked run, EOF-with-an-approval
+/// -pending auto-denies (§12.3) and both of the assertions above still hold —
+/// the file is still unwritten and the log still has a denied decision. The
+/// auto-denial announces itself in the transcript, so the two paths are
+/// distinguishable; this is what distinguishes them.
+#[then("the denial came from the typed answer, not from input running out")]
+fn the_denial_was_typed_not_automatic(world: &mut BddWorld) {
+    assert!(
+        !world
+            .last_stdout
+            .contains("input ended with an approval pending"),
+        "the approval was auto-denied at EOF, so the typed \"n\" never \
+         reached the run:\n{}",
+        world.last_stdout
+    );
+}
+
+#[then("two sessions exist")]
+fn two_sessions_exist(world: &mut BddWorld) {
+    let dir = world.project().join(".forge").join("sessions");
+    let count = std::fs::read_dir(&dir)
+        .expect("sessions dir")
+        .flatten()
+        .count();
+    assert_eq!(count, 2, "expected two session files");
+}
+
+#[then("the chat output says the source session is untouched")]
+fn chat_output_says_source_untouched(world: &mut BddWorld) {
+    assert!(
+        world.last_stdout.contains("is untouched"),
+        "stdout: {}",
+        world.last_stdout
+    );
+}

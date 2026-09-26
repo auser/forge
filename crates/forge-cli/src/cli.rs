@@ -12,8 +12,11 @@ pub struct Cli {
     #[command(flatten)]
     pub global: GlobalOpts,
 
+    /// No subcommand opens the interactive chat (see `Command::Chat`).
+    /// This is `Option` for exactly that reason: `forge` alone must not be
+    /// a usage error.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Args, Clone, Debug, Default)]
@@ -67,6 +70,20 @@ pub struct GlobalOpts {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Interactive chat: a scrolling transcript with slash commands.
+    /// `forge` with no subcommand is the same thing.
+    Chat {
+        /// Optional first turn; the chat stays interactive afterwards.
+        #[arg(value_name = "PROMPT")]
+        prompt: Vec<String>,
+        /// Continue the project's most recently active session.
+        #[arg(short = 'c', long = "continue")]
+        continue_session: bool,
+        /// Continue a named session.
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Option<String>,
+    },
+
     /// Initialize a project for Forge (idempotent).
     Init,
 

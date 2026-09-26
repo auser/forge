@@ -1,5 +1,5 @@
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_MODEL",
@@ -1617,6 +1617,112 @@ fn unknown_provider_errors_do_not_advertise_mocks() {
         "stderr: {stderr}"
     );
     assert!(!stderr.contains("mock"), "stderr advertises mock: {stderr}");
+}
+
+/// A project directory for the chat tests: a real project root, and a
+/// config that names no provider the chat could leak into its banner. The
+/// chat shell never calls a model, so it needs no mock — and `forge()`
+/// leaves `FORGE_TEST_MOCKS=1` set, which is precisely what makes the
+/// "no mock in the banner" assertion below worth making.
+fn scaffold(tmp: &Path) -> PathBuf {
+    let project = tmp.join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "approval = \"prompt\"\n",
+    )
+    .expect("write config");
+    project
+}
+
+/// Wait for a child, bounded, killing and failing rather than hanging —
+/// the same guard (and the same name) as `forge-cli/tests/chat.rs`'s.
+///
+/// Every chat test is in the hang class: a regression that stops the chat
+/// noticing EOF, or wedges its editor thread on the way out, leaves the
+/// process alive for ever. A plain `wait()`/`wait_with_output()` hands
+/// that to the whole suite as a hang; this hands it to one test as a
+/// failure.
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            let _ = child.wait();
+            panic!("timed out after {timeout:?} waiting for the chat to exit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn bare_forge_opens_the_chat_and_exits_at_eof() {
+    use std::io::Read as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path());
+    // stdin is an empty pipe: the chat starts, reads EOF, exits cleanly.
+    let mut child = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bare forge runs");
+    drop(child.stdin.take());
+    // The banner is a few hundred bytes, far inside the pipe buffer, so
+    // the child never blocks on a writer nobody is draining.
+    let status = wait_for_exit(&mut child, std::time::Duration::from_secs(20));
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    assert!(
+        status.success(),
+        "bare forge should exit 0, got {status:?}\n{stdout}"
+    );
+    assert!(stdout.contains("forge "), "banner missing: {stdout}");
+    assert!(
+        stdout.contains("/help"),
+        "banner should point at /help: {stdout}"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("mock"),
+        "no mock may be named: {stdout}"
+    );
+}
+
+#[test]
+fn chat_refuses_json_output() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path());
+    let out = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "chat"])
+        .output()
+        .expect("runs");
+    assert!(!out.status.success(), "--json chat must fail");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing may reach stdout: {:?}",
+        out.stdout
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--json is not supported by the interactive chat"),
+        "{stderr}"
+    );
 }
 
 /// `--help` must not offer the test-only router either.
