@@ -48,7 +48,7 @@ use tokio::task::JoinHandle;
 
 use crate::controller::{Action, Controller, Signal};
 use crate::host::{ChatHost, HostChange, NeedleState};
-use crate::io::{ChatIo, CompletionSnapshot, Line, Prompt, ReadOutcome};
+use crate::io::{ChatIo, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome};
 use crate::render::TranscriptState;
 
 /// How the chat resolves the session it starts in (design §7).
@@ -128,6 +128,11 @@ struct App<Io, Host> {
     background: Vec<String>,
     bg_tx: mpsc::UnboundedSender<BgMsg>,
     bg_rx: mpsc::UnboundedReceiver<BgMsg>,
+    /// Batch mode has seen EOF, so there is nothing left to read: the
+    /// `read` arm of the main `select!` is switched off from here on. See
+    /// [`App::settle_ended_input`] for what takes over the job that arm's
+    /// endless re-reading used to do by accident.
+    input_ended: bool,
     exit_code: Option<i32>,
 }
 
@@ -154,6 +159,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             background: Vec::new(),
             bg_tx,
             bg_rx,
+            input_ended: false,
             exit_code: None,
         };
         app.refresh_completions();
@@ -183,7 +189,12 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             let actions = self.controller.on_line(&prompt);
             self.execute(actions).await;
         }
-        self.drive().await
+        // Unconditional, and the *only* `shutdown` call site: `drive`
+        // returns a `Result`, so a `?` added inside it later must not be
+        // able to leave `TerminalIo`'s editor thread running.
+        let code = self.drive().await;
+        self.io.shutdown();
+        code
     }
 
     /// The project's most recently active session: sessions are ULIDs, so
@@ -221,10 +232,12 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
 
     // --- the main loop --------------------------------------------------
 
-    /// One `io.read` is always outstanding, including while a turn runs
-    /// (§6.2): the four arms below are `read`, the attached run's events,
-    /// its settling, and a detached job's notice. `biased` and the
-    /// ordering are load-bearing — see the module doc.
+    /// One `io.read` is always outstanding while input can still arrive,
+    /// including while a turn runs (§6.2): the four arms below are `read`,
+    /// the attached run's events, its settling, and a detached job's
+    /// notice. `biased` and the ordering are load-bearing — see the module
+    /// doc. The one thing that switches an arm off for good is batch
+    /// mode's EOF; see the `read` arm's own comment.
     async fn drive(&mut self) -> Result<i32, ForgeError> {
         loop {
             let prompt = self.prompt();
@@ -261,15 +274,37 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Some(msg) = self.bg_rx.recv() => {
                     self.on_bg(msg);
                 }
-                outcome = self.io.read(prompt) => {
+                // Switched off once batch mode's input has ended: every
+                // `ChatIo` re-signals EOF on each read (`PipedIo`'s reader
+                // thread reports it once and drops the sender, so `recv`
+                // resolves `None` instantly for ever after), and an
+                // unguarded arm turns that into a zero-cost-to-resolve
+                // branch that wins every iteration — a busy-wait for the
+                // whole length of every in-flight and queued turn, measured
+                // at ~78x the CPU of the same script with stdin held open.
+                // What the spin was silently doing — re-delivering EOF so
+                // the end-of-input decision got taken again as the state
+                // changed — is [`App::settle_ended_input`]'s job instead.
+                outcome = self.io.read(prompt), if !self.input_ended => {
                     self.on_read(outcome).await;
+                }
+                // Not reachable today: `self.bg_tx` lives as long as this
+                // loop does, so `bg_rx.recv()` never resolves `None` and
+                // that arm is never disabled. It exists so that a future
+                // change which *does* disable every arm ends the chat
+                // rather than panicking inside `select!`.
+                else => {
+                    self.exit_code = Some(0);
                 }
             }
             if self.interrupted_now().await {
                 self.handle_signal(Signal::Interrupt).await;
             }
+            // Re-taken here, after every arm and after the interrupt peek,
+            // because this iteration is the only thing that can have
+            // changed the state it depends on.
+            self.settle_ended_input().await;
             if let Some(code) = self.exit_code {
-                self.io.shutdown();
                 return Ok(code);
             }
             // Give a just-spawned or just-unblocked run task a turn before
@@ -348,13 +383,52 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 self.refresh_completions();
             }
             ReadOutcome::Interrupt => self.handle_signal(Signal::Interrupt).await,
-            ReadOutcome::Eof => self.handle_signal(Signal::Eof).await,
+            ReadOutcome::Eof => {
+                // In batch mode this is final — stdin does not come back —
+                // so stop asking for lines. In interactive mode it is a
+                // keystroke (Ctrl-D) and the next one is still to come.
+                if self.io.interactivity() == Interactivity::Batch {
+                    self.input_ended = true;
+                }
+                self.handle_signal(Signal::Eof).await;
+            }
             ReadOutcome::Failed(message) => self.emit(Line::bad(format!("error: {message}"))),
         }
     }
 
     async fn handle_signal(&mut self, signal: Signal) {
         let actions = self.controller.on_signal(signal);
+        self.execute(actions).await;
+    }
+
+    /// Batch mode's end-of-input decision, re-taken every time the state it
+    /// depends on can have changed (§12.3).
+    ///
+    /// EOF in batch mode means "no more input", not "stop now": the
+    /// in-flight turn finishes and the queue runs first. So the decision
+    /// cannot be taken once at EOF — it has to be revisited as the turn
+    /// settles, as the queue drains, and as events arrive. Before, nothing
+    /// revisited it explicitly; the exhausted `read` arm re-delivered EOF
+    /// thousands of times a second and the decision was re-taken as a side
+    /// effect of that spin. This is the same decision, taken deterministically
+    /// at the points where it can change answer, which is what
+    /// [`Controller::on_drained`] exists for.
+    ///
+    /// Two outcomes, mirroring [`Controller::on_eof`]'s own two:
+    ///
+    /// * a run parked on an approval nobody can answer any more is denied,
+    ///   the safe stated action (§12.3), and the turn is left to unwind;
+    /// * otherwise, once nothing is attached and the queue is empty, the
+    ///   chat cancels what is left and leaves 0.
+    async fn settle_ended_input(&mut self) {
+        if !self.input_ended {
+            return;
+        }
+        if self.controller.pending_approval().is_some() {
+            self.handle_signal(Signal::Eof).await;
+            return;
+        }
+        let actions = self.controller.on_drained();
         self.execute(actions).await;
     }
 
@@ -639,44 +713,63 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         )));
         self.emit(Line::meta(note));
         self.background.push(run_id.clone());
-        if let Some(RunEvents::Live(rx)) = events {
-            self.spawn_background_watcher(run_id, rx);
-        }
+        // *Every* origin gets a watcher, `/attach`'s included. Without
+        // that, `/bg` after `/attach` detached a run nothing was left
+        // watching: `Controller::on_background` had already counted it,
+        // `on_job_settled` is reachable only through a watcher's
+        // `BgMsg::Settled`, so `live_work()` stayed above zero for the rest
+        // of the process — `/model` and `/approval` refused for ever, every
+        // exit gesture needing two requests for ever, `ChatState::Detached`
+        // for ever, with nothing actually running. A detached-but-followed
+        // run is exactly what `/jobs` and `/attach` are for.
+        let events = match events {
+            Some(events) => events,
+            // The one case where `events` is cleared while the run is
+            // still this driver's: an owned run whose broadcast closed
+            // early (the `None` arm of `drive`'s events branch).
+            // Re-subscribing is safe either way — `AgentService::subscribe`
+            // hands back an already-closed stream for a run that can no
+            // longer go live, which the watcher reports as settled at once.
+            None => RunEvents::Live(self.host.service().subscribe(&run_id)),
+        };
+        self.spawn_background_watcher(run_id, events);
     }
 
-    fn spawn_background_watcher(&self, run_id: String, mut rx: broadcast::Receiver<Event>) {
+    /// Follow a detached run to its end on its own task, printing §10.1's
+    /// two notice kinds and — whatever happens — reporting it settled
+    /// exactly once, which is the only way the driver's detached count ever
+    /// comes back down.
+    fn spawn_background_watcher(&self, run_id: String, events: RunEvents) {
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        // One definition of "this ends a run" — sharing it
-                        // is what keeps a watcher for a job in a background
-                        // job that never settles if a new terminal kind is
-                        // added and only one of the two call sites is
-                        // updated for it.
-                        let terminal = event.kind.is_terminal();
-                        let notice = match &event.kind {
-                            EventKind::ApprovalRequested { .. } => {
-                                Some(format!("job {run_id} needs approval - /attach {run_id}"))
-                            }
-                            EventKind::Completed { .. } => Some(format!("job {run_id} completed")),
-                            EventKind::Error { .. } => Some(format!("job {run_id} failed")),
-                            EventKind::Cancelled { .. } => Some(format!("job {run_id} cancelled")),
-                            _ => None,
-                        };
-                        if let Some(text) = notice {
-                            let _ = tx.send(BgMsg::Notice(Line::notice(text)));
-                        }
-                        if terminal {
-                            let _ = tx.send(BgMsg::Settled(run_id.clone()));
-                            break;
-                        }
+            let mut events = events;
+            while let Some(event) = recv_events(Some(&mut events)).await {
+                // One definition of "this ends a run" — sharing it is what
+                // keeps a watcher from sitting on a background job that
+                // never settles if a new terminal kind is added and only
+                // one of the two call sites is updated for it.
+                let terminal = event.kind.is_terminal();
+                let notice = match &event.kind {
+                    EventKind::ApprovalRequested { .. } => {
+                        Some(format!("job {run_id} needs approval - /attach {run_id}"))
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    EventKind::Completed { .. } => Some(format!("job {run_id} completed")),
+                    EventKind::Error { .. } => Some(format!("job {run_id} failed")),
+                    EventKind::Cancelled { .. } => Some(format!("job {run_id} cancelled")),
+                    _ => None,
+                };
+                if let Some(text) = notice {
+                    let _ = tx.send(BgMsg::Notice(Line::notice(text)));
+                }
+                if terminal {
+                    break;
                 }
             }
+            // Sent on the stream ending too, not only on a terminal event:
+            // once the events stop this job cannot be followed any further,
+            // and a count that never comes down is worse than one that
+            // comes down a moment early.
+            let _ = tx.send(BgMsg::Settled(run_id));
         });
     }
 
@@ -688,8 +781,14 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         if let Some(run_id) = self.run_id.take() {
             let _ = self.host.service().cancel(&run_id);
         }
-        for run_id in self.background.drain(..) {
+        for run_id in std::mem::take(&mut self.background) {
             let _ = self.host.service().cancel(&run_id);
+            // §12.3's notice, in every mode: a job that dies with the
+            // process says so, rather than disappearing silently. Piped
+            // mode is where it matters most (EOF skips §10.2's
+            // confirmation entirely), but there is no reason a terminal
+            // user who confirmed the abandonment should be told less.
+            self.emit(Line::notice(format!("job {run_id} cancelled at exit")));
         }
         self.events = None;
         self.handle = None;
@@ -1001,6 +1100,41 @@ mod tests {
         assert!(io.output().contains("  = "), "{}", io.output());
     }
 
+    /// Batch mode must *wait* for the turn it is draining, not busy-wait.
+    ///
+    /// Every `ChatIo` re-signals EOF on each read once input has ended
+    /// (`PipedIo`'s reader thread reports it once and drops the sender, so
+    /// `recv` resolves `None` instantly from then on). With the `read` arm
+    /// left enabled, that arm resolves in zero time on every iteration and
+    /// `drive` spins for the whole length of every in-flight and queued
+    /// turn — measured against the real binary on one turn whose tool call
+    /// was `sleep 3`: 2.34 s of user CPU with stdin closed against 0.03 s
+    /// with it held open, ~78x, scaling with turn length.
+    ///
+    /// The transcript is identical either way, which is exactly why this
+    /// asserts on the *number of reads* instead: the turn below takes
+    /// 200 ms, which a spin turns into tens of thousands of EOF reads.
+    #[tokio::test]
+    async fn batch_mode_waits_out_a_turn_instead_of_spinning_on_an_exhausted_reader() {
+        let (host, _tmp) = FakeHost::with_slow_script();
+        let mut io = ScriptedIo::batch(["something slow"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        assert!(
+            io.output().contains("slow turn done"),
+            "the turn still ran to its answer:\n{}",
+            io.output()
+        );
+        assert!(
+            io.eof_reads() <= 2,
+            "the driver read the exhausted reader {} times while a 200ms \
+             turn ran: it is busy-waiting, not waiting",
+            io.eof_reads()
+        );
+    }
+
     /// Review Focus 1, in the driver: cancel the run, survive, stay usable.
     #[tokio::test]
     async fn an_interrupt_mid_turn_cancels_the_run_and_the_chat_continues() {
@@ -1126,6 +1260,61 @@ mod tests {
         );
     }
 
+    /// `/bg` after `/attach` detaches a run this driver did not start —
+    /// and it must be watched exactly like one it did.
+    ///
+    /// `Controller::on_background` counts the job the moment `/bg` is
+    /// accepted, and the only thing that ever un-counts it is a watcher's
+    /// `BgMsg::Settled`. When `/bg` skipped the watcher for an attached
+    /// run, `live_work()` stayed above zero for the rest of the process
+    /// with nothing running: `/model` and `/approval` refused for ever,
+    /// every `/quit`, `Ctrl-D` and second `Ctrl-C` needing two requests for
+    /// ever. Both halves are asserted here — the job reports in, and the
+    /// single `/quit` afterwards leaves without the live-job warning.
+    #[tokio::test]
+    async fn bg_after_attach_watches_the_job_and_frees_the_live_work_count() {
+        let (host, _tmp) = FakeHost::with_slow_script();
+        let service = host.service();
+        let started = service
+            .start_run_with_options("do the thing", RunOptions::default())
+            .expect("start");
+        let run_id = started.run_id.clone();
+        let mut io = ScriptedIo::new([format!("/attach {run_id}"), "/bg".to_string()]);
+        let chat = tokio::spawn(run(io.handle(), host, Start::fresh()));
+
+        // The script deliberately stops at `/bg`: an interactive
+        // `ScriptedIo` then waits at the prompt exactly like a terminal
+        // would, which is what gives the detached job time to finish and
+        // its watcher time to report. Without a watcher no notice ever
+        // arrives and this is what fails, with its own message, rather
+        // than the test hanging.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let completed = format!("job {run_id} completed");
+        while !io.output().contains(&completed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no watcher ever reported the backgrounded attach:\n{}",
+                io.output()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Typed only now, which a fixed script cannot express: by this
+        // point the job has settled, so one `/quit` must be enough.
+        io.push_line("/quit");
+        let code = tokio::time::timeout(Duration::from_secs(10), chat)
+            .await
+            .expect("the chat exits on one /quit once the job has settled")
+            .expect("the chat task did not panic")
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        assert!(
+            !io.output().contains("still running"),
+            "nothing was running, so nothing may be claimed to be:\n{}",
+            io.output()
+        );
+    }
+
     /// The same rule from the other side: a turn is never started in a
     /// session that already has a live run.
     #[tokio::test]
@@ -1213,10 +1402,11 @@ mod tests {
         // abandon" rule (§10.2) would either warn and then have nothing left
         // to supply the second request, or (with a second `/quit`) cancel
         // the still-live run before it got a chance to finish on its own,
-        // testing a cancellation instead of a natural completion. Batch
-        // mode's EOF is re-signalled on every otherwise-empty read (§12.3),
-        // so `on_drained` keeps getting a chance to notice the attach has
-        // settled and the queued second turn has run, and *then* exit —
+        // testing a cancellation instead of a natural completion. In batch
+        // mode, EOF starts a drain rather than an exit (§12.3) and
+        // `App::settle_ended_input` re-takes that decision every time the
+        // state behind it changes — here, when the attach settles and again
+        // when the queued second turn finishes, and *then* it exits —
         // deterministically, with no race against the run's own timing.
         let mut io = ScriptedIo::batch([format!("/attach {run_id}"), "second turn".to_string()]);
         let code = run(io.handle(), host, Start::fresh())

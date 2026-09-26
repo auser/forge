@@ -58,9 +58,17 @@ struct Shared {
     output: Mutex<String>,
     interactivity: Interactivity,
     reads_done: AtomicUsize,
+    /// Reads that resolved [`ReadOutcome::Eof`] — the count that makes a
+    /// batch-mode busy-wait visible to an assertion. See
+    /// [`ScriptedIo::eof_reads`].
+    eof_reads: AtomicUsize,
     trigger: Mutex<Trigger>,
     fired: AtomicBool,
     notify: Notify,
+    /// Woken by [`ScriptedIo::push_line`], so an interactive read that
+    /// found the queue empty can pick a later-pushed line up instead of
+    /// pending for ever.
+    pushed: Notify,
 }
 
 /// A queue of input lines and a captured output buffer standing in for a
@@ -102,9 +110,11 @@ impl ScriptedIo {
                 output: Mutex::new(String::new()),
                 interactivity,
                 reads_done: AtomicUsize::new(0),
+                eof_reads: AtomicUsize::new(0),
                 trigger: Mutex::new(Trigger::None),
                 fired: AtomicBool::new(false),
                 notify: Notify::new(),
+                pushed: Notify::new(),
             }),
         }
     }
@@ -137,6 +147,35 @@ impl ScriptedIo {
         ScriptedIoHandle(Arc::clone(&self.shared))
     }
 
+    /// Append a line to the queue *after* the chat has started, so a test
+    /// can type in reaction to the transcript rather than only up front.
+    ///
+    /// A fixed script cannot express "and then, once the background job has
+    /// reported in, press Ctrl-D": every scripted line is popped within
+    /// microseconds of the last, long before anything with real timing in
+    /// it has happened. Pushing wakes an interactive read that already
+    /// found the queue empty, so the line is picked up even if the chat got
+    /// there first.
+    pub fn push_line(&mut self, line: impl Into<String>) {
+        self.shared
+            .lines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(line.into());
+        self.shared.pushed.notify_one();
+    }
+
+    /// How many reads resolved [`ReadOutcome::Eof`].
+    ///
+    /// A batch-mode driver that keeps an exhausted reader in its `select!`
+    /// gets EOF back instantly on every iteration and spins for the whole
+    /// length of the turn; this is how a test asserts that it does not,
+    /// without measuring CPU. The transcript is identical either way, so
+    /// nothing else here can catch that regression.
+    pub fn eof_reads(&self) -> usize {
+        self.shared.eof_reads.load(Ordering::SeqCst)
+    }
+
     /// The transcript captured so far.
     pub fn output(&self) -> String {
         self.shared
@@ -153,6 +192,31 @@ impl ScriptedIo {
 pub struct ScriptedIoHandle(Arc<Shared>);
 
 impl ScriptedIoHandle {
+    fn pop_line(&self) -> Option<String> {
+        self.0
+            .lines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
+
+    /// One accepted line's bookkeeping, shared by the queued and the
+    /// pushed path so a [`Trigger::AfterFirstPrompt`] cannot depend on
+    /// which of the two delivered the first line.
+    fn on_line_read(&self, line: String) -> ReadOutcome {
+        let n = self.0.reads_done.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == 1 {
+            let armed = matches!(
+                &*self.0.trigger.lock().unwrap_or_else(|e| e.into_inner()),
+                Trigger::AfterFirstPrompt
+            );
+            if armed {
+                self.fire();
+            }
+        }
+        ReadOutcome::Line(line)
+    }
+
     fn record(&self, text: &str) {
         {
             let mut output = self.0.output.lock().unwrap_or_else(|e| e.into_inner());
@@ -197,32 +261,20 @@ impl ChatIo for ScriptedIoHandle {
         // chance to run at all (see app.rs's module doc for why the main
         // loop needs the same courtesy on the way out).
         tokio::task::yield_now().await;
-        let line = self
-            .0
-            .lines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front();
-        match line {
-            Some(line) => {
-                let n = self.0.reads_done.fetch_add(1, Ordering::SeqCst) + 1;
-                if n == 1 {
-                    let armed = matches!(
-                        &*self.0.trigger.lock().unwrap_or_else(|e| e.into_inner()),
-                        Trigger::AfterFirstPrompt
-                    );
-                    if armed {
-                        self.fire();
-                    }
-                }
-                ReadOutcome::Line(line)
+        loop {
+            if let Some(line) = self.pop_line() {
+                return self.on_line_read(line);
             }
-            None => match self.0.interactivity {
-                Interactivity::Batch => ReadOutcome::Eof,
-                // A real prompt with nothing typed yet: waits forever,
-                // exactly like `Notify` below.
-                Interactivity::Interactive => std::future::pending().await,
-            },
+            match self.0.interactivity {
+                Interactivity::Batch => {
+                    self.0.eof_reads.fetch_add(1, Ordering::SeqCst);
+                    return ReadOutcome::Eof;
+                }
+                // A real prompt with nothing typed yet: waits until
+                // something is typed, which for a test is
+                // [`ScriptedIo::push_line`] and otherwise is never.
+                Interactivity::Interactive => self.0.pushed.notified().await,
+            }
         }
     }
 
