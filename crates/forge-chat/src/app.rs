@@ -230,8 +230,30 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             let prompt = self.prompt();
             tokio::select! {
                 biased;
-                Some(event) = recv_events(self.events.as_mut()), if self.events.is_some() => {
-                    self.apply_event(event);
+                event = recv_events(self.events.as_mut()), if self.events.is_some() => {
+                    match event {
+                        Some(event) => self.apply_event(event),
+                        // The stream ended on its own with no `JoinHandle`
+                        // to tell us so — reached only via `/attach`, since
+                        // an owned run's authoritative settlement is the
+                        // `handle` arm above instead, and that arm alone
+                        // clears `self.events` for that case. Without this,
+                        // `self.events` (and the controller's `attached`)
+                        // would stay set forever once a followed run
+                        // finished, and the chat would never accept another
+                        // turn again (Review Focus 4).
+                        None if self.handle.is_none() => self.settle_attached_run().await,
+                        // An owned run's channel closing early (a `Closed`
+                        // broadcast receiver resolves `None` on *every*
+                        // subsequent poll, not just once) — clear `events`
+                        // so this arm's guard goes false and stops winning
+                        // this `biased` race on every iteration; without
+                        // that, the still-pending `handle` arm below would
+                        // never get polled again at all, an instant, silent,
+                        // CPU-bound spin rather than a visible hang. Its
+                        // resolution remains the authoritative settlement.
+                        None => self.events = None,
+                    }
                 }
                 joined = join_handle(self.handle.as_mut()), if self.handle.is_some() => {
                     self.on_joined(joined).await;
@@ -250,7 +272,6 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 self.io.shutdown();
                 return Ok(code);
             }
-            self.refresh_completions();
             // Give a just-spawned or just-unblocked run task a turn before
             // asking `io` for the next line again — see the module doc.
             tokio::task::yield_now().await;
@@ -279,6 +300,16 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         }
     }
 
+    /// Rebuild the Tab-completion snapshot: discovered skills, user-visible
+    /// models, and — the two calls that matter here — `list_runs()` and
+    /// `sessions().list_sessions()`, both synchronous filesystem reads, the
+    /// former re-reading and re-parsing every session's whole JSONL log.
+    /// Called once at startup and once after each *submitted line*
+    /// (`on_read`'s `Line` arm), not on every loop iteration: completions
+    /// are only ever read back out when a `Prompt` is built for the next
+    /// `io.read`, so refreshing on every event a running turn emits would
+    /// be doing this filesystem work, scaling with session count and log
+    /// size, once per event instead of once per prompt.
     fn refresh_completions(&mut self) {
         let skills = self.host.skills().into_iter().map(|s| s.name).collect();
         let models = self.host.models().into_iter().map(|m| m.name).collect();
@@ -311,6 +342,10 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             ReadOutcome::Line(line) => {
                 let actions = self.controller.on_line(&line);
                 self.execute(actions).await;
+                // Refresh here, not in the main loop, and not for every
+                // event a running turn emits — see `refresh_completions`'s
+                // doc for why that would be the wrong frequency.
+                self.refresh_completions();
             }
             ReadOutcome::Interrupt => self.handle_signal(Signal::Interrupt).await,
             ReadOutcome::Eof => self.handle_signal(Signal::Eof).await,
@@ -450,6 +485,25 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         }
     }
 
+    /// A followed run (`/attach`) finished, or stopped being followable, on
+    /// its own — no `JoinHandle` involved, so `finish_run` is not the path
+    /// here. Same tail as `finish_run`: footer, clear state, tell the
+    /// controller, run whatever was queued. There is no `RunOutcome` to
+    /// fall back to (this driver never started the run), but that is fine —
+    /// whatever text the run had, this driver already rendered live, event
+    /// by event, while attached.
+    async fn settle_attached_run(&mut self) {
+        if let Some(transcript) = self.transcript.take() {
+            self.emit(transcript.footer());
+        }
+        self.run_id = None;
+        self.events = None;
+        self.controller.on_run_settled();
+        if let Some(next) = self.controller.take_queued() {
+            self.start_turn(next).await;
+        }
+    }
+
     /// A transcript line: `notify` while a turn is attached (it may land
     /// while a prompt is up), `write` between turns. Both take the same
     /// [`Line`], so the transcript is identical either way (§6.2).
@@ -470,7 +524,15 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Action::Approve(approved) => {
                     if let Some(run_id) = self.run_id.clone() {
                         let message = if approved { "y" } else { "n" };
-                        let _ = self.host.service().send_input(&run_id, message);
+                        // Unlike `CancelRun`/`CancelAllJobs`, a failure here
+                        // is not something the process is leaving anyway or
+                        // already-recorded elsewhere: if the run settled in
+                        // the narrow window before the answer arrived, the
+                        // user's approve/deny would otherwise vanish with
+                        // no feedback at all.
+                        if let Err(e) = self.host.service().send_input(&run_id, message) {
+                            self.emit(Line::bad(format!("error: {e}")));
+                        }
                     }
                 }
                 Action::CancelRun => {
@@ -588,12 +650,12 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        let terminal = matches!(
-                            event.kind,
-                            EventKind::Completed { .. }
-                                | EventKind::Error { .. }
-                                | EventKind::Cancelled { .. }
-                        );
+                        // One definition of "this ends a run" — sharing it
+                        // is what keeps a watcher for a job in a background
+                        // job that never settles if a new terminal kind is
+                        // added and only one of the two call sites is
+                        // updated for it.
+                        let terminal = event.kind.is_terminal();
                         let notice = match &event.kind {
                             EventKind::ApprovalRequested { .. } => {
                                 Some(format!("job {run_id} needs approval - /attach {run_id}"))
@@ -1124,6 +1186,62 @@ mod tests {
         assert!(
             out.contains("the first answer"),
             "history is re-rendered:\n{out}"
+        );
+    }
+
+    /// Review Focus 4: `/attach` follows a run that finishes on its own —
+    /// no `Ctrl-C`, no `/bg`, nothing the driver did. Without
+    /// `App::settle_attached_run`, `self.events` (and the controller's
+    /// `attached`) would stay set forever once the followed run's stream
+    /// closed, and every turn typed afterwards would queue behind a run
+    /// that will never report as finished. The run is started directly
+    /// through the service, bypassing the chat, so it is genuinely live
+    /// when `/attach` reaches it and finishes while this driver is
+    /// streaming it — not already terminal by the time `/attach` runs.
+    #[tokio::test]
+    async fn an_attached_run_that_finishes_on_its_own_frees_the_chat_to_keep_going() {
+        let (host, _tmp) = FakeHost::with_slow_script();
+        let service = host.service();
+        let started = service
+            .start_run_with_options("do the thing", RunOptions::default())
+            .expect("start");
+        let run_id = started.run_id.clone();
+        // Batch mode, deliberately, rather than typing `/quit` after: a
+        // fixed script's lines are all read within microseconds of each
+        // other, real turns take real time, so a scripted `/quit` cannot be
+        // relied on to land after the attach settles — the "ask once, then
+        // abandon" rule (§10.2) would either warn and then have nothing left
+        // to supply the second request, or (with a second `/quit`) cancel
+        // the still-live run before it got a chance to finish on its own,
+        // testing a cancellation instead of a natural completion. Batch
+        // mode's EOF is re-signalled on every otherwise-empty read (§12.3),
+        // so `on_drained` keeps getting a chance to notice the attach has
+        // settled and the queued second turn has run, and *then* exit —
+        // deterministically, with no race against the run's own timing.
+        let mut io = ScriptedIo::batch([format!("/attach {run_id}"), "second turn".to_string()]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0, "the chat must not hang once the attach settles");
+        let out = io.output();
+        assert!(
+            out.contains("slow turn done"),
+            "the attached run's own answer streamed live:\n{out}"
+        );
+        assert!(
+            out.matches("  = ").count() >= 2,
+            "the queued second turn ran to its own footer too, proving the \
+             chat kept accepting input once the attach settled:\n{out}"
+        );
+        let runs = service.list_runs().expect("list runs");
+        let attached_run = runs
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .expect("the attached run is still listed");
+        assert_eq!(
+            attached_run.state.as_str(),
+            "completed",
+            "the run finished on its own, not via a forced cancellation: {attached_run:?}"
         );
     }
 }
