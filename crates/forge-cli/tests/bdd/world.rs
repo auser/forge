@@ -5,7 +5,35 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Wait until `buf` stops growing for `settle`, or give up after an overall
+/// bound — used by [`BddWorld::run_forge_with_stdin`] to pace piped lines
+/// like a person watching the transcript rather than firing them all before
+/// the chat's own async work has a chance to run. Never panics on timeout:
+/// a stall here just means the caller writes the next line anyway, and
+/// whatever that produces (or fails to) is caught by the bounded exit wait
+/// that follows, not by this helper.
+async fn wait_for_quiescence(buf: &Arc<Mutex<String>>, settle: Duration) {
+    const OVERALL_BOUND: Duration = Duration::from_secs(15);
+    let deadline = Instant::now() + OVERALL_BOUND;
+    let mut last_len = buf.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let mut last_change = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let len = buf.lock().unwrap_or_else(|e| e.into_inner()).len();
+        if len != last_len {
+            last_len = len;
+            last_change = Instant::now();
+        } else if last_change.elapsed() >= settle {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+    }
+}
 
 pub const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_MODEL",
@@ -179,6 +207,118 @@ impl BddWorld {
         self.last_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         self.last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         self.last_code = output.status.code();
+    }
+
+    /// Like [`Self::run_forge`] (same scrub, same hermetic HOME/XDG, same
+    /// `FORGE_TEST_MOCKS`), but for the interactive chat: stdin is a pipe
+    /// fed one line per element of `lines`, then closed (EOF), which ends
+    /// the chat the same way a piped `forge chat` ends in production
+    /// (§12.3's `Interactivity::Batch`).
+    ///
+    /// Lines are *not* all written the instant the child spawns. `app.rs`'s
+    /// main loop keeps one `io.read` outstanding even while a turn is
+    /// attached (so `/bg` and an interrupt stay reachable mid-turn), and a
+    /// command that shares a session with a live run — `/fork`, `/session
+    /// new`, `/session <id>` (design §11) — is refused rather than queued
+    /// while that run is still attached. Handing the whole script to the
+    /// pipe up front races that refusal for real: a manual repro of exactly
+    /// this scenario (`first` / `/fork` / `second` with no pacing) landed
+    /// `/fork` on "a turn is still running" every time, because the bytes
+    /// were already sitting in the kernel pipe buffer before the first
+    /// turn's own async work had a chance to settle — a plain *prompt*
+    /// typed the same way is fine (§6.5's FIFO queue takes it regardless of
+    /// timing), but a session-move command is not. So this waits for the
+    /// transcript to go quiet — [`wait_for_quiescence`] — before writing
+    /// each line after the first, the same way a real person would only
+    /// type `/fork` once they can see the previous turn's answer on
+    /// screen. Bounded, not indefinite: a stall just means the next line is
+    /// written anyway, and the final exit wait below is what actually
+    /// catches a chat that never comes back.
+    ///
+    /// Stdout/stderr are drained on a background task concurrently with the
+    /// stdin writes (never sequentially after them, and never blocking the
+    /// writer): both the quiescence wait above and the classic
+    /// piped-process deadlock need the reader running the whole time, not
+    /// started only once every line has already been sent.
+    pub async fn run_forge_with_stdin(&mut self, args: &[&str], lines: &[&str]) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        self.flush_config();
+        let root = self.project();
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&xdg).expect("xdg");
+
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_forge"));
+        cmd.arg("--project")
+            .arg(&root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for var in FORGE_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("NO_COLOR", "1")
+            .env("FORGE_NEEDLE_AUTOFETCH", "false")
+            .env("FORGE_TEST_MOCKS", "1");
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+
+        let mut child = cmd.spawn().expect("spawn forge chat");
+        let mut stdin = child.stdin.take().expect("chat stdin");
+        let stdout = child.stdout.take().expect("chat stdout");
+        let mut stderr = child.stderr.take().expect("chat stderr");
+
+        let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stdout_writer = std::sync::Arc::clone(&stdout_buf);
+        let stdout_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => stdout_writer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_str(&line),
+                }
+            }
+        });
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            buf
+        });
+
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                wait_for_quiescence(&stdout_buf, Duration::from_millis(200)).await;
+            }
+            stdin
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write chat line");
+        }
+        drop(stdin); // EOF right after the last line; nothing else to say
+
+        let timeout = Duration::from_secs(30);
+        let status = tokio::time::timeout(timeout, child.wait())
+            .await
+            .unwrap_or_else(|_| panic!("forge chat did not exit within {timeout:?}"))
+            .expect("forge chat exits");
+        stdout_task.await.expect("stdout reader task");
+        let stderr_bytes = stderr_task.await.expect("stderr reader task");
+
+        self.last_stdout = stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        self.last_stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        self.last_code = status.code();
     }
 
     /// Spawn `forge serve` on a free loopback port and wait for /health.

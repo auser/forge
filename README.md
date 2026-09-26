@@ -100,11 +100,12 @@ and "remote".
 
 ## Where it runs
 
-One shared runtime, four front ends: the `forge` CLI, a REST/SSE server
-(`forge serve`), an MCP tool server (`forge mcp` — Claude Code, VS Code,
-Cursor), and a native in-editor agent over the Agent Client Protocol
-(`forge acp` — Zed). Same routing, same approval policy, same session log,
-whichever one you use.
+One shared runtime, five front ends: the `forge` CLI, an interactive
+terminal chat (`forge chat`, and what bare `forge` runs — see [Interactive
+chat](#interactive-chat)), a REST/SSE server (`forge serve`), an MCP tool
+server (`forge mcp` — Claude Code, VS Code, Cursor), and a native in-editor
+agent over the Agent Client Protocol (`forge acp` — Zed). Same routing, same
+approval policy, same session log, whichever one you use.
 
 ## Where to read more
 
@@ -418,11 +419,217 @@ curl -s -X POST http://127.0.0.1:7341/v1/runs/<run-id>/input \
   -H 'content-type: application/json' -d '{"input": "y"}'   # approve a pause
 ```
 
+## Interactive chat
+
+`forge` with no subcommand — and `forge chat` explicitly — opens a
+conversation: one session across turns, slash commands, inline approvals,
+and forking, over the same `AgentService` every other front end uses.
+
+```bash
+forge                              # fresh session, interactive
+forge chat                         # the same thing, spelled out
+forge chat "fix the build"         # fresh session, first turn pre-filled
+forge chat --continue              # the project's most recently active session
+forge chat --session <id>          # a named session
+```
+
+The banner, once, on entry:
+
+```text
+forge  ~/code/myproject
+model qwen3-coder  router needle  approval prompt  brain active
+session 01JCF3...  /help for commands
+```
+
+### Slash commands
+
+```text
+/help       every command, then the discovered skills
+/model      list models, or /model <name> to switch
+/approval   show the approval policy, or /approval <mode>
+/config     effective settings, or /config <key> for one
+/skills     discovered skills, name and description
+/graph      rank project files for a query
+/session    this session, or new, or /session <id>
+/fork       fork this conversation, optionally --at <pos>
+/bg         detach the running turn and keep talking
+/jobs       runs and their states
+/attach     follow a run again by id
+/quit       leave (Ctrl-D does the same)
+/exit       leave (Ctrl-D does the same)
+```
+
+Typing a skill's name as a slash command (e.g. `/demo`) activates it the
+same way a matching plain prompt would — `/name` invocation still relies on
+`SkillRegistry::match_task`'s lexical word/substring matching, not a needle
+decision (see [Known limitations](#known-limitations-v03)). `/model`,
+`/approval` and `/graph` never offer a test-only mock as a choice, but the
+entry banner and `/model`/`/config`/`/approval` report the *active* model
+honestly even when it is one — hiding that would be a lie about what is
+running.
+
+### Keybindings, and the complete Ctrl-C rule
+
+A read is outstanding almost all the time, including while a turn is
+running — that is what makes `/bg`, `/jobs` and `/attach` reachable at all.
+The first matching row wins:
+
+| state | `Ctrl-C` does | exits? |
+| --- | --- | --- |
+| input line non-empty, in any state | clears the input line; the chat never sees it | no |
+| empty line, turn running | cancels the turn, prints `  ! cancelled`, returns to the prompt | no |
+| empty line, turn running, approval pending | cancels the turn; the pending operation is **not** run, prints `the operation was not run` | no |
+| empty line, idle | prints `(press Ctrl-C again, or Ctrl-D, or /quit, to exit)` | no |
+| empty line, idle, within 2s of the previous one | requests an exit (asks once first if a job is still live) | yes, code 130 |
+
+Submitting any line — even an empty one that just gets ignored — disarms
+the double-`Ctrl-C` exit, so "clear a line, then interrupt once" can never
+quit by accident.
+
+`Ctrl-D` on an empty line requests an exit (code 0) in every state, the
+same turn-running-too included. `/quit` and `/exit` do the same. Exiting is
+one action however it was requested: the first request prints a warning if
+a background job is still live, the next one abandons it and leaves. A
+failed turn never ends the chat — a bad model endpoint, a denied approval,
+an unreadable session log print a `  ! error:` line and return to the
+prompt.
+
+The rest are `rustyline` defaults: `Tab` completes a slash command, a skill
+name, or a `/attach` job id; `Up`/`Down`/`Ctrl-R` recall history;
+`Ctrl-A/E/K/U/W`, `Alt-B/F` are the usual emacs-style editing; `Ctrl-L`
+clears the screen only (the transcript is still in scrollback, the
+conversation untouched); `Enter` submits unless the line looks unfinished
+(an odd number of ` ``` ` fences, or a trailing backslash), in which case it
+inserts a newline instead.
+
+**Real-terminal verification, honestly scoped.** A real PTY-backed test
+(`forge-cli/tests/chat.rs`) proves a typed `Ctrl-C` reaches the chat and
+that the process survives it — but only on Unix, since it drives an actual
+pseudo-terminal via `libc`. `SIGINT` mid-turn in piped mode (no terminal at
+all) has the same real-process test on every platform, but the fix behind
+it — one persistent signal listener raced inside `read()` itself, instead
+of a fresh one-shot check that can silently miss a signal delivered while
+nothing is listening — is `#[cfg(unix)]`-only in `PipedIo`. On Windows,
+`interrupted()` falls back to a fresh `tokio::signal::ctrl_c()` per check,
+which is the same unreliable shape the Unix fix replaced: that bug is still
+live there.
+
+### Approvals, inline
+
+Under `approval = "prompt"` (the default), a risky tool call stops and asks
+as a transcript line, answered at the same prompt that is already up — no
+swapped prompt, no separate reader on stdin:
+
+```text
+  * write_file notes.txt
+  ! approval needed: write notes.txt (risky) - y to approve, anything else denies
+> y
+    -> approved
+    -> ok (3 ms)
+```
+
+`y`/`yes` approves; anything else, including an empty line, denies. A slash
+command typed while an approval is pending is acted on and the approval
+stays pending (`/jobs` cannot accidentally deny a write); only a non-command
+line answers it. This is the same parked mechanism `forge mcp` and
+`forge acp` use because their stdin is a protocol channel — the chat uses
+it too, for a different reason: stdin here is the line editor's, and a
+second reader on the same file descriptor (the old `is_terminal()`-inferred
+inline prompt) would race it. So every stdin-owning front end now takes an
+explicit `ApprovalChannel::Parked` rather than inferring the channel from
+whether stdin happens to be a TTY.
+
+### Background jobs, forking, piped input
+
+```text
+> refactor the parser
+  - routing: needle -> qwen3-coder (conf 0.88)
+  * read_file src/parser.rs
+    -> ok (4 ms)
+/bg
+  - detached run 01JCF4... - /jobs to list, /attach 01JCF4... to follow
+  - this conversation continues in fork 01JCFB... (the job keeps writing to 01JCF3...)
+>
+```
+
+`/bg` detaches the *view*, not the work — the turn is a tokio task in
+**this** process, and forking the conversation for the foreground (rather
+than leaving both continuations in one session) is what keeps two runs
+from ever writing interleaved history into the same log. **Background is
+this process only: closing the terminal, or exiting the chat, ends every
+detached run with it.** There is no daemon and no socket, so a run another
+`forge` process started shows its recorded history through `/attach` but
+cannot be attached to live, and a parked background approval can only be
+answered by attaching to it — nothing offers `/approve <run-id>` sight
+unseen. `/jobs` lists every live run plus the 20 most recent finished ones.
+
+`/fork` forks the current session and **continues in the fork**, leaving
+the source untouched:
+
+```text
+> /fork
+  - forked to session 01JCF9... (42 events copied)
+  - this conversation continues in the fork; 01JCF3... is untouched
+>
+```
+
+Piped stdin works the way `forge run` already does: a line arriving while
+no run is parked is a prompt or a command, a line arriving while a run is
+parked on approval is the answer, and EOF means "no more input" — the
+in-flight turn finishes, every queued prompt runs in order, then the chat
+exits 0. `forge chat < script.txt` and `printf 'first\nsecond\n' | forge`
+both run every line, in one session, in order; each line is echoed with a
+`> ` gutter so the captured stdout reads as a transcript.
+
+Colour follows the same rule as everywhere else in forge: on iff stdout is
+a TTY, `NO_COLOR` is unset, `--no-color` was not passed, and `TERM` is
+neither unset nor `dumb`. On `TERM=dumb`, `rustyline` reports the terminal
+unsupported and falls back to a plain line read — editing, history recall
+and Tab completion are unavailable, everything else works, and the banner
+says so once.
+
+`forge --json` (bare) and `forge chat --json` refuse rather than pretend:
+`--json` promises stdout is one machine-readable value, which a
+conversation cannot honour. Use `forge run --json` instead.
+
+### Known chat-specific limitations
+
+Three are real gaps, not yet fixed, and worth knowing before you rely on
+the behaviour they touch:
+
+- **`/graph` in the chat cannot use semantic search.** `ChatHost::graph_context`
+  is a *synchronous* trait method, and embedding a query is inherently
+  async, so the needle-embedded semantic blend that `forge graph context`/
+  `graph grep --semantic` can use outside the chat is unreachable from
+  here — even with a working needle engine and a built index, `/graph`
+  is always the plain lexical ranking.
+- **A background notice can land mid-line.** `notify()` no longer
+  coordinates with an in-progress prompt: an out-of-band line (a
+  `/bg` job finishing, an approval another job needs) prints wherever
+  the cursor happens to be rather than being drawn cleanly above the
+  prompt. This is a deliberate trade, not an oversight: `rustyline`
+  18.0.1's `select()` is missing a buffer-check its sibling `poll()` has,
+  so keeping the `ExternalPrinter` that would coordinate the two meant
+  *any* multi-byte burst arriving at once — a paste, fast type-ahead, a
+  line typed right after Ctrl-C — permanently wedged the editor thread.
+  Interleaved output was judged the smaller cost.
+- **A line typed during a turn can, rarely, be lost.** `TerminalIo::read`
+  is not cancel-safe the way `App::drive`'s `select!` needs once a single
+  turn emits several events (a routing line, the answer, and a footer are
+  three, for one turn) — see the `Job` doc in `terminal_io.rs` for the
+  exact mechanism. Reproduced against a real pty; not yet fixed.
+
+Beyond those three, see [Known limitations](#known-limitations-v03) for the
+ones shared with the rest of forge (no token-by-token streaming, background
+runs not surviving the process, lexical-only skill matching, no path
+completion).
+
 ## Command line
 
 ```text
 forge init                          Initialize a project (idempotent)
 forge run [--max-turns N] <prompt>  Run the multi-turn agent loop
+forge chat [--continue|--session]   Open the interactive chat (also: bare forge)
 forge serve [--host --port]         Start the REST/SSE server
 forge mcp                           Serve MCP over stdio (editors, agents)
 forge acp                           Serve ACP over stdio (forge as the agent
@@ -797,7 +1004,11 @@ described, while a front end that owns stdin itself takes the *parked* channel,
 where a risky operation always returns an `approval required` pause and is
 answered through the run's input channel — so nothing ever reads stdin behind
 the protocol's or the line editor's back. `forge mcp` and `forge acp` get that
-same pause today because their stdin is the protocol rather than a terminal.
+same pause today because their stdin is the protocol rather than a terminal;
+`forge chat` builds its runtime with the parked channel explicitly for the
+same reason, even on a real terminal, since there stdin belongs to the line
+editor and a second, inferred reader on the same file descriptor would race
+it (see [Interactive chat](#interactive-chat)).
 `auto` runs, `deny` blocks. The test-only `mock`
 *execution* provider records requests
 for tests. MVM/container/remote executors plug into the same trait later.
@@ -1419,7 +1630,7 @@ go in `specs/adrs/`.
   wiremock; server covered with tower oneshot + a real ephemeral-port roundtrip).
 - BDD: `just bdd` runs cucumber against `tests/features/` using the compiled
   `forge` binary in hermetic temp dirs (isolated `HOME`/`XDG_CONFIG_HOME`), with
-  mock providers — fully offline. Currently 25 features / 49 scenarios / 193 steps.
+  mock providers — fully offline. Currently 26 features / 54 scenarios / 215 steps.
 - Mocks are **test-only**. `model = "mock-local"`, `model = "scripted-mock"`,
   `router = "mock"` and `execution = "mock"` are all refused by configuration
   unless `FORGE_TEST_MOCKS=1` is
@@ -1524,6 +1735,18 @@ go in `specs/adrs/`.
   pre-embedded, task-embedding-ranked selection the design describes —
   both are deferred to the same follow-up as the semantic-blend sharing
   above.
+- **Interactive chat** (see [Interactive chat](#interactive-chat) for the
+  three real gaps behind `/graph`, `notify()` and `TerminalIo::read`) shares
+  the rest of the harness's known limits rather than adding new ones: no
+  token-by-token streaming (the loop returns a finished answer, exactly like
+  `forge acp`); a `/bg`-detached job does not survive the process and
+  another `forge` process can only see its recorded history, never attach
+  to it live (the same in-process-only limit `forge serve`/`forge mcp`/
+  `forge acp` already have); a skill named as a slash command
+  (`/demo`) activates through the same lexical `SkillRegistry::match_task`
+  as a plain prompt, not a needle decision; and there is no path completion
+  — `Tab` completes commands, skill names and `/attach` job ids, nothing
+  filesystem-shaped.
 
 ## Contributing
 

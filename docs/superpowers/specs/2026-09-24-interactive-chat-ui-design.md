@@ -1167,3 +1167,83 @@ Deliberately out of scope, each with the reason and the shape of the fix:
   something the user did not literally ask for. It is justified as UX (two
   continuations of one past need two sessions) plus defence in depth; the
   concurrency invariant itself is the runtime's to enforce, not the UI's.
+
+## 16. Amendment (implemented 2026-09-25)
+
+Recorded after all eleven tasks landed and `just verify` passed, per §15's
+own contract that no "later" go unrecorded.
+
+**§2.2's measured dependency count landed exactly as predicted.** Diffing
+`Cargo.lock` immediately before and after `rustyline` was added
+(`git show b164b37~1:Cargo.lock` vs `git show b164b37:Cargo.lock`, `comm
+-13` on the sorted `name = "..."` lines) shows exactly the 8 packages §2.2's
+table predicted: `rustyline`, `nix`, `unicode-segmentation`, `radix_trie`,
+`nibble_vec`, `endian-type`, and the two Windows-only clipboard crates
+(`clipboard-win`, `error-code`). No surprise transitive growth.
+
+**One §14 follow-up moved before this design shipped, not after.** The
+per-session concurrency guard and replay's group-by-`run_id` fix — §14
+explicitly filed as "landing separately, not part of this sub-project," and
+§10.1.1 as the invariant `/bg`'s fork relies on rather than upholds itself —
+landed in `ba31374` ("replay groups by run, and a session refuses a second
+concurrent run") on 2026-09-24, an ancestor of every commit in this
+sub-project's history. So by the time `/bg` shipped, `ForgeError::SessionBusy`
+was already real, not merely assumed; the design's own defence-in-depth
+argument for forking regardless (§10.1.1's second bullet) is what made that
+timing not load-bearing either way. Every other §14 item (token streaming,
+cross-process background runs, explicit skill activation, path completion,
+on-demand `tool_result` rendering, editing config from the chat, `/doctor`,
+non-text input) remains exactly as scoped — none of them shipped, and the
+README's Known limitations say so.
+
+**One real-terminal finding changed §6.2's own mechanism, not just its
+proof.** §6.2 specifies `ChatIo::notify` uses rustyline's
+`ExternalPrinter` while a prompt is up, falling back to plain stdout only
+on a dumb/unsupported terminal (§12.2). Testing against a real pty
+(`forge-cli/tests/chat.rs`) found that keeping an `ExternalPrinter` alive
+routes *every* keystroke's wait through `rustyline` 18.0.1's
+`PosixRawReader::select`, whose sibling `poll` guards its blocking read with
+a buffer-length check that `select` is missing — so any multi-byte burst in
+one kernel read (a paste, fast type-ahead, or a line typed right after
+Ctrl-C) permanently wedges the editor thread on a byte the OS has already
+delivered and will never redeliver. `TerminalIo::editor_thread_main` no
+longer calls `create_external_printer` at all: `notify()` now always uses
+the plain-stdout path §12.2 described as the dumb-terminal fallback, on
+every terminal. The tradeoff is real and shipped deliberately (interleaved
+output instead of a hang) rather than vendoring a three-line patch to a
+third-party crate — see the module doc in `terminal_io.rs` and the README's
+[Interactive chat](../../../README.md#interactive-chat) section for the
+user-facing statement of it.
+
+**One cancel-safety gap surfaced by the same real-terminal testing is
+still open.** §6.5 promises "forge never discards what you typed," argued
+from rustyline's `TCSADRAIN` behaviour alone. A real pty test found a
+second, independent hazard the design did not anticipate: `App::drive`'s
+`select!` reconstructs `io.read()` fresh every loop iteration and drops
+whichever branch does not win, which is safe for `PipedIo` (a receive-only
+channel) but not for `TerminalIo::read`, whose first poll *sends* a
+`Job::Read` to the editor thread before awaiting the reply — a send that
+cannot be un-sent by dropping the future that issued it. A turn that emits
+several events (routing line, answer, footer — three, for one turn) can
+therefore abandon several `Job::Read`s in a row, and the editor thread has
+no way to tell an abandoned job from a live one: it answers whichever it
+dequeues next, leaving the caller that is genuinely still waiting stuck on
+a receiver that will now never fire. Documented as a known, not-yet-fixed
+gap in `terminal_io.rs`'s `Job` doc and in the README's Known limitations,
+rather than closed here — the right fix (a persistent loop reading the
+*latest* prompt off a `watch` channel, mirroring `PipedIo`'s persistent
+producer thread) is real, separate work.
+
+**`--json`'s refusal message differs in wording from §12.4's, not in
+effect.** §12.4 quotes `--json is not supported by the interactive chat;
+use forge run --json, or forge serve for a machine-readable stream`. The
+shipped message (`chat_cmd.rs`) is `--json is not supported by the
+interactive chat; use \`forge run --json\` for machine-readable output` —
+the same refusal, one fewer alternative named. Not corrected here to avoid
+touching a message an existing test may already match verbatim; worth a
+one-line fix next time that file is open for another reason.
+
+**Verified, not merely re-asserted, before this amendment was written**:
+`cargo test -p forge-cli --test bdd` (26 features / 54 scenarios / 215
+steps, including the four new `chat.feature` scenarios) and `just verify`
+both green — see `task-11-report.md` for the exact commands and output.

@@ -513,7 +513,11 @@ fn sigint_cancels_the_turn_without_killing_the_chat() {
     writeln!(stdin, "/quit").expect("the chat must still be listening");
     drop(stdin);
 
-    let status = child.wait().expect("wait");
+    // Bounded (`wait_for_exit`, not a plain `child.wait()`): this site runs
+    // only after the cancellation marker above is already observed, so it
+    // is lower risk than the other two call sites in this file, but a
+    // regression here should fail the suite rather than hang it too.
+    let status = wait_for_exit(&mut child, Duration::from_secs(10));
     stdout_thread.join().expect("stdout reader thread");
     stderr_thread.join().expect("stderr reader thread");
     let stdout = stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
