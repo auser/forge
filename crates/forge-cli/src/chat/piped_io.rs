@@ -36,10 +36,12 @@
 //!
 //! The fix: read stdin on one dedicated `std::thread` for the whole chat,
 //! pushed into a channel `read()` merely receives from.
-//! `mpsc::UnboundedReceiver::recv` is documented cancel-safe — dropped
-//! mid-`select!`, no message is lost; it is simply still there for the
-//! next `recv().await`. The underlying blocking read only ever happens on
-//! the dedicated thread, never inside a future `select!` can drop.
+//! `mpsc::Receiver::recv` is documented cancel-safe regardless of the
+//! channel's bound — dropped mid-`select!`, no message is lost; it is
+//! simply still there for the next `recv().await`. The underlying
+//! blocking read only ever happens on the dedicated thread, never inside a
+//! future `select!` can drop. (The channel itself is bounded at 1, for a
+//! separate reason — see `PipedIo::new`.)
 //!
 //! # `SIGINT` mid-turn: why it is handled inside `read`, not `interrupted`
 //!
@@ -122,7 +124,7 @@ use super::palette::Palette;
 /// both of those are load-bearing, not incidental).
 pub struct PipedIo {
     palette: Palette,
-    lines: mpsc::UnboundedReceiver<ReadOutcome>,
+    lines: mpsc::Receiver<ReadOutcome>,
     /// One persistent `SIGINT` listener for this `PipedIo`'s whole life —
     /// see the module doc for why a fresh one per check silently drops
     /// signals that arrive while nothing is registered.
@@ -132,17 +134,18 @@ pub struct PipedIo {
 
 impl PipedIo {
     pub fn new(palette: Palette) -> Result<Self, ForgeError> {
-        // Unbounded, but not actually unbounded in practice: the producer
-        // thread below blocks inside `read_one_line` (a synchronous,
-        // line-buffered stdin read) between every `send`, so it can never
-        // race ahead and pile up more than the one line it just read
-        // while waiting for `read()` to drain the previous one. What makes
-        // `recv` cancel-safe to drop mid-`select!` (the module doc above)
-        // is a property of the channel type regardless of bound; the
-        // choice of `unbounded` over `channel(1)` here is just this
-        // natural one-line-at-a-time backpressure, not a claim that
-        // arbitrarily much stdin can queue up unread.
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Bounded at 1, deliberately: `read_one_line` blocks on physical
+        // data being available from the kernel, not on whether `read()`
+        // has drained the previous message, so `forge chat < script.txt`
+        // (this type's own primary use case, module doc) can have every
+        // line already sitting in the pipe buffer and ready to return
+        // instantly, call after call. An unbounded channel would let this
+        // thread race arbitrarily far ahead of `read()`. `blocking_send`
+        // (this is a plain `std::thread`, not an async task) is the
+        // backpressure: once the one slot is full, this thread parks
+        // until `read()` takes it, and the kernel pipe buffer — not this
+        // channel — absorbs whatever the writer sends beyond that.
+        let (tx, rx) = mpsc::channel(1);
         std::thread::spawn(move || {
             loop {
                 let outcome = read_one_line();
@@ -154,7 +157,7 @@ impl PipedIo {
                 // empty read"), with no thread left spinning on a stream
                 // that will never produce anything else.
                 let done = !matches!(outcome, ReadOutcome::Line(_));
-                if tx.send(outcome).is_err() || done {
+                if tx.blocking_send(outcome).is_err() || done {
                     break;
                 }
             }
