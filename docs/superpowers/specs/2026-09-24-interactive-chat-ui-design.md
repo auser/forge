@@ -1282,9 +1282,16 @@ in zero time on every iteration and the loop span at full tilt
 the whole duration of every in-flight and queued turn. Measured on one
 turn whose tool call was `sleep 3`: stdin closed, 2.34 s of user CPU;
 stdin held open, 0.03 s — ~78x, scaling linearly with turn length, in
-`PipedIo`'s own stated primary use case. Fixed by switching the `read` arm
-off at EOF (`App::input_ended`) and giving the end-of-input decision an
-explicit home, `App::settle_ended_input`, re-taken after every loop
+`PipedIo`'s own stated primary use case. Fixed by *re-aiming* the `read`
+arm at EOF (`read_or_wait_for_interrupt`, selected on `App::input_ended`):
+it awaits `io.interrupted()`, which pends, instead of `io.read()`, which
+resolves instantly. Disabling the arm outright — the obvious fix, and the
+first one written — silently removed piped `Ctrl-C` for the whole drain,
+because `PipedIo::read` *is* the piped SIGINT listener (§12.3 as corrected
+above); a process-level test that closes stdin **before** signalling now
+guards that, the case the pre-existing SIGINT test could not reach because
+it holds stdin open to send `/quit`. The end-of-input decision also gets
+an explicit home, `App::settle_ended_input`, re-taken after every loop
 iteration — which is every point the state behind it can change: a run
 settling, a cancelled run settling, an attach settling, a queued turn
 starting, and an `ApprovalRequested` arriving *after* EOF (the case the
@@ -1337,6 +1344,15 @@ rather than joined (`append_history` already ran for every accepted line,
 so the thread-exit `save_history` was never the durability mechanism), and
 `App::start` calls `io.shutdown()` unconditionally on `drive`'s return
 rather than on one path inside it.
+
+**A queued prompt could be stranded by a turn that failed to start.**
+`start_turn`'s error path called `on_run_settled` without `take_queued`,
+unlike every other settlement path (`finish_run`, `settle_attached_run`,
+`settle_cancelled_run`). Pre-existing, but worse after the EOF fix: the
+old spin re-took the end-of-input decision regardless, so the symptom was
+wasted CPU; with the loop correctly idle it is a silent hang. `start_turn`
+is now a loop over the queue rather than a single attempt, which also
+avoids boxing a recursive `async fn`.
 
 **`forge-chat`'s crate doc claimed a purity it does not have.** "no
 terminal, no `rustyline`, no I/O syscalls" — but `ChatHost::service()`

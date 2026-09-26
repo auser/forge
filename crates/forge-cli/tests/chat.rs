@@ -230,14 +230,24 @@ fn scaffold_idle(tmp: &Path) -> PathBuf {
 /// signal before it finishes. `approval = "auto"` so the (at-least-`risky`)
 /// command runs without a round trip of its own competing with the signal.
 fn scaffold_slow(tmp: &Path) -> PathBuf {
+    scaffold_sleeping(tmp, "1")
+}
+
+/// [`scaffold_slow`] with the sleep's length spelled out, for a test that
+/// wants more margin between "the tool call is visibly under way" and "the
+/// turn would have finished on its own anyway" — without which a *missed*
+/// cancellation and a *late* one look the same from outside.
+fn scaffold_sleeping(tmp: &Path, seconds: &str) -> PathBuf {
     let project = tmp.join("project");
     std::fs::create_dir_all(&project).expect("project dir");
     std::fs::write(
         project.join("script.json"),
-        r#"[
-            {"tool_calls": [{"id": "call_1", "name": "run_command", "arguments": {"command": "sleep", "args": ["1"]}}]},
-            {"text": "slow thing done"}
-        ]"#,
+        format!(
+            r#"[
+            {{"tool_calls": [{{"id": "call_1", "name": "run_command", "arguments": {{"command": "sleep", "args": ["{seconds}"]}}}}]}},
+            {{"text": "slow thing done"}}
+        ]"#
+        ),
     )
     .expect("write script");
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
@@ -527,6 +537,71 @@ fn sigint_cancels_the_turn_without_killing_the_chat() {
         "SIGINT must not change the exit status: {status:?}"
     );
     assert!(stdout.contains("  ! cancelled"), "{stdout}");
+    assert!(
+        session_log(&project).contains("\"cancelled\""),
+        "the run recorded it"
+    );
+}
+
+/// The same guarantee, with stdin **already closed** — which is what
+/// `echo 'do the thing' | forge chat` actually is.
+///
+/// The test above holds stdin open for the whole turn (it writes `/quit`
+/// afterwards), so `App`'s `input_ended` is never true there and the whole
+/// post-EOF drain goes unexercised. That gap hid a real regression: the
+/// first fix for the batch-mode busy-wait disabled the `read` arm of
+/// `App::drive`'s `select!` at EOF — and `PipedIo::read` *is* the piped
+/// SIGINT listener (it races the persistent `Signal` `biased`-first inside
+/// itself; `interrupted()` is only a secondary path, and `interrupted_now`'s
+/// peek runs only once `select!` resolves for some other reason, which a
+/// running tool call starves). Disabling the arm therefore removed
+/// cancellation for the entire drain, which for a one-shot pipe is the
+/// entire turn: the signal was ignored and the run went to completion.
+///
+/// A three-second sleep, not one: the margin has to be wide enough that
+/// "cancelled late" and "never cancelled" cannot be confused.
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_the_turn_after_stdin_has_already_closed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold_sleeping(tmp.path(), "3");
+    let mut child = forge(tmp.path(), &project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let (stdout_buf, stdout_thread) = tail_stream(child.stdout.take().expect("stdout"));
+    let (_stderr_buf, stderr_thread) = tail_stream(child.stderr.take().expect("stderr"));
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        writeln!(stdin, "start the slow thing").expect("write");
+    } // EOF *before* the signal: the chat is draining from here on
+
+    wait_for(&stdout_buf, "  * run_command", Duration::from_secs(10));
+    // SAFETY: `child.id()` is a live pid this process owns until `wait`,
+    // and `SIGINT` on a running process is always a defined operation.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+
+    // No `/quit` to send and nothing left to type: input ended long ago, so
+    // the cancellation itself has to be what ends the process.
+    let status = wait_for_exit(&mut child, Duration::from_secs(20));
+    stdout_thread.join().expect("stdout reader thread");
+    stderr_thread.join().expect("stderr reader thread");
+    let stdout = stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    assert!(
+        status.success(),
+        "SIGINT must not change the exit status: {status:?}\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  ! cancelled"),
+        "the signal must cancel the turn even though stdin is closed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("slow thing done"),
+        "a cancelled turn must not go on to answer:\n{stdout}"
+    );
     assert!(
         session_log(&project).contains("\"cancelled\""),
         "the run recorded it"

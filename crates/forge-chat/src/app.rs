@@ -128,10 +128,11 @@ struct App<Io, Host> {
     background: Vec<String>,
     bg_tx: mpsc::UnboundedSender<BgMsg>,
     bg_rx: mpsc::UnboundedReceiver<BgMsg>,
-    /// Batch mode has seen EOF, so there is nothing left to read: the
-    /// `read` arm of the main `select!` is switched off from here on. See
-    /// [`App::settle_ended_input`] for what takes over the job that arm's
-    /// endless re-reading used to do by accident.
+    /// Batch mode has seen EOF, so there is nothing left to read. The
+    /// `read` arm of the main `select!` stays live and waits for an
+    /// interrupt instead ([`read_or_wait_for_interrupt`]), and
+    /// [`App::settle_ended_input`] takes over the end-of-input decision
+    /// that arm's endless re-reading used to drive by accident.
     input_ended: bool,
     exit_code: Option<i32>,
 }
@@ -236,8 +237,9 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// including while a turn runs (§6.2): the four arms below are `read`,
     /// the attached run's events, its settling, and a detached job's
     /// notice. `biased` and the ordering are load-bearing — see the module
-    /// doc. The one thing that switches an arm off for good is batch
-    /// mode's EOF; see the `read` arm's own comment.
+    /// doc. No arm is ever switched off for good; after batch mode's EOF
+    /// the `read` arm waits for an interrupt instead of a line — see
+    /// [`read_or_wait_for_interrupt`].
     async fn drive(&mut self) -> Result<i32, ForgeError> {
         loop {
             let prompt = self.prompt();
@@ -274,25 +276,20 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Some(msg) = self.bg_rx.recv() => {
                     self.on_bg(msg);
                 }
-                // Switched off once batch mode's input has ended: every
-                // `ChatIo` re-signals EOF on each read (`PipedIo`'s reader
-                // thread reports it once and drops the sender, so `recv`
-                // resolves `None` instantly for ever after), and an
-                // unguarded arm turns that into a zero-cost-to-resolve
-                // branch that wins every iteration — a busy-wait for the
-                // whole length of every in-flight and queued turn, measured
-                // at ~78x the CPU of the same script with stdin held open.
-                // What the spin was silently doing — re-delivering EOF so
-                // the end-of-input decision got taken again as the state
-                // changed — is [`App::settle_ended_input`]'s job instead.
-                outcome = self.io.read(prompt), if !self.input_ended => {
+                // Always a live arm — never disabled, only *re-aimed*: see
+                // [`read_or_wait_for_interrupt`] for why switching it off
+                // after batch mode's EOF (the obvious way to stop the spin)
+                // would take piped `Ctrl-C` down with it.
+                outcome = read_or_wait_for_interrupt(
+                    &mut self.io, prompt, self.input_ended,
+                ) => {
                     self.on_read(outcome).await;
                 }
-                // Not reachable today: `self.bg_tx` lives as long as this
-                // loop does, so `bg_rx.recv()` never resolves `None` and
-                // that arm is never disabled. It exists so that a future
-                // change which *does* disable every arm ends the chat
-                // rather than panicking inside `select!`.
+                // Not reachable: this arm and `bg_rx`'s are both always
+                // enabled (`self.bg_tx` lives as long as this loop, so
+                // `recv()` never resolves `None`). It exists so that a
+                // future change which *does* disable every arm ends the
+                // chat rather than panicking inside `select!`.
                 else => {
                     self.exit_code = Some(0);
                 }
@@ -409,8 +406,9 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// cannot be taken once at EOF — it has to be revisited as the turn
     /// settles, as the queue drains, and as events arrive. Before, nothing
     /// revisited it explicitly; the exhausted `read` arm re-delivered EOF
-    /// thousands of times a second and the decision was re-taken as a side
-    /// effect of that spin. This is the same decision, taken deterministically
+    /// thousands of times a second (see [`read_or_wait_for_interrupt`]) and
+    /// the decision was re-taken as a side effect of that spin. This is the
+    /// same decision, taken deterministically
     /// at the points where it can change answer, which is what
     /// [`Controller::on_drained`] exists for.
     ///
@@ -650,31 +648,44 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// cancel here is intentionally best-effort — and the turn would run to
     /// completion uncancelled.
     async fn start_turn(&mut self, prompt: String) {
-        let run_id = forge_session::new_run_id();
-        let events = self.host.service().subscribe(&run_id);
-        let started = self.host.service().start_run_with_options(
-            prompt,
-            RunOptions {
-                run_id: Some(run_id.clone()),
-                session_id: Some(self.session_id.clone()),
-                ..RunOptions::default()
-            },
-        );
-        match started {
-            Ok(started) => {
-                self.run_id = Some(run_id);
-                self.events = Some(RunEvents::Live(events));
-                self.handle = Some(started.handle);
-                self.transcript = Some(TranscriptState::new());
-                tokio::task::yield_now().await;
-            }
-            Err(e) => {
-                // No concurrency guard here on purpose (design §5, §10.1.1):
-                // `AgentService` owns the one-live-run-per-session refusal,
-                // and if it ever surfaces it is rendered as a normal failed
-                // turn, same as any other typed error.
-                self.emit(Line::bad(format!("error: {e}")));
-                self.controller.on_run_settled();
+        // A loop, not a recursive call, because a turn that fails to start
+        // must still hand on to whatever was queued behind it — and a
+        // `async fn` cannot call itself without boxing. Every other
+        // settlement path (`finish_run`, `settle_attached_run`,
+        // `settle_cancelled_run`) takes the queue the same way; this one
+        // used to drop it, leaving `/quit`-less batch input waiting on a
+        // turn that would never start. That was a spin before the EOF fix
+        // and is a silent hang after it, so it is fixed here.
+        let mut pending = Some(prompt);
+        while let Some(prompt) = pending.take() {
+            let run_id = forge_session::new_run_id();
+            let events = self.host.service().subscribe(&run_id);
+            let started = self.host.service().start_run_with_options(
+                prompt,
+                RunOptions {
+                    run_id: Some(run_id.clone()),
+                    session_id: Some(self.session_id.clone()),
+                    ..RunOptions::default()
+                },
+            );
+            match started {
+                Ok(started) => {
+                    self.run_id = Some(run_id);
+                    self.events = Some(RunEvents::Live(events));
+                    self.handle = Some(started.handle);
+                    self.transcript = Some(TranscriptState::new());
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => {
+                    // No concurrency guard here on purpose (design §5,
+                    // §10.1.1): `AgentService` owns the
+                    // one-live-run-per-session refusal, and if it ever
+                    // surfaces it is rendered as a normal failed turn, same
+                    // as any other typed error.
+                    self.emit(Line::bad(format!("error: {e}")));
+                    self.controller.on_run_settled();
+                    pending = self.controller.take_queued();
+                }
             }
         }
     }
@@ -1034,6 +1045,49 @@ async fn recv_events(events: Option<&mut RunEvents>) -> Option<Event> {
         Some(RunEvents::Attached(attachment)) => attachment.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// What the main loop's fourth arm awaits: the next line, or — once batch
+/// mode's input has ended — the next interrupt.
+///
+/// A free function taking the single `&mut Io` because that is the whole
+/// constraint: [`ChatIo::read`] and [`ChatIo::interrupted`] both take
+/// `&mut self`, so they can never be two live branches of one `select!`
+/// (E0499, confirmed against the compiler). One arm that awaits *either*
+/// is the way to have both without two borrows.
+///
+/// Why this is not simply `if ended { disable the arm }`. Two requirements
+/// meet here and only this shape satisfies both:
+///
+/// * **No spin.** Every `ChatIo` re-signals EOF on each read once input has
+///   ended (`PipedIo`'s reader thread reports it once and drops the sender,
+///   so `recv` resolves `None` instantly for ever after). An arm that keeps
+///   calling `read` therefore resolves in zero time on every iteration and
+///   busy-waits for the whole length of every in-flight and queued turn —
+///   measured at 3.01 s of user CPU against 0.03 s for one `sleep 3` turn.
+/// * **`Ctrl-C` still works.** `PipedIo::read` *is* the piped SIGINT
+///   listener: it races the persistent `Signal` against the stdin channel,
+///   `biased`, signal first (see its module doc — `interrupted()` is a
+///   secondary path, and [`App::interrupted_now`]'s peek only runs once
+///   `select!` resolves for some *other* reason, which a running tool call
+///   starves indefinitely). Disabling the arm at EOF would therefore remove
+///   cancellation for the entire drain — and in `echo prompt | forge chat`,
+///   where stdin closes at once, the drain is the whole turn.
+///
+/// Awaiting `interrupted()` instead satisfies both: it pends on the same
+/// persistent `Signal` rather than resolving instantly, and an interrupt
+/// reaches `App::on_read` as [`ReadOutcome::Interrupt`], which is the same
+/// `Signal::Interrupt` path a typed Ctrl-C takes.
+async fn read_or_wait_for_interrupt<Io: ChatIo>(
+    io: &mut Io,
+    prompt: Prompt,
+    input_ended: bool,
+) -> ReadOutcome {
+    if input_ended {
+        io.interrupted().await;
+        return ReadOutcome::Interrupt;
+    }
+    io.read(prompt).await
 }
 
 /// Await the attached run's task, if this driver owns one (it does not for
