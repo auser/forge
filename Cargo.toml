@@ -57,6 +57,16 @@ rmcp = { version = "3.4", default-features = false, features = [
     "server",
     "transport-io",
 ] }
+# Inline line editor for the interactive chat: history, completion,
+# multi-line input and typed Ctrl-C/Ctrl-D, without taking over the
+# screen. default-features off drops `derive` (a proc-macro tree) and
+# `with-dirs` (`home`); what is left adds 8 packages to this workspace,
+# of which 2 are Windows-only. reedline was measured at 23 and rejected
+# on cost (see the Phase B design, §2.2).
+rustyline = { version = "18", default-features = false, features = [
+    "custom-bindings",
+    "with-file-history",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serial_test = "3"

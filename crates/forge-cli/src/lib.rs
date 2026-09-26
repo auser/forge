@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod chat;
 pub mod cli;
 pub mod commands;
 pub mod tracing_setup;
