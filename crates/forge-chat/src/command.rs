@@ -247,11 +247,17 @@ fn skill_prompt(name: &str, rest: &str) -> String {
 /// `/fork` takes `--at <pos|run-id>` or nothing. A bare argument is a usage
 /// error rather than a guess: `/fork 18` could plausibly mean a position or
 /// a session id, and forking at the wrong point is not a cheap mistake.
+///
+/// The flag has to *end* at `--at`: matching it as a bare prefix read
+/// `/fork --atomic` as `--at omic` and forked at a position nobody typed.
+/// An unrecognised flag is a usage error, like any other.
 fn parse_fork(argument: Option<&str>) -> Parsed {
     match argument {
         None => Parsed::Fork(None),
         Some(rest) => match rest.strip_prefix("--at") {
-            Some(at) if !at.trim().is_empty() => Parsed::Fork(Some(at.trim().to_string())),
+            Some(at) if at.starts_with(char::is_whitespace) && !at.trim().is_empty() => {
+                Parsed::Fork(Some(at.trim().to_string()))
+            }
             _ => Parsed::Usage(FORK_USAGE),
         },
     }
@@ -518,6 +524,16 @@ mod tests {
         );
         assert_eq!(Command::parse("/fork --at", &s), Parsed::Usage(FORK_USAGE));
         assert_eq!(Command::parse("/fork 18", &s), Parsed::Usage(FORK_USAGE));
+        // The flag ends at `--at`: matched as a bare prefix, this parsed as
+        // `Fork(Some("omic"))` and forked at a position nobody typed.
+        assert_eq!(
+            Command::parse("/fork --atomic", &s),
+            Parsed::Usage(FORK_USAGE)
+        );
+        assert_eq!(
+            Command::parse("/fork --at-18", &s),
+            Parsed::Usage(FORK_USAGE)
+        );
     }
 
     #[test]

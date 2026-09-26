@@ -275,7 +275,8 @@ already established by the others rather than inventing new ones:
 
 - **Pure core, thin shell.** `forge-chat` holds slash parsing, the
   input/signal state machine and event→transcript rendering as plain
-  functions with no terminal dependency and no I/O syscall — the same
+  functions with no terminal dependency (its driver does reach the
+  filesystem, but only through `AgentService` — see the crate doc) — the same
   split `forge-acp::dispatch` keeps pure while `forge-acp`'s stdio loop
   stays outside it. `forge-cli::chat` (the `ChatIo`/`ChatHost`
   implementations: `TerminalIo`, `PipedIo`, `CliHost`) is the thin shell

@@ -2036,6 +2036,24 @@ fn session_events_include_a_denied_approval(world: &mut BddWorld) {
     );
 }
 
+/// Without this, the scenario passes whether or not the feature works: if
+/// the `"n"` is eaten before it reaches the parked run, EOF-with-an-approval
+/// -pending auto-denies (§12.3) and both of the assertions above still hold —
+/// the file is still unwritten and the log still has a denied decision. The
+/// auto-denial announces itself in the transcript, so the two paths are
+/// distinguishable; this is what distinguishes them.
+#[then("the denial came from the typed answer, not from input running out")]
+fn the_denial_was_typed_not_automatic(world: &mut BddWorld) {
+    assert!(
+        !world
+            .last_stdout
+            .contains("input ended with an approval pending"),
+        "the approval was auto-denied at EOF, so the typed \"n\" never \
+         reached the run:\n{}",
+        world.last_stdout
+    );
+}
+
 #[then("two sessions exist")]
 fn two_sessions_exist(world: &mut BddWorld) {
     let dir = world.project().join(".forge").join("sessions");

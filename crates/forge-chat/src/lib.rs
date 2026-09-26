@@ -1,5 +1,20 @@
-//! Forge's interactive chat, as a **pure** crate: no terminal, no
-//! `rustyline`, no I/O syscalls.
+//! Forge's interactive chat, with the terminal held at arm's length: no
+//! terminal, no `rustyline`, no TTY, and nothing here that can only be
+//! exercised by a person typing.
+//!
+//! **What this crate does *not* claim.** It is not free of I/O. Everything
+//! outside [`app`] is a pure function, but `app` drives a real
+//! `AgentService` handed to it by [`ChatHost::service`], and several of
+//! that service's methods are synchronous filesystem reads taken straight
+//! on the executor: [`app`]'s `refresh_completions` (`list_runs()` —
+//! which re-reads and re-parses every session's whole JSONL log — plus
+//! `list_sessions()`), `events_for`, and `fork_session`. The multi-thread
+//! runtime `forge-cli` builds keeps that off the critical path, so it is
+//! latency rather than a stall, and §14 has the bounded-listing follow-up.
+//! Stated plainly here because the earlier "no I/O syscalls" wording was
+//! not true and would mislead whoever next adds a `ChatHost` method: the
+//! rule this crate actually keeps is **no terminal**, and filesystem
+//! access **only** through `AgentService`.
 //!
 //! This is `forge-acp`'s split applied again — there, `dispatch` is pure
 //! and `server` owns the I/O, which is why the whole forge→ACP mapping is

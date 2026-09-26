@@ -998,10 +998,14 @@ contradicting it:
 - no history file is written and no completion exists — there is nobody
   to complete for.
 
-`Ctrl-C` still works in piped mode: SIGINT reaches the process, the
-`interrupted()` arm fires, and the turn is cancelled exactly as on a
-terminal. That is what makes the most important keybinding testable
-without a pty (§13.2).
+`Ctrl-C` still works in piped mode: SIGINT reaches the process and the
+turn is cancelled exactly as on a terminal. That is what makes the most
+important keybinding testable without a pty (§13.2). *(Corrected: this
+paragraph originally said "the `interrupted()` arm fires". It does not —
+`App::drive` has no `interrupted()` arm, only a peek taken after
+`select!` resolves for some other reason, which a running tool call can
+starve indefinitely. `PipedIo::read` races the SIGINT listener itself;
+see §16.)*
 
 ### 12.4 `--json`
 
@@ -1135,6 +1139,18 @@ Deliberately out of scope, each with the reason and the shape of the fix:
   `brain active/off` line carries the one fact a conversation needs.
 - **Images, audio, non-text input.** No provider behind this chat takes
   them (the ACP adapter advertises the same).
+- **Taking the completion snapshot's filesystem listings off the
+  executor.** `App::refresh_completions` calls `list_runs()` (which
+  re-reads and re-parses every session's whole JSONL log) and
+  `list_sessions()` synchronously, once per submitted line, on the
+  executor — as do `events_for` and `fork_session` at their own call
+  sites. The multi-thread runtime `forge-cli` builds keeps this off the
+  critical path, so it is latency, not a stall, and moving *these two*
+  behind `spawn_blocking` would leave the others exactly as they are. The
+  fix worth having is a bounded/incremental `list_runs`, in the runtime,
+  where every front end gets it. `forge-chat`'s crate doc states the
+  honest rule in the meantime: no terminal, filesystem access only
+  through `AgentService`.
 
 ## 15. Self-review
 
@@ -1247,3 +1263,90 @@ one-line fix next time that file is open for another reason.
 `cargo test -p forge-cli --test bdd` (26 features / 54 scenarios / 215
 steps, including the four new `chat.feature` scenarios) and `just verify`
 both green — see `task-11-report.md` for the exact commands and output.
+
+## 17. Whole-branch review fixes (2026-09-25)
+
+A review of the whole branch, rather than of any one task, found five
+defects that a per-task review structurally could not see — each of them
+spanning two tasks' worth of code. All are fixed; the two that changed
+what §12.3 describes are recorded here as the appendix §15 asks for.
+
+**Batch mode busy-waited for the whole length of every turn.**
+`Controller::on_drained` — the method whose entire purpose is "the driver
+has nothing left to run, decide whether that is the end" — was never
+called by the driver at all. Batch mode terminated anyway, by accident:
+every `ChatIo` re-signals EOF on each read once input has ended, the
+`read` arm of `App::drive`'s `select!` was unguarded, so that arm resolved
+in zero time on every iteration and the loop span at full tilt
+(`read -> Eof -> on_eof -> on_drained -> [] -> yield_now -> repeat`) for
+the whole duration of every in-flight and queued turn. Measured on one
+turn whose tool call was `sleep 3`: stdin closed, 2.34 s of user CPU;
+stdin held open, 0.03 s — ~78x, scaling linearly with turn length, in
+`PipedIo`'s own stated primary use case. Fixed by switching the `read` arm
+off at EOF (`App::input_ended`) and giving the end-of-input decision an
+explicit home, `App::settle_ended_input`, re-taken after every loop
+iteration — which is every point the state behind it can change: a run
+settling, a cancelled run settling, an attach settling, a queued turn
+starting, and an `ApprovalRequested` arriving *after* EOF (the case the
+spin was load-bearing for: §12.3's auto-denial). `select!` also gained an
+`else` arm, so an all-arms-disabled state would end the chat rather than
+panic. `Controller`'s three `on_drained` tests are load-bearing now
+instead of vacuous, and `ScriptedIo::eof_reads` lets a test assert the
+*absence of a spin* — the transcript is identical either way, so nothing
+else could have caught it.
+
+**`/bg` after `/attach` permanently corrupted the live-work count.**
+`do_background` spawned a watcher only for `RunEvents::Live`, so a run
+detached after `/attach` had none — while `Controller::on_background` had
+already counted it and the only thing that ever un-counts a job is a
+watcher's `BgMsg::Settled`. `live_work()` therefore stayed above zero for
+the rest of the process with nothing running: `/model` and `/approval`
+refused for ever with "finish or cancel the running turn first", every
+`/quit`, `Ctrl-D` and second `Ctrl-C` needing two requests for ever,
+`ChatState::Detached` for ever. Fixed by making the watcher take a
+`RunEvents` and drive it through the same `recv_events` both origins
+already share — a detached-but-followed run is exactly what `/jobs` and
+`/attach` are for. The watcher now also reports `Settled` when the stream
+simply ends, not only on a terminal event, so no future shape of this can
+strand the count either.
+
+**§12.3's `  # job ... cancelled at exit` notice is now implemented.**
+It was specified and never written: `do_cancel_all_jobs` cancelled
+silently. It now prints one notice per detached job, in every mode rather
+than only in piped mode — a terminal user who confirmed the abandonment
+has no less right to know which jobs it took.
+
+**§12.3's piped-`Ctrl-C` mechanism is not the one that shipped.** The
+section said "SIGINT reaches the process, the `interrupted()` arm fires".
+There is no `interrupted()` arm: `read` and `interrupted` both take
+`&mut self`, so `App::drive` can only peek at `interrupted()` *after*
+`select!` has resolved for some other reason — which a running tool call
+starves indefinitely, making the cancellation a coin flip (measured: 3
+passes in 5, 2 hangs). `PipedIo::read` races the SIGINT listener inside
+itself instead, which is a live arm every iteration. §12.3's paragraph is
+corrected in place; `piped_io.rs`'s module doc carries the full argument.
+
+**`TerminalIo::shutdown` could hang the process after `/quit`.** It joined
+the editor thread unconditionally. If that thread is inside `readline()`
+serving an orphaned `Job` — the cancel-safety hazard §16 records as still
+open — `readline` returns only when a key is pressed, so the join is a
+process that has printed nothing, drawn no prompt, and will not exit.
+Reachable today: a turn running with an orphaned job outstanding, then
+enough `kill -INT`s to reach `Quit(130)`. The thread is now detached
+rather than joined (`append_history` already ran for every accepted line,
+so the thread-exit `save_history` was never the durability mechanism), and
+`App::start` calls `io.shutdown()` unconditionally on `drive`'s return
+rather than on one path inside it.
+
+**`forge-chat`'s crate doc claimed a purity it does not have.** "no
+terminal, no `rustyline`, no I/O syscalls" — but `ChatHost::service()`
+hands the crate the whole runtime, and `app` takes synchronous filesystem
+reads on the executor (`refresh_completions`' `list_runs()` +
+`list_sessions()` after every submitted line, `events_for`,
+`fork_session`, `latest_session`). The claim is corrected rather than the
+code: moving the two listings behind `spawn_blocking` would leave the
+other three exactly as they are and still not make the sentence true,
+while the fix worth having — a bounded, incremental `list_runs` — belongs
+in the runtime, where every front end gets it (filed in §14). The rule the
+crate actually keeps, and now states, is: no terminal; filesystem access
+only through `AgentService`.

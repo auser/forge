@@ -21,6 +21,7 @@ Feature: Interactive chat
     When I chat with the lines "write the notes" and "n"
     Then the file "notes.txt" does not exist
     And the session events include an approval decision that was denied
+    And the denial came from the typed answer, not from input running out
 
   Scenario: Forking from the chat creates a second session
     Given an initialized project with a mock model
