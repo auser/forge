@@ -57,6 +57,42 @@ use super::palette::Palette;
 
 /// One request to the editor thread: ask for a line under this prompt, and
 /// where to send the answer.
+///
+/// # A separate, real, not-fixed-here hazard: this `read` is not
+/// cancel-safe the way `App::drive`'s `select!` needs it to be
+///
+/// `App::drive` (`forge-chat::app`) reconstructs `self.io.read(prompt)`
+/// fresh every loop iteration and drops whichever branch does not win
+/// (`forge-chat`'s module doc; `PipedIo`'s own module doc walks through why
+/// that is safe for a `read` backed by a channel it only *receives* from).
+/// `TerminalIo::read` is not that: its first poll *sends* a new `Job::Read`
+/// to this thread before awaiting the reply, and `mpsc::Sender::send`, once
+/// it has enqueued the message, cannot be un-sent by dropping the future
+/// that called it. While a turn is streaming multiple events — normal,
+/// even for a one-line answer (a routing line, the answer, a footer are
+/// three) — the read arm can lose several iterations in a row, each one
+/// constructing, sending, and then abandoning its own `Job::Read` with a
+/// now-dropped `oneshot::Sender` on this end. This thread has no way to
+/// tell an abandoned job from a live one: it serves whichever one it
+/// dequeues next, `resp.send` silently failing for a dropped receiver, and
+/// the caller that is actually still awaiting a reply is left holding a
+/// *different* `Job`'s receiver that will now never fire — genuinely stuck
+/// (`TerminalIo::shutdown`'s `handle.join()` included, since the thread is
+/// then blocked inside a `readline()` for a job nobody is listening to any
+/// more). Reproduced against a real pty: a turn with several events,
+/// followed by a further typed line, occasionally has that line vanish
+/// into an abandoned job instead of reaching `App::on_read` at all.
+///
+/// `PipedIo`'s fix (one persistent producer thread, `read()` only ever
+/// receiving) does not carry over directly, because unlike `PipedIo`,
+/// *what* to read next genuinely depends on a per-call `Prompt` (fresh
+/// completions) — this thread cannot free-run a queue of results the way
+/// `PipedIo`'s stdin thread does. The right shape is likely a persistent
+/// loop here that always reads the *latest* known prompt from a
+/// non-blocking side channel (e.g. `watch`) rather than one popped per
+/// call, feeding an unbounded outcomes channel `read()` only receives
+/// from — real, separate work, out of scope for the printer/`select`
+/// defect this module's other doc comments describe.
 enum Job {
     Read(Prompt, oneshot::Sender<ReadOutcome>),
 }
@@ -163,7 +199,11 @@ impl ChatIo for TerminalIo {
         // Dropping the only sender closes the channel; the editor thread's
         // `blocking_recv` then returns `None` on its own, so it falls
         // through to `save_history` and exits without needing a dedicated
-        // shutdown message.
+        // shutdown message. That only holds if the editor thread is
+        // actually back at `blocking_recv` when this runs — see the `Job`
+        // doc for the separate, not-fixed-here case where it is instead
+        // stuck inside an orphaned `readline()` for a job nobody is
+        // waiting on any more, which this would then block on forever.
         self.jobs_tx = None;
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
@@ -198,16 +238,30 @@ fn editor_thread_main(
         );
     }
 
-    let printer: Box<dyn ExternalPrinter + Send> = match editor.create_external_printer() {
-        Ok(printer) => Box::new(printer),
-        Err(e) => {
-            // A dumb or unsupported terminal, most likely. A notice printed
-            // slightly awkwardly (no coordination with an in-progress
-            // prompt) beats a notice lost.
-            tracing::debug!(error = %e, "external printer unavailable; notices fall back to stdout");
-            Box::new(StdoutPrinter)
-        }
-    };
+    // Deliberately *never* `editor.create_external_printer()`: doing so
+    // switches every keystroke's wait, for the rest of this `Editor`'s life,
+    // from `PosixRawReader::next_key` (which drains its own `BufReader`
+    // before ever asking the OS for more) onto `PosixRawReader::select`
+    // (rustyline 18.0.1, `tty/unix.rs`), which does not — `select`'s sibling
+    // `poll` guards its blocking OS call with `if self.tty_in.buffer().len()
+    // > 0 { return Ok(true) }`; `select` has no such guard before calling
+    // `select::select(..)`. Whenever a single kernel-level read hands
+    // rustyline more than one byte at once — a paste, or exactly the
+    // type-ahead this app means to preserve across a turn (see this
+    // module's doc) — only the first byte is consumed; the rest sit
+    // forever in that private buffer, and the *next* wait for input blocks
+    // in `select` for a new byte that will never arrive, because the OS
+    // already delivered everything it had. `crates/forge-cli/tests/
+    // chat.rs`'s pty tests reproduced this with no Ctrl-C involved at all
+    // (a single `write_all` of a whole line, first read of the session),
+    // and also confirmed a typed Ctrl-C followed by a line typed one byte
+    // at a time never wedges — Ctrl-C itself adds nothing; it is just one
+    // easy way to end up typing the next line quickly enough to burst.
+    // `notify()` therefore always uses [`StdoutPrinter`]: plain, uncoloured,
+    // and unsynchronized with an in-progress prompt, but never able to wedge
+    // the next `readline()`. A notice printed awkwardly beats a chat that
+    // stops accepting input.
+    let printer: Box<dyn ExternalPrinter + Send> = Box::new(StdoutPrinter);
     if ready_tx.send(StartupResult::Ready(printer)).is_err() {
         return; // the caller gave up before we were ready
     }
@@ -242,6 +296,11 @@ fn editor_thread_main(
             Err(ReadlineError::Eof) => ReadOutcome::Eof,
             Err(e) => ReadOutcome::Failed(e.to_string()),
         };
+        // `resp.send` failing (the receiver already dropped) is not
+        // reported anywhere here — see the `Job` doc for why that is a
+        // real, separate, not-fixed-here hazard rather than a harmless
+        // no-op: this line was already consumed either way, and it is not
+        // recoverable from this side.
         let _ = resp.send(outcome);
     }
 
@@ -267,10 +326,11 @@ fn build_editor(
     Ok(editor)
 }
 
-/// Fallback used when `create_external_printer` fails: plain, unstyled
-/// stdout. Not wired through [`Palette`] because by the time this is
-/// chosen the terminal has already told rustyline it cannot do the things
-/// colour depends on.
+/// The only [`ExternalPrinter`] this module uses (see `editor_thread_main`'s
+/// comment on why `create_external_printer` is never called): plain stdout,
+/// unsynchronized with an in-progress prompt. Not wired through [`Palette`]
+/// itself because [`TerminalIo::notify`] already paints the line before
+/// handing it to `print`; this just writes bytes.
 struct StdoutPrinter;
 
 impl ExternalPrinter for StdoutPrinter {

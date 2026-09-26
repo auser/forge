@@ -18,31 +18,53 @@
 //! Hermetic exactly like `cli.rs`/`acp.rs`/`mcp.rs`: temp HOME/XDG, FORGE_*
 //! scrubbed, autofetch off, offline scripted-mock providers only.
 //!
-//! # Known limitation found by the pty test, not fixed here
+//! # A typed Ctrl-C, and the chat afterward
 //!
 //! `a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat`
 //! proves the headline claim — a typed Ctrl-C at an idle prompt reaches the
 //! chat as `ReadOutcome::Interrupt`, the process stays alive, the exit hint
-//! prints — but it does **not** go on to prove the chat is still usable
-//! afterward, because it is not: **the very next `Editor::readline()` call
-//! hangs forever.** Reproduced on every run (many, over multiple sessions),
-//! isolated to `rustyline`'s external-printer machinery specifically —
-//! commenting out `editor.create_external_printer()` in
-//! `terminal_io.rs::editor_thread_main` (always using the `StdoutPrinter`
-//! fallback instead) made the second `readline()` return normally every
-//! time, in the same test, with nothing else changed. Two consecutive
-//! *normal* (`Ok(Line(_))`) submissions never trigger it; only a call that
-//! returned `Err(ReadlineError::Interrupted)` poisons the next one.
+//! prints — *and* goes on to submit a further line and assert it is
+//! answered, closing a gap an earlier pass through this test left open: the
+//! very next `Editor::readline()` used to hang forever.
 //!
-//! Not fixed here: removing `create_external_printer()` unconditionally
-//! would silently degrade `notify()` (background job notices, design
-//! §10.1) for every session, not only ones that hit Ctrl-C, and the actual
-//! defect is inside `rustyline` 18.0.1 or in some assumption this crate's
-//! use of it does not satisfy — tracking it down further, or reworking
-//! `TerminalIo`'s printer lifecycle to dodge it, is real work in its own
-//! right and out of this task's scope (process-level *tests*). This is
-//! exactly the gap Task 8's brief flagged as unverified against a real
-//! PTY, now verified, and broken.
+//! That hang was never really about Ctrl-C. It traced to
+//! `rustyline` 18.0.1's `PosixRawReader::select` (`tty/unix.rs`), used for
+//! every keystroke's wait for as long as an `ExternalPrinter` exists
+//! (`editor.create_external_printer()`, once called, routes
+//! `wait_for_input` there for the rest of that `Editor`'s life instead of
+//! through the plain, self-buffering `next_key`). `select`'s sibling
+//! `poll` guards its blocking OS call with `if self.tty_in.buffer().len() >
+//! 0 { return Ok(true) }`; `select` has no such guard. Whenever a single
+//! kernel-level read hands rustyline more than one byte at once, only the
+//! first is consumed — the rest sit forever in that private buffer, and
+//! every subsequent wait blocks for a byte the OS will never re-deliver
+//! (it already handed it over). `diag`-style reproduction (not checked in)
+//! confirmed this hangs on the *first* line of a session with no Ctrl-C
+//! anywhere in it, purely by writing the line in one `write_all` rather
+//! than one byte at a time, and separately confirmed that a Ctrl-C followed
+//! by a line typed one byte at a time (with a delay between bytes) never
+//! hangs. Ctrl-C was a reliable *trigger* — the near-instant return to a
+//! fresh `readline()` narrows the window in which a fast-typed or
+//! type-ahead-queued follow-up line arrives as more than one byte in a
+//! single kernel read — but not the *cause*: a paste, or the type-ahead
+//! this app's raw-mode setup deliberately preserves across a turn
+//! (`terminal_io.rs`'s module doc, the `TCSADRAIN` note), hits the exact
+//! same defect with no interrupt involved at all.
+//!
+//! `TerminalIo::editor_thread_main` no longer calls
+//! `create_external_printer` at all (see its own comment there), which
+//! keeps every keystroke on the safe `next_key` path. `notify()` — the
+//! only feature that used the external printer, background-job notices
+//! landing while a prompt is on screen (design §10.1) — now always uses the
+//! `StdoutPrinter` fallback that previously covered only dumb/unsupported
+//! terminals: unsynchronized with an in-progress prompt (a notice can print
+//! awkwardly mid-line) but never able to wedge the next read. That is a
+//! real, deliberate product tradeoff, not a silent one: the alternative
+//! (patching rustyline's `select` to add the same buffer check `poll`
+//! already has, three lines, mirroring an existing pattern in the same
+//! file) was verified working against this exact suite but was not applied
+//! here, since it means vendoring a patched copy of a third-party crate
+//! into the tree rather than a workspace-declared dependency version bump.
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -604,26 +626,28 @@ mod pty {
     }
 }
 
-/// The one thing a pipe cannot prove (see the module doc above): a typed
-/// Ctrl-C on a real terminal survives as `ReadOutcome::Interrupt`, not a
-/// process-killing `SIGINT` — proved here by the controller's own idle-Ctrl-C
-/// contract (`on_interrupt`'s `None` arm, `forge-chat::controller`): one
-/// interrupt at an empty prompt only *hints* that a second one exits, so
-/// seeing that hint and then a live, still-responsive process is only
-/// possible if the byte reached the chat as `ReadOutcome::Interrupt` and
-/// not as a real `SIGINT` (whose default disposition would have killed the
-/// process outright, before it could print anything at all).
+/// A pipe cannot prove either half of this (see the module doc above): a
+/// typed Ctrl-C on a real terminal survives as `ReadOutcome::Interrupt`, not
+/// a process-killing `SIGINT` — proved here by the controller's own
+/// idle-Ctrl-C contract (`on_interrupt`'s `None` arm, `forge-chat::
+/// controller`): one interrupt at an empty prompt only *hints* that a
+/// second one exits, so seeing that hint and then a live, still-responsive
+/// process is only possible if the byte reached the chat as
+/// `ReadOutcome::Interrupt` and not as a real `SIGINT` (whose default
+/// disposition would have killed the process outright, before it could
+/// print anything at all) — and, second, that the chat is still genuinely
+/// usable afterward: a further line, submitted in one `write_all` (a
+/// deliberate burst — see the module doc's account of why that used to
+/// hang the very next `readline()`, with no interrupt required at all, once
+/// `create_external_printer` was in play) reaches the model and comes back
+/// answered.
 ///
-/// Deliberately does not go on to prove the chat is still fully usable by
-/// typing a further line: it is not. See the big finding in this file's
-/// module doc — one typed Ctrl-C over a real pty leaves the *next*
-/// `Editor::readline()` call hung forever inside `rustyline` itself,
-/// something no pipe-backed test could ever exercise (`PipedIo` has no
-/// `rustyline` in it at all) and the in-process `forge-chat` suite cannot
-/// either (its `ScriptedIo` has no real terminal or real `rustyline`
-/// underneath it). This test ends by killing the child rather than
-/// asking it to `/quit`, which is exactly the gap: a real user hitting
-/// Ctrl-C once at an idle prompt cannot be asked to do that.
+/// Does not go on to `/quit`: that would race a separate, real,
+/// not-fixed-here hazard (`terminal_io.rs`'s `Job` doc) in how
+/// `TerminalIo::read` is not cancel-safe under `App::drive`'s `select!`
+/// once a turn has emitted more than one event — a flaky assertion on
+/// that would be testing the wrong bug. Ended by killing the child
+/// instead, as before.
 #[cfg(unix)]
 #[test]
 fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
@@ -658,9 +682,21 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
         "the chat must still be alive after one Ctrl-C"
     );
 
-    // No further interaction attempted — see this test's doc and the
-    // module doc's "Known limitation" section. Killed, not asked to
-    // `/quit`, because asking is exactly what does not currently work.
+    // The chat must still be usable: a further line, delivered as one
+    // burst rather than paced keystrokes, must reach the model and come
+    // back answered. This is exactly the shape that used to hang forever
+    // (module doc).
+    writer
+        .write_all(b"explain alpha.rs\n")
+        .expect("write a further line after the interrupt");
+    // "the answer" only ever reaches stdout via a real run: the scripted
+    // model replying to *this* submitted line. Not asserting on the
+    // echoed prompt text itself — rustyline redraws it interleaved with
+    // ANSI synchronized-update escapes, which a literal substring check
+    // would be too fragile to survive.
+    wait_for(&output, "the answer", Duration::from_secs(10));
+
+    // Killed, not asked to `/quit` — see this test's doc for why.
     drop(writer);
     child.kill().ok();
     child.wait().ok();
