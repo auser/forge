@@ -8,9 +8,13 @@
 //! * [`palette`] — the `NO_COLOR`/dumb-terminal decision both of the above
 //!   share, so a piped run and an interactive one agree on when colour is
 //!   off.
+//! * [`host`] — `CliHost`, the `ChatHost` seam: config resolution, provider
+//!   construction and credential detection, none of which `forge-chat` is
+//!   allowed to see.
 //!
 //! Design: `docs/superpowers/specs/2026-09-24-interactive-chat-ui-design.md`.
 
+pub mod host;
 pub mod palette;
 pub mod piped_io;
 pub mod terminal_io;

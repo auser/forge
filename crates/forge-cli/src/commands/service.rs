@@ -94,7 +94,13 @@ pub struct ServiceOptions {
 /// The flags' own override layer with a front end's choices applied on top.
 /// One function, so there is exactly one answer to "what did this runtime
 /// resolve from" for `forge config show` and the chat alike.
-fn overrides_for(ctx: &Context, options: &ServiceOptions) -> CliOverrides {
+///
+/// `pub(crate)`, not private: `chat::host::CliHost::config_summary` (§9)
+/// calls this directly to resolve `/config` against the *current*
+/// session overrides (post-`/model`/`/approval`), rather than re-deriving
+/// the override chain a second time and risking it disagreeing with this
+/// one.
+pub(crate) fn overrides_for(ctx: &Context, options: &ServiceOptions) -> CliOverrides {
     let mut overrides = ctx.cli_overrides();
     if let Some(model) = &options.model {
         overrides.model = Some(model.clone());

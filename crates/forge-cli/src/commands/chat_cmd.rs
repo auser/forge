@@ -2,13 +2,22 @@
 //! subcommand runs.
 //!
 //! This is the command *shell*: the things that have to be settled before
-//! any transcript exists (the `--json` refusal, config resolution, the
-//! entry banner). The transcript/prompt loop itself lives in the pure
-//! `forge-chat` crate and is wired in later; until then this prints the
-//! banner, says on stderr that the loop is not here yet, and exits 0.
+//! any transcript exists — the `--json` refusal, and building the
+//! `CliHost` (which resolves configuration and constructs the whole
+//! runtime, so a chat that cannot start fails here rather than mid-loop).
+//! The transcript/prompt loop itself, including the entry banner (design
+//! §7, session id and needle wording included), lives in `forge_chat::run`
+//! — this module's job ends at handing it a `ChatIo` and a `Start`.
 
+use std::io::IsTerminal;
+
+use forge_chat::{SessionStart, Start};
 use forge_core::ForgeError;
 
+use crate::chat::host::CliHost;
+use crate::chat::palette::Palette;
+use crate::chat::piped_io::PipedIo;
+use crate::chat::terminal_io::TerminalIo;
 use crate::commands::Context;
 
 /// Everything `forge chat` accepts, shared with the no-subcommand path so
@@ -36,9 +45,6 @@ pub async fn run(ctx: &Context, args: ChatArgs) -> Result<(), ForgeError> {
         ));
     }
 
-    // Resolved before the banner: a chat must not open over a config it
-    // cannot read, and the banner reports what this resolution decided.
-    let resolved = ctx.resolve_config()?;
     let root = ctx.project_root()?;
 
     tracing::debug!(
@@ -48,20 +54,41 @@ pub async fn run(ctx: &Context, args: ChatArgs) -> Result<(), ForgeError> {
         "chat requested"
     );
 
-    // The entry banner (design §7). Two facts it cannot state yet, both
-    // owned by later work rather than guessed at here: the session id
-    // (there is no session until the loop starts one) and `brain
-    // active`/`brain off (...)`, which comes from the chat host's
-    // `Environment::needle` so that it and `forge doctor` cannot tell a
-    // user different stories.
-    println!("forge {}  {}", env!("CARGO_PKG_VERSION"), root.display());
-    println!(
-        "model {}  router {}  approval {}",
-        resolved.config.model, resolved.config.router, resolved.config.approval
-    );
-    println!("/help for commands");
+    // Resolves configuration and builds the whole runtime (model, router,
+    // execution, skills, needle) — a chat that cannot start over its own
+    // config fails here, before anything has reached stdout, rather than
+    // mid-loop.
+    let host = CliHost::new(ctx).await?;
 
-    // Diagnostic, so stdout stays the transcript.
-    eprintln!("note: the interactive chat is not wired up yet; this is the banner only");
+    let palette = Palette::detect(ctx.global.no_color);
+    let start = Start {
+        session: match (args.session, args.continue_session) {
+            (Some(id), _) => SessionStart::Named(id),
+            (None, true) => SessionStart::Continue,
+            (None, false) => SessionStart::Fresh,
+        },
+        first_prompt: (!args.prompt.is_empty()).then(|| args.prompt.join(" ")),
+    };
+
+    // The entry banner (design §7) — session id and needle wording
+    // included — is printed by `forge_chat::run` itself (`App::print_banner`,
+    // over `ChatIo`), not here: those two facts are not available until
+    // the session has started and this `CliHost` has resolved them.
+    let code = if std::io::stdin().is_terminal() {
+        let history_path = root.join(".forge").join("chat-history");
+        let io = TerminalIo::new(palette, history_path)?;
+        forge_chat::run(io, host, start).await?
+    } else {
+        let io = PipedIo::new(palette);
+        forge_chat::run(io, host, start).await?
+    };
+
+    // `forge_chat::run` already calls `ChatIo::shutdown` on every normal
+    // exit path itself (`App::drive`, right before returning) — and could
+    // not be called again from here regardless, since `io` was moved into
+    // `run`. Only the exit code crosses back.
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
