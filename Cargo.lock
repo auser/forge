@@ -628,6 +628,7 @@ dependencies = [
  "forge-server",
  "forge-session",
  "forge-skills",
+ "libc",
  "reqwest",
  "rustyline",
  "serde",

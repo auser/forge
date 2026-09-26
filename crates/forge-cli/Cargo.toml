@@ -57,3 +57,10 @@ serial_test.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true
+
+# Not in the root [workspace.dependencies]: `libc` is already resolved in
+# the lockfile as a transitive dependency of `rustyline`, so this adds no
+# new crate to the tree. `tests/chat.rs` uses it (unix only) to send a real
+# SIGINT and to open a pty for a real-terminal Ctrl-C test.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

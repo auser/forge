@@ -79,7 +79,7 @@ pub async fn run(ctx: &Context, args: ChatArgs) -> Result<(), ForgeError> {
         let io = TerminalIo::new(palette, history_path)?;
         forge_chat::run(io, host, start).await?
     } else {
-        let io = PipedIo::new(palette);
+        let io = PipedIo::new(palette)?;
         forge_chat::run(io, host, start).await?
     };
 
