@@ -76,10 +76,11 @@ use super::palette::Palette;
 /// tell an abandoned job from a live one: it serves whichever one it
 /// dequeues next, `resp.send` silently failing for a dropped receiver, and
 /// the caller that is actually still awaiting a reply is left holding a
-/// *different* `Job`'s receiver that will now never fire — genuinely stuck
-/// (`TerminalIo::shutdown`'s `handle.join()` included, since the thread is
-/// then blocked inside a `readline()` for a job nobody is listening to any
-/// more). Reproduced against a real pty: a turn with several events,
+/// *different* `Job`'s receiver that will now never fire — genuinely stuck.
+/// (`TerminalIo::shutdown` used to compound this into a hang of the whole
+/// process by joining a thread parked inside an orphaned `readline()`; it
+/// detaches the thread instead — see its doc. The stuck *caller* above is
+/// still open.) Reproduced against a real pty: a turn with several events,
 /// followed by a further typed line, occasionally has that line vanish
 /// into an abandoned job instead of reaching `App::on_read` at all.
 ///
@@ -113,6 +114,7 @@ pub struct TerminalIo {
     /// editor thread is told to stop (see `shutdown`'s doc).
     jobs_tx: Option<mpsc::Sender<Job>>,
     printer: Box<dyn ExternalPrinter + Send>,
+    /// Dropped, never joined, on the way out — see [`TerminalIo::shutdown`].
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -199,15 +201,24 @@ impl ChatIo for TerminalIo {
         // Dropping the only sender closes the channel; the editor thread's
         // `blocking_recv` then returns `None` on its own, so it falls
         // through to `save_history` and exits without needing a dedicated
-        // shutdown message. That only holds if the editor thread is
-        // actually back at `blocking_recv` when this runs — see the `Job`
-        // doc for the separate, not-fixed-here case where it is instead
-        // stuck inside an orphaned `readline()` for a job nobody is
-        // waiting on any more, which this would then block on forever.
+        // shutdown message.
         self.jobs_tx = None;
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
-        }
+        // Deliberately **not** joined. That only ever completes if the
+        // thread is back at `blocking_recv` when this runs; if it is
+        // instead inside `readline()` serving an orphaned `Job` (the `Job`
+        // doc's separate, still-open cancel-safety hazard), `readline`
+        // returns only when a key is pressed — so a join here is the
+        // process hanging after `/quit` with no prompt on screen and
+        // nothing saying why. Reachable without the `Job` hazard being
+        // fixed: a turn running with an orphaned job outstanding, then
+        // enough `kill -INT`s to drive the `Controller` to `Quit(130)`.
+        //
+        // Nothing is lost by detaching: `append_history` already ran for
+        // every accepted line (see `editor_thread_main`), so the
+        // thread-exit `save_history` is a belt-and-braces flush, not the
+        // durability mechanism. A detached thread at process exit is
+        // strictly better than a hang.
+        drop(self.thread.take());
     }
 }
 

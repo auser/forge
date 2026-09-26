@@ -1635,29 +1635,62 @@ fn scaffold(tmp: &Path) -> PathBuf {
     project
 }
 
+/// Wait for a child, bounded, killing and failing rather than hanging —
+/// the same guard (and the same name) as `forge-cli/tests/chat.rs`'s.
+///
+/// Every chat test is in the hang class: a regression that stops the chat
+/// noticing EOF, or wedges its editor thread on the way out, leaves the
+/// process alive for ever. A plain `wait()`/`wait_with_output()` hands
+/// that to the whole suite as a hang; this hands it to one test as a
+/// failure.
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            let _ = child.wait();
+            panic!("timed out after {timeout:?} waiting for the chat to exit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn bare_forge_opens_the_chat_and_exits_at_eof() {
+    use std::io::Read as _;
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = scaffold(tmp.path());
     // stdin is an empty pipe: the chat starts, reads EOF, exits cleanly.
-    let out = forge(tmp.path())
+    let mut child = forge(tmp.path())
         .args(["--project"])
         .arg(&project)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
         .expect("bare forge runs");
+    drop(child.stdin.take());
+    // The banner is a few hundred bytes, far inside the pipe buffer, so
+    // the child never blocks on a writer nobody is draining.
+    let status = wait_for_exit(&mut child, std::time::Duration::from_secs(20));
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
     assert!(
-        out.status.success(),
-        "bare forge should exit 0, got {:?}",
-        out.status
+        status.success(),
+        "bare forge should exit 0, got {status:?}\n{stdout}"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("forge "), "banner missing: {stdout}");
     assert!(
         stdout.contains("/help"),
