@@ -29,8 +29,9 @@ use forge_chat::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,
 };
-use forge_core::{ForgeError, ProjectGraph};
+use forge_core::ForgeError;
 use forge_execution::ApprovalChannel;
+use forge_needle::EngineEmbedder;
 use forge_runtime::AgentService;
 
 use crate::commands::Context;
@@ -57,6 +58,14 @@ pub struct CliHost {
     /// needle is even in play) never changes for the life of a
     /// conversation — only the model and the approval mode do.
     needle: NeedleState,
+    /// The on-device embedder for `/context`'s semantic blend, when this
+    /// build has a working engine and weights. Built once at construction
+    /// for the same reason as `needle`: nothing a chat session does can
+    /// change it (a brain fetched by `forge init` in another window is
+    /// picked up on the next chat, not mid-conversation). `None` means
+    /// `/context` ranks lexically — the same degradation `forge graph
+    /// context` has without an engine.
+    embedder: Option<EngineEmbedder>,
 }
 
 impl CliHost {
@@ -73,12 +82,22 @@ impl CliHost {
         };
         let service = build_run_service_with(&ctx, options.clone()).await?;
         let needle = needle_state(service.config()).await;
+        // Embedding is an engine capability, not a routing choice: no
+        // `router = "needle"` gate here, mirroring `forge graph context`'s
+        // `context_embedder`. A second `info()` round-trip on the shared,
+        // cached engine — cheap. An embedder that fails to build degrades
+        // to lexical ranking rather than failing chat startup.
+        let embedder = match forge_needle::engine_if_available(service.config()).await {
+            Some(engine) => EngineEmbedder::new(engine).await.ok(),
+            None => None,
+        };
         Ok(Self {
             ctx,
             root,
             service: Arc::new(service),
             options,
             needle,
+            embedder,
         })
     }
 }
@@ -182,26 +201,35 @@ impl ChatHost for CliHost {
         query: &str,
         limit: usize,
     ) -> Result<Vec<ContextLine>, ForgeError> {
-        context_lines(&self.root, query, limit)
+        context_lines(&self.root, self.embedder.as_ref(), query, limit).await
     }
 }
 
 /// [`ChatHost::graph_context`]'s body, pulled out so it is testable without
 /// a full `CliHost` (which needs a whole runtime to construct).
 ///
-/// Still the plain lexical ranking (`LocalGraph::context`), not
-/// `forge_graph::query::blended_context` — but by choice now, not by
-/// construction: the trait method is async, so embedding the query and
-/// blending semantically is *reachable* from here, and what is missing is
-/// the engine wiring (which embedder this host was built with, and where
-/// the index lives), not the signature. Without a working needle engine,
-/// `blended_context` degrades to exactly this lexical ranking anyway (see
-/// `query.rs`'s `lexical_only`), so the lexical path is also the honest
-/// fallback once blending lands.
-fn context_lines(root: &Path, query: &str, limit: usize) -> Result<Vec<ContextLine>, ForgeError> {
+/// The semantic blend (`forge_graph::blended_context`) whenever a working
+/// embedder *and* a matching index exist: the embedder must embed the
+/// query text, which is what the trait method's async signature is for.
+/// Without either, `blended_context` degrades to exactly the lexical
+/// ranking (`query.rs`'s `lexical_only`), so the lexical path is also the
+/// honest fallback — engine-less builds and unbuilt indexes change
+/// nothing.
+async fn context_lines(
+    root: &Path,
+    embedder: Option<&EngineEmbedder>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<ContextLine>, ForgeError> {
     let graph = forge_graph::LocalGraph::open(root)?;
-    Ok(graph
-        .context(query, limit)
+    let hits = forge_graph::blended_context(
+        &graph,
+        embedder.map(|e| e as &dyn forge_core::embed::Embedder),
+        query,
+        limit,
+    )
+    .await?;
+    Ok(hits
         .into_iter()
         .map(|hit| ContextLine {
             path: hit.path,
@@ -268,6 +296,8 @@ async fn needle_state(config: &forge_config::Config) -> NeedleState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `LocalGraph::build` is a trait method.
+    use forge_core::ProjectGraph as _;
 
     /// The single place mocks are filtered out (§9.3). Everything the chat
     /// *offers* comes from here, so this test is the gate.
@@ -319,34 +349,40 @@ mod tests {
         );
     }
 
-    /// [`context_lines`] over a real (if tiny) graph: the mapping from the
-    /// graph's own `ContextHit` into `ContextLine` must carry the path and
-    /// score through unchanged, and honour `limit`.
-    #[test]
-    fn context_lines_maps_lexical_hits_and_honours_the_limit() {
+    /// [`context_lines`] over a real (if tiny) graph with no embedder: the
+    /// mapping from the ranker's hit into `ContextLine` must carry the path
+    /// and score through, and honour `limit`.
+    #[tokio::test]
+    async fn context_lines_maps_lexical_hits_and_honours_the_limit() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("alpha.rs"), "fn alpha_marker() {}\n").expect("write");
         std::fs::write(tmp.path().join("beta.rs"), "fn beta_other() {}\n").expect("write");
         let mut graph = forge_graph::LocalGraph::open(tmp.path()).expect("open");
         graph.build().expect("build");
 
-        let hits = context_lines(tmp.path(), "alpha_marker", 10).expect("context");
+        let hits = context_lines(tmp.path(), None, "alpha_marker", 10)
+            .await
+            .expect("context");
         assert_eq!(hits[0].path, "alpha.rs");
-        assert!(hits[0].score > 0);
+        assert!(hits[0].score > 0.0);
 
         // Both files match (one token each), so the cap is what is actually
         // being exercised here, not "only one file could ever match".
-        let capped = context_lines(tmp.path(), "alpha beta", 1).expect("context");
+        let capped = context_lines(tmp.path(), None, "alpha beta", 1)
+            .await
+            .expect("context");
         assert_eq!(capped.len(), 1);
     }
 
     /// A project with no built graph at all must not error — `open`
     /// degrades to an empty graph state, and `/context` before `forge
     /// graph build` should read as "no matches", not a crash.
-    #[test]
-    fn context_lines_on_an_unbuilt_project_is_empty_not_an_error() {
+    #[tokio::test]
+    async fn context_lines_on_an_unbuilt_project_is_empty_not_an_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let hits = context_lines(tmp.path(), "anything", 10).expect("context");
+        let hits = context_lines(tmp.path(), None, "anything", 10)
+            .await
+            .expect("context");
         assert!(hits.is_empty());
     }
 

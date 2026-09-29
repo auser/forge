@@ -598,15 +598,9 @@ conversation cannot honour. Use `forge run --json` instead.
 
 ### Known chat-specific limitations
 
-Three are real gaps, not yet fixed, and worth knowing before you rely on
-the behaviour they touch:
+One is a real gap, not yet fixed, and worth knowing before you rely on the
+behaviour it touches:
 
-- **`/graph` in the chat still ranks lexically.** `ChatHost::graph_context`
-  is async now, so the needle-embedded semantic blend that
-  `forge graph context`/`graph grep --semantic` can use outside the chat is
-  no longer ruled out by the signature — what is missing is the wiring
-  (which embedder the chat's host was built with, and where the index
-  lives). Until that lands, `/graph` is always the plain lexical ranking.
 - **A background notice can land mid-line.** `notify()` no longer
   coordinates with an in-progress prompt: an out-of-band line (a
   `/bg` job finishing, an approval another job needs) prints wherever
@@ -617,11 +611,13 @@ the behaviour they touch:
   *any* multi-byte burst arriving at once — a paste, fast type-ahead, a
   line typed right after Ctrl-C — permanently wedged the editor thread.
   Interleaved output was judged the smaller cost.
-- **A line typed during a turn can, rarely, be lost.** `TerminalIo::read`
-  is not cancel-safe the way `App::drive`'s `select!` needs once a single
-  turn emits several events (a routing line, the answer, and a footer are
-  three, for one turn) — see the `Job` doc in `terminal_io.rs` for the
-  exact mechanism. Reproduced against a real pty; not yet fixed.
+
+Note that `/graph` in the chat *does* blend semantically when the build
+has a working needle engine and a semantic index (`forge graph build`
+maintains one whenever the engine is available): the same
+`blended_context` ranking `forge graph context` uses, reached through the
+now-async `ChatHost::graph_context`. Without an engine or index it is the
+plain lexical ranking — the same degradation as outside the chat.
 
 Beyond those three, see [Known limitations](#known-limitations-v03) for the
 ones shared with the rest of forge (no token-by-token streaming, background
