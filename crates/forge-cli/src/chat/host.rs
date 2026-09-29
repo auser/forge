@@ -177,7 +177,11 @@ impl ChatHost for CliHost {
         }
     }
 
-    fn graph_context(&self, query: &str, limit: usize) -> Result<Vec<ContextLine>, ForgeError> {
+    async fn graph_context(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ContextLine>, ForgeError> {
         context_lines(&self.root, query, limit)
     }
 }
@@ -185,16 +189,15 @@ impl ChatHost for CliHost {
 /// [`ChatHost::graph_context`]'s body, pulled out so it is testable without
 /// a full `CliHost` (which needs a whole runtime to construct).
 ///
-/// Deliberately the plain lexical ranking (`LocalGraph::context`), not
-/// `forge_graph::query::blended_context`: the latter needs to *embed the
-/// query text*, which is async, and `ChatHost::graph_context` is sync (a
-/// deliberate asymmetry with `switch` in the trait itself — everything
-/// here is meant to be plain owned data, cheaply available). Without a
-/// working needle engine, `blended_context` degrades to exactly this
-/// lexical ranking anyway (see `query.rs`'s `lexical_only`), so nothing
-/// with a real embedder loses semantic blending that a sync call could
-/// have honestly offered — it is the async-only half that is unreachable
-/// from here.
+/// Still the plain lexical ranking (`LocalGraph::context`), not
+/// `forge_graph::query::blended_context` — but by choice now, not by
+/// construction: the trait method is async, so embedding the query and
+/// blending semantically is *reachable* from here, and what is missing is
+/// the engine wiring (which embedder this host was built with, and where
+/// the index lives), not the signature. Without a working needle engine,
+/// `blended_context` degrades to exactly this lexical ranking anyway (see
+/// `query.rs`'s `lexical_only`), so the lexical path is also the honest
+/// fallback once blending lands.
 fn context_lines(root: &Path, query: &str, limit: usize) -> Result<Vec<ContextLine>, ForgeError> {
     let graph = forge_graph::LocalGraph::open(root)?;
     Ok(graph

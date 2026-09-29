@@ -189,6 +189,24 @@ pub trait ChatIo: Send {
     /// `ReadOutcome::Interrupt` instead (§6.2); both funnel into one pure
     /// `Controller::on_signal`, which is what makes "Ctrl-C cancels the
     /// turn" testable with no terminal and no signal.
+    ///
+    /// **Contract: this must never resolve unless the user actually
+    /// interrupted.** It has two call sites, and a spurious resolution
+    /// breaks both: `App::interrupted_now` peeks it after every `select!`
+    /// resolution (a phantom `Signal::Interrupt` every loop iteration,
+    /// cancelling whatever is running), and once batch input has ended,
+    /// `read_or_wait_for_interrupt` awaits it as the loop's one live read
+    /// arm — where resolving instantly means that arm wins every iteration,
+    /// the exact busy-wait spin the post-EOF drain exists to prevent. All
+    /// current implementations uphold this by pending on a genuine wakeup:
+    /// a persistent signal listener (`PipedIo`, whose `read` races the same
+    /// listener), `tokio::signal::ctrl_c()` (`TerminalIo`, where a signal
+    /// arriving while nothing is registered can be *missed* but never
+    /// *invented* — the secondary path only, per its module doc), or a
+    /// `Notify` a test fires deliberately (`ScriptedIo`). An
+    /// "already-interrupted" sticky flag returned repeatedly would violate
+    /// it, which is why a listener — not a latched bool — is the right
+    /// shape.
     async fn interrupted(&mut self);
     /// Can this io ask the user a follow-up question? A terminal can (so
     /// an exit with a live job is confirmed); piped stdin cannot (so EOF

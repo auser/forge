@@ -3,12 +3,36 @@
 //! `rustyline::Editor::readline` blocks the calling thread until a line is
 //! typed, so it cannot live on a tokio worker (it would starve every other
 //! task on that worker for the whole prompt). Instead one `std::thread`
-//! owns the `Editor` for the life of the chat and receives
-//! `(Prompt, oneshot::Sender<ReadOutcome>)` jobs over an `mpsc`, exactly the
-//! pattern `NeedleEngine::spawn` uses for `libneedle`
+//! owns the `Editor` for the life of the chat — the same pattern
+//! `NeedleEngine::spawn` uses for `libneedle`
 //! (`crates/forge-needle/src/engine.rs`): a blocking, non-`Send`-friendly
-//! resource lives behind a channel rather than trying to make it `Send` or
+//! resource lives behind channels rather than trying to make it `Send` or
 //! `async`.
+//!
+//! # The two channels, and why `read` is only ever a receive
+//!
+//! `App::drive` (`forge-chat::app`) reconstructs `io.read(prompt)` fresh on
+//! every loop iteration and drops whichever `select!` branch does not win,
+//! so `read` must be cancel-safe: droppable at any await point with nothing
+//! lost. That rules out sending a per-call job carrying a `oneshot` reply
+//! channel — a send, once enqueued, cannot be un-sent by dropping the
+//! future that made it, so a turn streaming several events (normal even
+//! for a one-line answer) piled up orphaned jobs whose `readline` consumed
+//! a typed line and delivered it to a receiver nobody held: the line
+//! vanished, and the caller that was still waiting never woke (reproduced
+//! against a real pty in `forge-cli/tests/chat.rs`).
+//!
+//! So the two directions travel on two separate channels, neither of which
+//! couples a call to a reply:
+//!
+//! * prompts flow in over an unbounded `std::sync::mpsc`, latest-wins: the
+//!   editor thread drains to the newest queued prompt between `readline`s.
+//!   A superseded prompt is only stale completion data, never a lost line.
+//! * outcomes flow out over an unbounded tokio `mpsc` that `read()` merely
+//!   `recv().await`s — documented cancel-safe: dropped mid-`select!`, the
+//!   outcome is simply still there for the next call. A line typed while a
+//!   turn is streaming is buffered here rather than abandoned, and the
+//!   next `read()` picks it up.
 //!
 //! # Ctrl-C arrives through `read`, not `interrupted`
 //!
@@ -51,56 +75,14 @@ use rustyline::{
     Cmd, CompletionType, ConditionalEventHandler, Config, Context, Editor, Event, EventContext,
     EventHandler, ExternalPrinter, Helper, KeyEvent, Movement, RepeatCount,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::palette::Palette;
 
-/// One request to the editor thread: ask for a line under this prompt, and
-/// where to send the answer.
-///
-/// # A separate, real, not-fixed-here hazard: this `read` is not
-/// cancel-safe the way `App::drive`'s `select!` needs it to be
-///
-/// `App::drive` (`forge-chat::app`) reconstructs `self.io.read(prompt)`
-/// fresh every loop iteration and drops whichever branch does not win
-/// (`forge-chat`'s module doc; `PipedIo`'s own module doc walks through why
-/// that is safe for a `read` backed by a channel it only *receives* from).
-/// `TerminalIo::read` is not that: its first poll *sends* a new `Job::Read`
-/// to this thread before awaiting the reply, and `mpsc::Sender::send`, once
-/// it has enqueued the message, cannot be un-sent by dropping the future
-/// that called it. While a turn is streaming multiple events — normal,
-/// even for a one-line answer (a routing line, the answer, a footer are
-/// three) — the read arm can lose several iterations in a row, each one
-/// constructing, sending, and then abandoning its own `Job::Read` with a
-/// now-dropped `oneshot::Sender` on this end. This thread has no way to
-/// tell an abandoned job from a live one: it serves whichever one it
-/// dequeues next, `resp.send` silently failing for a dropped receiver, and
-/// the caller that is actually still awaiting a reply is left holding a
-/// *different* `Job`'s receiver that will now never fire — genuinely stuck.
-/// (`TerminalIo::shutdown` used to compound this into a hang of the whole
-/// process by joining a thread parked inside an orphaned `readline()`; it
-/// detaches the thread instead — see its doc. The stuck *caller* above is
-/// still open.) Reproduced against a real pty: a turn with several events,
-/// followed by a further typed line, occasionally has that line vanish
-/// into an abandoned job instead of reaching `App::on_read` at all.
-///
-/// `PipedIo`'s fix (one persistent producer thread, `read()` only ever
-/// receiving) does not carry over directly, because unlike `PipedIo`,
-/// *what* to read next genuinely depends on a per-call `Prompt` (fresh
-/// completions) — this thread cannot free-run a queue of results the way
-/// `PipedIo`'s stdin thread does. The right shape is likely a persistent
-/// loop here that always reads the *latest* known prompt from a
-/// non-blocking side channel (e.g. `watch`) rather than one popped per
-/// call, feeding an unbounded outcomes channel `read()` only receives
-/// from — real, separate work, out of scope for the printer/`select`
-/// defect this module's other doc comments describe.
-enum Job {
-    Read(Prompt, oneshot::Sender<ReadOutcome>),
-}
-
 /// What the editor thread reports back once it has (or has not) built the
 /// `Editor`. `TerminalIo::new` blocks on this exactly once, at startup —
-/// after that every exchange is the async `Job`/`ReadOutcome` channel.
+/// after that the only exchanges are the prompt/outcome channels (see the
+/// module doc).
 enum StartupResult {
     Ready(Box<dyn ExternalPrinter + Send>),
     Failed(String),
@@ -110,9 +92,22 @@ enum StartupResult {
 /// that decides whether anything it prints gets colour.
 pub struct TerminalIo {
     palette: Palette,
-    /// `None` after [`TerminalIo::shutdown`]: dropping the sender is how the
-    /// editor thread is told to stop (see `shutdown`'s doc).
-    jobs_tx: Option<mpsc::Sender<Job>>,
+    /// The latest-prompt channel: every `read()` call sends one, the editor
+    /// thread drains to the newest between `readline`s. `None` after
+    /// [`TerminalIo::shutdown`]: dropping the sender is how the editor
+    /// thread is told to stop (see `shutdown`'s doc). Unbounded because a
+    /// stale prompt is worthless — only the newest is ever used — so the
+    /// queue's depth is just "how many `read()` calls happened during one
+    /// `readline`", and bounding it would only ever drop the *freshest*
+    /// data.
+    prompts_tx: Option<std_mpsc::Sender<Prompt>>,
+    /// Completed read outcomes, produced only on the editor thread.
+    /// `read()` receives from here and does nothing else, which is what
+    /// makes it cancel-safe under `App::drive`'s `select!`. Unbounded
+    /// because the producer is human typing speed gated by one `readline`
+    /// at a time — the queue can hold at most the lines typed faster than
+    /// the driver drains them.
+    outcomes: mpsc::UnboundedReceiver<ReadOutcome>,
     printer: Box<dyn ExternalPrinter + Send>,
     /// Dropped, never joined, on the way out — see [`TerminalIo::shutdown`].
     thread: Option<std::thread::JoinHandle<()>>,
@@ -126,12 +121,15 @@ impl TerminalIo {
     /// supplies to seed recall with, not a file this type owns.
     pub fn new(palette: Palette, history_path: PathBuf) -> Result<Self, ForgeError> {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel::<StartupResult>(1);
-        let (jobs_tx, jobs_rx) = mpsc::channel::<Job>(1);
+        let (prompts_tx, prompts_rx) = std_mpsc::channel::<Prompt>();
+        let (outcomes_tx, outcomes) = mpsc::unbounded_channel::<ReadOutcome>();
         let color_mode = palette.color_mode();
 
         let thread = std::thread::Builder::new()
             .name("chat-editor".to_string())
-            .spawn(move || editor_thread_main(color_mode, history_path, ready_tx, jobs_rx))
+            .spawn(move || {
+                editor_thread_main(color_mode, history_path, ready_tx, prompts_rx, outcomes_tx)
+            })
             .map_err(|e| {
                 ForgeError::config(format!("failed to start the chat editor thread: {e}"))
             })?;
@@ -139,7 +137,8 @@ impl TerminalIo {
         match ready_rx.recv() {
             Ok(StartupResult::Ready(printer)) => Ok(Self {
                 palette,
-                jobs_tx: Some(jobs_tx),
+                prompts_tx: Some(prompts_tx),
+                outcomes,
                 printer,
                 thread: Some(thread),
             }),
@@ -162,15 +161,21 @@ impl TerminalIo {
 #[async_trait]
 impl ChatIo for TerminalIo {
     async fn read(&mut self, prompt: Prompt) -> ReadOutcome {
-        let Some(tx) = self.jobs_tx.as_ref() else {
+        let Some(tx) = self.prompts_tx.as_ref() else {
             return ReadOutcome::Failed("the terminal editor has been shut down".to_string());
         };
-        let (resp_tx, resp_rx) = oneshot::channel();
-        if tx.send(Job::Read(prompt, resp_tx)).await.is_err() {
+        // The send only refreshes the editor's completion data for its next
+        // `readline`; it carries no per-call reply channel, so a read future
+        // dropped mid-`select!` leaves nothing half-sent or orphaned. The
+        // reply arrives on the shared outcomes channel, which is only ever
+        // received from — and `recv` is cancel-safe, so a dropped read loses
+        // nothing either. Both directions together are what make a line
+        // typed mid-turn survive to the next call (see the module doc).
+        if tx.send(prompt).is_err() {
             return ReadOutcome::Failed("the terminal editor thread is gone".to_string());
         }
-        resp_rx.await.unwrap_or_else(|_| {
-            ReadOutcome::Failed("the terminal editor dropped the reply".to_string())
+        self.outcomes.recv().await.unwrap_or_else(|| {
+            ReadOutcome::Failed("the terminal editor thread is gone".to_string())
         })
     }
 
@@ -198,20 +203,19 @@ impl ChatIo for TerminalIo {
     }
 
     fn shutdown(&mut self) {
-        // Dropping the only sender closes the channel; the editor thread's
-        // `blocking_recv` then returns `None` on its own, so it falls
-        // through to `save_history` and exits without needing a dedicated
-        // shutdown message.
-        self.jobs_tx = None;
-        // Deliberately **not** joined. That only ever completes if the
-        // thread is back at `blocking_recv` when this runs; if it is
-        // instead inside `readline()` serving an orphaned `Job` (the `Job`
-        // doc's separate, still-open cancel-safety hazard), `readline`
-        // returns only when a key is pressed — so a join here is the
-        // process hanging after `/quit` with no prompt on screen and
-        // nothing saying why. Reachable without the `Job` hazard being
-        // fixed: a turn running with an orphaned job outstanding, then
-        // enough `kill -INT`s to drive the `Controller` to `Quit(130)`.
+        // Dropping the only sender closes the prompt channel; the editor
+        // thread's blocking `recv` between `readline`s then returns `Err`
+        // on its own, so it falls through to `save_history` and exits
+        // without needing a dedicated shutdown message.
+        self.prompts_tx = None;
+        // Deliberately **not** joined. In every normal exit the thread is
+        // parked at that `recv` (a quit is only ever processed after a
+        // `readline` completed, and every `read` call sends a prompt before
+        // awaiting, so the thread is never left inside `readline` by the
+        // driver's own flow) and the join would return at once — but a
+        // future exit path that leaves a `readline` genuinely outstanding
+        // (whose return needs a keypress) would turn a join here into the
+        // process hanging with no prompt on screen and nothing saying why.
         //
         // Nothing is lost by detaching: `append_history` already ran for
         // every accepted line (see `editor_thread_main`), so the
@@ -223,13 +227,22 @@ impl ChatIo for TerminalIo {
 }
 
 /// The editor thread's body: build the `Editor` (reporting success or
-/// failure over `ready_tx` exactly once), then serve `Job::Read` requests
-/// until the channel closes, then persist history on the way out.
+/// failure over `ready_tx` exactly once), then run one `readline` per
+/// typed line until the prompt channel closes, then persist history on the
+/// way out.
+///
+/// The loop never waits on the *outcome* side: each completed `readline`
+/// is pushed onto `outcomes_tx` whether or not a `read()` is awaiting one
+/// right then, so a line typed while the driver was busy streaming a turn
+/// is buffered, never dropped into a reply channel nobody holds (that
+/// coupling — a per-call job with a `oneshot` back — is what used to lose
+/// those lines; see the module doc).
 fn editor_thread_main(
     color_mode: rustyline::ColorMode,
     history_path: PathBuf,
     ready_tx: std_mpsc::SyncSender<StartupResult>,
-    mut jobs_rx: mpsc::Receiver<Job>,
+    prompts_rx: std_mpsc::Receiver<Prompt>,
+    outcomes_tx: mpsc::UnboundedSender<ReadOutcome>,
 ) {
     let mut editor = match build_editor(color_mode) {
         Ok(editor) => editor,
@@ -277,13 +290,28 @@ fn editor_thread_main(
         return; // the caller gave up before we were ready
     }
 
+    // Block for the first prompt: a `readline` only ever starts once the
+    // driver has actually asked for a line, so the prompt on screen is
+    // always a real one, never a default drawn at thread start.
+    let Ok(mut prompt) = prompts_rx.recv() else {
+        return; // dropped before the first read: nothing was ever asked
+    };
+
     // `Prompt::history` is a one-time seed (recall from before this process
     // started); re-adding it on every turn would otherwise re-insert the
     // same lines throughout the session, since `history_ignore_dups` only
     // catches *consecutive* duplicates.
     let mut seeded = false;
 
-    while let Some(Job::Read(prompt, resp)) = jobs_rx.blocking_recv() {
+    loop {
+        // Latest prompt wins. A turn can stream many events — and the
+        // driver sends a fresh prompt per `read()` call, one per loop
+        // iteration — while a single `readline` is in progress; the
+        // superseded ones differ only in completion data, so nothing is
+        // lost by dropping straight to the newest.
+        while let Ok(newer) = prompts_rx.try_recv() {
+            prompt = newer;
+        }
         if !seeded {
             for line in &prompt.history {
                 let _ = editor.add_history_entry(line.as_str());
@@ -307,12 +335,19 @@ fn editor_thread_main(
             Err(ReadlineError::Eof) => ReadOutcome::Eof,
             Err(e) => ReadOutcome::Failed(e.to_string()),
         };
-        // `resp.send` failing (the receiver already dropped) is not
-        // reported anywhere here — see the `Job` doc for why that is a
-        // real, separate, not-fixed-here hazard rather than a harmless
-        // no-op: this line was already consumed either way, and it is not
-        // recoverable from this side.
-        let _ = resp.send(outcome);
+        // Buffered, not replied: see this function's doc. A send failure
+        // means the receiver (and with it the chat) is gone.
+        if outcomes_tx.send(outcome).is_err() {
+            break;
+        }
+        // Wait for the next `read()` call before reading again. Every
+        // `read()` sends its prompt before awaiting, so this `recv` cannot
+        // be what the driver is waiting on; and at shutdown the closed
+        // channel ends the loop with no readline left outstanding.
+        match prompts_rx.recv() {
+            Ok(next) => prompt = next,
+            Err(_) => break,
+        }
     }
 
     let _ = editor.save_history(&history_path);

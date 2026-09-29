@@ -28,7 +28,16 @@ pub trait ChatHost: Send + Sync {
     fn skills(&self) -> Vec<SkillChoice>;
     /// `forge config show`/`explain` data: key, value, origin.
     fn config_summary(&self, key: Option<&str>) -> Vec<ConfigLine>;
-    fn graph_context(&self, query: &str, limit: usize) -> Result<Vec<ContextLine>, ForgeError>;
+    /// Ranked project-graph hits for `/context`. Async so that semantic
+    /// blending — which must *embed the query text*, an inherently async
+    /// call into the needle engine — is reachable from chat; a sync
+    /// signature here is what previously forbade it outright, even with a
+    /// working engine and a built index.
+    async fn graph_context(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ContextLine>, ForgeError>;
 }
 
 /// The one setting a slash command may change. A session-scoped override,

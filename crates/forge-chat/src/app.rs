@@ -621,7 +621,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Action::ShowApproval => self.do_show_approval(),
                 Action::ShowConfig(key) => self.do_show_config(key),
                 Action::ListSkills => self.do_list_skills(),
-                Action::Graph(query) => self.do_graph(query),
+                Action::Graph(query) => self.do_graph(query).await,
                 Action::ShowSession => self.do_show_session(),
                 Action::NewSession => self.do_new_session(),
                 Action::SwitchSession(id) => self.do_switch_session(id),
@@ -959,8 +959,8 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         }
     }
 
-    fn do_graph(&mut self, query: String) {
-        match self.host.graph_context(&query, 10) {
+    async fn do_graph(&mut self, query: String) {
+        match self.host.graph_context(&query, 10).await {
             Ok(hits) if hits.is_empty() => self.emit(Line::meta("no matches")),
             Ok(hits) => {
                 for hit in hits {

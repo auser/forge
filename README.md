@@ -597,12 +597,12 @@ conversation cannot honour. Use `forge run --json` instead.
 Three are real gaps, not yet fixed, and worth knowing before you rely on
 the behaviour they touch:
 
-- **`/graph` in the chat cannot use semantic search.** `ChatHost::graph_context`
-  is a *synchronous* trait method, and embedding a query is inherently
-  async, so the needle-embedded semantic blend that `forge graph context`/
-  `graph grep --semantic` can use outside the chat is unreachable from
-  here — even with a working needle engine and a built index, `/graph`
-  is always the plain lexical ranking.
+- **`/graph` in the chat still ranks lexically.** `ChatHost::graph_context`
+  is async now, so the needle-embedded semantic blend that
+  `forge graph context`/`graph grep --semantic` can use outside the chat is
+  no longer ruled out by the signature — what is missing is the wiring
+  (which embedder the chat's host was built with, and where the index
+  lives). Until that lands, `/graph` is always the plain lexical ranking.
 - **A background notice can land mid-line.** `notify()` no longer
   coordinates with an in-progress prompt: an out-of-band line (a
   `/bg` job finishing, an approval another job needs) prints wherever
