@@ -822,8 +822,11 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
     // Wait for the idle prompt: the banner's last line, printed once
     // `App::drive` is blocked on its first `io.read` — i.e. `rustyline` is
     // genuinely mid-`readline()`, in raw mode, on the other end of this
-    // pty.
-    wait_for(&output, "/help for commands", Duration::from_secs(10));
+    // pty. The waits in this test are 30 s, not 10: still bounded, but a
+    // loaded shared machine (this one runs other projects' builds) made
+    // the 10 s bound flake twice on unrelated commits — the property under
+    // test is "the interrupt reaches the controller", not responsiveness.
+    wait_for(&output, "/help for commands", Duration::from_secs(30));
 
     // A single typed Ctrl-C: on a real terminal in raw mode this is just
     // byte 0x03 arriving on the child's stdin, exactly as it would from a
@@ -837,7 +840,7 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
     // by a chat that is still running its main loop — a real `SIGINT`
     // reaching an unprotected process instead would simply end it, with no
     // further output at all.
-    wait_for(&output, "press Ctrl-C again", Duration::from_secs(10));
+    wait_for(&output, "press Ctrl-C again", Duration::from_secs(30));
     assert!(
         matches!(child.try_wait(), Ok(None)),
         "the chat must still be alive after one Ctrl-C"
@@ -855,7 +858,7 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
     // echoed prompt text itself — rustyline redraws it interleaved with
     // ANSI synchronized-update escapes, which a literal substring check
     // would be too fragile to survive.
-    wait_for(&output, "the answer", Duration::from_secs(10));
+    wait_for(&output, "the answer", Duration::from_secs(30));
 
     // Killed, not asked to `/quit` — see this test's doc for why.
     drop(writer);

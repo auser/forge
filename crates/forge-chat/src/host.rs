@@ -96,10 +96,12 @@ pub struct ConfigLine {
     pub origin: String,
 }
 
-/// One ranked context hit, in the graph's own units (a project-relative
-/// path and the graph's integer score), so nothing is converted twice.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One ranked context hit. The score is the ranker's own: the lexical
+/// graph's integer score as a float, or the blend's 0..~1.5 weighted
+/// cosine when semantic blending is in play — `f64` because truncating a
+/// blended score to the old integer type reduced every hit to 0 or 1.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContextLine {
     pub path: String,
-    pub score: u32,
+    pub score: f64,
 }

@@ -964,7 +964,10 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             Ok(hits) if hits.is_empty() => self.emit(Line::meta("no matches")),
             Ok(hits) => {
                 for hit in hits {
-                    self.emit(Line::meta(format!("{} ({})", hit.path, hit.score)));
+                    // Two decimals: the score is a blend weight when
+                    // semantic search is in play, an integer-valued
+                    // lexical score otherwise.
+                    self.emit(Line::meta(format!("{} ({:.2})", hit.path, hit.score)));
                 }
             }
             Err(e) => self.emit(Line::bad(format!("error: {e}"))),
