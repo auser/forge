@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,6 +39,16 @@ pub type ModelFactory =
 /// Router name recorded for a run answered by the direct-dispatch fast
 /// path instead of the model loop.
 const NEEDLE_DISPATCH: &str = "needle-dispatch";
+
+/// Budget for the *first* `tool_call` in a process — see
+/// [`AgentService::needle_fast_path`] for the measurements behind it.
+///
+/// Small on purpose. A cold `libneedle` needs ~8 s for that call and cannot win
+/// whatever we allow it, so the only question is how fast we give up; the
+/// backends that *can* answer (an already-warm engine, or `HashBackend`) do so
+/// in microseconds, far inside this. Not configurable: it is a property of the
+/// engine's one-time setup cost, not a preference.
+const FIRST_TOOL_CALL_PROBE: Duration = Duration::from_millis(250);
 
 /// The two `decide` options of the fast-path guardrail. Order matters:
 /// only `GUARD_SAFE` (index 0) lets a call through, and `HashBackend`
@@ -347,6 +358,10 @@ pub struct AgentService {
     /// On-device brain for the direct-dispatch fast path. `None` (the
     /// default) means every run goes through the model loop.
     needle: Option<Arc<NeedleEngine>>,
+    /// Whether the engine's tool surface has been installed yet. The install is
+    /// a property of the engine, not of any one run, so it is paid once per
+    /// process — see [`AgentService::needle_fast_path`].
+    needle_warmed: AtomicBool,
     /// Per-run tracking, pruned when a run reaches a terminal state (see
     /// [`AgentService::finish_run`]).
     broadcasters: Mutex<HashMap<String, broadcast::Sender<Event>>>,
@@ -378,6 +393,7 @@ impl AgentService {
             graph: None,
             model_factory: None,
             needle: None,
+            needle_warmed: AtomicBool::new(false),
             broadcasters: Mutex::new(HashMap::new()),
             inputs: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
@@ -1187,8 +1203,40 @@ impl AgentService {
             // Let the loop's own checkpoint report the cancellation.
             return None;
         }
-        let budget = Duration::from_millis(self.config.router_timeout_ms);
         let tools_json = serde_json::to_string(tools).ok()?;
+
+        // The first `tool_call` in a process installs and tokenizes the tool
+        // surface, and that is expensive in a way no later call is. Measured on
+        // an M-series release build with forge's seven real tools
+        // (crates/forge-needle/tests/fastpath_latency.rs): the cold call takes
+        // ~8 s where warm calls are p50 1.1 s / p90 2.2 s. Loading the weights
+        // is not the cause — that is 29 ms.
+        //
+        // 8 s cannot fit any budget worth giving a *fast* path, so the cold call
+        // is never going to be the one that dispatches. Giving it
+        // `router_timeout_ms` (5 s) meant every fresh `forge run` waited the
+        // full 5 s, logged "timed out picking a tool", and called the model
+        // anyway — and `forge run` is one process per invocation, so for the CLI
+        // that was *every* run.
+        //
+        // So the first attempt gets a deliberately tiny budget instead. A
+        // backend that can answer instantly still does — an already-warm engine,
+        // or `HashBackend` — which matters because skipping the first attempt
+        // outright would make the fast path unreachable for every one-shot run.
+        // A cold `libneedle` blows the probe and we fall through in
+        // milliseconds.
+        //
+        // Losing the probe does not waste the work: `timeout` drops our
+        // receiver, but the engine thread has already picked the job up and runs
+        // it to completion, which is exactly the one-time install. It finishes
+        // while this turn's model call — which the turn was committed to anyway —
+        // is in flight, so the next turn finds a warm engine.
+        let first_attempt = !self.needle_warmed.swap(true, Ordering::SeqCst);
+        let budget = if first_attempt {
+            FIRST_TOOL_CALL_PROBE
+        } else {
+            Duration::from_millis(self.config.router_timeout_ms)
+        };
 
         let call =
             match tokio::time::timeout(budget, engine.tool_call(prompt.to_string(), tools_json))
@@ -1198,6 +1246,14 @@ impl AgentService {
                 Ok(Ok(None)) => return None,
                 Ok(Err(e)) => {
                     tracing::debug!(run_id, error = %e, "needle fast path unavailable");
+                    return None;
+                }
+                Err(_) if first_attempt => {
+                    tracing::debug!(
+                        run_id,
+                        "needle fast path probe expired; the tool surface is installing in the \
+                         background and later turns will use it. This turn goes to the model."
+                    );
                     return None;
                 }
                 Err(_) => {

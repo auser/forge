@@ -1,5 +1,4 @@
 /target/
-/.forge/
 /.claude/
 # Per-platform libneedle engine binaries (feature `ffi`). Apache-2.0 and
 # redistributable, but a 1.1 MB blob per target that `cargo check`/`just
@@ -9,3 +8,18 @@
 .cursorindexingignore
 .specstory/
 specs/scratch.md
+
+# Per-project forge state: config.toml, the built graph, session transcripts.
+# Unanchored so nested projects are covered too, not just the repo root.
+.forge/
+
+# Local secrets, and anything an editor or tool leaves beside them
+# (`.env.backup`, `.env.local`, `.env.save`, …). `.env` was previously covered
+# only by individual developers' global gitignore, which a fresh clone cannot
+# rely on — so one careless `git add -A` could have committed real credentials.
+# The example file lives at examples/env.example and is unaffected by these
+# patterns; the negations guard against a dotfile variant being added later.
+.env
+.env.*
+!.env.example
+!.env.sample
