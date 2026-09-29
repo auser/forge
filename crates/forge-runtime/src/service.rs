@@ -769,12 +769,33 @@ impl AgentService {
     /// talk to must not be hidden by a busy history — while terminal ones
     /// are bounded, because a long-lived project accumulates them without
     /// limit.
+    ///
+    /// The bound is on the *work*, not just the response: chat calls this
+    /// once per submitted line, so it cannot re-read and re-parse every
+    /// session's whole JSONL log each time. Sessions are walked
+    /// newest-modified first, and once [`LISTED_TERMINAL_RUNS`] terminal
+    /// runs are collected, any session file last modified at or before the
+    /// current cutoff is skipped unparsed — every event in it predates its
+    /// mtime, so nothing in it could displace a run already kept. One
+    /// honest consequence: a run that died without writing a terminal
+    /// event (state `Running` forever) and whose session file has been
+    /// untouched since before the cutoff no longer lists as live. Runs
+    /// *this* process tracks are in memory and always listed regardless.
     pub fn list_runs(&self) -> Result<Vec<RunSummary>, ForgeError> {
         let mut summaries: Vec<RunSummary> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // `last_event_at` of each terminal run collected so far, newest
+        // first; the cutoff for skipping old session files unparsed.
+        let mut terminal_stamps: Vec<DateTime<Utc>> = Vec::new();
 
-        for info in self.sessions.list_sessions()? {
-            let events = self.sessions.events_for(&info.session_id)?;
+        for (session_id, _path, modified) in self.sessions.session_files_by_recency()? {
+            if terminal_stamps.len() >= LISTED_TERMINAL_RUNS {
+                let cutoff = terminal_stamps[LISTED_TERMINAL_RUNS - 1];
+                if DateTime::<Utc>::from(modified) <= cutoff {
+                    continue;
+                }
+            }
+            let events = self.sessions.events_for(&session_id)?;
             let mut runs: Vec<String> = Vec::new();
             for event in &events {
                 if !runs.contains(&event.run_id) {
@@ -805,9 +826,18 @@ impl AgentService {
                         })
                     });
                 seen.insert(run_id.clone());
+                if state.is_terminal()
+                    && let Some(stamp) = own.last().map(|e| e.ts)
+                {
+                    // Keep newest-first so the cutoff is a plain index.
+                    let slot = terminal_stamps
+                        .binary_search_by(|probe| stamp.cmp(probe))
+                        .unwrap_or_else(|slot| slot);
+                    terminal_stamps.insert(slot, stamp);
+                }
                 summaries.push(RunSummary {
                     run_id,
-                    session_id: Some(info.session_id.clone()),
+                    session_id: Some(session_id.clone()),
                     state,
                     started_at: own.first().map(|e| e.ts),
                     last_event_at: own.last().map(|e| e.ts),
