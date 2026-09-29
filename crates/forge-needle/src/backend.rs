@@ -16,13 +16,19 @@ use std::path::PathBuf;
 /// itself once the binary has a backend, and the callers that are *about* to
 /// run init say so in their own words.
 ///
-/// `--git` rather than `--path`: someone hitting this may well have installed
-/// a prebuilt binary and have no checkout to build from. Release binaries for
-/// the platforms with a verified engine already ship with the brain, so the
-/// other honest answer — upgrade — is named in README's install section rather
-/// than here, where it would dilute the one command.
+/// No `--features` flag, because there isn't one: the engine is linked by
+/// default, so a brain-less binary means engine resolution failed at build
+/// time (offline, `NEEDLE_NO_DOWNLOAD`, or an unverified target), and a plain
+/// reinstall on a machine that *can* resolve is the fix. `--git` rather than
+/// `--path`: someone hitting this may well have installed a prebuilt binary
+/// and have no checkout to build from. Release binaries for the platforms
+/// with a verified engine already ship with the brain, so the other honest
+/// answer — upgrade — is named in README's install section rather than here,
+/// where it would dilute the one command.
 pub const ENGINE_REMEDY: &str = "install a build with the brain: \
-     `cargo install --locked --features needle-ffi --git https://github.com/auser/forge forge-cli`";
+     `cargo install --locked --git https://github.com/auser/forge forge-cli` \
+     (the engine links by default; if it still resolves to nothing, see \
+     crates/needle-sys: NEEDLE_LIB_DIR, vendor/, NEEDLE_NO_DOWNLOAD)";
 
 /// Error surface of a Needle backend. `Declined` is a designed outcome:
 /// Needle refuses to guess; callers must fall back, never retry blindly.
@@ -65,9 +71,9 @@ pub struct NeedleToolCall {
 }
 
 /// Synchronous backend contract. Implementations: `HashBackend`
-/// (deterministic, test/BDD), `FfiBackend` (real model, feature `ffi`).
-/// All methods run on the engine's dedicated thread — implementations
-/// may block and need not be Sync.
+/// (deterministic, test/BDD), `FfiBackend` (real model, when the build
+/// linked `libneedle`). All methods run on the engine's dedicated thread —
+/// implementations may block and need not be Sync.
 pub trait NeedleBackend: Send + 'static {
     fn load(&mut self) -> Result<(), BackendError>;
     fn model_id(&self) -> String;
@@ -82,10 +88,11 @@ pub trait NeedleBackend: Send + 'static {
     ) -> Result<Option<NeedleToolCall>, BackendError>;
 }
 
-/// The backend `engine_from_config` picks when this binary was built without
-/// the `ffi` feature: there is no engine in the process at all. `load()`
-/// always fails, so any `NeedleRouter` built on it always errors and the
-/// `FallbackRouter` wrapping it in `router_from_config` degrades to the
+/// The backend `engine_from_config` picks when this build has no engine
+/// linked (`crate::HAS_EMBEDDED_BACKEND` is `false` — `needle-sys` resolved
+/// nothing at build time): there is no engine in the process at all.
+/// `load()` always fails, so any `NeedleRouter` built on it always errors and
+/// the `FallbackRouter` wrapping it in `router_from_config` degrades to the
 /// configured fallback (`static`, by default). `router = "needle"` is
 /// therefore a safe default in every build; without the engine it is simply
 /// honest about being unavailable.
@@ -167,7 +174,9 @@ mod tests {
 
     /// Whatever the wording, the message has to end in something the reader
     /// can actually run, and it has to be the same one `forge init` and
-    /// `forge doctor` name — hence one shared constant.
+    /// `forge doctor` name — hence one shared constant. There is deliberately
+    /// no cargo feature in it: the engine is linked by default, so the remedy
+    /// is a reinstall that can resolve the engine, not a flag.
     #[test]
     fn the_no_backend_error_carries_the_one_remedy() {
         let message = BackendError::EngineMissing.to_string();
@@ -176,8 +185,12 @@ mod tests {
             "the error must carry the shared remedy verbatim: {message}"
         );
         assert!(
-            ENGINE_REMEDY.contains("needle-ffi"),
-            "the remedy must name the feature: {ENGINE_REMEDY}"
+            ENGINE_REMEDY.contains("cargo install"),
+            "the remedy must be runnable as written: {ENGINE_REMEDY}"
+        );
+        assert!(
+            !ENGINE_REMEDY.contains("--features"),
+            "there is no engine feature to name any more: {ENGINE_REMEDY}"
         );
         assert!(
             !ENGINE_REMEDY.contains("forge init"),

@@ -1,6 +1,24 @@
 //! Raw, unsafe bindings to `libneedle` — the Cactus Needle 3 on-device
-//! inference engine. The safe wrapper is
-//! `forge_needle::ffi_backend::FfiBackend` (feature `ffi`).
+//! inference engine. The safe wrapper is `forge_needle::ffi_backend::FfiBackend`.
+//!
+//! # Linked or stubbed: the `needle_engine` cfg
+//!
+//! `build.rs` emits `--cfg needle_engine` when (and only when) it resolved a
+//! real engine and emitted link flags for it. With the cfg set, the
+//! declarations below are the real `extern "C"` imports. Without it — engine
+//! resolution failed and the build continued engine-less with a warning — the
+//! crate instead compiles plain Rust **stubs** with identical names and
+//! signatures: every fallible call returns failure and `needle_last_error`
+//! says why. The stubs exist so downstream crates (`forge-needle` and
+//! everything above it) compile and link unchanged either way, and branch on
+//! [`ENGINE_LINKED`] instead of a cargo feature. They are plain Rust fns, not
+//! `#[no_mangle] extern "C"`: callers reach them as `needle_sys::needle_init`
+//! Rust paths, so source-compatible stubs suffice and they export no symbols
+//! that could shadow a real engine.
+//!
+//! [`ENGINE_LINKED`] is the only correct answer to "can this build run
+//! inference" — a fact about what the build script resolved, not a feature
+//! someone asked for.
 //!
 //! # Why these are hand-written
 //!
@@ -64,6 +82,19 @@
 
 use std::os::raw::{c_char, c_int, c_uchar, c_ulonglong};
 
+/// Whether this build actually linked `libneedle` — set from the
+/// `needle_engine` cfg that `build.rs` emits only when engine resolution
+/// succeeded and link flags went out. This is **the only correct answer to
+/// "can this build run inference"**: a build-time fact about what resolved,
+/// not a feature someone requested. `forge-needle` re-exports it as
+/// `forge_needle::HAS_EMBEDDED_BACKEND`; everything above reads that.
+///
+/// When this is `false` the functions below are inert stubs (see the module
+/// docs): they fail cleanly, so code built on them still compiles, links and
+/// runs — it just reports the engine as missing.
+pub const ENGINE_LINKED: bool = cfg!(needle_engine);
+
+#[cfg(needle_engine)]
 unsafe extern "C" {
     /// `int needle_init(const char*, const char*, const char*)` — installs the
     /// system-facts string and tools JSON. Returns the static-prefix token
@@ -101,6 +132,94 @@ unsafe extern "C" {
     /// `.cact` archive. Returns 0 on success, negative on failure. Copies the
     /// bytes.
     pub fn needle_load(cact: *const c_uchar, n: c_ulonglong) -> c_int;
+}
+
+// Engine-less stand-ins, compiled when `build.rs` resolved no engine. Same
+// names and signatures as the real imports, so callers never branch on the
+// cfg themselves — they branch on `ENGINE_LINKED`, and anything that calls
+// anyway gets a clean, explainable failure rather than a link error. Plain
+// Rust fns, deliberately not `#[no_mangle] extern "C"`: they are reached as
+// `needle_sys::needle_*` Rust paths and must export no symbols that could
+// collide with a real `libneedle` elsewhere in the link.
+
+/// What every stub reports through [`needle_last_error`].
+#[cfg(not(needle_engine))]
+const NOT_LINKED: &[u8] = b"needle engine not linked in this build\0";
+
+/// Stub for the engine-less build: no model exists, so there is no prefix to
+/// install. Always fails.
+///
+/// # Safety
+///
+/// Unlike the real import, this touches no C state; the pointer arguments are
+/// never dereferenced.
+#[cfg(not(needle_engine))]
+pub unsafe fn needle_init(
+    _system_prompt: *const c_char,
+    _tools_json: *const c_char,
+    _tool_index_path: *const c_char,
+) -> c_int {
+    -1
+}
+
+/// Stub for the engine-less build: reports why, instead of the runtime's
+/// per-call error. The pointer is a `'static` string, so the real contract
+/// ("valid until the next API call") is trivially upheld.
+///
+/// # Safety
+///
+/// Returns a pointer to a static NUL-terminated string; never null.
+#[cfg(not(needle_engine))]
+pub unsafe fn needle_last_error() -> *const c_char {
+    NOT_LINKED.as_ptr().cast()
+}
+
+/// Stub for the engine-less build: nothing is generated. Always fails.
+///
+/// # Safety
+///
+/// Unlike the real import, this touches no C state; the pointer arguments are
+/// never dereferenced.
+#[cfg(not(needle_engine))]
+pub unsafe fn needle_complete(
+    _input: *const c_char,
+    _max_new_tokens: c_int,
+    _out: *mut c_char,
+    _out_capacity: c_int,
+) -> c_int {
+    -1
+}
+
+/// Stub for the engine-less build: no dimension can be reported. Always
+/// fails.
+///
+/// # Safety
+///
+/// Unlike the real import, this touches no C state; the pointer arguments are
+/// never dereferenced.
+#[cfg(not(needle_engine))]
+pub unsafe fn needle_embed(_input: *const c_char, _out: *mut f32, _out_capacity: c_int) -> c_int {
+    -1
+}
+
+/// Stub for the engine-less build: no conversation exists, so there is
+/// nothing to clear.
+///
+/// # Safety
+///
+/// A no-op; touches no state at all.
+#[cfg(not(needle_engine))]
+pub unsafe fn needle_reset() {}
+
+/// Stub for the engine-less build: no weights can be bound. Always fails.
+///
+/// # Safety
+///
+/// Unlike the real import, this touches no C state; the pointer arguments are
+/// never dereferenced.
+#[cfg(not(needle_engine))]
+pub unsafe fn needle_load(_cact: *const c_uchar, _n: c_ulonglong) -> c_int {
+    -1
 }
 
 #[cfg(test)]

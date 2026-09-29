@@ -73,9 +73,8 @@ struct PinnedEngine {
 ///
 /// Note what is *not* published at all: there is no `macos-x86_64` folder in
 /// the repo (checked against the HF `siblings` listing), so
-/// `x86_64-apple-darwin` has no engine to fetch — which is one of the reasons
-/// `needle-ffi` is not a default feature. See README's "Embedded Needle
-/// brain".
+/// `x86_64-apple-darwin` has no engine to fetch — builds for it always
+/// resolve engine-less and warn. See README's "Embedded Needle brain".
 ///
 /// What is left is arm64, on both platforms — and both are verified end to end
 /// (real `decide` against real weights, statically linked, no new runtime
@@ -119,11 +118,6 @@ const BASE_URL_ENV: &str = "NEEDLE_ENGINE_BASE_URL";
 /// Override the shared engine cache directory. Default:
 /// `$CARGO_HOME/needle-engine`, else `~/.cargo/needle-engine`, else `OUT_DIR`.
 const CACHE_DIR_ENV: &str = "NEEDLE_ENGINE_CACHE_DIR";
-/// Cargo sets `CARGO_FEATURE_<NAME>` for each feature enabled on *this*
-/// crate. `fetch` is turned on by `forge-needle`'s `ffi` feature and by
-/// nothing else, which is how a build script — which cannot see downstream
-/// features — knows the engine is actually going to be linked.
-const FETCH_FEATURE_ENV: &str = "CARGO_FEATURE_FETCH";
 
 /// Every env var that changes this build script's decision, so cargo reruns
 /// it when one of them changes.
@@ -164,23 +158,25 @@ impl FetchError {
         match self {
             Self::UnsupportedTarget => format!(
                 "no verified libneedle engine is published for {target}, so this build has no \
-                 embedded brain. Either build without the feature (`cargo build` with no \
-                 `--features needle-ffi` — forge routes with static rules and stays fully \
-                 usable), or put an engine you trust in crates/needle-sys/vendor/{target}/ and \
-                 point {LIB_DIR_ENV} at it. Verified targets: {}.",
+                 embedded brain — it continues engine-less and forge routes with static rules, \
+                 fully usable. To get a brain anyway, put an engine you trust in \
+                 crates/needle-sys/vendor/{target}/ and point {LIB_DIR_ENV} at it. Verified \
+                 targets: {}.",
                 pinned_targets().join(", ")
             ),
             Self::Disabled => format!(
                 "{NO_DOWNLOAD_ENV} is set, so the libneedle engine was not downloaded and this \
-                 build has no embedded brain. Put an engine in \
-                 crates/needle-sys/vendor/{target}/ (or point {LIB_DIR_ENV} at one), or build \
-                 without `--features needle-ffi`."
+                 build has no embedded brain — it continues engine-less and forge routes with \
+                 static rules. To get a brain, put an engine in \
+                 crates/needle-sys/vendor/{target}/ (or point {LIB_DIR_ENV} at one), or unset \
+                 {NO_DOWNLOAD_ENV} to let the build fetch it."
             ),
             Self::Transfer(detail) => format!(
-                "could not download the libneedle engine for {target} ({detail}). If this \
-                 machine is offline, build without `--features needle-ffi` — forge routes with \
-                 static rules and stays fully usable — or fetch the engine on a connected \
-                 machine into crates/needle-sys/vendor/{target}/ and set {NO_DOWNLOAD_ENV}=1."
+                "could not download the libneedle engine for {target} ({detail}), so this build \
+                 has no embedded brain — it continues engine-less and forge routes with static \
+                 rules, fully usable. If this machine is offline, set {NO_DOWNLOAD_ENV}=1 to \
+                 skip the download attempt, or fetch the engine on a connected machine into \
+                 crates/needle-sys/vendor/{target}/."
             ),
             Self::Checksum { expected, actual } => format!(
                 "the downloaded libneedle engine for {target} does not match the checksum forge \
@@ -449,8 +445,9 @@ fn ensure_cached_engine(
 /// Step 3 of the resolution order: download-at-build with checksum
 /// verification. Returns the *directory* to add to the link search path.
 ///
-/// Never called unless the `fetch` feature is on — i.e. unless
-/// `forge-needle/ffi` asked for a linkable engine.
+/// Called whenever `NEEDLE_LIB_DIR` and `vendor/` resolved nothing: the
+/// engine is on by default, so no feature gates this — `NEEDLE_NO_DOWNLOAD`
+/// is the opt-out.
 fn fetch_engine_dir(target: &str, out_dir: &Path) -> Result<PathBuf, FetchError> {
     let engine = pinned_engine(target).ok_or(FetchError::UnsupportedTarget)?;
     let base_url = match std::env::var(BASE_URL_ENV) {

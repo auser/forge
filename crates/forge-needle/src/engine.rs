@@ -146,8 +146,8 @@ fn is_abandoned(job: &Job) -> bool {
 /// `BackendError::Inference` instead of unwinding out of the engine thread
 /// and killing the engine for the rest of the process.
 ///
-/// This matters most for `FfiBackend` (feature `ffi`), whose wrapper code
-/// does pointer, length and UTF-8 work around a C library. **It is not a
+/// This matters most for `FfiBackend`, whose wrapper code does pointer,
+/// length and UTF-8 work around a C library. **It is not a
 /// sandbox for the C library itself**: `catch_unwind` cannot catch a C++
 /// exception thrown across an `extern "C"` boundary, a `SIGSEGV`, or an
 /// `abort()`, and a `panic = "abort"` profile disables it entirely. What it

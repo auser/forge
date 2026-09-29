@@ -1450,7 +1450,8 @@ async fn initialized_project_no_needle_weights(world: &mut BddWorld) {
     // `run_forge` already injects `FORGE_NEEDLE_AUTOFETCH=false` and leaves
     // `FORGE_NEEDLE_BACKEND` unset for every invocation, so the starter
     // config's default `router = "needle"` ends up with no usable engine:
-    // no weights fetched, no hash test backend selected, no `ffi` feature.
+    // no weights fetched and no hash test backend selected (and the BDD
+    // build may not even have an engine linked).
     world.run_forge(&["init"]).await;
     assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
 }

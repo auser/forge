@@ -143,14 +143,14 @@ fn legacy_config_item(root: &Path, config: &forge_config::Config) -> Option<Init
 /// degrades to an informational item, matching the design's guarantee that
 /// forge stays fully functional on static routing without weights.
 ///
-/// Feature-gated first: the `needle-ffi` feature (off by default — see
-/// `forge-cli/Cargo.toml`) is what actually lets anything *use* fetched
-/// weights (`FfiBackend` vs. `UnavailableBackend`). Without it, fetching the
-/// ~35 MB `full` artifact would only ever sit on disk unused, so this skips
-/// the fetch entirely rather than downloading bytes no build here can act on
-/// — regardless of `local_only`/`autofetch`, since the more fundamental
-/// reason to skip is "this binary has no inference backend to feed", not the
-/// config.
+/// Engine-gated first: `forge_needle::HAS_EMBEDDED_BACKEND` — a build-time
+/// fact about whether `needle-sys` linked a real engine — is what decides
+/// whether anything here can *use* fetched weights (`FfiBackend` vs.
+/// `UnavailableBackend`). Without an engine, fetching the ~35 MB `full`
+/// artifact would only ever sit on disk unused, so this skips the fetch
+/// entirely rather than downloading bytes no build here can act on —
+/// regardless of `local_only`/`autofetch`, since the more fundamental reason
+/// to skip is "this binary has no inference backend to feed", not the config.
 ///
 /// That skip note carries [`forge_needle::ENGINE_REMEDY`] — the same single
 /// command the router's error and `forge doctor` name. It has to: the
@@ -158,16 +158,17 @@ fn legacy_config_item(root: &Path, config: &forge_config::Config) -> Option<Init
 /// later in the same session, said "weights missing — run `forge init` to
 /// fetch". Both sentences were true and together they described a loop with
 /// no exit. Whatever a reader sees first must now point at the one command
-/// that ends it.
+/// that ends it — and all three sites now read the same fact, so the advice
+/// cannot disagree with the binary it comes from.
 fn needle_weights_item(root: &Path, config: &forge_config::Config) -> InitItem {
-    if !cfg!(feature = "needle-ffi") {
+    if !forge_needle::HAS_EMBEDDED_BACKEND {
         return InitItem {
             status: ItemStatus::Detected,
             path: root.to_path_buf(),
             note: Some(format!(
-                "needle weights: skipped — this build has no embedded inference backend \
-                 (`needle-ffi`), so weights would sit unused and routing stays static. \
-                 To fix, {}, then re-run `forge init` and it fetches them.",
+                "needle weights: skipped — this build has no embedded inference backend, so \
+                 weights would sit unused and routing stays static. To fix, {}, then re-run \
+                 `forge init` and it fetches them.",
                 forge_needle::ENGINE_REMEDY
             )),
         };
@@ -426,17 +427,15 @@ mod tests {
         assert!(legacy_config_item(Path::new("/proj"), &config).is_none());
     }
 
-    /// Regression test for the fix that made this path feature-aware: a
-    /// default build (no `needle-ffi` — this is exactly how `cargo test`
-    /// compiles this crate; see `forge-cli/Cargo.toml`'s `default = []`)
+    /// Regression test for the fix that made this path engine-aware: a build
+    /// with no linked engine (`forge_needle::HAS_EMBEDDED_BACKEND == false`)
     /// must skip the fetch entirely rather than downloading ~35 MB it has
-    /// no backend to use, and must say so. Guarded with `cfg!` rather than
-    /// `#[cfg(not(feature = "needle-ffi"))]` so `cargo test --features
-    /// needle-ffi` still compiles this test (it just returns early instead
-    /// of asserting the wrong branch).
+    /// no backend to use, and must say so. Guarded with a runtime check rather
+    /// than `#[cfg]` so an engine-linked test run still compiles this test (it
+    /// just returns early instead of asserting the wrong branch).
     #[test]
-    fn needle_weights_item_skips_fetch_without_needle_ffi_feature() {
-        if cfg!(feature = "needle-ffi") {
+    fn needle_weights_item_skips_fetch_without_an_engine() {
+        if forge_needle::HAS_EMBEDDED_BACKEND {
             return;
         }
 
@@ -455,7 +454,10 @@ mod tests {
 
         let note = item.note.expect("note present");
         assert!(note.contains("skipped"), "note: {note}");
-        assert!(note.contains("needle-ffi"), "note: {note}");
+        assert!(
+            note.contains("no embedded inference backend"),
+            "note: {note}"
+        );
         assert!(
             !weights_path.exists(),
             "no fetch should have happened, but a file exists at {}",
@@ -470,7 +472,7 @@ mod tests {
     /// fetch", and neither told them where the loop ends.
     #[test]
     fn the_skip_note_names_the_one_command_that_gets_a_working_brain() {
-        if cfg!(feature = "needle-ffi") {
+        if forge_needle::HAS_EMBEDDED_BACKEND {
             return;
         }
 

@@ -10,16 +10,6 @@ license.workspace = true
 # linkage would be a second claim on the same global state.
 links = "needle"
 
-[features]
-# Resolution step 3: download the pinned, checksum-verified engine at build
-# time when it is not already vendored. Off by default, and turned on by
-# exactly one thing — `forge-needle`'s `ffi` feature — because a build script
-# cannot see downstream features, and `needle-sys` is a workspace member that
-# compiles on every `cargo build` whether or not anything links it. So this
-# feature is how build.rs knows the engine is actually going to be used, and
-# how a plain default build is guaranteed to touch no network.
-fetch = []
-
 # No bindgen, still: the six `extern "C"` declarations are hand-written in
 # src/lib.rs rather than generated, so build.rs parses no headers and needs no
 # libclang — which would otherwise become an undocumented prerequisite of

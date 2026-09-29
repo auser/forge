@@ -43,7 +43,7 @@ pub fn build_execution(
 /// The engine is attached only when it can actually answer — that check is
 /// `forge_needle::engine_if_available`, the same seam `forge graph build`
 /// uses, so env `FORGE_NEEDLE_BACKEND=hash` and the `[needle]` config are
-/// honoured in exactly one place. Unavailable (no `ffi` feature, weights not
+/// honoured in exactly one place. Unavailable (engine-less build, weights not
 /// fetched) yields `None` and the plain agent loop.
 ///
 /// Commands that never start a fresh prompt (`resume`, `cancel`, session

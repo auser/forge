@@ -1,13 +1,16 @@
 //! End-to-end tests for the real `libneedle` backend against real weights.
 //!
-//! Opt in explicitly — these need a linked engine and a 35 MB `.cact` archive,
-//! so they are not part of `just verify`:
+//! Opt in explicitly — these need a 35 MB `.cact` archive, so they are not
+//! part of `just verify`:
 //!
 //! ```sh
-//! NEEDLE_LIB_DIR=$PWD/crates/needle-sys/vendor/$(rustc -vV | sed -n 's/^host: //p') \
 //! FORGE_NEEDLE_E2E_WEIGHTS=~/.cache/forge/models/needle3.cact \
-//!   cargo test -p forge-needle --features "ffi needle-e2e" --test e2e -- --nocapture
+//!   cargo test -p forge-needle --features needle-e2e --test e2e -- --nocapture
 //! ```
+//!
+//! They also need a build that actually linked the engine; an engine-less
+//! build (`needle-sys` resolved nothing — see `HAS_EMBEDDED_BACKEND`) skips
+//! rather than fails.
 //!
 //! # Why this is one test function
 //!
@@ -20,7 +23,7 @@
 //! lazy engine (the same thing with more moving parts) or `--test-threads=1`
 //! (an invisible requirement that fails confusingly when forgotten).
 
-#![cfg(all(feature = "ffi", feature = "needle-e2e"))]
+#![cfg(feature = "needle-e2e")]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,6 +88,13 @@ fn weights() -> PathBuf {
 
 #[tokio::test]
 async fn needle_ffi_backend_end_to_end() {
+    if !forge_needle::HAS_EMBEDDED_BACKEND {
+        eprintln!(
+            "skipping: this build linked no needle engine (engine resolution failed or was \
+             disabled at build time — see crates/needle-sys)"
+        );
+        return;
+    }
     let path = weights();
     let engine = Arc::new(NeedleEngine::spawn(FfiBackend::new(path.clone())));
 

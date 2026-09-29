@@ -28,22 +28,24 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      # Default features only: the `ffi` feature links libneedle, a native
-      # engine binary this job deliberately does without. `cargo clippy` never
-      # links, so the ffi/e2e code still gets full type+lint coverage via the
-      # next step (this mirrors `just lint` + `just lint-ffi` + `just test`),
-      # and the `verify-ffi` job below links and runs it for real.
+      # The engine is on by default, so this is the full picture on this
+      # (unpinned, x86_64) host: needle-sys resolves no engine here, warns,
+      # and continues engine-less — `cargo clippy` never links, so the whole
+      # workspace including ffi_backend.rs still gets full type+lint coverage.
+      # The e2e test targets are feature-gated and get theirs in the next
+      # step; the `verify-ffi` job below links and runs the backend for real.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # NEEDLE_NO_DOWNLOAD keeps this pass link-free *and* network-free: `ffi`
-      # turns on needle-sys/fetch, and there is no reason to pull an engine
-      # binary for a pass that never links one. An unresolvable engine is a
-      # warning rather than an error precisely so this keeps working.
-      - name: Clippy (ffi, link-free)
+      # NEEDLE_NO_DOWNLOAD keeps this pass link-free *and* network-free:
+      # engine resolution always runs at build time now, and there is no
+      # reason to pull an engine binary for a pass that never links one. An
+      # unresolvable engine is a warning rather than an error precisely so
+      # this keeps working.
+      - name: Clippy (e2e targets, link-free)
         env:
           NEEDLE_NO_DOWNLOAD: "1"
-        run: cargo clippy -p forge-needle --features "ffi needle-e2e" --all-targets -- -D warnings
+        run: cargo clippy -p forge-needle --features needle-e2e --all-targets -- -D warnings
 
       - name: Tests
         run: cargo test --workspace
@@ -51,11 +53,11 @@ jobs:
       - name: BDD
         run: cargo test -p forge-cli --test bdd
 
-  # Links and *runs* the ffi backend, which the `verify` job can only
+  # Links and *runs* the FFI backend, which the `verify` job can only
   # type-check. Not the required status check: it fetches the engine from
   # Hugging Face, so an outage upstream must not be able to block a merge —
   # but nothing else in CI would notice a pinned checksum going stale, an
-  # engine that stops linking, or an ffi unit test that starts failing for
+  # engine that stops linking, or an FFI unit test that starts failing for
   # real rather than merely compiling.
   #
   # **arm64, not x86_64.** The only Linux engine forge can link is
@@ -102,7 +104,7 @@ jobs:
           NEEDLE_REQUIRE_ENGINE: "1"
         run: >-
           cargo clippy -p needle-sys -p forge-needle --all-targets
-          --features "ffi needle-e2e" -- -D warnings
+          --features needle-e2e -- -D warnings
 
       # The weights themselves are not fetched here (35 MB, and the e2e suite
       # that needs them is gated behind `needle-e2e` + an env var), so this is
@@ -111,4 +113,4 @@ jobs:
       - name: Tests (ffi)
         env:
           NEEDLE_REQUIRE_ENGINE: "1"
-        run: cargo test -p forge-needle --features ffi
+        run: cargo test -p forge-needle

@@ -586,11 +586,10 @@ struct WeightsState {
     remedy: Option<String>,
 }
 
-/// The `needle-ffi` feature is an exact proxy for "this binary can run
-/// inference": with it, `engine_from_config` builds `FfiBackend` and the build
-/// linked a real `libneedle` (a build with the feature and no engine fails at
-/// link time, so a running binary that has the feature has the engine);
-/// without it, it builds `UnavailableBackend`, which cannot load anything.
+/// `forge_needle::HAS_EMBEDDED_BACKEND` is the exact fact "this binary can
+/// run inference": it is true only when `needle-sys`'s build script resolved
+/// a real engine and linked it, and false whenever it continued engine-less —
+/// a build-time fact about what resolved, not a feature someone asked for.
 fn backend_state(using_hash_backend: bool) -> BackendState {
     if using_hash_backend {
         return BackendState {
@@ -600,7 +599,7 @@ fn backend_state(using_hash_backend: bool) -> BackendState {
                 .to_string(),
         };
     }
-    if cfg!(feature = "needle-ffi") {
+    if forge_needle::HAS_EMBEDDED_BACKEND {
         BackendState {
             usable: true,
             detail: "backend built in (libneedle linked)".to_string(),
@@ -608,7 +607,7 @@ fn backend_state(using_hash_backend: bool) -> BackendState {
     } else {
         BackendState {
             usable: false,
-            detail: "backend not in this build (`needle-ffi` off)".to_string(),
+            detail: "backend not in this build (no engine linked)".to_string(),
         }
     }
 }
@@ -1153,7 +1152,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_backend_less_build_is_never_told_to_run_forge_init() {
-        if cfg!(feature = "needle-ffi") {
+        if forge_needle::HAS_EMBEDDED_BACKEND {
             return; // this binary *has* a backend; nothing to assert
         }
         let mut config = forge_config::Config::default();
@@ -1193,12 +1192,12 @@ mod tests {
 
     /// The mirror image: with a backend present, missing weights *are* a
     /// `forge init` job, and the hint must survive. (Only assertable in an
-    /// `ffi` build; the two tests together cover both branches, so neither
-    /// build configuration loses the coverage.)
+    /// engine-linked build; the two tests together cover both branches, so
+    /// neither build configuration loses the coverage.)
     #[tokio::test]
     #[serial]
     async fn missing_weights_with_a_backend_present_do_point_at_forge_init() {
-        if !cfg!(feature = "needle-ffi") {
+        if !forge_needle::HAS_EMBEDDED_BACKEND {
             return;
         }
         let mut config = forge_config::Config::default();
@@ -1223,7 +1222,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn verified_weights_without_a_backend_blame_the_backend_not_the_weights() {
-        if cfg!(feature = "needle-ffi") {
+        if forge_needle::HAS_EMBEDDED_BACKEND {
             return;
         }
         use sha2::{Digest, Sha256};
