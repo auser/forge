@@ -8,6 +8,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
@@ -124,6 +125,14 @@ struct AcpClient {
     /// Set when the client should send `session/cancel` on the first
     /// permission request — the deterministic way to cancel mid-turn.
     cancel_on_permission: Option<String>,
+    /// The agent's stderr, drained continuously on a background thread: a
+    /// piped stderr that nobody reads deadlocks the child the moment its
+    /// log output exceeds the pipe buffer (and on a degraded machine that
+    /// buffer can be far smaller than the nominal 16 KB — observed: 512
+    /// bytes), while the client is blocked waiting on stdout. The same
+    /// lesson the chat pty tests learned with `tail_stream`.
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AcpClient {
@@ -137,6 +146,22 @@ impl AcpClient {
             .expect("spawn forge acp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut stderr_pipe = child.stderr.take().expect("stderr");
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&stderr);
+        let stderr_drain = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr_pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&buf[..n]),
+                }
+            }
+        });
         Self {
             child,
             stdin,
@@ -147,6 +172,8 @@ impl AcpClient {
             answer: Answer::Allow,
             permission_requests: 0,
             cancel_on_permission: None,
+            stderr,
+            stderr_drain: Some(stderr_drain),
         }
     }
 
@@ -315,11 +342,12 @@ impl AcpClient {
     fn shutdown(mut self) -> std::process::Output {
         drop(self.stdin);
         let status = self.child.wait().expect("wait for forge acp");
-        let mut stderr = Vec::new();
-        if let Some(mut handle) = self.child.stderr.take() {
-            use std::io::Read;
-            let _ = handle.read_to_end(&mut stderr);
+        // The child has exited, so its stderr is at EOF and the drain
+        // thread ends on its own.
+        if let Some(drain) = self.stderr_drain.take() {
+            let _ = drain.join();
         }
+        let stderr = std::mem::take(&mut *self.stderr.lock().unwrap_or_else(|e| e.into_inner()));
         assert!(
             status.success(),
             "forge acp exited with {status}: {}",

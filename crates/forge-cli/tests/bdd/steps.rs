@@ -1977,6 +1977,12 @@ fn one_session_holds_both_runs(world: &mut BddWorld) {
     let files: Vec<_> = std::fs::read_dir(&dir)
         .expect("sessions dir")
         .flatten()
+        // Transcripts only: each session also has a `<id>.decisions.jsonl`
+        // beside it since the decision log landed.
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+        })
         .collect();
     assert_eq!(
         files.len(),
@@ -2061,6 +2067,12 @@ fn two_sessions_exist(world: &mut BddWorld) {
     let count = std::fs::read_dir(&dir)
         .expect("sessions dir")
         .flatten()
+        // Transcripts only — decision logs (`*.decisions.jsonl`) share the
+        // directory and are not sessions.
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+        })
         .count();
     assert_eq!(count, 2, "expected two session files");
 }
