@@ -2163,6 +2163,167 @@ async fn needle_fast_path_declines_prompts_it_cannot_fill() {
     assert_eq!(outcome.turns, 1);
 }
 
+// --- decision log ---
+
+/// The raw decision log of one session, written beside its transcript.
+fn decision_log_raw(root: &std::path::Path, session_id: &str) -> String {
+    let path = root
+        .join(".forge")
+        .join("sessions")
+        .join(format!("{session_id}.decisions.jsonl"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("no decision log at {}: {e}", path.display()))
+}
+
+fn decision_records(
+    root: &std::path::Path,
+    session_id: &str,
+) -> Vec<forge_session::DecisionRecord> {
+    decision_log_raw(root, session_id)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("record parses"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_dispatched_turn_records_a_decide_stage_with_the_dispatch_outcome() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("unused")]));
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("fn main() {}\n"));
+    let service = needle_service(tmp.path(), model, exec);
+
+    let outcome = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("run");
+    assert!(has_needle_dispatch(&outcome), "{:?}", event_kinds(&outcome));
+
+    let records = decision_records(tmp.path(), &outcome.session_id);
+    let decide = records
+        .iter()
+        .find(|r| r.stage == forge_session::Stage::Decide)
+        .expect("a decide-stage record");
+    assert_eq!(decide.decider, forge_session::Decider::Needle);
+    assert_eq!(decide.outcome, forge_session::Outcome::Dispatched);
+    assert_eq!(decide.choice, "read_file");
+    assert_eq!(decide.question, "tool");
+
+    // The decide-before-routing reorder is NOT part of this wiring: on main
+    // routing happens first, so a dispatched turn also carries a route record
+    // for the model it never called. When the reorder lands this assertion
+    // flips to "no route record on a dispatched turn".
+    let route = records
+        .iter()
+        .find(|r| r.stage == forge_session::Stage::Route)
+        .expect("main routes before dispatching");
+    assert_eq!(route.decider, forge_session::Decider::Static);
+    assert_eq!(route.outcome, forge_session::Outcome::Routed);
+    assert_eq!(route.question, "model");
+
+    // The log carries decision shape, never content: the prompt and the tool
+    // arguments ("Cargo.toml") must not appear anywhere in it.
+    let raw = decision_log_raw(tmp.path(), &outcome.session_id);
+    assert!(
+        !raw.contains("Cargo.toml"),
+        "tool arguments must never reach the decision log: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn a_declined_dispatch_is_recorded_explicitly() {
+    // A decline must be a record, not a missing row: the decline rate this
+    // log exists to measure is read off these rows.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("prose answer")]));
+    let exec = Arc::new(MockExecution::new(tmp.path()));
+    let service = needle_service(tmp.path(), model, exec);
+
+    // Prose: HashBackend answers but chooses nothing.
+    let outcome = service
+        .run("please read Cargo.toml for me")
+        .await
+        .expect("run");
+    assert!(!has_needle_dispatch(&outcome));
+
+    let records = decision_records(tmp.path(), &outcome.session_id);
+    let decide = records
+        .iter()
+        .find(|r| r.stage == forge_session::Stage::Decide)
+        .expect("a decline is still a decision");
+    assert_eq!(decide.decider, forge_session::Decider::Needle);
+    assert_eq!(decide.outcome, forge_session::Outcome::Declined);
+    assert_eq!(decide.choice, "none");
+    assert_eq!(decide.confidence, None);
+    // Routing still happened and was recorded.
+    assert!(
+        records
+            .iter()
+            .any(|r| r.stage == forge_session::Stage::Route)
+    );
+}
+
+#[tokio::test]
+async fn a_service_with_no_engine_records_unavailable() {
+    // An absent engine must be visible in the data rather than showing up as
+    // missing rows.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("plain loop")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+
+    let outcome = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("run");
+    assert!(!has_needle_dispatch(&outcome));
+
+    let records = decision_records(tmp.path(), &outcome.session_id);
+    let decide = records
+        .iter()
+        .find(|r| r.stage == forge_session::Stage::Decide)
+        .expect("no engine is still a decision");
+    assert_eq!(decide.decider, forge_session::Decider::None);
+    assert_eq!(decide.outcome, forge_session::Outcome::Unavailable);
+    assert_eq!(decide.choice, "none");
+}
+
+#[tokio::test]
+async fn concurrent_runs_write_whole_parseable_lines() {
+    // Two runs at once against one service: one shared DecisionLog (its mutex
+    // serializes appends), one file per session. Every line in both files
+    // must parse whole — a torn line is the failure this guards.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        text_reply("a"),
+        text_reply("b"),
+        text_reply("c"),
+        text_reply("d"),
+    ]));
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("fn main() {}\n"));
+    let service = Arc::new(needle_service(tmp.path(), model, exec));
+
+    let svc_a = Arc::clone(&service);
+    let svc_b = Arc::clone(&service);
+    let (ra, rb) = tokio::join!(
+        svc_a.run("read_file: {\"path\": \"Cargo.toml\"}"),
+        svc_b.run("please read Cargo.toml for me"),
+    );
+    let a = ra.expect("run a");
+    let b = rb.expect("run b");
+    assert_ne!(a.session_id, b.session_id);
+
+    for session_id in [&a.session_id, &b.session_id] {
+        let raw = decision_log_raw(tmp.path(), session_id);
+        assert!(!raw.is_empty(), "each run records its decisions");
+        for line in raw.lines() {
+            serde_json::from_str::<forge_session::DecisionRecord>(line)
+                .unwrap_or_else(|e| panic!("torn line {line:?}: {e}"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn run_command_tool_executes_and_clamps_risk() {
     let tmp = tempfile::tempdir().expect("tempdir");

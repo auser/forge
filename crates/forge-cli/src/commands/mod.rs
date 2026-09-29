@@ -90,6 +90,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             SessionCommand::List => session_cmd::list(&ctx),
             SessionCommand::Show { id } => session_cmd::show(&ctx, &id),
             SessionCommand::Fork { id, at } => session_cmd::fork(&ctx, &id, at.as_deref()),
+            SessionCommand::Decisions => session_cmd::decisions(&ctx),
         },
         Command::Model { command } => model_cmd::run(&ctx, command).await,
         Command::Router { command } => match command {
