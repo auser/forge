@@ -343,8 +343,8 @@ impl ForgeTools {
     }
 
     /// The on-device embedder, when one is genuinely usable. `None` is
-    /// normal (no weights fetched, no `ffi` feature) and never an error on
-    /// its own — `forge_graph_context` simply stays lexical.
+    /// normal (no weights fetched, or an engine-less build) and never an
+    /// error on its own — `forge_graph_context` simply stays lexical.
     async fn embedder(&self) -> Option<EngineEmbedder> {
         let engine = forge_needle::engine_if_available(self.service.config()).await?;
         match EngineEmbedder::new(engine).await {

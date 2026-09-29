@@ -341,7 +341,19 @@ async fn graph_grep_matches_symbols() {
 
 #[tokio::test]
 async fn semantic_grep_without_an_engine_is_a_tool_error_naming_the_fix() {
-    let (_tmp, tools) = fixture();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    project(tmp.path());
+    build_graph(tmp.path());
+    // Point weights at an empty directory: the engine is linked by default
+    // now, so "no usable brain" can no longer be assumed from the build —
+    // it has to be forced, or a machine with real weights fetched (and an
+    // engine to load them) would take the semantic path and fail on the
+    // unbuilt index instead. An unloadable engine is the same `None` from
+    // `engine_if_available` as an engine-less build, so this asserts the
+    // intended branch in every build configuration.
+    let mut config = Config::default();
+    config.needle.weights_path = tmp.path().join("no-weights").to_string_lossy().into_owned();
+    let tools = tools_for(tmp.path(), config);
     let outcome = tools
         .call(
             "forge_graph_grep",

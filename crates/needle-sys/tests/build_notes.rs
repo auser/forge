@@ -8,14 +8,16 @@
 //! `src/lib.rs` and `needle.h`, with a minimal manifest and, crucially, *no*
 //! `vendor/` directory. That is what makes the assertions mean something on
 //! any machine: a developer who has fetched `libneedle.a` into
-//! `crates/needle-sys/vendor/<target>/` (as `just verify-ffi` needs) would
-//! otherwise never exercise the missing-library path at all, and the first
-//! version of this test passed vacuously on exactly such a machine.
+//! `crates/needle-sys/vendor/<target>/` would otherwise never exercise the
+//! missing-library path at all, and the first version of this test passed
+//! vacuously on exactly such a machine. The standalone copy is also what
+//! compiles the engine-less stub path in `src/lib.rs` on a machine whose real
+//! workspace build resolves an engine.
 //!
-//! Regression under test: `needle-sys` is a workspace member, so it builds
-//! even when nothing links it and the `ffi` feature is off. It used to emit
-//! `cargo:warning=needle-sys: no libneedle.a found…` there, which users read
-//! as a build error on a plain `cargo build --release --locked`.
+//! The contract under test: engine resolution always runs (the engine is on
+//! by default; nothing asks for it), an engine that cannot be resolved is one
+//! `cargo:warning` and a successful engine-less build — never silence, and
+//! never a failure unless `NEEDLE_REQUIRE_ENGINE=1`.
 //!
 //! The download path (resolution step 3) is unit-tested in
 //! `engine_resolution.rs` instead; these runs only assert what cargo shows a
@@ -92,8 +94,6 @@ fn standalone_copy(dir: &Path) -> PathBuf {
          version = \"0.1.0\"\n\
          edition = \"2024\"\n\
          links = \"needle\"\n\
-         \n[features]\n\
-         fetch = []\n\
          \n[dependencies]\n\
          \n[build-dependencies]\n\
          sha2 = \"0.10\"\n",
@@ -108,8 +108,7 @@ fn build(root: &Path, lib_dir: Option<&Path>) -> (bool, String) {
     build_with(root, lib_dir, &[], &[])
 }
 
-/// As [`build`], plus extra cargo arguments (`--features fetch`) and extra
-/// environment variables.
+/// As [`build`], plus extra cargo arguments and extra environment variables.
 ///
 /// `NEEDLE_NO_DOWNLOAD=1` is always set: these tests assert messages, and a
 /// real download would make them depend on the network and on Hugging Face
@@ -150,56 +149,33 @@ fn build_with(
     (output.status.success(), combined)
 }
 
-/// A default build with no engine present must be completely silent about
-/// it. This is the user-facing contract: `cargo build --release --locked`
-/// on a fresh checkout prints no warnings.
+/// A build with no resolvable engine is the supported degradation, but it is
+/// never silent: exactly one `cargo:warning` naming the cause and the way to
+/// a brain, and the build succeeds. (The engine is on by default, so there is
+/// no "you didn't ask for this" quiet path to preserve.)
+///
+/// The assertion is host-aware for the same reason
+/// `no_download_is_honoured` is: on a pinned host `NEEDLE_NO_DOWNLOAD=1` is
+/// what stopped the fetch; on an unpinned host resolution stops earlier, at
+/// "no verified engine is published". Both messages share the two phrases
+/// asserted here.
 #[test]
-fn a_default_build_emits_no_warning_about_the_missing_engine() {
+fn an_engine_less_build_warns_once_and_succeeds() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (ok, output) = build(tmp.path(), None);
     assert!(ok, "needle-sys must build without the engine:\n{output}");
     assert!(
-        !output.contains("warning:"),
-        "a default build must not warn at all:\n{output}"
+        output.contains("warning:") && output.contains("needle-sys:"),
+        "an engine-less build must say so, once:\n{output}"
+    );
+    assert_eq!(
+        output.matches("no embedded brain").count(),
+        1,
+        "one warning, not a stream of them:\n{output}"
     );
     assert!(
-        !output.to_lowercase().contains("libneedle"),
-        "the missing-library note must not surface without -vv:\n{output}"
-    );
-}
-
-/// The note still exists — it is just verbose-only, so someone debugging a
-/// link failure can find it.
-#[test]
-fn the_missing_engine_note_is_still_there_under_verbose_output() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let manifest = standalone_copy(tmp.path());
-    let output = Command::new(env!("CARGO"))
-        .arg("build")
-        .arg("-vv")
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .arg("--target-dir")
-        .arg(shared_target_dir())
-        .env_remove("NEEDLE_LIB_DIR")
-        .env("NEEDLE_NO_DOWNLOAD", "1")
-        .env("NEEDLE_ENGINE_CACHE_DIR", tmp.path().join("engine-cache"))
-        .env("CARGO_TERM_COLOR", "never")
-        .output()
-        .expect("cargo build -vv runs");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.status.success(), "{combined}");
-    assert!(
-        combined.contains("needle-sys: no libneedle.a"),
-        "the note should be readable under -vv:\n{combined}"
-    );
-    assert!(
-        combined.contains("ffi"),
-        "the note should say which feature actually needs the engine:\n{combined}"
+        output.contains("vendor/"),
+        "the warning must name how to supply an engine by hand:\n{output}"
     );
 }
 
@@ -228,30 +204,30 @@ fn a_wrong_needle_lib_dir_fails_loudly() {
     );
 }
 
-/// With `fetch` on — i.e. somebody asked for `--features needle-ffi` — an
-/// engine that cannot be resolved is a `cargo:warning`, not silence: the user
-/// *did* ask for a brain, and the only symptom otherwise would be a link
-/// error further down the build with no explanation attached.
+/// An engine that cannot be resolved is a `cargo:warning`, not silence: the
+/// engine is wanted by default, and the only symptom of a quiet path would be
+/// a user wondering why `forge doctor` reports no backend.
 ///
 /// It is a warning rather than a failure on purpose: `just lint-ffi` and CI's
-/// link-free clippy pass compile the `ffi` code on machines with no engine,
+/// link-free clippy pass compile the backend code on machines with no engine,
 /// and that coverage guarantee outranks pre-empting a link error the warning
-/// already explains.
+/// already explains. `NEEDLE_REQUIRE_ENGINE=1` is the hard stop for builds
+/// that must not degrade (tested below).
 #[test]
-fn with_fetch_enabled_an_unresolvable_engine_warns_with_the_one_remedy() {
+fn an_unresolvable_engine_warns_with_the_one_remedy() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (ok, output) = build_with(tmp.path(), None, &["--features", "fetch"], &[]);
+    let (ok, output) = build_with(tmp.path(), None, &[], &[]);
     assert!(
         ok,
         "an unresolvable engine must not fail the build (lint-ffi depends on it):\n{output}"
     );
     assert!(
         output.contains("warning:") && output.contains("needle-sys:"),
-        "the user asked for the engine, so its absence must be visible:\n{output}"
+        "the engine's absence must be visible:\n{output}"
     );
     assert!(
-        output.contains("needle-ffi"),
-        "the warning must name the feature to drop for an engine-less build:\n{output}"
+        output.contains("static rules"),
+        "the warning must say forge still works engine-less:\n{output}"
     );
 }
 
@@ -269,7 +245,6 @@ fn require_engine_turns_an_unresolvable_engine_into_a_build_failure() {
         .arg(&manifest)
         .arg("--target-dir")
         .arg(shared_target_dir())
-        .args(["--features", "fetch"])
         .env_remove("NEEDLE_LIB_DIR")
         .env_remove("NEEDLE_CXX_RUNTIME")
         .env("NEEDLE_NO_DOWNLOAD", "1")
@@ -298,8 +273,8 @@ fn require_engine_turns_an_unresolvable_engine_into_a_build_failure() {
     );
 }
 
-/// With `fetch` on and no engine available, nothing may touch the network and
-/// no cache may appear — and the warning must name the *actual* reason.
+/// With no engine available, nothing may touch the network and no cache may
+/// appear — and the warning must name the *actual* reason.
 ///
 /// Which reason that is depends on the host, and the assertion is deliberately
 /// target-aware rather than forcing a pinned target into the fixture. Forcing
@@ -318,10 +293,10 @@ fn require_engine_turns_an_unresolvable_engine_into_a_build_failure() {
 /// which drives `ensure_cached_engine` directly with a pinned engine it builds
 /// itself. Nothing is lost on an unpinned host.
 #[test]
-fn no_download_is_honoured_when_fetch_is_enabled() {
+fn no_download_is_honoured() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let host = host_target();
-    let (ok, output) = build_with(tmp.path(), None, &["--features", "fetch"], &[]);
+    let (ok, output) = build_with(tmp.path(), None, &[], &[]);
     assert!(ok, "{output}");
 
     if pinned_engine(&host).is_some() {
@@ -358,13 +333,13 @@ fn no_download_is_honoured_when_fetch_is_enabled() {
 /// required `verify` CI job (stock Ubuntu: neither `libc++.a` nor `libc++.so`).
 ///
 /// The alternative was installing `libc++-dev` into that gate. Rejected: the
-/// gate builds with default features, where `fetch` is off, no engine resolves
-/// and no C++ runtime is ever named — so nothing in the *product* needs libc++
-/// there, and adding a system package to the required gate to satisfy one
-/// fixture would change what the gate assumes in order to avoid fixing the
-/// fixture. `libstdc++` was the other option and is wrong twice: it is the
-/// runtime this whole round proved the engine does *not* use, and it does not
-/// exist on macOS.
+/// gate runs on x86_64 Linux, an unpinned target, so no engine ever resolves
+/// there and no C++ runtime is ever named — nothing in the *product* needs
+/// libc++ in that job, and adding a system package to the required gate to
+/// satisfy one fixture would change what the gate assumes in order to avoid
+/// fixing the fixture. `libstdc++` was the other option and is wrong twice:
+/// it is the runtime this whole round proved the engine does *not* use, and
+/// it does not exist on macOS.
 ///
 /// Runtime selection is a separate concern from engine resolution, and it keeps
 /// its own coverage: seven tests in `engine_resolution.rs` pin the choice per
@@ -386,12 +361,7 @@ fn a_vendored_engine_is_used_without_any_download() {
     // any native library it is pointed at, even for a build that never links.
     std::fs::write(vendor.join(name), b"!<arch>\n").expect("write engine");
 
-    let (ok, output) = build_with(
-        &root,
-        None,
-        &["--features", "fetch"],
-        &[("NEEDLE_CXX_RUNTIME", "none")],
-    );
+    let (ok, output) = build_with(&root, None, &[], &[("NEEDLE_CXX_RUNTIME", "none")]);
     assert!(ok, "{output}");
     assert!(
         !output.contains("warning:"),

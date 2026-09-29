@@ -35,11 +35,11 @@ const FORGE_ENV_VARS: &[&str] = &[
 /// `router = "needle"` with `needle.autofetch = true`) would resolve
 /// `~/.cache/forge/models/` to the developer's *real* home directory and
 /// attempt a real fetch from Hugging Face on every test run touching init.
-/// This must hold independent of which cargo features are compiled in —
-/// the `needle-ffi` feature gate in `forge init` itself (see
-/// `commands::init::needle_weights_item`) already prevents the fetch in a
-/// default build, but hermeticity here must not depend on that; a
-/// `--features needle-ffi` test run must stay just as isolated.
+/// This must hold independent of whether the build linked an engine — the
+/// engine check in `forge init` itself (see
+/// `commands::init::needle_weights_item`) already prevents the fetch in an
+/// engine-less build, but hermeticity here must not depend on that; an
+/// engine-linked test run must stay just as isolated.
 fn forge(tmp: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_forge"));
     for var in FORGE_ENV_VARS {
@@ -164,13 +164,14 @@ fn init_is_idempotent() {
 }
 
 /// `forge init` must never fetch the ~35 MB needle weights artifact in a
-/// build that has no inference engine to use it — this binary is compiled
-/// without the `needle-ffi` feature (the crate's `default = []`, and this
-/// integration suite builds with default features), so it should report
-/// the skip rather than silently succeeding after a real network fetch.
+/// build that has no inference engine to use it — when the workspace built
+/// engine-less (`needle-sys` resolved nothing), it should report the skip
+/// rather than silently succeeding after a real network fetch. An
+/// engine-linked build takes the fetch path instead, so this test returns
+/// early there.
 #[test]
-fn init_skips_needle_weights_fetch_without_needle_ffi_feature() {
-    if cfg!(feature = "needle-ffi") {
+fn init_skips_needle_weights_fetch_without_an_engine() {
+    if forge_needle::HAS_EMBEDDED_BACKEND {
         return;
     }
 
@@ -187,16 +188,16 @@ fn init_skips_needle_weights_fetch_without_needle_ffi_feature() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("utf8");
     assert!(
-        stdout.contains("needle-ffi"),
-        "expected the feature-off skip message: {stdout}"
+        stdout.contains("no embedded inference backend"),
+        "expected the engine-less skip message: {stdout}"
     );
     assert!(
         stdout.contains("skipped"),
-        "expected the feature-off skip message: {stdout}"
+        "expected the engine-less skip message: {stdout}"
     );
     assert!(
         !tmp.path().join("home/.cache/forge/models").exists(),
-        "init must not create/fetch into the weights cache dir without needle-ffi"
+        "init must not create/fetch into the weights cache dir without an engine"
     );
 }
 
@@ -332,7 +333,7 @@ fn serve_serves_health_on_ephemeral_port() {
 /// holds together.
 #[test]
 fn a_failed_needle_route_never_tells_a_backend_less_build_to_run_forge_init() {
-    if cfg!(feature = "needle-ffi") {
+    if forge_needle::HAS_EMBEDDED_BACKEND {
         return; // this binary has a backend; the hint is not reachable
     }
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -612,7 +613,8 @@ fn graph_build_check_map_and_stale_detection() {
 
 #[test]
 fn graph_semantic_grep_needs_needle_weights_without_an_engine() {
-    // Default build (no `needle-ffi` feature, no FORGE_NEEDLE_BACKEND hook):
+    // No engine available to this run (engine-less build, or engine-linked
+    // but the hermetic HOME has no weights, and no FORGE_NEEDLE_BACKEND hook):
     // `engine_if_available` must report unavailable, and `graph grep
     // --semantic` must fail loudly rather than silently returning nothing.
     let tmp = tempfile::tempdir().expect("tempdir");

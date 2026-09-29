@@ -14,14 +14,15 @@
 //!
 //! ```sh
 //! FORGE_NEEDLE_E2E_WEIGHTS=~/.cache/forge/models/needle3.cact \
-//!   cargo test --release -p forge-needle --features "ffi needle-e2e" \
+//!   cargo test --release -p forge-needle --features needle-e2e \
 //!   --test fastpath_latency -- --nocapture
 //! ```
 //!
 //! Release build only: debug-build inference numbers say nothing about what a
-//! user experiences.
+//! user experiences. An engine-less build (`HAS_EMBEDDED_BACKEND` false) skips
+//! rather than fails.
 
-#![cfg(all(feature = "ffi", feature = "needle-e2e"))]
+#![cfg(feature = "needle-e2e")]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -73,6 +74,10 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 /// threads. See `e2e.rs` for the longer version of this reasoning.
 #[test]
 fn fast_path_tool_call_latency() {
+    if !forge_needle::HAS_EMBEDDED_BACKEND {
+        eprintln!("skipping: this build linked no needle engine");
+        return;
+    }
     let mut backend = FfiBackend::new(weights());
 
     let load_started = Instant::now();

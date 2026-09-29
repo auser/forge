@@ -3,12 +3,13 @@
 //! for why there is no `bindgen` here), so this build script parses no
 //! headers and generates no code.
 //!
-//! **Resolution order** (the design spec's §3, now complete):
+//! **Resolution order** (the design spec's §3, now complete) — always run, on
+//! every build: the engine is on by default, so nothing asks for it.
 //!
 //! 1. `NEEDLE_LIB_DIR` — an engine the operator fetched themselves.
 //! 2. `crates/needle-sys/vendor/<target>/` — a vendored engine.
-//! 3. **Download at build time, SHA-256 verified** — only when the `fetch`
-//!    feature is on, which only `forge-needle`'s `ffi` feature turns on.
+//! 3. **Download at build time, SHA-256 verified** — the pinned engine for
+//!    the targets forge has verified (`PINNED_ENGINES`).
 //!
 //! Step 3 and the pinned per-target checksums live in `build_support.rs`,
 //! included below so the same code can be unit-tested (`cargo test` never
@@ -36,27 +37,27 @@
 //! but deliberately left out, is documented on `PINNED_ENGINES`.
 //!
 //! The binary is **not** committed (see `.gitignore`): it is a ~1 MB
-//! per-platform blob and forge only needs it when the `ffi` feature is on.
-//! `needle.h` *is* committed, as the contract of record for the hand-written
-//! declarations.
+//! per-platform blob that resolution fetches on demand. `needle.h` *is*
+//! committed, as the contract of record for the hand-written declarations.
 //!
-//! **Diagnostics policy.** `needle-sys` is a workspace member, so it builds on
-//! every `cargo build`/`check` even when nothing links it and the `ffi`
-//! feature is off, which is the overwhelmingly common case. So the volume of
-//! what this prints is keyed on whether the engine was actually asked for:
+//! **The fact downstream code reads.** When (and only when) an engine
+//! resolved and link flags went out, this script also emits
+//! `cargo:rustc-cfg=needle_engine`; `src/lib.rs` mirrors that into
+//! [`needle_sys::ENGINE_LINKED`], the *only* correct answer to "can this
+//! build run inference" — a build-time fact about what resolved, not a
+//! feature someone requested. The check-cfg directive is emitted
+//! unconditionally so the cfg never trips `unexpected_cfgs`.
 //!
-//! * `fetch` off (default build), no engine → quiet `println!` note, visible
-//!   only under `cargo build -vv`. Nothing is wrong: `cargo check`/`clippy`
-//!   never link.
-//! * `fetch` on, engine unresolvable → `cargo:warning` naming the one thing
-//!   to do next, and the build continues engine-less. It continues rather
-//!   than failing because `just lint-ffi`/CI's link-free clippy pass compiles
-//!   the `ffi` code *without* linking on machines that have no engine, and
-//!   that guarantee is worth more than pre-empting a link error whose cause
-//!   the warning already states.
-//! * `fetch` on, engine unresolvable, `NEEDLE_REQUIRE_ENGINE=1` → hard
-//!   failure. Release and CI builds that intend to ship a brain set this, so
-//!   a brain-less binary can never go out labelled brain-enabled.
+//! **Diagnostics policy.** The engine is always wanted now, so there is no
+//! quiet path:
+//!
+//! * Engine unresolvable → one `cargo:warning` naming the single thing to do
+//!   next, and the build continues engine-less: `src/lib.rs` links stub
+//!   symbols instead, `ENGINE_LINKED` is `false`, and forge routes with
+//!   static rules and stays usable.
+//! * Engine unresolvable, `NEEDLE_REQUIRE_ENGINE=1` → hard failure. Release
+//!   and CI builds that intend to ship a brain set this, so a brain-less
+//!   binary can never go out labelled brain-enabled.
 //! * `NEEDLE_LIB_DIR` set but wrong → `cargo:warning` *and* a failure.
 //!   Operator error, deserves to be impossible to miss.
 
@@ -138,9 +139,9 @@ fn main() {
         None => static_lib(&vendor, &target).map(|_| vendor.clone()),
     };
 
-    // Step 3: only when something downstream actually wants to link.
-    let wants_engine = std::env::var(FETCH_FEATURE_ENV).is_ok();
-    if lib_dir.is_none() && wants_engine {
+    // Step 3: the engine is always wanted, so the fetch attempt always runs
+    // when steps 1 and 2 found nothing.
+    if lib_dir.is_none() {
         match fetch_engine_dir(&target, &out_dir) {
             Ok(dir) => {
                 println!(
@@ -150,9 +151,9 @@ fn main() {
                 lib_dir = Some(dir);
             }
             Err(e) => {
-                // Warn either way: whether this is fatal or not, the user did
-                // ask for an engine, and a build script's own stderr is easy
-                // to lose in a parallel build's output.
+                // Warn either way: whether this is fatal or not, an engine-less
+                // build is a real (if supported) outcome, and a build script's
+                // own stderr is easy to lose in a parallel build's output.
                 let message = e.message(&target);
                 println!("cargo:warning=needle-sys: {}", one_line(&message));
                 if env_flag(REQUIRE_ENV) {
@@ -164,20 +165,15 @@ fn main() {
         }
     }
 
-    match &lib_dir {
-        Some(dir) => emit_link_flags(dir, &target, &host),
-        // Deliberately NOT `cargo:warning=` — see the module docs. This is
-        // a note for someone reading `cargo build -vv`, not a diagnostic
-        // for every user of a default build. The `fetch`-on case already
-        // warned above.
-        None if !wants_engine => println!(
-            "needle-sys: no {} for {target}; building without the engine. This is normal unless \
-             you enabled forge-needle's `ffi` feature — then set {LIB_DIR_ENV} or place the \
-             engine in crates/needle-sys/vendor/{target}/ (see README, \"Embedded Needle brain\"). \
-             https://huggingface.co/Cactus-Compute/needle3 (Apache-2.0).",
-            lib_file_name(&target),
-        ),
-        None => {}
+    // The build-time fact: `src/lib.rs` compiles its real declarations or its
+    // stubs on this cfg, and mirrors it as `ENGINE_LINKED` for the rest of
+    // the workspace. Declared unconditionally so the cfg is always known.
+    println!("cargo::rustc-check-cfg=cfg(needle_engine)");
+
+    // The fetch attempt above already warned when nothing resolved; nothing
+    // more to say on that path.
+    if let Some(dir) = &lib_dir {
+        emit_link_flags(dir, &target, &host);
     }
 }
 
@@ -207,6 +203,9 @@ fn env(key: &str) -> String {
 /// no point telling someone to install libc++ for a build that was never going
 /// to link anything.
 fn emit_link_flags(dir: &Path, target: &str, host: &str) {
+    // The fact that makes this build's `ENGINE_LINKED` true — emitted only
+    // alongside real link flags, never for an engine-less build.
+    println!("cargo:rustc-cfg=needle_engine");
     println!("cargo:rustc-link-search=native={}", dir.display());
     println!("cargo:rustc-link-lib=static=needle");
 

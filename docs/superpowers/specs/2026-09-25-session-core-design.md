@@ -34,12 +34,27 @@ trait (§13), the gate and risk taxonomy (§3), egress tiers (§11), graph hygie
 and freshness (§17), the approval contract (§18), budgets (§19), the daemon
 (§20), and earned autonomy (§15). The decision log (§4) has landed.
 
+**Ported since:** the "engine default-on with graceful degradation" paragraph
+below has now landed, on branch `needle-default-on` — and it was indeed built
+against `main`'s `build_support` rather than transplanted. `needle-sys`'s build
+script always runs engine resolution (no `fetch` feature), warns and continues
+engine-less with inert stub functions when nothing resolves, and emits the fact
+as `--cfg needle_engine`, surfaced as `forge_needle::HAS_EMBEDDED_BACKEND`. The
+`forge-needle/ffi` and `forge-cli/needle-ffi` features and every
+`cfg!(feature = ...)` branch on them are gone; only `forge-needle/needle-e2e`
+survives, as a test gate. That is the §16 single-command property: a plain
+`cargo build` gets the brain wherever a verified engine exists.
+
+<details><summary>What this paragraph said before the port landed</summary>
+
 **Still unported, recorded so it is not lost:** `main` has `default = []` for
 `forge-cli` and still branches on `cfg!(feature = "needle-ffi")` in seven places
 across `init.rs` and `doctor.rs`. Making the engine default-on with graceful
 degradation — the §16 single-command property — should be designed against
 `main`'s `EngineResolution`/`build_support` rather than transplanted from the
 abandoned branch.
+
+</details>
 
 ## Goal
 

@@ -1372,9 +1372,24 @@ mod tests {
         // prior (possibly panicked) jev test in this same process leaked a
         // credential — this test is about needle's own fallback, not jev's.
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        // Point weights at a path that does not exist: the engine is linked
+        // by default now, so "no usable brain" can no longer be assumed from
+        // the build — on a machine with real weights fetched, the needle
+        // router would genuinely route and there would be no fallback to
+        // assert. Forcing the weights away exercises the intended branch in
+        // every build configuration.
+        let tmp = tempfile::tempdir().expect("tempdir");
         let config = Config {
             router: "needle".to_string(),
             router_fallback: "static".to_string(),
+            needle: forge_config::NeedleConfig {
+                weights_path: tmp
+                    .path()
+                    .join("no-weights.cact")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..forge_config::NeedleConfig::default()
+            },
             ..Config::default()
         };
         let router = router_from_config(&config, &[("qwen3-coder".to_string(), caps(true))])

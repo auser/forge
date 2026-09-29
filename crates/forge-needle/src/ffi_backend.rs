@@ -1,5 +1,10 @@
 //! The real on-device backend: [`NeedleBackend`] implemented over
-//! `libneedle`'s C API (crate `needle-sys`, feature `ffi`).
+//! `libneedle`'s C API (crate `needle-sys`).
+//!
+//! Compiled unconditionally; whether it talks to a real engine is
+//! `needle-sys`'s build-time fact ([`crate::HAS_EMBEDDED_BACKEND`]). An
+//! engine-less build links inert stubs instead, so this module's pure
+//! envelope/argument handling keeps its unit tests either way.
 //!
 //! # Mapping the trait onto the C API
 //!

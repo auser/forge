@@ -162,23 +162,15 @@ if [[ -z "$INSTALLED" ]]; then
     command -v cargo >/dev/null 2>&1 \
         || die "cargo not found and no release asset available. Install Rust via https://rustup.rs and re-run."
 
-    # Release assets for these targets ship with the embedded needle brain, so
-    # a source install has to as well — otherwise falling back to cargo would
-    # silently hand someone a statically-routing forge and they would have no
-    # way to know why the headline feature is inert. The engine is fetched and
-    # checksum-verified by needle-sys's build script; the list is the one in
-    # crates/needle-sys/build_support.rs, and anything not on it has no
-    # published engine (Intel macOS), an unlinkable one (x86_64: its archive
-    # needs a libc++ nobody distributes), or an unverified one (Windows).
+    # The embedded needle brain is on by default: needle-sys's build script
+    # fetches and checksum-verifies the engine on the targets forge has
+    # verified (the list in crates/needle-sys/build_support.rs), and warns and
+    # continues engine-less everywhere else (Intel macOS: no published engine;
+    # x86_64: its archive needs a libc++ nobody distributes; Windows:
+    # unverified). So a plain install gets the brain wherever one exists.
     #
     # Linux additionally needs libc++'s development files at build time
-    # (libc++-dev + libc++abi-dev on Debian/Ubuntu); if they are missing the
-    # build falls back below rather than failing.
-    NEEDLE_FEATURES=()
-    case "$TRIPLE" in
-        aarch64-apple-darwin|aarch64-unknown-linux-gnu)
-            NEEDLE_FEATURES=(--features needle-ffi) ;;
-    esac
+    # (libc++-dev + libc++abi-dev on Debian/Ubuntu).
 
     SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || true
     if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/Cargo.toml" ]]; then
@@ -191,21 +183,17 @@ if [[ -z "$INSTALLED" ]]; then
     fi
     CARGO_ARGS+=(--locked --root "$WORK/cargo-root")
 
-    if [[ ${#NEEDLE_FEATURES[@]} -gt 0 ]]; then
-        info "installing with cargo from $SOURCE_DESC (with the embedded brain)"
-        # Retry without the feature if the engine could not be fetched or
-        # linked: a brain-less forge is fully functional on static routing, so
-        # an unreachable Hugging Face must not turn a working install into no
-        # install at all. `forge doctor` reports which one you ended up with.
-        if ! cargo "${CARGO_ARGS[@]}" "${NEEDLE_FEATURES[@]}"; then
-            warn "could not build with the embedded brain (engine download or link failed);"
-            warn "retrying without it — forge will route with static rules."
-            warn "run \`forge doctor\` afterwards; the 'needle brain' line says how to add it."
-            cargo "${CARGO_ARGS[@]}"
-        fi
-    else
-        info "installing with cargo from $SOURCE_DESC"
-        cargo "${CARGO_ARGS[@]}"
+    info "installing with cargo from $SOURCE_DESC (with the embedded brain where one exists)"
+    # Retry engine-less if the engine could not be fetched or linked: a
+    # brain-less forge is fully functional on static routing, so an
+    # unreachable Hugging Face or a missing libc++-dev must not turn a working
+    # install into no install at all. `forge doctor` reports which one you
+    # ended up with.
+    if ! cargo "${CARGO_ARGS[@]}"; then
+        warn "could not build with the embedded brain (engine download or link failed);"
+        warn "retrying without it — forge will route with static rules."
+        warn "run \`forge doctor\` afterwards; the 'needle brain' line says how to add it."
+        NEEDLE_NO_DOWNLOAD=1 cargo "${CARGO_ARGS[@]}"
     fi
 
     mkdir -p "$PREFIX"

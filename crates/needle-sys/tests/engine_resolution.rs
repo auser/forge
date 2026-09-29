@@ -199,8 +199,8 @@ fn no_download_opts_out_of_the_network_entirely() {
     assert!(message.contains(NO_DOWNLOAD_ENV), "{message}");
     assert!(message.contains("vendor/"), "{message}");
     assert!(
-        message.contains("needle-ffi"),
-        "the message must name the feature to drop: {message}"
+        message.contains(LIB_DIR_ENV),
+        "the message must name how to supply an engine by hand: {message}"
     );
     assert!(
         !cache.exists(),
@@ -255,8 +255,8 @@ fn an_unreachable_mirror_fails_with_an_actionable_message() {
         "must name what failed: {message}"
     );
     assert!(
-        message.contains("needle-ffi"),
-        "must name the one-command way out: {message}"
+        message.contains("static rules"),
+        "must say forge still works engine-less: {message}"
     );
     assert!(
         message.contains(NO_DOWNLOAD_ENV),
@@ -301,10 +301,10 @@ fn every_pinned_engine_is_well_formed_and_unique() {
     }
 }
 
-/// Intel macOS has no published engine, so it must not be claimed — this is
-/// the concrete reason `needle-ffi` cannot be a default feature, and a
-/// regression here would turn a graceful "static routing" build into a link
-/// error for every Intel Mac.
+/// Intel macOS has no published engine, so it must not be claimed — with the
+/// engine on by default this is the target whose every build resolves
+/// engine-less, and a regression here would turn a graceful "static routing"
+/// build into a link error for every Intel Mac.
 #[test]
 fn unsupported_targets_are_reported_as_unsupported_not_guessed() {
     assert!(pinned_engine("x86_64-apple-darwin").is_none());

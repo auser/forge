@@ -59,11 +59,13 @@ escalated rather than acted on.
 descriptions, not a needle decision. See [Skills](#skills).)
 
 **Whether you actually have a brain depends on the build.** Real on-device
-inference needs the native engine, which sits behind the `needle-ffi` cargo
-feature: the prebuilt release binaries for `aarch64-apple-darwin` and
-`aarch64-unknown-linux-gnu` are built with it (so the installed default on those
-platforms is a working brain), while a plain `cargo build`, Intel macOS, x86_64
-Linux and Windows get a statically-routing binary.
+inference needs the native engine, and the engine is **on by default**: the
+build fetches and checksum-verifies it automatically for the platforms forge
+has verified, so the prebuilt release binaries for `aarch64-apple-darwin` and
+`aarch64-unknown-linux-gnu` — and a plain `cargo build` on those machines —
+come with a working brain. Intel macOS, x86_64 Linux and Windows get a
+statically-routing binary (the build warns once and continues engine-less),
+because no linkable engine exists for them yet.
 That is a supported configuration and fully usable, not a degraded one: you
 get deterministic static routing instead of the on-device model, and you give
 up the direct-dispatch fast path and the local semantic index
@@ -71,7 +73,7 @@ up the direct-dispatch fast path and the local semantic index
 unchanged. `forge doctor` tells you which you have on its
 `needle engine` / `needle brain` lines, and names the one command that
 changes it. Details: [Installation](#installation) and [Embedded Needle brain
-(`ffi`)](#embedded-needle-brain-ffi).
+](#embedded-needle-brain).
 
 ## The generation plane: local first, cloud when it is earned
 
@@ -157,18 +159,20 @@ Release assets are built by CI for every `v*` tag (see
 **The embedded brain comes with it** on `aarch64-apple-darwin` and
 `aarch64-unknown-linux-gnu` — the two platforms whose on-device engine forge has
 both checksum-verified *and* link-verified. Release assets for those targets are
-built with `needle-ffi`, CI asserts each one really has the engine before
-publishing, and the `cargo install` fallback adds the feature too (retrying
-without it if the engine cannot be fetched, so a bad network never costs you the
-install). Intel macOS, x86_64 Linux and Windows get a statically-routing binary,
-because no linkable engine exists for them yet (see [Embedded Needle brain
-(`ffi`)](#embedded-needle-brain-ffi) for exactly why each); `forge doctor` says
-which one you have on its `needle engine` line.
+built with `NEEDLE_REQUIRE_ENGINE=1` so a brain-less binary fails the release
+build instead of shipping, and CI runs each asset and asserts it really reports
+the engine before publishing. The `cargo install` fallback gets the brain too —
+the engine is fetched and checksum-verified by `needle-sys`'s build script on
+every build; if it cannot be fetched, the install retries engine-less, so a bad
+network never costs you the install. Intel macOS, x86_64 Linux and Windows get a
+statically-routing binary, because no linkable engine exists for them yet (see
+[Embedded Needle brain](#embedded-needle-brain) for exactly why each);
+`forge doctor` says which one you have on its `needle engine` line.
 
 Brain-enabled assets need nothing extra installed to run — the C++ runtime is
 linked statically on Linux and ships with the OS on macOS, so they depend on
 exactly what a brain-less build does. Full detail:
-[Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi).
+[Embedded Needle brain](#embedded-needle-brain).
 
 ## Quickstart
 
@@ -304,13 +308,13 @@ inside a `[models.<name>]` entry the fields are `base_url` and `key_env`; the
 `model_`-prefixed spellings are top-level keys only. Rename them.
 
 **Weights/brain notes.** `forge init` fetches and verifies Needle's weights
-when `needle.autofetch` is on (the default) and the build has the
-`needle-ffi` feature — a one-time ~35 MB download for `needle.variant =
+when `needle.autofetch` is on (the default) and the build has the engine
+linked — a one-time ~35 MB download for `needle.variant =
 "full"` (the only variant with a hosted, pinned artifact today;
 `small`/`medium` report "no pinned weights artifact"), cached under
 `~/.cache/forge/models/`; re-running `init` re-verifies the checksum and
 skips the download if it already matches. Whenever weights aren't present
-(no network, `--local-only`, a build without `needle-ffi`, or a
+(no network, `--local-only`, an engine-less build, or a
 variant with nothing to fetch), routing falls back to deterministic static
 routing (`fallback_used: true` in the events) and the run proceeds with the
 configured model — a fully supported, fully offline mode, not a degraded one.
@@ -320,7 +324,7 @@ the brain as a line-pair — the backend and the weights on the first line, the
 verdict and the single command that changes it on the second:
 
 ```text
-[warn] needle engine: backend not in this build (`needle-ffi` off); weights not fetched (…) — nothing here could use them
+[warn] needle engine: backend not in this build (no engine linked); weights not fetched (…) — nothing here could use them
 [warn] needle brain: inactive — falling back to static routing; install a build with the brain: `cargo install …`
 ```
 
@@ -387,7 +391,7 @@ is unsure about, resumed runs — runs the full agent loop exactly as before.
 The fast path is purely an optimization: it dispatches through the same
 approval-gated execution provider as the loop, so it can never do something
 a normal run of the same configuration could not, and without a working
-brain (no `ffi` feature, weights missing) it simply never engages.
+brain (engine-less build, weights missing) it simply never engages.
 
 Approval, when a tool call needs it (`approval = "prompt"`):
 
@@ -654,8 +658,8 @@ Seven modes:
   once weights are on disk; **default**; `forge init` fetches/verifies
   weights for `needle.variant = "full"`, the one variant Cactus-Compute
   currently publishes as a standalone artifact; real inference needs a build
-  with the `needle-ffi` feature — see [Embedded Needle brain
-  (`ffi`)](#embedded-needle-brain-ffi) — and falls back to static without
+  with the engine linked — see [Embedded Needle
+  brain](#embedded-needle-brain) — and falls back to static without
   it, or when weights are unavailable: unpinned variant, `--local-only`,
   no network),
 - `jev` (Jev/OpenJev System One decision model — TypeSafe's hosted API at
@@ -849,9 +853,9 @@ build still succeeds, and no `embeddings.bin` is touched.
 
 `embeddings.bin` is a single `serde_json` blob today (an 8-byte `FRGEMB01`
 magic prefix + one JSON object), parsed in full on every load. That is fine
-at the hash backend's 64 dimensions, but the real `ffi` backend embeds at
-3072 dimensions (see [Embedded Needle brain
-(`ffi`)](#embedded-needle-brain-ffi)); a project with ~1,000 embedded symbols
+at the hash backend's 64 dimensions, but the real FFI backend embeds at
+3072 dimensions (see [Embedded Needle brain](#embedded-needle-brain)); a
+project with ~1,000 embedded symbols
 would produce a ~45 MB index under that format. A raw little-endian-`f32`
 format bump is planned — safe to do later because the magic prefix makes a
 version change non-silent (mismatch → clean rebuild, never a misread) — see
@@ -1203,40 +1207,42 @@ just release   # release build
 just clean
 ```
 
-### Embedded Needle brain (`ffi`)
+### Embedded Needle brain
 
 Real on-device inference needs a per-platform native engine (`libneedle`) that
-this repo does not carry, so it sits behind one feature flag — **and enabling
-that flag is the whole job**, because the build fetches and checksum-verifies
-the engine for you:
+this repo does not carry — and getting one is **not your job**: the engine is
+on by default, and the build fetches and checksum-verifies it for you:
 
 ```bash
-cargo build --release -p forge-cli --features needle-ffi
+cargo build --release -p forge-cli
 ```
 
-That is the single command. No `curl`, no manual checksum step.
+That is the single command. No feature flag, no `curl`, no manual checksum
+step. What the build actually linked is a build-time fact the binary knows
+about itself — `forge doctor`'s `needle engine` line reads it — not a feature
+someone asked for.
 
 | crate | feature | effect |
 | --- | --- | --- |
-| `forge-needle` | `ffi` | `FfiBackend` over `libneedle` instead of `UnavailableBackend`; turns on `needle-sys/fetch` |
-| `forge-needle` | `needle-e2e` | enables `tests/e2e.rs` (needs `ffi` + real weights) |
-| `forge-cli` | `needle-ffi` | builds the `forge` binary with the above |
+| `forge-needle` | `needle-e2e` | compiles `tests/e2e.rs` / `tests/fastpath_latency.rs` (needs real weights at run time; skips when the build linked no engine) |
 
-Prebuilt release binaries for the supported platforms below already have the
-engine linked in, and CI refuses to publish one that claims the feature and
-does not — see [Installation](#installation). You only need this section to
-build one yourself.
+That is the only needle-related cargo feature left, and it is a test gate, not
+an engine gate. Prebuilt release binaries for the supported platforms below
+already have the engine linked in, and CI refuses to publish one that does not
+report it — see [Installation](#installation). You only need this section when
+the build cannot get an engine itself.
 
 #### How the engine gets there
 
-`crates/needle-sys/build.rs` resolves it in three steps, first hit wins:
+`crates/needle-sys/build.rs` resolves it on every build in three steps, first
+hit wins:
 
 1. `NEEDLE_LIB_DIR=/path/to/dir` — an engine you supplied.
 2. `crates/needle-sys/vendor/<target-triple>/` — a vendored engine
    (gitignored).
-3. **Download, verified against a pinned SHA-256** — only when the `ffi`
-   feature is on. A default build never reaches this step and never touches
-   the network.
+3. **Download, verified against a pinned SHA-256** — the pinned engine for the
+   targets forge has verified. `NEEDLE_NO_DOWNLOAD=1` opts this step out
+   (offline, air-gapped, distro packaging).
 
 The engine ships per platform in the same Apache-2.0 Hugging Face repo as the
 weights, [`Cactus-Compute/needle3`](https://huggingface.co/Cactus-Compute/needle3).
@@ -1257,9 +1263,8 @@ The pinned checksums live in `PINNED_ENGINES` in
 checksums for the rest and the reason each is held back:
 
 - **Intel macOS: no engine exists.** There is no `macos-x86_64` folder in the
-  repo at all. This is the main reason `needle-ffi` is not a default feature —
-  making it one would turn "forge builds and routes statically" into "forge does
-  not build" on those machines.
+  repo at all. Builds for that target always resolve engine-less — they warn
+  once at build time and forge routes statically.
 - **x86_64 Linux and x86_64 Windows: the archive cannot be linked.** Both leave
   `std::__1::__hash_memory` undefined, and no distributed libc++ defines it
   (checked across libc++ 18 and 20, dev and runtime, static and shared). That
@@ -1270,16 +1275,16 @@ checksums for the rest and the reason each is held back:
   `needle.lib` an MSVC `-lneedle` resolves, and needs a libc++ MSVC has not got.
 - **armv7/riscv64:** no forge target builds them, so the link is unexercised.
 
-On any other target, `--features needle-ffi` warns that no verified engine
-exists and links nothing; supply one yourself via step 1 or 2 if you have one
-you trust.
+On any other target the build warns that no verified engine exists and links
+nothing (engine-less build); supply one yourself via step 1 or 2 if you have
+one you trust.
 
 #### The C++ runtime (Linux build prerequisite)
 
 `libneedle` is C++ built with clang against **libc++** — on every platform, not
 just macOS. (`nm --undefined-only` over each published artifact shows
 `_ZNSt3__1…`, libc++'s inline namespace, and zero libstdc++ `__cxx11` symbols.)
-So on Linux, building with `needle-ffi` needs libc++'s development files:
+So on Linux, linking the engine needs libc++'s development files:
 
 ```bash
 sudo apt-get install libc++-dev libc++abi-dev     # Debian/Ubuntu
@@ -1314,29 +1319,25 @@ header ever stops matching those declarations.
 #### Running it
 
 ```bash
-just verify-ffi   # clippy + unit tests with `ffi` on
+just verify-ffi   # clippy + unit tests with the engine linked
 just e2e          # real-weights end-to-end suite (release build)
 ```
 
-`just verify` already type- and lint-checks the `ffi` code on every run via
-`just lint-ffi` — `cargo clippy` never links, so that needs no engine binary.
-The recipes above are what additionally *run* it.
+`just verify` already type- and lint-checks all the FFI code on every run —
+`ffi_backend.rs` is compiled by the plain workspace lint, and `just lint-ffi`
+adds the e2e test targets link-free (`cargo clippy` never links, so that needs
+no engine binary). The recipes above are what additionally *run* it.
 
-**If `ffi` is on and no engine could be resolved**, the build prints a
-`cargo:warning` naming the one thing to do next and carries on without link
-flags; a binary that actually calls into the engine then fails at link time
-with undefined `_needle_*` symbols, the warning still visible above it. It
-warns rather than stopping because `just lint-ffi` and CI compile the `ffi`
-code on machines with no engine on purpose, and that coverage is worth more
-than pre-empting a link error whose cause is already on screen. Set
-`NEEDLE_REQUIRE_ENGINE=1` when you would rather it stop — which is exactly
-what the release workflow does, so a brain-less binary can never ship
-labelled brain-enabled.
-
-A default build — no `ffi` — never links the engine and says nothing about it:
-`needle-sys` prints a note only under `cargo build -vv`, deliberately not a
-`cargo:warning`, because the crate compiles on every workspace build whether
-or not anything needs the engine.
+**If no engine could be resolved**, the build prints one `cargo:warning`
+naming the one thing to do next and carries on engine-less: `needle-sys` compiles
+inert stubs with the same signatures, `forge_needle::HAS_EMBEDDED_BACKEND` is
+`false`, and forge routes with static rules, fully usable. It warns rather than
+stopping because `just lint-ffi` and CI compile the backend code on machines
+with no engine on purpose, and that coverage is worth more than pre-empting a
+problem whose cause is already on screen. Set `NEEDLE_REQUIRE_ENGINE=1` when you
+would rather it stop — which is exactly what the release workflow does for
+brain-enabled targets, so a brain-less binary can never ship labelled
+brain-enabled.
 
 `just e2e` needs weights as well as the engine:
 
@@ -1422,13 +1423,14 @@ go in `specs/adrs/`.
   (`FORGE_MOCK_VERBOSE=1` additionally makes the mock echo a snippet of the
   assembled system context, when you want that plumbing visible in a test.)
 - Needle FFI: `just verify-ffi` and `just e2e` are opt-in and excluded from
-  `just verify` — the first downloads a native engine, the second also needs
-  real weights. `just verify` still type- and lint-checks all the `ffi` code
-  link-free via `just lint-ffi`. In CI the same split is two jobs: the required
+  `just verify` — the first links a native engine, the second also needs
+  real weights. `just verify` still type- and lint-checks all the FFI code
+  link-free (`just lint` compiles the backend; `just lint-ffi` adds the e2e
+  test targets). In CI the same split is two jobs: the required
   `verify`, and an advisory `verify-ffi` that links and runs the backend for
   real (so a stale engine checksum or a broken link cannot go unnoticed) but
   cannot block a merge when the artifact host is down. See [Embedded Needle
-  brain (`ffi`)](#embedded-needle-brain-ffi).
+  brain](#embedded-needle-brain).
 
 ## Known limitations (v0.3)
 
@@ -1482,16 +1484,16 @@ go in `specs/adrs/`.
   with `extract()`-based argument repair in the agent loop) is not
   implemented yet; it needs real-model quality data first and is deferred to
   a later spec sub-project.
-- `needle-ffi` is not a default cargo feature, so a plain `cargo build` still
-  produces a brain-less binary that routes statically (and `forge init` skips
-  the weights fetch in it, since there would be no backend to use them). It
-  cannot be a default: Cactus publishes no engine for Intel macOS at all, the
-  x86_64 archives need a libc++ nobody distributes, the Windows one is
-  link-untested, and offline builds would fail to link rather than degrade.
+- The engine is on by default, but not every platform can have one: Cactus
+  publishes no engine for Intel macOS at all, the x86_64 archives need a
+  libc++ nobody distributes, and the Windows one is link-untested — builds
+  there warn once and continue engine-less (and `forge init` skips the
+  weights fetch in them, since there would be no backend to use them).
   **Prebuilt release binaries for `aarch64-apple-darwin` and
   `aarch64-unknown-linux-gnu` do have the engine**, so the installed default on
-  those platforms is a working brain; building it yourself is one flag (see
-  [Embedded Needle brain (`ffi`)](#embedded-needle-brain-ffi)). Whichever build
+  those platforms is a working brain; everywhere else the binary routes
+  statically until an engine exists (see
+  [Embedded Needle brain](#embedded-needle-brain)). Whichever build
   you have, `forge doctor`'s `needle engine` / `needle brain` line-pair states
   the backend, the weights, the verdict and the one command that changes it.
   **x86_64 Linux is the notable gap** — the most common server platform, and it
@@ -1504,8 +1506,8 @@ go in `specs/adrs/`.
   handler yet. Follow-up: share one `semantic_blend` implementation between
   the CLI and `forge-server` via `forge-runtime`.
 - `embeddings.bin`'s whole-file `serde_json` format has a known scale limit
-  for `ffi` builds: fine at the hash backend's 64 dimensions, but the real
-  engine embeds at 3072 dimensions, where a project with ~1,000 symbols
+  for engine-linked builds: fine at the hash backend's 64 dimensions, but the
+  real engine embeds at 3072 dimensions, where a project with ~1,000 symbols
   would produce a ~45 MB index parsed in full on every load. A raw
   little-endian-`f32` format bump is planned; deferred for now because the
   `FRGEMB01` magic prefix makes that change safe to land later (a version

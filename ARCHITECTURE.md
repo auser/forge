@@ -51,14 +51,17 @@ generate text — which is exactly why it is safe to run on every request.
 
 - `needle-sys` — six hand-written `extern "C"` declarations against
   `libneedle` (no bindgen, no libclang; a unit test pins the committed
-  `needle.h` against the declarations). The engine is resolved in three steps:
-  `NEEDLE_LIB_DIR` → `vendor/<target>/` → download at build time against a
-  pinned SHA-256, the last only under the `ffi` feature, so a default build
-  never reaches for the network. Downloads are cached by content hash, so
+  `needle.h` against the declarations). The engine is resolved on every build
+  in three steps: `NEEDLE_LIB_DIR` → `vendor/<target>/` → download at build
+  time against a pinned SHA-256. Downloads are cached by content hash, so
   once per machine. `NEEDLE_NO_DOWNLOAD=1` opts out (offline/packaging);
   `NEEDLE_REQUIRE_ENGINE=1` turns "no engine" from a warning into a build
   failure, which is how release builds guarantee a brain-labelled binary has
-  one. Linked only with the `ffi` feature.
+  one. When nothing resolves, the build warns once and compiles inert stub
+  functions instead — and emits the fact as `--cfg needle_engine`, surfaced
+  to the workspace as `forge_needle::HAS_EMBEDDED_BACKEND`: the only correct
+  answer to "can this build run inference" (a fact about what linked, not a
+  feature someone requested).
 - The engine's C++ runtime is chosen from the **artifact**, not the OS: every
   published `libneedle.a` is clang/libc++ (`_ZNSt3__1…` undefined symbols, no
   libstdc++ `__cxx11`), so Linux links libc++ — statically, plus the `-L` that
@@ -76,7 +79,7 @@ generate text — which is exactly why it is safe to run on every request.
   indexing all use the same cached instance).
 - Weights are fetched once by `forge init` (SHA-256-pinned, atomic rename,
   refetch-once; `[needle] weights_sha256` lets an operator pin their own).
-  Builds without the `ffi` feature skip the fetch and say so.
+  Engine-less builds skip the fetch and say so.
 - **One story about why the brain is off.** Two distinct causes, never
   conflated: `BackendError::EngineMissing` ("no engine in this build", fixed by
   a reinstall) and `BackendError::WeightsMissing` ("no weights on disk", fixed
