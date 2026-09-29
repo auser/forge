@@ -569,6 +569,9 @@ impl BddWorld {
     }
 
     /// All session JSONL content under .forge/sessions, concatenated.
+    /// Decision logs (`*.decisions.jsonl`) live in the same directory but
+    /// are not session events — records carry `session`, not `session_id`,
+    /// so including them would corrupt every "all events …" assertion.
     pub fn session_log(&mut self) -> String {
         let dir = self.project().join(".forge").join("sessions");
         let mut out = String::new();
@@ -577,6 +580,13 @@ impl BddWorld {
             Err(_) => return out,
         };
         for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".decisions.jsonl")
+            {
+                continue;
+            }
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
                 out.push_str(&text);
             }

@@ -175,6 +175,8 @@ pub enum SessionCommand {
         #[arg(long, value_name = "POSITION_OR_RUN_ID")]
         at: Option<String>,
     },
+    /// Summarise the decision log (dispatch/routing stats across sessions).
+    Decisions,
 }
 
 #[derive(Subcommand)]

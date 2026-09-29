@@ -404,13 +404,29 @@ fn run_works_offline_with_mock_model() {
     let stdout = String::from_utf8(output.stdout).expect("utf8");
     assert_eq!(stdout.trim(), "mock response to: hello world");
 
-    // The session was persisted under .forge/sessions/.
+    // The session was persisted under .forge/sessions/ — one transcript,
+    // plus its decision log (dispatch/routing records, not events).
     let sessions_dir = project.join(".forge").join("sessions");
     assert!(sessions_dir.is_dir());
     let entries: Vec<_> = std::fs::read_dir(&sessions_dir)
         .expect("read sessions")
+        .flatten()
         .collect();
-    assert_eq!(entries.len(), 1);
+    let transcripts = entries
+        .iter()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+        })
+        .count();
+    assert_eq!(transcripts, 1, "one session transcript: {entries:?}");
+    assert!(
+        entries.iter().any(|e| e
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".decisions.jsonl")),
+        "the run's decision log should be there too: {entries:?}"
+    );
 }
 
 #[test]
@@ -845,16 +861,19 @@ fn scripted_mock_loop_edits_file_and_emits_tool_events() {
         "content: {content}"
     );
 
-    // And the full tool trail is in the session log.
-    let log = std::fs::read_to_string(
-        std::fs::read_dir(project.join(".forge/sessions"))
-            .expect("sessions")
-            .next()
-            .expect("one session")
-            .expect("entry")
-            .path(),
-    )
-    .expect("log");
+    // And the full tool trail is in the session log. The directory also
+    // holds the decision log (`*.decisions.jsonl`); the trail is in the
+    // transcript.
+    let transcript = std::fs::read_dir(project.join(".forge/sessions"))
+        .expect("sessions")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+        })
+        .expect("one session transcript");
+    let log = std::fs::read_to_string(transcript).expect("log");
     for needle in [
         "tool_call_requested",
         "tool_started",
@@ -1633,4 +1652,46 @@ fn help_does_not_advertise_the_mock_router() {
         !stdout.contains("mock"),
         "help must not advertise mocks: {stdout}"
     );
+}
+
+#[test]
+fn session_decisions_summarises_the_decision_log() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    let sessions = project.join(".forge").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::write(
+        sessions.join("sess-1.decisions.jsonl"),
+        concat!(
+            r#"{"ts":"2026-09-25T00:00:00.000Z","session":"sess-1","turn":1,"stage":"decide","decider":"needle","question":"tool","choice":"read_file","confidence":1.0,"outcome":"dispatched","elapsed_ms":900,"speculative":false}"#,
+            "\n",
+            r#"{"ts":"2026-09-25T00:00:01.000Z","session":"sess-1","turn":2,"stage":"decide","decider":"needle","question":"tool","choice":"none","confidence":0.47,"outcome":"declined","elapsed_ms":1100,"speculative":false}"#,
+            "\n",
+            // A truncated final line is the normal state of an append-only
+            // log whose writer died: skipped, never fatal.
+            r#"{"ts":"2026-09-25T00:00:02.000Z","session":"sess-"#,
+        ),
+    )
+    .expect("write log");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["session", "decisions", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json on stdout");
+    assert_eq!(value["decide"]["total"], 2);
+    assert_eq!(value["decide"]["dispatched"], 1);
+    assert_eq!(value["decide"]["declined"], 1);
+    // The number the next phase is designed against.
+    assert_eq!(value["decide"]["decline_rate"], 0.5);
+    assert_eq!(value["decide"]["mean_elapsed_ms"], 1000);
+    assert_eq!(value["route"]["total"], 0);
 }

@@ -12,7 +12,10 @@ use forge_core::{
     SkillMeta, SkillRegistry, ToolCall, ToolResult,
 };
 use forge_needle::NeedleEngine;
-use forge_session::{JsonlSessionStore, new_run_id, new_session_id};
+use forge_session::{
+    Decider, DecisionLog, JsonlSessionStore, Outcome, RecordDraft, Stage, new_run_id,
+    new_session_id,
+};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -372,6 +375,10 @@ pub struct AgentService {
     finished: Mutex<FinishedRuns>,
     /// One live run per session (see [`AgentService::claim_session`]).
     live_sessions: Arc<LiveSessions>,
+    /// What forge decided, appended beside the transcripts as
+    /// `<session-id>.decisions.jsonl` — decision shape only, never prompt
+    /// text or tool arguments (see `forge_session::decisions`).
+    decision_log: Arc<DecisionLog>,
 }
 
 impl AgentService {
@@ -383,6 +390,9 @@ impl AgentService {
         sessions: Arc<JsonlSessionStore>,
         config: Config,
     ) -> Self {
+        // The log lives beside the transcripts: sessions.root() is the
+        // directory holding `<session-id>.jsonl`.
+        let decision_log = Arc::new(DecisionLog::new(sessions.root().to_path_buf()));
         Self {
             model,
             router,
@@ -399,6 +409,7 @@ impl AgentService {
             cancel_tokens: Mutex::new(HashMap::new()),
             finished: Mutex::new(FinishedRuns::default()),
             live_sessions: Arc::new(LiveSessions::default()),
+            decision_log,
         }
     }
 
@@ -1346,6 +1357,10 @@ impl AgentService {
         let mut input_rx = self.take_input_receiver(&run_id);
         let mut collected = Vec::new();
         let mut tool_call_count = 0usize;
+        let decisions = DecisionLog::handle(&self.decision_log, &session_id);
+        // A1 records one turn per run; the turn counter becomes real when the
+        // turn loop gains a per-conversation owner.
+        let turn_no: u32 = 1;
 
         let fail = |collected: &mut Vec<Event>, error: ForgeError| -> ForgeError {
             let event = Event::new(
@@ -1398,6 +1413,7 @@ impl AgentService {
             required_capabilities: Vec::new(),
             candidates,
         };
+        let route_started = std::time::Instant::now();
         let decision = match self.router.route(&routing_request).await {
             Ok(decision) => decision,
             Err(e) => return Err(fail(&mut collected, e)),
@@ -1408,6 +1424,29 @@ impl AgentService {
             confidence = decision.confidence,
             fallback = decision.fallback_used,
             "routing decision"
+        );
+        decisions.record(
+            turn_no,
+            RecordDraft {
+                stage: Stage::Route,
+                // Map from the router that actually answered, not from
+                // `fallback_used`: a primary `static` router is not needle
+                // having fallen back, and conflating them would corrupt the
+                // decline rate this log exists to measure.
+                decider: match decision.router_name.as_str() {
+                    "needle" | "needle-dispatch" => Decider::Needle,
+                    "static" | "cheapest" | "mock" => Decider::Static,
+                    _ => Decider::Llm,
+                },
+                question: "model".to_string(),
+                choice: decision.selected_model.clone(),
+                confidence: Some(decision.confidence),
+                probabilities: std::collections::BTreeMap::new(),
+                candidates: routing_request.candidates.clone(),
+                outcome: Outcome::Routed,
+                elapsed_ms: route_started.elapsed().as_millis() as u64,
+                speculative: false,
+            },
         );
         self.emit(
             &sender,
@@ -1501,10 +1540,46 @@ impl AgentService {
         // must not turn it into tool execution. All other gates and the
         // dispatch itself live in `needle_fast_path`; `None` means "run
         // normally", and nothing has been emitted or executed by then.
-        if resumed_from.is_none()
-            && !tools.is_empty()
-            && let Some(fast) = self.needle_fast_path(prompt, &run_id, &tools).await
-        {
+        //
+        // Whatever the fast path answers is recorded — dispatched, declined
+        // and (with no engine attached) unavailable alike. A decline that
+        // left no record would be invisible in exactly the decline-rate data
+        // this log exists to produce.
+        let fast = if resumed_from.is_none() && !tools.is_empty() {
+            let started = std::time::Instant::now();
+            let outcome = self.needle_fast_path(prompt, &run_id, &tools).await;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            decisions.record(
+                turn_no,
+                RecordDraft {
+                    stage: Stage::Decide,
+                    decider: if self.needle.is_some() {
+                        Decider::Needle
+                    } else {
+                        Decider::None
+                    },
+                    question: "tool".to_string(),
+                    choice: outcome
+                        .as_ref()
+                        .map(|f| f.call.name.clone())
+                        .unwrap_or_else(|| "none".to_string()),
+                    confidence: outcome.as_ref().map(|f| f.confidence),
+                    probabilities: std::collections::BTreeMap::new(),
+                    candidates: tools.iter().map(|t| t.name.clone()).collect(),
+                    outcome: match (&outcome, self.needle.is_some()) {
+                        (Some(_), _) => Outcome::Dispatched,
+                        (None, true) => Outcome::Declined,
+                        (None, false) => Outcome::Unavailable,
+                    },
+                    elapsed_ms,
+                    speculative: false,
+                },
+            );
+            outcome
+        } else {
+            None
+        };
+        if let Some(fast) = fast {
             tracing::info!(
                 run_id,
                 tool = %fast.call.name,

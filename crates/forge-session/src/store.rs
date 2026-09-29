@@ -158,6 +158,18 @@ impl JsonlSessionStore {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
+            // `<id>.decisions.jsonl` is the decision log living beside the
+            // transcript (see `decisions.rs`), not a session: skip it by
+            // name, or it would surface as a phantom session whose id ends
+            // in ".decisions" — and `latest_session` would happily resume
+            // it.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".decisions.jsonl"))
+            {
+                continue;
+            }
             let Some(session_id) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -346,6 +358,31 @@ mod tests {
             store.latest_session().expect("latest"),
             Some("sess-b".to_string())
         );
+    }
+
+    /// The decision log lives beside the transcripts as
+    /// `<id>.decisions.jsonl`; it is not a session, and must never be
+    /// listed or resumed as one.
+    #[test]
+    fn decision_logs_are_not_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path());
+        store
+            .append(Event::new(
+                "r",
+                "sess-a",
+                EventKind::ToolStarted { name: "t".into() },
+            ))
+            .expect("append");
+        std::fs::write(tmp.path().join("sess-a.decisions.jsonl"), "{}\n").expect("write");
+
+        let sessions = store.list_sessions().expect("list");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the decision log must not list as a session: {sessions:?}"
+        );
+        assert_eq!(sessions[0].session_id, "sess-a");
     }
 
     #[test]

@@ -192,3 +192,92 @@ pub fn show(ctx: &Context, id: &str) -> Result<(), ForgeError> {
     }
     print_events(ctx, &events)
 }
+
+/// `forge session decisions` — summarise `.forge/sessions/*.decisions.jsonl`.
+///
+/// The decline rate is the number the next phase's design hangs on: whether
+/// falling back to a second decider is worth its latency depends entirely on
+/// how often the first one declines on real work. Published benchmarks do not
+/// transfer; this does.
+pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
+    let root = ctx.project_root()?.join(".forge").join("sessions");
+    let mut total = 0u64;
+    let mut dispatched = 0u64;
+    let mut declined = 0u64;
+    let mut unavailable = 0u64;
+    let mut elapsed_ms_total = 0u64;
+    let mut routed = 0u64;
+
+    if root.is_dir() {
+        for entry in std::fs::read_dir(&root)
+            .map_err(|e| ForgeError::session(format!("reading {}: {e}", root.display())))?
+        {
+            let entry = entry
+                .map_err(|e| ForgeError::session(format!("reading {}: {e}", root.display())))?;
+            let path = entry.path();
+            if !path.to_string_lossy().ends_with(".decisions.jsonl") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| ForgeError::session(format!("reading {}: {e}", path.display())))?;
+            for line in raw.lines() {
+                // A truncated final line is normal for an append-only log that
+                // was being written when the process died. Skip, never fail.
+                let Ok(record) = serde_json::from_str::<forge_session::DecisionRecord>(line) else {
+                    continue;
+                };
+                match record.stage {
+                    forge_session::Stage::Decide => {
+                        total += 1;
+                        elapsed_ms_total += record.elapsed_ms;
+                        match record.outcome {
+                            forge_session::Outcome::Dispatched => dispatched += 1,
+                            forge_session::Outcome::Declined => declined += 1,
+                            forge_session::Outcome::Unavailable => unavailable += 1,
+                            _ => {}
+                        }
+                    }
+                    forge_session::Stage::Route => routed += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let decline_rate = if total == 0 {
+        0.0
+    } else {
+        declined as f64 / total as f64
+    };
+    let mean_ms = elapsed_ms_total.checked_div(total).unwrap_or(0);
+
+    let report = serde_json::json!({
+        "decide": {
+            "total": total,
+            "dispatched": dispatched,
+            "declined": declined,
+            "unavailable": unavailable,
+            "decline_rate": decline_rate,
+            "mean_elapsed_ms": mean_ms,
+        },
+        "route": { "total": routed },
+    });
+
+    if ctx.global.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|e| ForgeError::session(format!("serializing decision summary: {e}")))?
+        );
+    } else {
+        println!(
+            "decide  {total} total — {dispatched} dispatched, {declined} declined, {unavailable} unavailable"
+        );
+        println!(
+            "        decline rate {:.0}%, mean {mean_ms} ms",
+            decline_rate * 100.0
+        );
+        println!("route   {routed} total");
+    }
+    Ok(())
+}
