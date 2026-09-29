@@ -21,8 +21,9 @@ use crate::commands::{Context, doctor};
 ///    already go to stderr (`tracing_setup::init`), which the stdio
 ///    binding explicitly allows.
 /// 2. **stdin is the protocol channel too**, so the run loop can never
-///    prompt on it. It does not: `NativeExecution::prompt_for_approval`
-///    checks `stdin().is_terminal()` first, and under an MCP client stdin
+///    prompt on it. It does not: `NativeExecution::ask_approval` asks
+///    inline only on the `ApprovalChannel::InlineTty` channel *and* a
+///    terminal stdin, and under an MCP client stdin
 ///    is a pipe — so a risky operation under `approval = "prompt"` pauses
 ///    the run with `ApprovalRequired` and waits for input delivered out of
 ///    band, which is what the `forge_run_input` tool does.

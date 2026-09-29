@@ -145,12 +145,21 @@ Each sub-project gets its own spec → plan → implementation cycle:
      cancellation readable from the type. Both adapters' existing test
      suites pass unmodified.
 
-   **Phase B (the interactive UI itself): designed** (sub-project 6b) —
-   [`2026-09-24-interactive-chat-ui-design.md`](2026-09-24-interactive-chat-ui-design.md),
-   with the implementation plan at
-   [`../plans/2026-09-24-interactive-chat-ui.md`](../plans/2026-09-24-interactive-chat-ui.md).
-   That document is the authority on everything this item left open; the
-   headline decisions, so the two specs cannot drift:
+   **Phase B (the interactive UI itself): implemented** (sub-project 6b,
+   branch `chat-ui-wired`) — `forge chat`, and what bare `forge` now runs,
+   is real: one shared session across turns, slash commands, inline
+   approvals, `/bg`/`/jobs`/`/attach`, and `/fork`, over the same
+   `AgentService` every other front end uses. Design of record:
+   [`2026-09-24-interactive-chat-ui-design.md`](2026-09-24-interactive-chat-ui-design.md)
+   (implementation plan at
+   [`../plans/2026-09-24-interactive-chat-ui.md`](../plans/2026-09-24-interactive-chat-ui.md)),
+   whose §16 amendment records what landed differently from the plan (the
+   measured dependency count matched exactly; the notify-during-a-turn
+   mechanism changed to avoid a real `rustyline` hang; one recorded
+   cancel-safety gap is still open) — and the README's [Interactive
+   chat](../../../README.md#interactive-chat) section is the user-facing
+   description of the shipped behavior, limitations included. The headline
+   decisions, so the two specs cannot drift:
 
    - **An inline transcript, not a full-screen TUI.** Normal scrollback, a
      rich input line at the bottom. `rustyline` 18 is the line editor

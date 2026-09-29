@@ -486,11 +486,12 @@ pub fn tool_kind(tool: &str) -> ToolKind {
 /// A tool call's arguments as the event stream carries them: a JSON string
 /// truncated to 120 characters.
 ///
-/// Truncation is why this is not just `serde_json::from_str`: the most
-/// interesting call (`write_file` with real content) is exactly the one
-/// whose summary gets cut mid-string. When the JSON does not parse we scan
-/// the text for the fields we care about, so a file edit still contributes
-/// a title and a location.
+/// Truncation is why reading a field is not just `serde_json::from_str`:
+/// the most interesting call (`write_file` with real content) is exactly
+/// the one whose summary gets cut mid-string. The truncation-tolerant scan
+/// lives in [`forge_core::tool_arg_field`], shared with the interactive
+/// chat's renderer; this type adds the parsed-`Value` view that
+/// [`Args::raw_input`] needs on top of it.
 struct Args<'a> {
     raw: &'a str,
     parsed: Option<Value>,
@@ -507,7 +508,8 @@ impl<'a> Args<'a> {
     }
 
     /// A string-valued argument, from the parsed JSON when it parsed and
-    /// from a textual scan of the truncated remains when it did not.
+    /// from [`forge_core::tool_arg_field`]'s scan of the truncated remains
+    /// when it did not.
     fn field(&self, key: &str) -> Option<String> {
         if let Some(value) = self.parsed.as_ref() {
             return value
@@ -516,27 +518,7 @@ impl<'a> Args<'a> {
                 .map(str::to_string)
                 .filter(|s| !s.is_empty());
         }
-        let needle = format!("\"{key}\":\"");
-        let start = self.raw.find(&needle)? + needle.len();
-        let rest = self.raw.get(start..)?;
-        // Stop at the closing quote, honouring backslash escapes so a
-        // path containing `\"` is not cut short.
-        let mut out = String::new();
-        let mut escaped = false;
-        for ch in rest.chars() {
-            match ch {
-                _ if escaped => {
-                    out.push(ch);
-                    escaped = false;
-                }
-                '\\' => escaped = true,
-                '"' => return Some(out).filter(|s| !s.is_empty()),
-                _ => out.push(ch),
-            }
-        }
-        // Truncated before the closing quote: an incomplete value is worse
-        // than none, since it would point at a path that does not exist.
-        None
+        forge_core::tool_arg_field(self.raw, key)
     }
 
     /// The file this call touches, as the model wrote it (project-relative).

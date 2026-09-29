@@ -206,6 +206,107 @@ impl EventKind {
     }
 }
 
+/// Read one string-valued field out of an [`EventKind::ToolCallRequested`]
+/// `args_summary`.
+///
+/// `args_summary` is a tool call's JSON arguments cut to 120 characters, and
+/// the truncation is the whole reason this is not `serde_json::from_str`:
+/// the most interesting call (`write_file` with real content) is exactly the
+/// one whose summary gets cut mid-string. So a valid object is read as JSON,
+/// and anything else is scanned textually for `"key":"` — which is what lets
+/// a file edit still contribute a path to a transcript line or an editor's
+/// tool-call title. Do not "simplify" this into a parse; that silently drops
+/// every truncated call.
+///
+/// A value cut before its closing quote yields `None`: half a path points at
+/// a file that does not exist, and no answer is better than a wrong one. An
+/// empty value is `None` for the same reason — every caller wants something
+/// it can show.
+///
+/// Shared by `forge-acp`'s tool-call dispatch and the interactive chat's
+/// transcript rendering, so the two cannot drift.
+pub fn tool_arg_field(args_summary: &str, key: &str) -> Option<String> {
+    if let Some(value) = serde_json::from_str::<serde_json::Value>(args_summary)
+        .ok()
+        .filter(serde_json::Value::is_object)
+    {
+        return value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+    }
+    let needle = format!("\"{key}\":\"");
+    let start = args_summary.find(&needle)? + needle.len();
+    let rest = args_summary.get(start..)?;
+    // Stop at the closing quote, honouring backslash escapes so a path
+    // containing `\"` is not cut short.
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in rest.chars() {
+        match ch {
+            _ if escaped => {
+                out.push(ch);
+                escaped = false;
+            }
+            '\\' => escaped = true,
+            '"' => return Some(out).filter(|s| !s.is_empty()),
+            _ => out.push(ch),
+        }
+    }
+    // Truncated before the closing quote: an incomplete value is worse than
+    // none, since it would point at a path that does not exist.
+    None
+}
+
+#[cfg(test)]
+mod tool_arg_tests {
+    use super::tool_arg_field;
+
+    #[test]
+    fn reads_a_field_from_valid_json() {
+        let summary = r#"{"path":"src/main.rs","content":"fn main() {}"}"#;
+        assert_eq!(
+            tool_arg_field(summary, "path").as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(tool_arg_field(summary, "missing"), None);
+    }
+
+    /// The whole reason this is not `serde_json::from_str`: the most
+    /// interesting call is the one whose summary was cut mid-string.
+    #[test]
+    fn reads_a_field_from_json_truncated_after_it() {
+        let summary = r#"{"path":"notes.txt","content":"a very long body that got cu"#;
+        assert_eq!(
+            tool_arg_field(summary, "path").as_deref(),
+            Some("notes.txt")
+        );
+    }
+
+    #[test]
+    fn a_value_cut_before_its_closing_quote_is_none_not_a_lie() {
+        let summary = r#"{"path":"src/very/long/pa"#;
+        // Half a path points at a file that does not exist; no answer is
+        // better than a wrong one.
+        assert_eq!(tool_arg_field(summary, "path"), None);
+    }
+
+    #[test]
+    fn honours_backslash_escapes_inside_the_value() {
+        let summary = r#"{"path":"a\"b/c.rs","content":"x"}"#;
+        assert_eq!(
+            tool_arg_field(summary, "path").as_deref(),
+            Some("a\"b/c.rs")
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_none() {
+        assert_eq!(tool_arg_field(r#"{"path":""}"#, "path"), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,24 +7,74 @@ use forge_core::{
     RiskLevel,
 };
 
+/// Where a gated operation puts its question.
+///
+/// Explicit, rather than inferred from `stdin().is_terminal()`, because a
+/// terminal does not mean stdin is *ours*. The interactive chat drives a
+/// `rustyline` line editor in raw mode on a dedicated editor thread, so a
+/// provider that read stdin here would be a second reader on the same file
+/// descriptor: the question would be drawn past the editor's line, the
+/// answer could be swallowed by whichever reader won the race, and no
+/// `approval_requested`/`approval_decided` event would ever reach the
+/// transcript. A front end that owns stdin therefore says so by
+/// construction instead of being guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalChannel {
+    /// Ask inline on the terminal when stdin is a TTY, park otherwise.
+    /// Today's behaviour, unchanged, and the default.
+    #[default]
+    InlineTty,
+    /// Never read stdin: always park with [`ForgeError::ApprovalRequired`]
+    /// and let the caller answer through the run's input channel — the
+    /// round trip `forge mcp` and `forge acp` already use.
+    Parked,
+}
+
+/// Whether a question is asked inline on the terminal.
+///
+/// `stdin_is_tty` is a parameter rather than a syscall so the decision is
+/// testable without a terminal: `Parked` must answer `false` even when the
+/// answer to "is stdin a TTY" is `true`, which is the entire point of the
+/// channel and the one thing a suite that never owns a TTY could not
+/// otherwise pin.
+fn asks_inline(channel: ApprovalChannel, stdin_is_tty: bool) -> bool {
+    matches!(channel, ApprovalChannel::InlineTty) && stdin_is_tty
+}
+
 /// Runs commands as local child processes via `tokio::process::Command`
 /// and performs file operations directly, both gated by the same approval
 /// policy. The project root is used for file-op risk classification.
 pub struct NativeExecution {
     approval: ApprovalPolicy,
     project_root: PathBuf,
+    channel: ApprovalChannel,
 }
 
 impl NativeExecution {
     pub fn new(approval: ApprovalPolicy, project_root: impl Into<PathBuf>) -> Self {
+        Self::with_channel(approval, project_root, ApprovalChannel::default())
+    }
+
+    /// [`NativeExecution::new`] with an explicit approval channel, for a
+    /// front end that owns stdin itself (see [`ApprovalChannel`]).
+    pub fn with_channel(
+        approval: ApprovalPolicy,
+        project_root: impl Into<PathBuf>,
+        channel: ApprovalChannel,
+    ) -> Self {
         Self {
             approval,
             project_root: project_root.into(),
+            channel,
         }
     }
 
     pub fn approval(&self) -> ApprovalPolicy {
         self.approval
+    }
+
+    pub fn approval_channel(&self) -> ApprovalChannel {
+        self.channel
     }
 
     pub fn project_root(&self) -> &std::path::Path {
@@ -42,25 +92,36 @@ impl NativeExecution {
             ApprovalPolicy::Deny => Err(ForgeError::execution(format!(
                 "approval denied: {description} is {risk:?} and policy is 'deny'"
             ))),
-            ApprovalPolicy::Prompt => prompt_for_approval(description, risk),
+            ApprovalPolicy::Prompt => self.ask_approval(description, risk),
             ApprovalPolicy::PromptDestructive => match risk {
-                RiskLevel::Destructive => prompt_for_approval(description, risk),
+                RiskLevel::Destructive => self.ask_approval(description, risk),
                 _ => Ok(()),
             },
         }
     }
+
+    /// Put the question where this provider's channel says it goes: inline
+    /// on the terminal, or parked as a typed "approval required" pause for
+    /// the caller to answer through the run's input channel. Parking is
+    /// also what a non-interactive stdin gets, so nothing ever hangs on a
+    /// pipe.
+    fn ask_approval(&self, description: &str, risk: RiskLevel) -> Result<(), ForgeError> {
+        if asks_inline(self.channel, std::io::stdin().is_terminal()) {
+            prompt_for_approval(description, risk)
+        } else {
+            Err(ForgeError::ApprovalRequired {
+                description: description.to_string(),
+                risk,
+            })
+        }
+    }
 }
 
-/// Interactive y/N prompt, only when stdin is a terminal. On a
-/// non-interactive stdin the operation pauses with a typed
-/// "approval required" error instead of hanging.
+/// Interactive y/N prompt on the terminal. Reached only when the channel
+/// is [`ApprovalChannel::InlineTty`] *and* stdin is a terminal, which is
+/// the one case where reading stdin here cannot collide with another
+/// reader (`asks_inline`).
 fn prompt_for_approval(description: &str, risk: RiskLevel) -> Result<(), ForgeError> {
-    if !std::io::stdin().is_terminal() {
-        return Err(ForgeError::ApprovalRequired {
-            description: description.to_string(),
-            risk,
-        });
-    }
     let mut stderr = std::io::stderr();
     write!(stderr, "approve {risk:?} operation {description}? [y/N] ")
         .and_then(|()| stderr.flush())
@@ -418,6 +479,88 @@ mod tests {
             .await
             .expect_err("must pause");
         assert!(err.to_string().contains("approval required"));
+    }
+
+    /// The property the whole channel exists for, and the only one that can
+    /// be stated about a *terminal* without having one: `Parked` never asks
+    /// inline, whatever stdin is. The TTY-ness is a parameter rather than a
+    /// syscall precisely so `stdin_is_tty = true` is testable here; the
+    /// suite itself never runs on a terminal.
+    #[test]
+    fn parked_never_asks_inline_even_when_stdin_is_a_terminal() {
+        assert!(!asks_inline(ApprovalChannel::Parked, true));
+        assert!(!asks_inline(ApprovalChannel::Parked, false));
+        // Inline is today's behaviour: ask on a terminal, park otherwise.
+        assert!(asks_inline(ApprovalChannel::InlineTty, true));
+        assert!(!asks_inline(ApprovalChannel::InlineTty, false));
+    }
+
+    /// The chat owns stdin through a line editor in raw mode on another
+    /// thread. A provider that read stdin itself would fight it, and the
+    /// transcript would never show `approval_requested`. So `Parked`
+    /// always defers to the run's input channel.
+    #[test]
+    fn parked_never_prompts_and_always_asks_the_caller() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exec = NativeExecution::with_channel(
+            ApprovalPolicy::Prompt,
+            tmp.path(),
+            ApprovalChannel::Parked,
+        );
+        let err = exec
+            .check_approval("write notes.txt", RiskLevel::Risky)
+            .expect_err("risky work under `prompt` must not be allowed silently");
+        assert!(
+            matches!(err, ForgeError::ApprovalRequired { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn parked_leaves_safe_auto_and_deny_exactly_as_they_were() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parked =
+            |policy| NativeExecution::with_channel(policy, tmp.path(), ApprovalChannel::Parked);
+        // Safe work is never gated, whatever the channel.
+        assert!(
+            parked(ApprovalPolicy::Prompt)
+                .check_approval("read main.rs", RiskLevel::Safe)
+                .is_ok()
+        );
+        assert!(
+            parked(ApprovalPolicy::Auto)
+                .check_approval("write notes.txt", RiskLevel::Risky)
+                .is_ok()
+        );
+        let denied = parked(ApprovalPolicy::Deny)
+            .check_approval("write notes.txt", RiskLevel::Risky)
+            .expect_err("deny blocks");
+        assert!(
+            !matches!(denied, ForgeError::ApprovalRequired { .. }),
+            "deny is a refusal, not a question"
+        );
+        // prompt-dangerous still only asks about destructive work.
+        assert!(
+            parked(ApprovalPolicy::PromptDestructive)
+                .check_approval("write notes.txt", RiskLevel::Risky)
+                .is_ok()
+        );
+        assert!(matches!(
+            parked(ApprovalPolicy::PromptDestructive)
+                .check_approval("rm -rf logs", RiskLevel::Destructive)
+                .expect_err("destructive asks"),
+            ForgeError::ApprovalRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn the_default_constructor_is_still_inline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exec = NativeExecution::new(ApprovalPolicy::Prompt, tmp.path());
+        assert_eq!(exec.approval_channel(), ApprovalChannel::InlineTty);
+        // And the channel's own default is that same behaviour, which is
+        // what keeps `ServiceOptions::default()` today's runtime.
+        assert_eq!(ApprovalChannel::default(), ApprovalChannel::InlineTty);
     }
 
     #[tokio::test]
