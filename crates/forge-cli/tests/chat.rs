@@ -415,8 +415,15 @@ fn a_piped_conversation_runs_two_turns_in_one_session() {
         2,
         "two turn footers:\n{stdout}"
     );
+    // Transcripts only: each session also has a `<id>.decisions.jsonl`
+    // beside it since the decision log landed.
     let sessions = std::fs::read_dir(project.join(".forge").join("sessions"))
         .expect("sessions dir")
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+        })
         .count();
     assert_eq!(sessions, 1, "two turns share one session");
 }
