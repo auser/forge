@@ -69,7 +69,8 @@ pub enum Parsed {
     /// `None` is `forge config show`; `Some` is `forge config explain`.
     Config(Option<String>),
     Skills,
-    Graph(String),
+    /// `/graph <query>`, optionally `/graph <query> -- <steering>`.
+    Graph(String, Option<String>),
     /// `/session` with no argument: report the current one.
     Session,
     SessionNew,
@@ -116,7 +117,35 @@ impl Command {
             "config" => Parsed::Config(argument),
             "skills" => Parsed::Skills,
             "graph" => match argument {
-                Some(query) => Parsed::Graph(query),
+                Some(text) => {
+                    let text = text.trim();
+                    // `/graph <query> -- <steering>`: the first ` -- `
+                    // separates the query from the free-text steering.
+                    // Steering with no query (`/graph -- x`) is a usage
+                    // error either way it is spaced.
+                    if text.starts_with("-- ") || text == "--" {
+                        Parsed::Usage("/graph <query>")
+                    } else {
+                        let (query, steering) = match text.split_once(" -- ") {
+                            Some((query, steering)) => {
+                                (query.trim().to_string(), steering.trim().to_string())
+                            }
+                            None => (text.to_string(), String::new()),
+                        };
+                        if query.is_empty() {
+                            Parsed::Usage("/graph <query>")
+                        } else {
+                            Parsed::Graph(
+                                query,
+                                if steering.is_empty() {
+                                    None
+                                } else {
+                                    Some(steering)
+                                },
+                            )
+                        }
+                    }
+                }
                 None => Parsed::Usage("/graph <query>"),
             },
             "session" => match argument.as_deref() {
@@ -338,7 +367,17 @@ mod tests {
         );
         assert_eq!(
             Command::parse("/graph auth flow", &s),
-            Parsed::Graph("auth flow".into())
+            Parsed::Graph("auth flow".into(), None)
+        );
+        assert_eq!(
+            Command::parse("/graph auth flow -- prefer tests", &s),
+            Parsed::Graph("auth flow".into(), Some("prefer tests".into()))
+        );
+        // A bare separator is not steering; an empty query is still a usage
+        // error.
+        assert_eq!(
+            Command::parse("/graph -- prefer tests", &s),
+            Parsed::Usage("/graph <query>")
         );
         assert_eq!(Command::parse("/session new", &s), Parsed::SessionNew);
         assert_eq!(

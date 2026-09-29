@@ -101,7 +101,8 @@ pub enum Action {
     /// `/config` (`None`) or `/config <key>` (`Some`).
     ShowConfig(Option<String>),
     ListSkills,
-    Graph(String),
+    /// `/graph <query>`, optionally `/graph <query> -- <steering>`.
+    Graph(String, Option<String>),
     ShowSession,
     NewSession,
     SwitchSession(String),
@@ -241,7 +242,7 @@ impl Controller {
             }
             Parsed::Config(key) => vec![Action::ShowConfig(key)],
             Parsed::Skills => vec![Action::ListSkills],
-            Parsed::Graph(query) => vec![Action::Graph(query)],
+            Parsed::Graph(query, steering) => vec![Action::Graph(query, steering)],
             // Read-only, so it answers in every state, mid-turn included.
             Parsed::Session => vec![Action::ShowSession],
             Parsed::SessionNew => self.move_session(Action::NewSession),

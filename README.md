@@ -250,6 +250,7 @@ exist for `deepseek-chat`, `kimi-k2.7-code`, `gpt-5`, and `claude-sonnet`.
 ```bash
 forge init                         # builds the project graph
 forge graph context "auth flow"    # ranked files for a task
+forge graph context "auth flow" --steer "prefer tests"   # steered ranking
 forge graph map                    # what's in this repo
 forge skill list                   # discovered skills
 forge doctor                       # what's configured, what's missing
@@ -453,7 +454,7 @@ session 01JCF3...  /help for commands
 /approval   show the approval policy, or /approval <mode>
 /config     effective settings, or /config <key> for one
 /skills     discovered skills, name and description
-/graph      rank project files for a query
+/graph      rank project files for a query, optionally /graph <query> -- <steering>
 /session    this session, or new, or /session <id>
 /fork       fork this conversation, optionally --at <pos>
 /bg         detach the running turn and keep talking
@@ -1081,7 +1082,12 @@ engine it fails with `semantic search needs needle weights (run forge init)`
 (exit 1) rather than silently falling back to literal search. `forge graph
 context <query>` blends the two signals when both an engine and a matching
 index exist: `final = 0.5 * (1 / (1 + lexical_rank)) + 0.5 * cosine`; otherwise
-its output is exactly the lexical ranking as before. For `--json` consumers:
+its output is exactly the lexical ranking as before. Both the CLI (`--steer
+"prefer tests"`), the chat (`/graph <query> -- <steering>`) and the MCP
+`forge_graph_context` tool (`steer`) accept steering text: it is embedded
+alongside the query in one batch, and each candidate's cosine is the best of
+the two vectors — steering is additive preference, symmetric with the blend's
+union semantics, and a no-op without an engine. For `--json` consumers:
 `score` is always a float — a blended 0-1 value when a needle engine and
 matching index both exist, otherwise the raw lexical rank count — whereas the
 `POST /v1/project/context` server endpoint always returns the raw lexical

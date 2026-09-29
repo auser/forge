@@ -113,6 +113,10 @@ fn graph_context_schema() -> Value {
                 "maximum": 100,
                 "default": 10,
                 "description": "Maximum number of files to return."
+            },
+            "steer": {
+                "type": "string",
+                "description": "Optional free text that steers the semantic half of the ranking (e.g. \"prefer tests over implementation\"). No effect without a needle engine and a built semantic index."
             }
         },
         "required": ["query"],
@@ -365,6 +369,7 @@ impl ForgeTools {
             Ok(limit) => limit.unwrap_or(10).clamp(1, 100) as usize,
             Err(outcome) => return outcome,
         };
+        let steer = args.get("steer").and_then(|v| v.as_str());
         let graph = match self.graph() {
             Ok(graph) => graph,
             Err(outcome) => return outcome,
@@ -377,6 +382,7 @@ impl ForgeTools {
                 .as_ref()
                 .map(|e| e as &dyn forge_core::embed::Embedder),
             query,
+            steer,
             limit,
         )
         .await
