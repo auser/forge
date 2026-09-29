@@ -721,14 +721,20 @@ mod pty {
         // SAFETY: `master`/`slave` are valid out-pointers; `winsize` is a
         // valid, initialized struct; the name/termios pointers are null,
         // which `openpty` treats as "use the defaults" on every platform
-        // this crate declares it for (apple, linux, the bsds).
+        // this crate declares it for (apple, linux, the bsds). The winsize
+        // pointer goes through `from_ref(..).cast_mut()` because the libc
+        // signatures disagree: macOS declares `winp` as `*mut winsize`,
+        // Linux as `*const winsize` — a `*mut` coerces to `*const`
+        // implicitly, and neither platform actually mutates the struct.
+        // (Passing `&mut winsize` trips clippy's `unnecessary_mut_passed`
+        // on the Linux CI runner while being required by macOS's decl.)
         let rc = unsafe {
             libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut winsize,
+                std::ptr::from_ref(&winsize).cast_mut(),
             )
         };
         if rc != 0 {
