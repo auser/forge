@@ -1590,6 +1590,57 @@ async fn list_runs_ignores_a_fork_marker() {
     assert!(listed.iter().all(|s| s.last_seq > 0), "{listed:?}");
 }
 
+/// The bound is on the *work*, not just the response: a session file
+/// untouched since before the cutoff is skipped unparsed — so old history
+/// costs nothing per call, even a corrupt file — while a recently touched
+/// file is parsed (and surfaces its corruption) as before.
+#[tokio::test]
+async fn list_runs_skips_session_files_untouched_since_before_the_cutoff() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        (0..LISTED_TERMINAL_RUNS + 2)
+            .map(|i| text_reply(&format!("answer {i}")))
+            .collect(),
+        forge_core::ApprovalPolicy::Auto,
+    );
+    for i in 0..LISTED_TERMINAL_RUNS + 2 {
+        service.run(&format!("ask {i}")).await.expect("run");
+    }
+
+    // An ancient, corrupt session file: nothing in it could displace a
+    // kept run, so it must never even be read.
+    let ancient = tmp
+        .path()
+        .join(".forge")
+        .join("sessions")
+        .join("ancient-corrupt.jsonl");
+    std::fs::write(&ancient, "this is not json\n").expect("write corrupt");
+    std::fs::File::options()
+        .write(true)
+        .open(&ancient)
+        .expect("open")
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+        .expect("backdate");
+
+    let listed = service
+        .list_runs()
+        .expect("a file old enough to be skipped is never parsed");
+    assert_eq!(listed.len(), LISTED_TERMINAL_RUNS, "{listed:?}");
+
+    // Touch it: now it is recent enough to parse — corruption and all.
+    std::fs::File::options()
+        .write(true)
+        .open(&ancient)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now())
+        .expect("touch");
+    assert!(
+        service.list_runs().is_err(),
+        "a recently touched file is parsed, corruption and all"
+    );
+}
+
 // --- fork ---------------------------------------------------------------
 
 /// Bytes of a session's log file, for "the source was not touched" checks.

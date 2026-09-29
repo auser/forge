@@ -109,6 +109,12 @@
 //! keep either: the shared `Signal`'s own "changed since last seen"
 //! bookkeeping means the two call sites can never double-fire on the same
 //! delivery.
+//!
+//! Every platform gets the same shape via [`CtrlC`]: a persistent
+//! `tokio::signal::unix::Signal` on unix, tokio's Windows `ctrl_c()`
+//! stream (same `recv()` semantics) on Windows, and a never-resolving
+//! future anywhere else — upholding `ChatIo::interrupted`'s contract by
+//! construction rather than by `#[cfg(unix)]` omission.
 use std::io::BufRead as _;
 
 use async_trait::async_trait;
@@ -125,11 +131,71 @@ use super::palette::Palette;
 pub struct PipedIo {
     palette: Palette,
     lines: mpsc::Receiver<ReadOutcome>,
-    /// One persistent `SIGINT` listener for this `PipedIo`'s whole life —
+    /// One persistent Ctrl-C listener for this `PipedIo`'s whole life —
     /// see the module doc for why a fresh one per check silently drops
     /// signals that arrive while nothing is registered.
+    ctrl_c: CtrlC,
+}
+
+/// A persistent Ctrl-C listener with the same shape on every platform:
+/// `recv()` awaits the next delivery without losing a signal that arrived
+/// while nobody was awaiting (tokio's registry only tells *current*
+/// listeners; see this module's doc, failure 1).
+///
+/// On unix that is one persistent `tokio::signal::unix::Signal`; on
+/// Windows `tokio::signal::windows::ctrl_c()` returns a stream with the
+/// same `recv()` semantics. On any other target there is no tokio signal
+/// support, so `recv()` pends forever — which upholds
+/// `ChatIo::interrupted`'s contract (never resolve unless the user
+/// actually interrupted) by simply never resolving: on such a target
+/// Ctrl-C is the OS's default handling, exactly as before this type grew
+/// a listener at all.
+enum CtrlC {
     #[cfg(unix)]
-    sigint: tokio::signal::unix::Signal,
+    Unix(tokio::signal::unix::Signal),
+    #[cfg(all(windows, not(unix)))]
+    Windows(tokio::signal::windows::CtrlC),
+    #[cfg(not(any(unix, windows)))]
+    Unsupported,
+}
+
+impl CtrlC {
+    fn install() -> Result<Self, ForgeError> {
+        #[cfg(unix)]
+        {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map(CtrlC::Unix)
+                .map_err(|e| ForgeError::config(format!("failed to install a SIGINT handler: {e}")))
+        }
+        #[cfg(all(windows, not(unix)))]
+        {
+            tokio::signal::windows::ctrl_c()
+                .map(CtrlC::Windows)
+                .map_err(|e| ForgeError::config(format!("failed to install a Ctrl-C handler: {e}")))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(CtrlC::Unsupported)
+        }
+    }
+
+    /// Await the next Ctrl-C delivery. Resolves only on a real signal (or
+    /// the stream closing, which cannot happen in practice); on platforms
+    /// with no tokio signal support it pends forever.
+    async fn recv(&mut self) {
+        match self {
+            #[cfg(unix)]
+            CtrlC::Unix(signal) => {
+                let _ = signal.recv().await;
+            }
+            #[cfg(all(windows, not(unix)))]
+            CtrlC::Windows(ctrl_c) => {
+                let _ = ctrl_c.recv().await;
+            }
+            #[cfg(not(any(unix, windows)))]
+            CtrlC::Unsupported => std::future::pending::<()>().await,
+        }
+    }
 }
 
 impl PipedIo {
@@ -162,23 +228,19 @@ impl PipedIo {
                 }
             }
         });
-        #[cfg(unix)]
-        let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .map_err(|e| ForgeError::config(format!("failed to install a SIGINT handler: {e}")))?;
+        let ctrl_c = CtrlC::install()?;
         Ok(Self {
             palette,
             lines: rx,
-            #[cfg(unix)]
-            sigint,
+            ctrl_c,
         })
     }
 }
 
 #[async_trait]
 impl ChatIo for PipedIo {
-    #[cfg(unix)]
     async fn read(&mut self, prompt: Prompt) -> ReadOutcome {
-        // `biased`, signal first: a `SIGINT` that arrives concurrently with
+        // `biased`, signal first: a Ctrl-C that arrives concurrently with
         // an already-queued line must cancel rather than let that line be
         // misread as an answer to whatever the signal was meant to
         // interrupt (mirrors the controller's own rule for an interrupt
@@ -186,16 +248,9 @@ impl ChatIo for PipedIo {
         // cancellation either, `forge-chat::controller`'s Review Focus 2).
         let outcome = tokio::select! {
             biased;
-            _ = self.sigint.recv() => ReadOutcome::Interrupt,
+            _ = self.ctrl_c.recv() => ReadOutcome::Interrupt,
             line = self.lines.recv() => line.unwrap_or(ReadOutcome::Eof),
         };
-        self.echo(&prompt, &outcome);
-        outcome
-    }
-
-    #[cfg(not(unix))]
-    async fn read(&mut self, prompt: Prompt) -> ReadOutcome {
-        let outcome = self.lines.recv().await.unwrap_or(ReadOutcome::Eof);
         self.echo(&prompt, &outcome);
         outcome
     }
@@ -210,16 +265,10 @@ impl ChatIo for PipedIo {
 
     /// A second, harmless line of defence for the narrow window between
     /// one `read()` call resolving and the next being constructed — the
-    /// real fix for a `SIGINT` mid-turn is folded into `read()` itself; see
+    /// real fix for a Ctrl-C mid-turn is folded into `read()` itself; see
     /// the module doc.
-    #[cfg(unix)]
     async fn interrupted(&mut self) {
-        let _ = self.sigint.recv().await;
-    }
-
-    #[cfg(not(unix))]
-    async fn interrupted(&mut self) {
-        let _ = tokio::signal::ctrl_c().await;
+        self.ctrl_c.recv().await;
     }
 
     fn interactivity(&self) -> Interactivity {

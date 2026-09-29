@@ -192,6 +192,52 @@ impl JsonlSessionStore {
         Ok(out)
     }
 
+    /// Session transcript files under the root — session id, path and
+    /// modification time, **newest-modified first** — without reading any
+    /// of them. This is the enumeration for callers (like
+    /// `AgentService::list_runs`) that cannot afford to re-read and
+    /// re-parse every session's whole log just to find the few recently
+    /// active ones.
+    pub fn session_files_by_recency(
+        &self,
+    ) -> Result<Vec<(String, PathBuf, std::time::SystemTime)>, ForgeError> {
+        let mut out = Vec::new();
+        if !self.root.is_dir() {
+            return Ok(out);
+        }
+        for entry in std::fs::read_dir(&self.root).map_err(ForgeError::Io)? {
+            let entry = entry.map_err(ForgeError::Io)?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // `<id>.decisions.jsonl` is the decision log living beside the
+            // transcript, not a session — same exclusion `list_sessions`
+            // applies.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".decisions.jsonl"))
+            {
+                continue;
+            }
+            let Some(session_id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map_err(ForgeError::Io)?;
+            out.push((session_id, path, modified));
+        }
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+        Ok(out)
+    }
+
     /// Most recently modified session id, if any.
     pub fn latest_session(&self) -> Result<Option<String>, ForgeError> {
         let mut latest: Option<(std::time::SystemTime, String)> = None;
