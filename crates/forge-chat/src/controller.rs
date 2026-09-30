@@ -1019,7 +1019,7 @@ mod tests {
     fn a_skill_from_the_snapshot_becomes_a_turn() {
         let mut c = idle();
         c.set_completions(CompletionSnapshot {
-            skills: vec!["tdd".into()],
+            skills: vec![("tdd".into(), "test-driven development".into())],
             ..CompletionSnapshot::default()
         });
         assert_eq!(

@@ -116,8 +116,9 @@ impl Line {
 /// can know.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompletionSnapshot {
-    /// Discovered skills, offered as `/name`.
-    pub skills: Vec<String>,
+    /// Discovered skills, offered as `/name` — name and description, so
+    /// the completion listing can show what each one does.
+    pub skills: Vec<(String, String)>,
     /// User-visible model names — already filtered by
     /// [`crate::host::ChatHost::models`], which is the one place test-only
     /// entries are dropped.
@@ -126,6 +127,15 @@ pub struct CompletionSnapshot {
     pub jobs: Vec<String>,
     /// The project's recent session ids.
     pub sessions: Vec<String>,
+}
+
+/// One completion candidate: the text inserted on acceptance, and the
+/// text shown in the listing (name plus description, aligned so the
+/// descriptions form a column).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionCandidate {
+    pub replacement: String,
+    pub display: String,
 }
 
 /// What to draw, and everything the editor needs to be useful, as data.

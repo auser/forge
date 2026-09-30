@@ -58,5 +58,8 @@ pub use host::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,
 };
-pub use io::{ChatIo, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome, Style};
+pub use io::{
+    ChatIo, CompletionCandidate, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome,
+    Style,
+};
 pub use render::TranscriptState;

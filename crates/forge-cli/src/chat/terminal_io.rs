@@ -63,7 +63,10 @@ use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 
 use async_trait::async_trait;
-use forge_chat::{ChatIo, Command, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome};
+use forge_chat::{
+    ChatIo, Command, CompletionCandidate, CompletionSnapshot, Interactivity, Line, Prompt,
+    ReadOutcome,
+};
 use forge_core::ForgeError;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
@@ -408,15 +411,35 @@ struct ChatHelper {
 }
 
 impl Completer for ChatHelper {
-    type Candidate = String;
+    type Candidate = DisplayCandidate;
 
     fn complete(
         &self,
         line: &str,
         pos: usize,
         _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<String>)> {
-        Ok(Command::complete(line, pos, &self.completions))
+    ) -> rustyline::Result<(usize, Vec<DisplayCandidate>)> {
+        let (start, candidates) = Command::complete(line, pos, &self.completions);
+        Ok((
+            start,
+            candidates.into_iter().map(DisplayCandidate).collect(),
+        ))
+    }
+}
+
+/// Local newtype so the rustyline trait impl is legal (orphan rule):
+/// the data is forge-chat's, the display protocol is this editor's.
+struct DisplayCandidate(CompletionCandidate);
+
+impl rustyline::completion::Candidate for DisplayCandidate {
+    /// The listing shows the name *and* what the command does, aligned —
+    /// the menu shape the other agent CLIs made the expectation.
+    fn display(&self) -> &str {
+        &self.0.display
+    }
+    /// …but only the name is ever inserted.
+    fn replacement(&self) -> &str {
+        &self.0.replacement
     }
 }
 

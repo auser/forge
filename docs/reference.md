@@ -544,7 +544,9 @@ an unreadable session log print a `  ! error:` line and return to the
 prompt.
 
 The rest are `rustyline` defaults: `Tab` completes a slash command, a skill
-name, or a `/attach` job id; `Up`/`Down`/`Ctrl-R` recall history;
+name, or a `/attach` job id — listed with each command's description, name
+and explanation aligned (`Tab` again after the bell, bash-style);
+`Up`/`Down`/`Ctrl-R` recall history;
 `Ctrl-A/E/K/U/W`, `Alt-B/F` are the usual emacs-style editing; `Ctrl-L`
 clears the screen only (the transcript is still in scrollback, the
 conversation untouched); `Enter` submits unless the line looks unfinished
