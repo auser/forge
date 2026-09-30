@@ -187,6 +187,15 @@ pub struct Config {
     /// while the serialized form is the values themselves.
     #[serde(skip)]
     pub explicit: ExplicitKeys,
+    /// Whether the winning `model` came from an explicit user action (a CLI
+    /// flag or environment variable — including the chat's `/model`, which
+    /// rides the same override path) rather than a config file or the
+    /// default. When pinned, routing's candidate set is exactly that one
+    /// model: an explicit choice is a constraint, not a suggestion the
+    /// router may improve on. Deliberately not serialized, for the same
+    /// reason as `explicit`.
+    #[serde(skip)]
+    pub model_pinned: bool,
     /// Unknown keys are tolerated and preserved.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -409,6 +418,7 @@ impl Default for Config {
             // Nothing here was explicitly configured — this *is* the
             // defaults layer.
             explicit: ExplicitKeys::default(),
+            model_pinned: false,
             extra: toml::Table::new(),
         }
     }
@@ -622,6 +632,11 @@ impl Config {
         // plain `&Config`, and two of them cannot be correct without it
         // (see `ExplicitKeys`).
         config.explicit = ExplicitKeys::from_sources(&sources);
+        // An explicit CLI/env model choice pins routing to that model; a
+        // config-file model is a preference the router may improve on.
+        config.model_pinned = sources
+            .get("model")
+            .is_some_and(|s| matches!(s.origin, Origin::CliFlag | Origin::Environment));
         config.validate()?;
 
         Ok(ResolvedConfig { config, sources })
