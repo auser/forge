@@ -464,6 +464,7 @@ impl ChatHost for FakeHost {
     async fn graph_context(
         &self,
         _query: &str,
+        _steering: Option<&str>,
         _limit: usize,
     ) -> Result<Vec<ContextLine>, ForgeError> {
         Ok(Vec::new())

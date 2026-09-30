@@ -199,9 +199,10 @@ impl ChatHost for CliHost {
     async fn graph_context(
         &self,
         query: &str,
+        steering: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ContextLine>, ForgeError> {
-        context_lines(&self.root, self.embedder.as_ref(), query, limit).await
+        context_lines(&self.root, self.embedder.as_ref(), query, steering, limit).await
     }
 }
 
@@ -211,7 +212,9 @@ impl ChatHost for CliHost {
 /// The semantic blend (`forge_graph::blended_context`) whenever a working
 /// embedder *and* a matching index exist: the embedder must embed the
 /// query text, which is what the trait method's async signature is for.
-/// Without either, `blended_context` degrades to exactly the lexical
+/// `steering` is embedded alongside the query in the same batch and steers
+/// the semantic half; it has no effect without an embedder. Without either
+/// engine or index, `blended_context` degrades to exactly the lexical
 /// ranking (`query.rs`'s `lexical_only`), so the lexical path is also the
 /// honest fallback — engine-less builds and unbuilt indexes change
 /// nothing.
@@ -219,6 +222,7 @@ async fn context_lines(
     root: &Path,
     embedder: Option<&EngineEmbedder>,
     query: &str,
+    steering: Option<&str>,
     limit: usize,
 ) -> Result<Vec<ContextLine>, ForgeError> {
     let graph = forge_graph::LocalGraph::open(root)?;
@@ -226,6 +230,7 @@ async fn context_lines(
         &graph,
         embedder.map(|e| e as &dyn forge_core::embed::Embedder),
         query,
+        steering,
         limit,
     )
     .await?;
@@ -360,7 +365,7 @@ mod tests {
         let mut graph = forge_graph::LocalGraph::open(tmp.path()).expect("open");
         graph.build().expect("build");
 
-        let hits = context_lines(tmp.path(), None, "alpha_marker", 10)
+        let hits = context_lines(tmp.path(), None, "alpha_marker", None, 10)
             .await
             .expect("context");
         assert_eq!(hits[0].path, "alpha.rs");
@@ -368,7 +373,7 @@ mod tests {
 
         // Both files match (one token each), so the cap is what is actually
         // being exercised here, not "only one file could ever match".
-        let capped = context_lines(tmp.path(), None, "alpha beta", 1)
+        let capped = context_lines(tmp.path(), None, "alpha beta", None, 1)
             .await
             .expect("context");
         assert_eq!(capped.len(), 1);
@@ -380,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn context_lines_on_an_unbuilt_project_is_empty_not_an_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let hits = context_lines(tmp.path(), None, "anything", 10)
+        let hits = context_lines(tmp.path(), None, "anything", None, 10)
             .await
             .expect("context");
         assert!(hits.is_empty());

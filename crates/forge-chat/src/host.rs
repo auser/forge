@@ -28,14 +28,18 @@ pub trait ChatHost: Send + Sync {
     fn skills(&self) -> Vec<SkillChoice>;
     /// `forge config show`/`explain` data: key, value, origin.
     fn config_summary(&self, key: Option<&str>) -> Vec<ConfigLine>;
-    /// Ranked project-graph hits for `/context`. Async so that semantic
+    /// Ranked project-graph hits for `/graph`. Async so that semantic
     /// blending — which must *embed the query text*, an inherently async
     /// call into the needle engine — is reachable from chat; a sync
     /// signature here is what previously forbade it outright, even with a
-    /// working engine and a built index.
+    /// working engine and a built index. `steering` is the optional
+    /// free-text half of `/graph <query> -- <steering>`: embedded alongside
+    /// the query, it steers the semantic half of the blend (see
+    /// `forge_graph::blended_context`).
     async fn graph_context(
         &self,
         query: &str,
+        steering: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ContextLine>, ForgeError>;
 }

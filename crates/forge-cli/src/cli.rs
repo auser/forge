@@ -227,6 +227,10 @@ pub enum GraphCommand {
     Context {
         #[arg(value_name = "QUERY")]
         query: String,
+        /// Free text that steers the semantic half of the ranking
+        /// (e.g. `--steer "prefer tests"`); no effect without an engine.
+        #[arg(long, value_name = "TEXT")]
+        steer: Option<String>,
     },
 }
 

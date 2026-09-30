@@ -26,7 +26,7 @@ pub async fn run(ctx: &Context, command: GraphCommand) -> Result<(), ForgeError>
         }
         GraphCommand::Callers { symbol } => callers(ctx, &symbol),
         GraphCommand::Blast { path } => blast(ctx, &path.to_string_lossy()),
-        GraphCommand::Context { query } => context(ctx, &query).await,
+        GraphCommand::Context { query, steer } => context(ctx, &query, steer.as_deref()).await,
     }
 }
 
@@ -317,7 +317,7 @@ fn blast(ctx: &Context, path: &str) -> Result<(), ForgeError> {
     Ok(())
 }
 
-async fn context(ctx: &Context, query: &str) -> Result<(), ForgeError> {
+async fn context(ctx: &Context, query: &str, steer: Option<&str>) -> Result<(), ForgeError> {
     let graph = open_built(ctx)?;
     // One ranking implementation for every adapter: `forge_graph_context`
     // over MCP calls the same function with the same embedder seam.
@@ -326,6 +326,7 @@ async fn context(ctx: &Context, query: &str) -> Result<(), ForgeError> {
         &graph,
         embedder.as_ref().map(|e| e as &dyn Embedder),
         query,
+        steer,
         10,
     )
     .await?;

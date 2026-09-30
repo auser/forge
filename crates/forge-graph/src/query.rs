@@ -70,6 +70,15 @@ async fn embed_one(embedder: &dyn Embedder, text: &str) -> Result<Vec<f32>, Forg
 /// semantic index when both a working embedder and a matching index exist;
 /// otherwise the lexical ranking is returned unchanged.
 ///
+/// `steering` is optional free text that steers the semantic half
+/// ("/graph auth flow -- prefer tests"): it is embedded alongside the
+/// query in one batch, and each candidate's cosine is the best (max) over
+/// the two vectors — symmetric with the blend's union semantics, and no
+/// new magic weight to defend. A file matching the steering strongly
+/// surfaces even when the query itself is a weak match. Steering has no
+/// effect on the lexical half, and is ignored entirely when there is no
+/// embedder (the lexical path cannot be steered by meaning).
+///
 /// Blend formula: `final = 0.5 * lexical_rank_score + 0.5 * cosine`, where
 /// `lexical_rank_score = 1 / (1 + rank)` over the lexical order (rank 0 =
 /// best lexical match) and `cosine` is the best (max) similarity among that
@@ -81,12 +90,13 @@ pub async fn blended_context(
     graph: &LocalGraph,
     embedder: Option<&dyn Embedder>,
     query: &str,
+    steering: Option<&str>,
     limit: usize,
 ) -> Result<Vec<ScoredHit>, ForgeError> {
     let lexical = graph.context(query, LEXICAL_POOL.max(limit));
     let mut out = match embedder {
         Some(embedder) => match matching_index(graph.root(), embedder) {
-            Some(index) => blend(&index, embedder, query, &lexical).await?,
+            Some(index) => blend(&index, embedder, query, steering, &lexical).await?,
             None => lexical_only(&lexical),
         },
         None => lexical_only(&lexical),
@@ -110,23 +120,39 @@ async fn blend(
     index: &EmbeddingIndex,
     embedder: &dyn Embedder,
     query: &str,
+    steering: Option<&str>,
     lexical: &[ContextHit],
 ) -> Result<Vec<ScoredHit>, ForgeError> {
-    let query_vector = embed_one(embedder, query).await?;
+    // One batch: query, plus the steering text when present.
+    let texts: Vec<String> = match steering {
+        Some(steering) => vec![query.to_string(), steering.to_string()],
+        None => vec![query.to_string()],
+    };
+    let vectors = embedder.embed(&texts).await?;
+    let query_vector = vectors
+        .first()
+        .ok_or_else(|| ForgeError::graph("embedder returned no vector for its input"))?;
 
-    // Best (max) cosine per path, from the top semantic matches.
+    // Best (max) cosine per path, from the top semantic matches — over the
+    // query vector and, when steering is present, the steering vector too.
     let mut cosine_by_path: BTreeMap<String, f32> = BTreeMap::new();
-    for (key, score) in index.search(&query_vector, SEMANTIC_POOL) {
-        if let Some((path, _symbol)) = key.rsplit_once("::") {
-            cosine_by_path
-                .entry(path.to_string())
-                .and_modify(|best| {
-                    if score > *best {
-                        *best = score;
-                    }
-                })
-                .or_insert(score);
+    let mut fold = |vector: &[f32]| {
+        for (key, score) in index.search(vector, SEMANTIC_POOL) {
+            if let Some((path, _symbol)) = key.rsplit_once("::") {
+                cosine_by_path
+                    .entry(path.to_string())
+                    .and_modify(|best| {
+                        if score > *best {
+                            *best = score;
+                        }
+                    })
+                    .or_insert(score);
+            }
         }
+    };
+    fold(query_vector);
+    if let Some(steering_vector) = vectors.get(1) {
+        fold(steering_vector);
     }
 
     let lexical_rank: BTreeMap<&str, usize> = lexical
@@ -232,7 +258,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let graph = project_with_graph(tmp.path());
 
-        let hits = blended_context(&graph, None, "alpha_marker", 10)
+        let hits = blended_context(&graph, None, "alpha_marker", None, 10)
             .await
             .expect("context");
 
@@ -247,7 +273,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let graph = project_with_graph(tmp.path());
 
-        let hits = blended_context(&graph, None, "fn", 1).await.expect("ctx");
+        let hits = blended_context(&graph, None, "fn", None, 1)
+            .await
+            .expect("ctx");
         assert!(hits.len() <= 1);
     }
 
@@ -266,10 +294,10 @@ mod tests {
             .save(&tmp.path().join(EMBEDDINGS_REL_PATH))
             .expect("save");
 
-        let blended = blended_context(&graph, Some(&TableEmbedder), "alpha_marker", 10)
+        let blended = blended_context(&graph, Some(&TableEmbedder), "alpha_marker", None, 10)
             .await
             .expect("context");
-        let lexical = blended_context(&graph, None, "alpha_marker", 10)
+        let lexical = blended_context(&graph, None, "alpha_marker", None, 10)
             .await
             .expect("context");
         assert_eq!(blended, lexical, "mismatched index must be ignored");
@@ -287,7 +315,7 @@ mod tests {
             .save(&tmp.path().join(EMBEDDINGS_REL_PATH))
             .expect("save");
 
-        let hits = blended_context(&graph, Some(&TableEmbedder), "needle", 10)
+        let hits = blended_context(&graph, Some(&TableEmbedder), "needle", None, 10)
             .await
             .expect("context");
         assert_eq!(
@@ -295,6 +323,59 @@ mod tests {
             Some("beta.rs"),
             "semantic-only match should lead: {hits:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn steering_surfaces_a_match_the_query_alone_cannot_see() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let graph = project_with_graph(tmp.path());
+        let mut index = EmbeddingIndex::new("table-test".to_string(), 2);
+        // beta.rs embeds as [1,0] — the "needle" direction. A query that
+        // does not contain "needle" embeds as [0,1] and cannot reach it.
+        index.upsert("beta.rs::beta_other".into(), "h".into(), vec![1.0, 0.0]);
+        index
+            .save(&tmp.path().join(EMBEDDINGS_REL_PATH))
+            .expect("save");
+
+        // Unsteered: beta.rs gets no cosine from the [0,1] query vector.
+        let plain = blended_context(&graph, Some(&TableEmbedder), "alpha_marker", None, 10)
+            .await
+            .expect("context");
+        assert!(
+            plain.iter().all(|h| h.path != "beta.rs" || h.score < 0.5),
+            "unsteered, beta.rs has no semantic match: {plain:?}"
+        );
+
+        // Steered by text containing "needle" (embeds [1,0]): beta.rs is
+        // surfaced through the steering vector even though the query is
+        // unchanged.
+        let steered = blended_context(
+            &graph,
+            Some(&TableEmbedder),
+            "alpha_marker",
+            Some("needle related"),
+            10,
+        )
+        .await
+        .expect("context");
+        let beta = steered
+            .iter()
+            .find(|h| h.path == "beta.rs")
+            .expect("steering surfaces beta.rs");
+        assert!(
+            beta.score >= 0.5,
+            "the steering cosine must count: {steered:?}"
+        );
+
+        // Without an embedder, steering changes nothing: the lexical path
+        // cannot be steered by meaning.
+        let lexical_plain = blended_context(&graph, None, "alpha_marker", None, 10)
+            .await
+            .expect("context");
+        let lexical_steered = blended_context(&graph, None, "alpha_marker", Some("needle"), 10)
+            .await
+            .expect("context");
+        assert_eq!(lexical_plain, lexical_steered);
     }
 
     #[tokio::test]
