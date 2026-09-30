@@ -74,14 +74,6 @@ impl RunRegistry {
     pub fn get_mut(&mut self, run_id: &str) -> Option<&mut RunEntry> {
         self.map.get_mut(run_id)
     }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
 }
 
 #[derive(Clone)]
@@ -155,7 +147,7 @@ mod tests {
         for i in 0..MAX_TRACKED_RUNS + 10 {
             registry.insert(format!("run-{i}"), entry(RunStatus::Completed));
         }
-        assert_eq!(registry.len(), MAX_TRACKED_RUNS);
+        assert_eq!(registry.map.len(), MAX_TRACKED_RUNS);
         // Oldest evicted, newest retained.
         assert!(registry.get("run-0").is_none());
         assert!(registry.get("run-9").is_none());
@@ -174,6 +166,6 @@ mod tests {
             registry.insert(format!("run-{i}"), entry(RunStatus::Running));
         }
         // All in-flight: allowed to exceed the cap.
-        assert_eq!(registry.len(), MAX_TRACKED_RUNS + 5);
+        assert_eq!(registry.map.len(), MAX_TRACKED_RUNS + 5);
     }
 }

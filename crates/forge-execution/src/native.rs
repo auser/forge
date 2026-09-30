@@ -69,16 +69,8 @@ impl NativeExecution {
         }
     }
 
-    pub fn approval(&self) -> ApprovalPolicy {
-        self.approval
-    }
-
     pub fn approval_channel(&self) -> ApprovalChannel {
         self.channel
-    }
-
-    pub fn project_root(&self) -> &std::path::Path {
-        &self.project_root
     }
 
     /// Gate an operation by risk level and approval policy. Shared by

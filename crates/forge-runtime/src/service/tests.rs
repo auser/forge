@@ -115,6 +115,8 @@ async fn full_run_emits_ordered_events() {
             "routing_decision_made",
             // v3: the model's answer, verbatim, for replay
             "assistant_message",
+            // the answer's round trip is a turn too
+            "turn_completed",
             "completed"
         ]
     );
@@ -124,10 +126,10 @@ async fn full_run_emits_ordered_events() {
         .sessions()
         .events_for(&outcome.session_id)
         .expect("read");
-    assert_eq!(persisted.len(), 4);
+    assert_eq!(persisted.len(), 5);
     assert!(persisted.iter().all(|e| e.run_id == outcome.run_id));
     let seqs: Vec<u64> = persisted.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, vec![1, 2, 3, 4]);
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
 }
 
 struct FailingRouter;
@@ -264,14 +266,15 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
             // v3 replay record of the tool's output
             "tool_result",
             "turn_completed",
-            // v3 replay record of the final answer
+            // v3 replay record of the final answer — itself a turn
             "assistant_message",
+            "turn_completed",
             "completed"
         ]
     );
     // Sequence numbers are monotonic.
     let seqs: Vec<u64> = outcome.events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=11).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=12).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -2046,6 +2049,7 @@ async fn needle_fast_path_absent_engine_changes_nothing() {
             "run_started",
             "routing_decision_made",
             "assistant_message",
+            "turn_completed",
             "completed"
         ]
     );

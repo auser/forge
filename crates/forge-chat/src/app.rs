@@ -78,13 +78,6 @@ impl Start {
         }
     }
 
-    pub fn continue_latest() -> Self {
-        Self {
-            session: SessionStart::Continue,
-            first_prompt: None,
-        }
-    }
-
     pub fn named(id: impl Into<String>) -> Self {
         Self {
             session: SessionStart::Named(id.into()),
@@ -251,7 +244,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                         // The stream ended on its own with no `JoinHandle`
                         // to tell us so — reached only via `/attach`, since
                         // an owned run's authoritative settlement is the
-                        // `handle` arm above instead, and that arm alone
+                        // `handle` arm below instead, and that arm alone
                         // clears `self.events` for that case. Without this,
                         // `self.events` (and the controller's `attached`)
                         // would stay set forever once a followed run
@@ -271,7 +264,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                     }
                 }
                 joined = join_handle(self.handle.as_mut()), if self.handle.is_some() => {
-                    self.on_joined(joined).await;
+                    self.finish_run(joined).await;
                 }
                 Some(msg) = self.bg_rx.recv() => {
                     self.on_bg(msg);
@@ -469,13 +462,6 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         for event in drained {
             self.apply_event(event);
         }
-    }
-
-    async fn on_joined(
-        &mut self,
-        joined: Result<Result<RunOutcome, ForgeError>, tokio::task::JoinError>,
-    ) {
-        self.finish_run(joined).await;
     }
 
     /// Cancel and *wait* for the attached run to settle (bounded), rather
@@ -1135,14 +1121,13 @@ mod tests {
             1,
             "the answer is printed exactly once:\n{out}"
         );
-        // `TurnCompleted` is emitted only for a turn that dispatched a tool
-        // call (see `forge-runtime`'s own
+        // `TurnCompleted` is emitted once per model round trip — tool
+        // dispatching iterations AND the final answer (see `forge-runtime`'s
         // `scripted_two_turn_run_writes_file_and_emits_full_trail`, which
-        // pins the same two-model-call script at one `turn_completed`
-        // event) — the transcript's footer counts those events, not model
-        // calls, so this two-call script reports one turn, not two.
+        // pins the same script at two `turn_completed` events) — so this
+        // two-call script reports two turns.
         assert!(
-            out.contains("  = 1 turn"),
+            out.contains("  = 2 turns"),
             "the footer reports the turns:\n{out}"
         );
     }

@@ -255,7 +255,7 @@ pub trait RunningProcess: Send {
 
 /// Runs commands and mutations. The runtime never invokes processes or
 /// touches the filesystem outside this trait; implementations include
-/// native, mock, container, MVM, remote.
+/// native and mock.
 #[async_trait]
 pub trait ExecutionProvider: Send + Sync {
     fn name(&self) -> &str;

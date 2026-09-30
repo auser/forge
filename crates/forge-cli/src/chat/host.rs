@@ -128,7 +128,11 @@ impl ChatHost for CliHost {
         let config = self.service.config();
         Environment {
             project_root: self.root.clone(),
-            model: active_model_label(&config.model),
+            // Unfiltered: `/config` and the entry banner report the truth
+            // even when the configured model is a mock — hiding it there
+            // would be a lie about what is running, not a safeguard. Only
+            // the *choice list* (`visible_models`) hides mocks.
+            model: config.model.clone(),
             router: config.router.clone(),
             approval: config.approval.clone(),
             needle: self.needle.clone(),
@@ -264,14 +268,6 @@ fn visible_models(candidates: &[&str], active: &str) -> Vec<ModelChoice> {
         .collect()
 }
 
-/// The model this conversation is actually configured with, unfiltered:
-/// `/config` and the entry banner report the truth even when it is a mock
-/// — hiding it there would be a lie about what is running, not a
-/// safeguard. Only the *choice list* ([`visible_models`]) hides mocks.
-fn active_model_label(active: &str) -> String {
-    active.to_string()
-}
-
 /// The chat's brain state, computed once (the router never changes for
 /// the life of a conversation, so nothing here needs recomputing on
 /// [`CliHost::switch`]).
@@ -334,11 +330,8 @@ mod tests {
             names.iter().all(|m| m.name != "scripted-mock"),
             "a mock is never offered as a choice"
         );
-        assert_eq!(
-            active_model_label("scripted-mock"),
-            "scripted-mock",
-            "`/config` and the banner report what is actually configured"
-        );
+        // `CliHost::environment` reports `config.model` as-is, so `/config`
+        // and the banner show what is actually configured.
     }
 
     /// `visible_models` sorts and de-duplicates: a `/model` listing built

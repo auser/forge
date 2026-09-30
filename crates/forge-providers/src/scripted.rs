@@ -106,14 +106,6 @@ impl ModelProvider for ScriptedMockModel {
     }
 }
 
-/// Helper for config plumbing: load a scripted mock from an optional
-/// script path.
-pub fn scripted_mock_from_path(
-    path: Option<&Path>,
-) -> Result<Option<Arc<dyn ModelProvider>>, ForgeError> {
-    Ok(ScriptedMockModel::from_optional_path(path)?.map(|m| Arc::new(m) as Arc<dyn ModelProvider>))
-}
-
 #[cfg(test)]
 mod tests {
     use forge_core::{Message, ToolDefinition};

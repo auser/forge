@@ -56,7 +56,6 @@ pub struct DirSummary {
 pub struct LocalGraph {
     root: PathBuf,
     state: GraphState,
-    last_report: Option<BuildReport>,
 }
 
 impl LocalGraph {
@@ -78,11 +77,7 @@ impl LocalGraph {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => GraphState::empty(),
             Err(e) => return Err(ForgeError::Io(e)),
         };
-        Ok(Self {
-            root,
-            state,
-            last_report: None,
-        })
+        Ok(Self { root, state })
     }
 
     pub fn root(&self) -> &Path {
@@ -95,10 +90,6 @@ impl LocalGraph {
 
     pub fn state(&self) -> &GraphState {
         &self.state
-    }
-
-    pub fn last_build_report(&self) -> Option<&BuildReport> {
-        self.last_report.as_ref()
     }
 
     /// Walk the working tree: project-relative path → (kind, size, mtime).
@@ -219,25 +210,16 @@ impl LocalGraph {
                 None => None,
             };
 
-            match reusable {
+            let hash = match reusable {
                 Some(hash) => {
                     report.reused.push(path.clone());
-                    files.insert(
-                        path.clone(),
-                        FileNode {
-                            path: path.clone(),
-                            kind: *kind,
-                            size: *size,
-                            mtime_ms: *mtime_ms,
-                            hash,
-                        },
-                    );
                     if let Some(syms) = old_symbols.get(path.as_str()) {
                         symbols.extend(syms.iter().cloned());
                     }
                     if let Some(imps) = old_imports.get(path.as_str()) {
                         imports.extend(imps.iter().cloned());
                     }
+                    hash
                 }
                 None => {
                     report.parsed.push(path.clone());
@@ -252,16 +234,6 @@ impl LocalGraph {
                         hasher.update(&bytes);
                         format!("{:x}", hasher.finalize())
                     };
-                    files.insert(
-                        path.clone(),
-                        FileNode {
-                            path: path.clone(),
-                            kind: *kind,
-                            size: *size,
-                            mtime_ms: *mtime_ms,
-                            hash,
-                        },
-                    );
                     // Symbol/import extraction is line/regex-based over
                     // source text, which only makes sense for valid UTF-8.
                     // Design choice (matches the graph's "deterministic,
@@ -280,8 +252,19 @@ impl LocalGraph {
                         let parsed: FileParse = parse_source(path, content);
                         attach_parsed(&mut symbols, &mut imports, path, parsed);
                     }
+                    hash
                 }
-            }
+            };
+            files.insert(
+                path.clone(),
+                FileNode {
+                    path: path.clone(),
+                    kind: *kind,
+                    size: *size,
+                    mtime_ms: *mtime_ms,
+                    hash,
+                },
+            );
         }
 
         for path in old.files.keys() {
@@ -301,20 +284,6 @@ impl LocalGraph {
         imports.sort_by(|a, b| (&a.from, &a.raw).cmp(&(&b.from, &b.raw)));
         imports.dedup_by(|a, b| a.from == b.from && a.raw == b.raw);
 
-        let tests = files.values().filter(|f| f.kind == FileKind::Test).count();
-        let stats = GraphStats {
-            files: files.len(),
-            directories: files
-                .keys()
-                .filter_map(|p| Path::new(p).parent().map(|p| p.to_path_buf()))
-                .collect::<HashSet<_>>()
-                .len(),
-            symbols: symbols.len(),
-            imports: imports.len(),
-            tests,
-            duration_ms: started.elapsed().as_millis() as u64,
-        };
-
         self.state = GraphState {
             version: crate::state::GRAPH_VERSION,
             files,
@@ -322,7 +291,10 @@ impl LocalGraph {
             imports,
         };
         self.save()?;
-        self.last_report = Some(report.clone());
+        let stats = GraphStats {
+            duration_ms: started.elapsed().as_millis() as u64,
+            ..self.stats()
+        };
         Ok((stats, report))
     }
 

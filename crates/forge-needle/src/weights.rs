@@ -1,7 +1,6 @@
 //! Weights lifecycle for the embedded Needle brain: which artifact a
 //! `[needle].variant` maps to, where it lives on disk, and how `forge init`
-//! (and eventually [`crate::backend`]'s FFI backend, Task 8) fetch and
-//! verify it.
+//! (via [`ensure_weights`]) fetches and verifies it.
 //!
 //! **Pinning reality (read before touching `VARIANTS`)**: `forge-config`'s
 //! `NEEDLE_VARIANTS` accepts `"small" | "medium" | "full"` as *configured*

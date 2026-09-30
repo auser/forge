@@ -66,7 +66,7 @@
 //! here, since it means vendoring a patched copy of a third-party crate
 //! into the tree rather than a workspace-declared dependency version bump.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -276,29 +276,33 @@ fn session_log(project: &Path) -> String {
     log
 }
 
-/// Drain `stream` line by line on a background thread into a shared buffer,
-/// so a test can poll for a marker without either blocking on a read that
-/// may never come or stealing the pipe out from under a later
+/// Drain `stream` on a background thread into a shared buffer, so a test
+/// can poll for a marker without either blocking on a read that may never
+/// come or stealing the pipe out from under a later
 /// `wait_with_output`/`wait` (the thread is the only reader from here on;
 /// everyone else reads the buffer). Returns once the stream hits EOF, so
 /// joining the handle after the child exits guarantees the buffer holds
 /// everything the process ever wrote.
+///
+/// Raw chunks, not lines: a line-buffered reader hides an unterminated
+/// prompt (rustyline's `"> "` has no newline) until the next newline lands,
+/// which makes "is the prompt actually up" unobservable — exactly what the
+/// pty Ctrl-C test needs to know before it types into raw mode.
 fn tail_stream<R: Read + Send + 'static>(
     stream: R,
 ) -> (Arc<Mutex<String>>, std::thread::JoinHandle<()>) {
     let buf = Arc::new(Mutex::new(String::new()));
     let shared = Arc::clone(&buf);
     let handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stream);
-        let mut line = String::new();
+        let mut reader = stream;
+        let mut chunk = [0u8; 4096];
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => shared
+                Ok(n) => shared
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .push_str(&line),
+                    .push_str(&String::from_utf8_lossy(&chunk[..n])),
             }
         }
     });
@@ -820,13 +824,21 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
     let (output, reader_thread) = tail_stream(master);
 
     // Wait for the idle prompt: the banner's last line, printed once
-    // `App::drive` is blocked on its first `io.read` — i.e. `rustyline` is
-    // genuinely mid-`readline()`, in raw mode, on the other end of this
-    // pty. The waits in this test are 30 s, not 10: still bounded, but a
-    // loaded shared machine (this one runs other projects' builds) made
-    // the 10 s bound flake twice on unrelated commits — the property under
-    // test is "the interrupt reaches the controller", not responsiveness.
+    // `App::drive` is blocked on its first `io.read`. The waits in this
+    // test are 30 s, not 10: still bounded, but a loaded shared machine
+    // (this one runs other projects' builds) made the 10 s bound flake
+    // twice on unrelated commits — the property under test is "the
+    // interrupt reaches the controller", not responsiveness.
     wait_for(&output, "/help for commands", Duration::from_secs(30));
+    // …and then wait for the prompt itself to be drawn. The banner is
+    // printed *before* the editor thread enters `readline()`; on a loaded
+    // machine a Ctrl-C written into that gap hits the tty with `ISIG` still
+    // on and arrives as a process signal the test never meant to send,
+    // instead of a raw-mode byte (observed: banner + "^C" echoed by the
+    // line discipline, no hint, green again the moment the machine calmed
+    // down). The prompt text only exists once `readline()` is genuinely
+    // blocked in raw mode on the other end of this pty.
+    wait_for(&output, "> ", Duration::from_secs(30));
 
     // A single typed Ctrl-C: on a real terminal in raw mode this is just
     // byte 0x03 arriving on the child's stdin, exactly as it would from a

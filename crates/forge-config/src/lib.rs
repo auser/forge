@@ -166,7 +166,7 @@ pub struct Config {
     pub server_port: u16,
     /// Agent-loop turn budget.
     pub max_turns: u32,
-    /// Reject http/laya routing decisions below this confidence.
+    /// Reject http/laya/needle/jev routing decisions below this confidence.
     pub router_confidence_threshold: f64,
     /// Fallback router when the primary fails or is below threshold
     /// ("static" or "cheapest").
@@ -178,8 +178,8 @@ pub struct Config {
     /// across config files; not settable via env/CLI flags.
     pub models: BTreeMap<String, ModelEntry>,
     /// The embedded on-device Needle brain: config for the default
-    /// `router = "needle"`. Weights resolution lands in a later phase;
-    /// until then, routing built on it degrades to `router_fallback`.
+    /// `router = "needle"`. When the weights are missing, routing built on
+    /// it degrades to `router_fallback`.
     pub needle: NeedleConfig,
     /// Which keys a real configuration layer set, rather than the
     /// compiled-in defaults (see [`ExplicitKeys`]). Deliberately not part of
@@ -468,7 +468,6 @@ pub struct CliOverrides {
     pub local_only: Option<bool>,
     pub server_host: Option<String>,
     pub server_port: Option<u16>,
-    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

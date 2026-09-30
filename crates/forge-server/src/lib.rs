@@ -29,7 +29,7 @@ use forge_core::{ForgeError, SkillRegistry};
 use forge_graph::LocalGraph;
 use forge_runtime::AgentService;
 
-pub use state::{AppState, MAX_TRACKED_RUNS, RunRegistry, RunStatus};
+use state::AppState;
 
 /// Build the axum router. Takes the shared service plus the skill registry
 /// and project graph handles explicitly so tests can compose them freely.
@@ -75,14 +75,6 @@ pub async fn bind(
     Ok((addr, async move {
         axum::serve(listener, router).await.map_err(ForgeError::Io)
     }))
-}
-
-/// Serve with graceful shutdown on ctrl-c.
-pub async fn serve(router: Router, host: &str, port: u16) -> Result<(), ForgeError> {
-    serve_with_shutdown(router, host, port, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
 }
 
 /// Serve with a caller-provided graceful-shutdown signal. The CLI passes

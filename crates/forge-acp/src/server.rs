@@ -99,7 +99,7 @@ impl Drop for TurnSlotGuard {
 }
 
 /// ACP over stdio, on top of the shared agent runtime.
-pub struct ForgeAcpServer {
+pub(crate) struct ForgeAcpServer {
     factory: Arc<dyn ServiceFactory>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// One runtime per *project*, keyed by canonicalized root — see
@@ -549,7 +549,7 @@ impl ForgeAcpServer {
                     Err(broadcast::error::RecvError::Closed) => {
                         // No more events can arrive; the run result is the
                         // only thing left to wait for.
-                        break join(&mut handle).await;
+                        break settle(handle.await);
                     }
                 },
                 joined = &mut handle => break settle(joined),
@@ -777,13 +777,6 @@ impl ForgeAcpServer {
         };
         let _ = waiting.send(payload);
     }
-}
-
-/// Await a run's task handle.
-async fn join(
-    handle: &mut tokio::task::JoinHandle<Result<forge_runtime::RunOutcome, ForgeError>>,
-) -> Result<String, dispatch::RunFailure> {
-    settle(handle.await)
 }
 
 /// Reduce a joined run to "final text" or a classified failure.

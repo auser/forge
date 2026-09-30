@@ -59,4 +59,4 @@ pub use host::{
     SkillChoice,
 };
 pub use io::{ChatIo, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome, Style};
-pub use render::{TranscriptState, summarize_call};
+pub use render::TranscriptState;

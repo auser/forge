@@ -1205,10 +1205,9 @@ impl AgentService {
     /// normally": this is an optimization, never a behaviour change.
     ///  1. a brain is attached and the run isn't cancelled;
     ///  2. `tool_call` produced a call within `router_timeout_ms`, from the
-    ///     same tool list the model would have been offered (the caller
-    ///     only calls this when that list is non-empty, i.e. when the
-    ///     resolved model is tool-capable — a chat-only provider gets the
-    ///     plain-completion path and the fast path must not widen that);
+    ///     full tool surface — the caller passes it regardless of the
+    ///     resolved model's tool capability (the capability gate further
+    ///     down governs only what the *model* is offered);
     ///  3. its confidence is at least `router_confidence_threshold`;
     ///  4. its arguments parse as a JSON *object* (what the dispatcher
     ///     reads arguments out of);
@@ -1489,7 +1488,9 @@ impl AgentService {
         // left no record would be invisible in exactly the decline-rate data
         // this log exists to produce.
         let decide_tools = tool_definitions();
-        let fast = if resumed_from.is_none() && !decide_tools.is_empty() {
+        // `tool_definitions()` is a fixed surface, so it is always
+        // non-empty and does not gate the fast path.
+        let fast = if resumed_from.is_none() {
             let started = std::time::Instant::now();
             let outcome = self.needle_fast_path(prompt, &run_id, &decide_tools).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -1794,6 +1795,13 @@ impl AgentService {
             };
             self.emit_assistant_message(&sender, &mut collected, &run_id, &session_id, &response)?;
             let summary: String = response.content.chars().take(80).collect();
+            // Same accounting as the loop's final iteration: one model
+            // round-trip is one turn, and the footer counts these events.
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(&run_id, &session_id, EventKind::TurnCompleted { turn: 1 }),
+            )?;
             self.emit(
                 &sender,
                 &mut collected,
@@ -1836,6 +1844,15 @@ impl AgentService {
 
             if response.tool_calls.is_empty() {
                 let summary: String = response.content.chars().take(80).collect();
+                // The final answer is a model round-trip like any other:
+                // the turn count (and the footer counting these events)
+                // includes it. Dispatch-path runs return before the loop
+                // and correctly emit none.
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(&run_id, &session_id, EventKind::TurnCompleted { turn }),
+                )?;
                 self.emit(
                     &sender,
                     &mut collected,

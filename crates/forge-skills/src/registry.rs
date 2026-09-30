@@ -109,7 +109,7 @@ impl FsSkillRegistry {
                 if !skill_file.is_file() {
                     continue;
                 }
-                match Self::read_meta(*source, &dir, &skill_file) {
+                match Self::read_meta(&dir, &skill_file) {
                     Some(meta) => {
                         if !out.iter().any(|(_, m)| m.name == meta.name) {
                             out.push((*source, meta));
@@ -127,7 +127,7 @@ impl FsSkillRegistry {
 
     /// Parse metadata from the head of a SKILL.md only (progressive
     /// disclosure: no full body read).
-    fn read_meta(source: SkillSource, dir: &Path, skill_file: &Path) -> Option<SkillMeta> {
+    fn read_meta(dir: &Path, skill_file: &Path) -> Option<SkillMeta> {
         let head = read_head(skill_file, 4096)?;
         let (fields, body) = frontmatter::split(&head);
         let dir_name = dir.file_name()?.to_string_lossy().to_string();
@@ -140,7 +140,6 @@ impl FsSkillRegistry {
             .map(str::to_string)
             .or_else(|| frontmatter::first_prose_line(body))
             .unwrap_or_default();
-        let _ = source;
         Some(SkillMeta {
             name,
             description,
@@ -226,23 +225,73 @@ impl SkillRegistry for FsSkillRegistry {
         Ok(Skill { meta, instructions })
     }
 
-    /// Naive case-insensitive substring match of skill name/description
-    /// against the prompt's words.
+    /// Score-based keyword match of skill name/description against the
+    /// prompt's content words. The old version matched when *any* prompt
+    /// word of 3+ letters was a substring of the name or description —
+    /// which, with real skill descriptions full of "the"/"this"/"use",
+    /// meant every skill activated on every prompt (observed: 45 skills
+    /// injected into one turn on a developer machine). Now: a name-token
+    /// hit scores 2, a description-token hit 1; below 2 the skill stays
+    /// out, and at most [`MAX_MATCHED_SKILLS`] activate, best score first.
     fn match_task(&self, prompt: &str) -> Vec<SkillMeta> {
-        let prompt = prompt.to_lowercase();
-        self.discover()
+        let prompt_words = content_words(prompt);
+        if prompt_words.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(u32, SkillMeta)> = self
+            .discover()
             .into_iter()
-            .filter(|(_, meta)| {
-                let name = meta.name.to_lowercase();
-                let desc = meta.description.to_lowercase();
-                prompt
-                    .split_whitespace()
-                    .any(|word| word.len() >= 3 && (name.contains(word) || desc.contains(word)))
+            .filter_map(|(_, meta)| {
+                let mut score = 0u32;
+                let name_tokens = tokenize(&meta.name);
+                let desc_tokens = tokenize(&meta.description);
+                for word in &prompt_words {
+                    if name_tokens.contains(word) {
+                        score += 2;
+                    } else if desc_tokens.contains(word) {
+                        score += 1;
+                    }
+                }
+                (score >= 2).then_some((score, meta))
             })
-            .map(|(_, meta)| meta)
-            .collect()
+            .collect();
+        // Best first; name order as a stable tiebreak.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        scored.truncate(MAX_MATCHED_SKILLS);
+        scored.into_iter().map(|(_, meta)| meta).collect()
     }
 }
+
+/// At most this many skills activate per turn: a prompt that matches
+/// everything gets the top few, not the library.
+const MAX_MATCHED_SKILLS: usize = 3;
+
+/// Prompt words worth matching on: lowercase alphanumeric tokens of 3+
+/// letters, minus glue words that appear in every skill description
+/// ("the", "this", "use") and matched the whole library before.
+fn content_words(text: &str) -> std::collections::BTreeSet<String> {
+    tokenize(text)
+        .into_iter()
+        .filter(|w| !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+fn tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Glue words that carry no relevance signal. Deliberately small — every
+/// entry here is a word a skill name is unlikely to be built from.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "this", "that", "from", "your", "you", "are", "was", "were",
+    "will", "would", "should", "could", "use", "used", "using", "when", "what", "how", "why",
+    "its", "all", "any", "can", "not", "but", "please", "tell", "does", "have", "has", "had",
+    "into", "about", "than", "then", "them", "they", "their", "there", "here", "just", "like",
+];
 
 /// Read at most `limit` bytes from a file (frontmatter-sized reads).
 fn read_head(path: &Path, limit: usize) -> Option<String> {

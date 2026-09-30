@@ -26,8 +26,6 @@ pub enum Stage {
     Decide,
     /// Choosing which model answers.
     Route,
-    /// The model call itself.
-    Generate,
 }
 
 /// Who decided.
@@ -49,7 +47,6 @@ pub enum Outcome {
     Dispatched,
     Declined,
     Routed,
-    Errored,
     Unavailable,
 }
 
@@ -180,10 +177,6 @@ impl DecisionLogHandle {
         if let Err(e) = self.log.append(&record) {
             tracing::warn!(error = %e, "could not append to the decision log");
         }
-    }
-
-    pub fn session_id(&self) -> &str {
-        &self.session
     }
 }
 

@@ -55,8 +55,9 @@ decided by a model calibrated to emit a choice plus a confidence — not by a
 chat model guessing in prose. Anything under the threshold is rejected and
 escalated rather than acted on.
 
-(Skill activation is still lexical matching over skill names and
-descriptions, not a needle decision. See [Skills](#skills).)
+(Skill activation is scored lexical matching over skill names and
+descriptions — a name-token hit or two description hits, at most three
+skills per turn — not a needle decision. See [Skills](#skills).)
 
 **Whether you actually have a brain depends on the build.** Real on-device
 inference needs the native engine, and the engine is **on by default**: the
@@ -367,6 +368,42 @@ stack, made explicit), `hybrid-needle` (local first, hosted escalation),
 example) presets, plus an [`env.example`](examples/env.example) template for
 provider keys. A unit test parses every preset against the current config
 schema, so a preset never drifts out of date.
+
+### Use forge from your editor
+
+**Zed** (or any ACP editor) — forge is an agent, via `forge acp`. In
+`~/.zed/settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "forge": {
+      "command": "forge",
+      "args": ["acp"]
+    }
+  }
+}
+```
+
+Pick "forge" in the agent panel's agent selector. Sessions, tool calls and
+approvals show up natively; the decision plane (needle fast path, routing)
+runs underneath as usual.
+
+**Cursor** (or any MCP client) — forge's project tools, via `forge mcp`. In
+`~/.cursor/mcp.json`, add to `mcpServers`:
+
+```json
+"forge": {
+  "command": "forge",
+  "args": ["mcp"]
+}
+```
+
+Cursor launches it with the workspace as the project root, so
+`forge_graph_context`/`forge_graph_grep` search the project you have open —
+run `forge graph build` there first. The full tool list: `forge mcp` in a
+terminal, or the [MCP server](#mcp-server-editors-and-agent-harnesses)
+section below.
 
 ## Usage
 

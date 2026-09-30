@@ -118,4 +118,4 @@ pub mod dispatch;
 pub mod protocol;
 pub mod server;
 
-pub use server::{ForgeAcpServer, ServiceFactory, serve_stdio};
+pub use server::{ServiceFactory, serve_stdio};

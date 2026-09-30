@@ -9,5 +9,4 @@ mod store;
 pub use decisions::{
     Decider, DecisionLog, DecisionLogHandle, DecisionRecord, Outcome, RecordDraft, Stage,
 };
-pub use redact::Redactor;
 pub use store::{JsonlSessionStore, SessionInfo, new_run_id, new_session_id};

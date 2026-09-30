@@ -9,7 +9,6 @@ pub mod query;
 mod state;
 
 pub use embed_index::EmbeddingIndex;
-pub use forge_core::ContextHit;
 pub use graph::{BuildReport, DirSummary, FreshnessReport, LocalGraph};
 pub use query::{EMBEDDINGS_REL_PATH, ScoredHit, blended_context, semantic_grep};
 pub use state::{FileKind, FileNode, ImportEdge, SymbolNode};

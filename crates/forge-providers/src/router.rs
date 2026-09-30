@@ -85,13 +85,7 @@ impl StaticRouter {
         if name == "mock" || name == "mock-local" {
             return crate::model::MockModel::new().capabilities();
         }
-        ModelCapabilities {
-            streaming: true,
-            tools: true,
-            structured_output: true,
-            vision: true,
-            max_context: usize::MAX,
-        }
+        optimistic_caps()
     }
 }
 
