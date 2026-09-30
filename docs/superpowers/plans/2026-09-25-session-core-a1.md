@@ -11,6 +11,8 @@
 **Spec:** `docs/superpowers/specs/2026-09-25-session-core-design.md` — phase A1 in §21. Read §2 (Session), §4 (decision log), §20 (runtime scope) before starting.
 
 > **Status (2026-09-28):** the decision-log wiring landed on branch `decision-log-wired` in reduced form — the runtime records dispatch and routing decisions where they happen today, and `forge session decisions` reads the log back. The `Session` object extraction, `EngineHandle`, and the decide-before-routing reorder (Tasks 2–4) were deferred; main had already diverged from this plan's assumptions.
+>
+> **Status (2026-09-29):** the reorder landed (branch `decide-before-routing`), again in reduced form: decide runs before routing in `run_inner`, needle is offered the full tool surface regardless of the configured model's tool capability, and decision-log turn numbers are real (per-session counter, store-seeded). The `Session` object extraction stays deferred — the engine is already shared process-wide (the `select_engine` cache) and warmth already handled (the 5s fast-path fix), so `EngineHandle`'s reasons no longer exist.
 
 ## Global Constraints
 
