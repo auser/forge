@@ -2376,6 +2376,41 @@ async fn a_service_with_no_engine_records_unavailable() {
 }
 
 #[tokio::test]
+async fn a_pinned_model_is_routings_only_candidate() {
+    // `--model X` is a constraint, not a suggestion: whatever the router
+    // would prefer, it is only ever offered the pinned model — an explicit
+    // choice must never be "improved on" onto a different provider.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = forge_config::Config {
+        model: "gpt-5".to_string(),
+        model_pinned: true,
+        ..forge_config::Config::default()
+    };
+    let service = AgentService::new(
+        Arc::new(ScriptedMockModel::new(vec![text_reply("answer")])),
+        Arc::new(MockRouter::selecting("Qwen3-Coder-Next-4bit")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        config,
+    );
+
+    let outcome = service.run("anything").await.expect("run");
+    let records = decision_records(tmp.path(), &outcome.session_id);
+    let route = records
+        .iter()
+        .find(|r| r.stage == forge_session::Stage::Route)
+        .expect("a route record");
+    assert_eq!(
+        route.candidates,
+        vec!["gpt-5".to_string()],
+        "the router is only ever offered the pinned model: {route:?}"
+    );
+}
+
+#[tokio::test]
 async fn turn_numbers_are_real_and_increment_per_run_in_a_session() {
     // The turn column joins decision records to the transcript; a
     // hardcoded 1 on every record would make a multi-turn session's log

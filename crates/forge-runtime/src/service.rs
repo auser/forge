@@ -1645,12 +1645,23 @@ impl AgentService {
         // ROUTE: only reached when needle declined (or is unavailable) and
         // a model will answer — which is what makes choosing one
         // meaningful.
-        // Candidates: the [models] table plus the configured model.
-        let mut candidates: Vec<String> = self.config.model_entries().keys().cloned().collect();
-        if !candidates.contains(&self.config.model) {
-            candidates.push(self.config.model.clone());
-        }
-        candidates.sort();
+        // Candidates: the [models] table plus the configured model — unless
+        // the model was pinned by an explicit user action (`--model`,
+        // `FORGE_MODEL`, the chat's `/model`): then the candidate set is
+        // exactly that model. An explicit choice is a constraint, not one
+        // more suggestion the router may improve on — a user who said
+        // `--model gpt-5` must never be "rerouted" onto a different
+        // provider (least of all one that then errors).
+        let candidates: Vec<String> = if self.config.model_pinned {
+            vec![self.config.model.clone()]
+        } else {
+            let mut candidates: Vec<String> = self.config.model_entries().keys().cloned().collect();
+            if !candidates.contains(&self.config.model) {
+                candidates.push(self.config.model.clone());
+            }
+            candidates.sort();
+            candidates
+        };
         let routing_request = RoutingRequest {
             task: task.to_string(),
             required_capabilities: Vec::new(),

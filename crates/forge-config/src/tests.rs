@@ -231,6 +231,39 @@ fn cli_overrides_env() {
         resolved.explain("model"),
         Some(("\"cli-model\"".to_string(), Origin::CliFlag))
     );
+    assert!(
+        resolved.config.model_pinned,
+        "a CLI-flag model pins routing's candidates"
+    );
+}
+
+#[test]
+#[serial]
+fn a_config_file_model_is_a_preference_not_a_pin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_project_config(tmp.path(), "model = \"file-model\"\n");
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+
+    assert_eq!(resolved.config.model, "file-model");
+    assert!(
+        !resolved.config.model_pinned,
+        "a config-file model stays a preference the router may improve on"
+    );
+}
+
+#[test]
+#[serial]
+fn an_environment_model_also_pins() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    unsafe { std::env::set_var("FORGE_MODEL", "env-model") };
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+
+    assert_eq!(resolved.config.model, "env-model");
+    assert!(resolved.config.model_pinned);
 }
 
 #[test]
