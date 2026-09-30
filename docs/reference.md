@@ -363,18 +363,21 @@ CLI flags beat everything. Values loaded from `.env` files are covered by
 session-log secret redaction just like shell-set keys.
 
 Forge ships ready-made config presets — copy one into `.forge/config.toml`
-(or `~/.config/forge/config.toml` for all projects) and you're done:
+(or `~/.config/forge/config.toml` for all projects), or let init write it:
 
 ```bash
-cp examples/configs/local-first.toml .forge/config.toml
+forge init --preset claude     # writes examples/configs/claude.toml as .forge/config.toml
 ```
 
-See [`examples/configs/`](examples/configs/) for `local-first` (the default
-stack, made explicit), `hybrid-needle` (local first, hosted escalation),
-`budget-hosted`, `offline-eval`, and `hybrid-laya` (the Laya-adapter
-example) presets, plus an [`env.example`](examples/env.example) template for
-provider keys. A unit test parses every preset against the current config
-schema, so a preset never drifts out of date.
+See [`examples/configs/`](examples/configs/) for `claude`, `codex` and
+`kimi` (plug-and-play with each tool's usual credential), plus
+`local-first` (the default stack, made explicit), `hybrid-needle` (local
+first, hosted escalation), `budget-hosted`, and `hybrid-laya` (the
+Laya-adapter example), and an [`env.example`](examples/env.example)
+template for provider keys. An existing config is never overwritten —
+`--preset` says so instead. Unit tests parse every preset (on disk and
+embedded) against the current config schema, so a preset never drifts out
+of date.
 
 ### Use forge from your editor
 

@@ -1,0 +1,14 @@
+# Plug-and-play with Codex: OpenAI's GPT-5 as the model, the embedded
+# needle brain deciding underneath (the default router).
+#
+# Credential: OPENAI_API_KEY in .env / your shell. A Codex CLI sign-in
+# (~/.codex/auth.json) is detected and reported, but the ChatGPT
+# subscription's Responses backend is not supported yet — today the key
+# is what works.
+
+model = "gpt-5"
+execution = "native"
+approval = "prompt"
+
+# Tip: `forge model list` shows every model your keys unlock; switch any
+# time by changing this one line (or /model inside the chat).

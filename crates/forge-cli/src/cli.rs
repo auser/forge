@@ -85,7 +85,13 @@ pub enum Command {
     },
 
     /// Initialize a project for Forge (idempotent).
-    Init,
+    Init {
+        /// Write this named preset as the starter config instead of the
+        /// default stack: claude, codex, kimi, local-first, hybrid-needle,
+        /// budget-hosted, hybrid-laya.
+        #[arg(long, value_name = "NAME")]
+        preset: Option<String>,
+    },
 
     /// Run a prompt through the agent.
     Run {

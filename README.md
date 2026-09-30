@@ -100,7 +100,9 @@ router = "needle"        # default; also static, cheapest, jev, laya
 approval = "prompt"      # or "auto" (never asks), "deny" (never runs risky)
 ```
 
-Presets live in [`examples/configs/`](examples/configs/).
+Presets live in [`examples/configs/`](examples/configs/) — or let init
+write one: `forge init --preset claude` (also `codex`, `kimi`,
+`local-first`, `hybrid-needle`, `budget-hosted`, `hybrid-laya`).
 
 ## Where to read more
 
