@@ -379,6 +379,11 @@ pub struct AgentService {
     /// `<session-id>.decisions.jsonl` — decision shape only, never prompt
     /// text or tool arguments (see `forge_session::decisions`).
     decision_log: Arc<DecisionLog>,
+    /// Per-session turn counter for the decision log, seeded from the
+    /// store on first touch (one parse per session per process) and then
+    /// kept in memory. A turn is a run today; the counter exists so the
+    /// log's `turn` column stops being a hardcoded 1 on every record.
+    session_turns: Mutex<HashMap<String, u32>>,
 }
 
 impl AgentService {
@@ -410,6 +415,7 @@ impl AgentService {
             finished: Mutex::new(FinishedRuns::default()),
             live_sessions: Arc::new(LiveSessions::default()),
             decision_log,
+            session_turns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1364,6 +1370,34 @@ impl AgentService {
         }
     }
 
+    /// The turn number this run is in its session, for the decision log:
+    /// 1 + the runs this session has already seen. Seeded from the store on
+    /// first touch (one parse per session per process — a forked session
+    /// continues from the runs its copied history holds), then kept in
+    /// memory so a busy chat costs nothing per line.
+    fn next_turn(&self, session_id: &str) -> u32 {
+        let mut turns = self.session_turns.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(turn) = turns.get_mut(session_id) {
+            *turn += 1;
+            return *turn;
+        }
+        let seen = self
+            .sessions
+            .events_for(session_id)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|e| matches!(e.kind, EventKind::RunStarted { .. }))
+                    .map(|e| e.run_id.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len() as u32
+            })
+            .unwrap_or(0);
+        let turn = seen + 1;
+        turns.insert(session_id.to_string(), turn);
+        turn
+    }
+
     async fn run_inner(
         &self,
         plan: RunPlan,
@@ -1388,9 +1422,7 @@ impl AgentService {
         let mut collected = Vec::new();
         let mut tool_call_count = 0usize;
         let decisions = DecisionLog::handle(&self.decision_log, &session_id);
-        // A1 records one turn per run; the turn counter becomes real when the
-        // turn loop gains a per-conversation owner.
-        let turn_no: u32 = 1;
+        let turn_no = self.next_turn(&session_id);
 
         let fail = |collected: &mut Vec<Event>, error: ForgeError| -> ForgeError {
             let event = Event::new(
@@ -1432,152 +1464,34 @@ impl AgentService {
             )?;
         }
 
-        // Candidates: the [models] table plus the configured model.
-        let mut candidates: Vec<String> = self.config.model_entries().keys().cloned().collect();
-        if !candidates.contains(&self.config.model) {
-            candidates.push(self.config.model.clone());
-        }
-        candidates.sort();
-        let routing_request = RoutingRequest {
-            task: task.to_string(),
-            required_capabilities: Vec::new(),
-            candidates,
-        };
-        let route_started = std::time::Instant::now();
-        let decision = match self.router.route(&routing_request).await {
-            Ok(decision) => decision,
-            Err(e) => return Err(fail(&mut collected, e)),
-        };
-        tracing::info!(
-            run_id,
-            model = %decision.selected_model,
-            confidence = decision.confidence,
-            fallback = decision.fallback_used,
-            "routing decision"
-        );
-        decisions.record(
-            turn_no,
-            RecordDraft {
-                stage: Stage::Route,
-                // Map from the router that actually answered, not from
-                // `fallback_used`: a primary `static` router is not needle
-                // having fallen back, and conflating them would corrupt the
-                // decline rate this log exists to measure.
-                decider: match decision.router_name.as_str() {
-                    "needle" | "needle-dispatch" => Decider::Needle,
-                    "static" | "cheapest" | "mock" => Decider::Static,
-                    _ => Decider::Llm,
-                },
-                question: "model".to_string(),
-                choice: decision.selected_model.clone(),
-                confidence: Some(decision.confidence),
-                probabilities: std::collections::BTreeMap::new(),
-                candidates: routing_request.candidates.clone(),
-                outcome: Outcome::Routed,
-                elapsed_ms: route_started.elapsed().as_millis() as u64,
-                speculative: false,
-            },
-        );
-        self.emit(
-            &sender,
-            &mut collected,
-            Event::new(
-                &run_id,
-                &session_id,
-                EventKind::RoutingDecisionMade {
-                    router: decision.router_name.clone(),
-                    selected_model: decision.selected_model.clone(),
-                    confidence: decision.confidence,
-                    fallback_used: decision.fallback_used,
-                    reason: decision.reason.clone(),
-                },
-            ),
-        )?;
-
-        // Build the conversation: system preamble (skills, graph context),
-        // then the replayed history of this session, then the user prompt.
-        // System first is what providers expect, and the history is a real
-        // user/assistant/tool transcript that must arrive in its own order.
-        let mut messages = Vec::new();
-        for meta in self.skills.match_task(task) {
-            match self.skills.activate(&meta.name) {
-                Ok(skill) => {
-                    self.emit(
-                        &sender,
-                        &mut collected,
-                        Event::new(
-                            &run_id,
-                            &session_id,
-                            EventKind::SkillActivated {
-                                name: skill.meta.name.clone(),
-                                path: skill.meta.path.clone(),
-                            },
-                        ),
-                    )?;
-                    messages.push(Message::system(format!(
-                        "Active skill `{}` instructions:\n{}",
-                        skill.meta.name, skill.instructions
-                    )));
-                }
-                Err(e) => {
-                    tracing::warn!(skill = %meta.name, error = %e, "skill activation failed")
-                }
-            }
-        }
-        if let Some(graph) = &self.graph {
-            let hits = graph.context(task, 5);
-            if !hits.is_empty() {
-                let listing = hits
-                    .iter()
-                    .map(|h| format!("- {} (score {})", h.path, h.score))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                messages.push(Message::system(format!(
-                    "Relevant project files (from the project graph):\n{listing}"
-                )));
-            }
-        }
-        messages.extend(history);
-        messages.push(Message::user(prompt));
-
-        // Resolve the provider for the routed model (defaults to the
-        // configured one).
-        let model = match &self.model_factory {
-            Some(factory) => match factory(&decision.selected_model) {
-                Ok(provider) => provider,
-                Err(e) => return Err(fail(&mut collected, e)),
-            },
-            None => self.model.clone(),
-        };
-        tracing::debug!(model = %model.name(), "model resolved for run");
-
-        let tools = if model.capabilities().tools {
-            tool_definitions()
-        } else {
-            Vec::new()
-        };
-
-        // Fast path: the on-device brain answers a well-defined prompt with
-        // one local tool call, before the model is called. Only when there is
-        // a *new* instruction to answer — a resume continues a conversation
-        // with no fresh prompt, so re-running the original prompt's tool
-        // would be wrong. Replayed history does not disqualify it: the second
-        // turn of a session is still a new instruction, and gating on history
-        // instead of on `resumed_from` would silently switch the fast path
-        // off for every continuation. And only when the run actually has
-        // tools, i.e. the resolved provider is tool-capable:
-        // a chat-only model's run is a plain completion and the fast path
-        // must not turn it into tool execution. All other gates and the
-        // dispatch itself live in `needle_fast_path`; `None` means "run
-        // normally", and nothing has been emitted or executed by then.
+        // DECIDE before ROUTE: the on-device brain is offered the full
+        // tool surface first, because a dispatch needs no model at all —
+        // and choosing a model is only meaningful once a model is known to
+        // be answering. (The old order routed first, so every dispatched
+        // turn paid for a routing decision it never used, and the log
+        // showed a model being "chosen" that was never called.) Needle is
+        // offered the full surface regardless of the configured model's
+        // tool capability: the capability gate below now governs only what
+        // the *model* is offered, never what needle may do instead of it.
+        //
+        // Only when there is a *new* instruction to answer — a resume
+        // continues a conversation with no fresh prompt, so re-running the
+        // original prompt's tool would be wrong. Replayed history does not
+        // disqualify it: the second turn of a session is still a new
+        // instruction, and gating on history instead of on `resumed_from`
+        // would silently switch the fast path off for every continuation.
+        // All other gates and the dispatch itself live in
+        // `needle_fast_path`; `None` means "run normally", and nothing has
+        // been emitted or executed by then.
         //
         // Whatever the fast path answers is recorded — dispatched, declined
         // and (with no engine attached) unavailable alike. A decline that
         // left no record would be invisible in exactly the decline-rate data
         // this log exists to produce.
-        let fast = if resumed_from.is_none() && !tools.is_empty() {
+        let decide_tools = tool_definitions();
+        let fast = if resumed_from.is_none() && !decide_tools.is_empty() {
             let started = std::time::Instant::now();
-            let outcome = self.needle_fast_path(prompt, &run_id, &tools).await;
+            let outcome = self.needle_fast_path(prompt, &run_id, &decide_tools).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             decisions.record(
                 turn_no,
@@ -1595,7 +1509,7 @@ impl AgentService {
                         .unwrap_or_else(|| "none".to_string()),
                     confidence: outcome.as_ref().map(|f| f.confidence),
                     probabilities: std::collections::BTreeMap::new(),
-                    candidates: tools.iter().map(|t| t.name.clone()).collect(),
+                    candidates: decide_tools.iter().map(|t| t.name.clone()).collect(),
                     outcome: match (&outcome, self.needle.is_some()) {
                         (Some(_), _) => Outcome::Dispatched,
                         (None, true) => Outcome::Declined,
@@ -1727,6 +1641,137 @@ impl AgentService {
                 events: collected,
             });
         }
+
+        // ROUTE: only reached when needle declined (or is unavailable) and
+        // a model will answer — which is what makes choosing one
+        // meaningful.
+        // Candidates: the [models] table plus the configured model.
+        let mut candidates: Vec<String> = self.config.model_entries().keys().cloned().collect();
+        if !candidates.contains(&self.config.model) {
+            candidates.push(self.config.model.clone());
+        }
+        candidates.sort();
+        let routing_request = RoutingRequest {
+            task: task.to_string(),
+            required_capabilities: Vec::new(),
+            candidates,
+        };
+        let route_started = std::time::Instant::now();
+        let decision = match self.router.route(&routing_request).await {
+            Ok(decision) => decision,
+            Err(e) => return Err(fail(&mut collected, e)),
+        };
+        tracing::info!(
+            run_id,
+            model = %decision.selected_model,
+            confidence = decision.confidence,
+            fallback = decision.fallback_used,
+            "routing decision"
+        );
+        decisions.record(
+            turn_no,
+            RecordDraft {
+                stage: Stage::Route,
+                // Map from the router that actually answered, not from
+                // `fallback_used`: a primary `static` router is not needle
+                // having fallen back, and conflating them would corrupt the
+                // decline rate this log exists to measure.
+                decider: match decision.router_name.as_str() {
+                    "needle" | "needle-dispatch" => Decider::Needle,
+                    "static" | "cheapest" | "mock" => Decider::Static,
+                    _ => Decider::Llm,
+                },
+                question: "model".to_string(),
+                choice: decision.selected_model.clone(),
+                confidence: Some(decision.confidence),
+                probabilities: std::collections::BTreeMap::new(),
+                candidates: routing_request.candidates.clone(),
+                outcome: Outcome::Routed,
+                elapsed_ms: route_started.elapsed().as_millis() as u64,
+                speculative: false,
+            },
+        );
+        self.emit(
+            &sender,
+            &mut collected,
+            Event::new(
+                &run_id,
+                &session_id,
+                EventKind::RoutingDecisionMade {
+                    router: decision.router_name.clone(),
+                    selected_model: decision.selected_model.clone(),
+                    confidence: decision.confidence,
+                    fallback_used: decision.fallback_used,
+                    reason: decision.reason.clone(),
+                },
+            ),
+        )?;
+
+        // Build the conversation: system preamble (skills, graph context),
+        // then the replayed history of this session, then the user prompt.
+        // System first is what providers expect, and the history is a real
+        // user/assistant/tool transcript that must arrive in its own order.
+        let mut messages = Vec::new();
+        for meta in self.skills.match_task(task) {
+            match self.skills.activate(&meta.name) {
+                Ok(skill) => {
+                    self.emit(
+                        &sender,
+                        &mut collected,
+                        Event::new(
+                            &run_id,
+                            &session_id,
+                            EventKind::SkillActivated {
+                                name: skill.meta.name.clone(),
+                                path: skill.meta.path.clone(),
+                            },
+                        ),
+                    )?;
+                    messages.push(Message::system(format!(
+                        "Active skill `{}` instructions:\n{}",
+                        skill.meta.name, skill.instructions
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(skill = %meta.name, error = %e, "skill activation failed")
+                }
+            }
+        }
+        if let Some(graph) = &self.graph {
+            let hits = graph.context(task, 5);
+            if !hits.is_empty() {
+                let listing = hits
+                    .iter()
+                    .map(|h| format!("- {} (score {})", h.path, h.score))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                messages.push(Message::system(format!(
+                    "Relevant project files (from the project graph):\n{listing}"
+                )));
+            }
+        }
+        messages.extend(history);
+        messages.push(Message::user(prompt));
+
+        // Resolve the provider for the routed model (defaults to the
+        // configured one).
+        let model = match &self.model_factory {
+            Some(factory) => match factory(&decision.selected_model) {
+                Ok(provider) => provider,
+                Err(e) => return Err(fail(&mut collected, e)),
+            },
+            None => self.model.clone(),
+        };
+        tracing::debug!(model = %model.name(), "model resolved for run");
+
+        // The capability gate: what the *model* is offered. Needle was
+        // offered the full surface above regardless of this — a chat-only
+        // model receives zero tools, exactly as before the reorder.
+        let tools = if model.capabilities().tools {
+            decide_tools
+        } else {
+            Vec::new()
+        };
 
         if tools.is_empty() {
             // Single-turn path: providers without tool support behave

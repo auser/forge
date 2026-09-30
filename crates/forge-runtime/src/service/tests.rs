@@ -1986,9 +1986,11 @@ async fn needle_fast_path_dispatches_exact_tool_prompt_without_the_model() {
         event_kinds(&outcome),
         [
             "run_started",
-            "routing_decision_made", // model routing
-            "routing_decision_made", // needle-dispatch
-            "assistant_message",     // v3: the call the brain made
+            "routing_decision_made", // needle-dispatch — the ONLY routing
+            // event: decide runs before routing,
+            // and a dispatched turn never picks a
+            // model
+            "assistant_message", // v3: the call the brain made
             "tool_call_requested",
             "tool_started",
             "tool_completed",
@@ -2124,9 +2126,44 @@ async fn needle_fast_path_dispatches_safe_reads_under_prompt_approval() {
 }
 
 #[tokio::test]
-async fn needle_fast_path_requires_a_tool_capable_model() {
-    // A chat-only provider's run is a plain completion with no tools at
-    // all; the fast path must not turn it into tool execution.
+async fn needle_fast_path_may_dispatch_for_a_chat_only_model() {
+    // The decide-before-routing reorder: needle is offered the full tool
+    // surface regardless of the configured model's tool capability — a
+    // dispatch needs no model at all, so a chat-only model is no reason to
+    // deny needle the attempt. The capability gate governs only what the
+    // *model* is offered (see the decline half below).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(
+        MockModel::new().with_capabilities(forge_core::ModelCapabilities {
+            streaming: true,
+            tools: false,
+            structured_output: false,
+            vision: false,
+            max_context: 8_192,
+        }),
+    );
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("fn main() {}\n"));
+    let service = needle_service(tmp.path(), model, exec.clone());
+
+    let outcome = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("run");
+
+    assert!(
+        has_needle_dispatch(&outcome),
+        "needle may act instead of the model: {:?}",
+        event_kinds(&outcome)
+    );
+    assert_eq!(exec.recorded_file_ops().len(), 1, "the dispatch executed");
+    assert_eq!(outcome.turns, 0, "no model turn ran");
+}
+
+#[tokio::test]
+async fn a_chat_only_model_still_receives_zero_tools_when_it_answers() {
+    // The other half of the capability gate: when needle declines, the
+    // chat-only model's run is still a plain completion — the reorder
+    // changed what *needle* is offered, never what the model is.
     let tmp = tempfile::tempdir().expect("tempdir");
     let model = Arc::new(
         MockModel::new().with_capabilities(forge_core::ModelCapabilities {
@@ -2141,7 +2178,7 @@ async fn needle_fast_path_requires_a_tool_capable_model() {
     let service = needle_service(tmp.path(), model, exec.clone());
 
     let outcome = service
-        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .run("please read Cargo.toml for me")
         .await
         .expect("run");
 
@@ -2259,17 +2296,15 @@ async fn a_dispatched_turn_records_a_decide_stage_with_the_dispatch_outcome() {
     assert_eq!(decide.choice, "read_file");
     assert_eq!(decide.question, "tool");
 
-    // The decide-before-routing reorder is NOT part of this wiring: on main
-    // routing happens first, so a dispatched turn also carries a route record
-    // for the model it never called. When the reorder lands this assertion
-    // flips to "no route record on a dispatched turn".
-    let route = records
-        .iter()
-        .find(|r| r.stage == forge_session::Stage::Route)
-        .expect("main routes before dispatching");
-    assert_eq!(route.decider, forge_session::Decider::Static);
-    assert_eq!(route.outcome, forge_session::Outcome::Routed);
-    assert_eq!(route.question, "model");
+    // The decide-before-routing reorder: decide runs first, so a dispatched
+    // turn carries NO route record — choosing a model is only meaningful
+    // once a model is known to be answering, and this turn never called one.
+    assert!(
+        records
+            .iter()
+            .all(|r| r.stage != forge_session::Stage::Route),
+        "a dispatched turn must not record a routing decision it never used: {records:?}"
+    );
 
     // The log carries decision shape, never content: the prompt and the tool
     // arguments ("Cargo.toml") must not appear anywhere in it.
@@ -2338,6 +2373,45 @@ async fn a_service_with_no_engine_records_unavailable() {
     assert_eq!(decide.decider, forge_session::Decider::None);
     assert_eq!(decide.outcome, forge_session::Outcome::Unavailable);
     assert_eq!(decide.choice, "none");
+}
+
+#[tokio::test]
+async fn turn_numbers_are_real_and_increment_per_run_in_a_session() {
+    // The turn column joins decision records to the transcript; a
+    // hardcoded 1 on every record would make a multi-turn session's log
+    // unreadable as a sequence.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        text_reply("first"),
+        text_reply("second"),
+    ]));
+    let exec = Arc::new(MockExecution::new(tmp.path()));
+    let service = needle_service(tmp.path(), model, exec);
+
+    let first = service
+        .run("please read Cargo.toml for me")
+        .await
+        .expect("first");
+    let second = service
+        .run_with_options(
+            "and again",
+            crate::service::RunOptions {
+                session_id: Some(first.session_id.clone()),
+                ..crate::service::RunOptions::default()
+            },
+        )
+        .await
+        .expect("second");
+
+    assert_eq!(first.session_id, second.session_id, "one session");
+    let records = decision_records(tmp.path(), &first.session_id);
+    let mut turns: Vec<u32> = records
+        .iter()
+        .filter(|r| r.stage == forge_session::Stage::Decide)
+        .map(|r| r.turn)
+        .collect();
+    turns.sort_unstable();
+    assert_eq!(turns, vec![1, 2], "one decide record per run, numbered");
 }
 
 #[tokio::test]
