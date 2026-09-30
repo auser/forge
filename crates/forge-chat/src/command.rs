@@ -14,7 +14,7 @@
 //! unrecognised `/word` is an error rather than a prompt, because silently
 //! sending a mistyped command to a model is how you pay for a typo.
 
-use crate::io::{CompletionSnapshot, Line};
+use crate::io::{CompletionCandidate, CompletionSnapshot, Line};
 
 /// The four approval policies (§9.1). One list, so the `/approval`
 /// completion candidates and the value the controller accepts cannot drift.
@@ -161,7 +161,7 @@ impl Command {
                 None => Parsed::Usage("/attach <run-id>"),
             },
             // Commands win over skills, so a skill cannot shadow `/help`.
-            _ if snapshot.skills.iter().any(|skill| skill == name) => {
+            _ if snapshot.skills.iter().any(|(skill, _)| skill == name) => {
                 Parsed::Prompt(skill_prompt(name, &rest))
             }
             _ => Parsed::Unknown(name.to_string()),
@@ -169,13 +169,19 @@ impl Command {
     }
 
     /// What `Tab` offers at `pos`, and the byte offset the offered items
-    /// replace from (§9.2).
+    /// replace from (§9.2). Candidates carry a display string beside the
+    /// replacement, so the listing shows what each command *does* — the
+    /// difference between a list of names and a menu.
     ///
     /// `pos` is a byte offset into `line`, as rustyline reports it; a
     /// nonsensical one is clamped rather than panicking, because this runs
     /// on the editor thread and a completer must never take the process
     /// down.
-    pub fn complete(line: &str, pos: usize, snapshot: &CompletionSnapshot) -> (usize, Vec<String>) {
+    pub fn complete(
+        line: &str,
+        pos: usize,
+        snapshot: &CompletionSnapshot,
+    ) -> (usize, Vec<CompletionCandidate>) {
         let head = &line[..clamp_boundary(line, pos)];
         let word_start = head
             .char_indices()
@@ -193,9 +199,14 @@ impl Command {
             }
             let candidates = COMMANDS
                 .iter()
-                .map(|(name, _)| (*name).to_string())
-                .chain(snapshot.skills.iter().map(|skill| format!("/{skill}")));
-            return (word_start, filtered(candidates, word));
+                .map(|(name, description)| (name.to_string(), description.to_string()))
+                .chain(
+                    snapshot
+                        .skills
+                        .iter()
+                        .map(|(name, description)| (format!("/{name}"), description.clone())),
+                );
+            return (word_start, described(candidates, word));
         }
 
         // An argument, and only the *first* one: `/model a b` completes
@@ -218,7 +229,18 @@ impl Command {
             // tools, and half-working path completion is worse than none.
             _ => Vec::new(),
         };
-        (word_start, filtered(candidates.into_iter(), word))
+        // Argument candidates display as themselves — they are values, not
+        // menu entries with something to explain.
+        (
+            word_start,
+            filtered(candidates.into_iter(), word)
+                .into_iter()
+                .map(|replacement| CompletionCandidate {
+                    display: replacement.clone(),
+                    replacement,
+                })
+                .collect(),
+        )
     }
 
     /// Was this line *meant* as a command?
@@ -298,6 +320,33 @@ fn filtered(candidates: impl Iterator<Item = String>, word: &str) -> Vec<String>
         .collect()
 }
 
+/// Prefix-filter (name, description) pairs, then align the descriptions
+/// into a column: `/help   every command, then the discovered skills`.
+fn described(
+    candidates: impl Iterator<Item = (String, String)>,
+    word: &str,
+) -> Vec<CompletionCandidate> {
+    let matches: Vec<(String, String)> = candidates
+        .filter(|(name, _)| name.starts_with(word))
+        .collect();
+    let width = matches
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0);
+    matches
+        .into_iter()
+        .map(|(name, description)| CompletionCandidate {
+            display: if description.is_empty() {
+                name.clone()
+            } else {
+                format!("{name:<width$}  {description}")
+            },
+            replacement: name,
+        })
+        .collect()
+}
+
 /// The largest byte offset <= `pos` that is a char boundary of `line`.
 fn clamp_boundary(line: &str, pos: usize) -> usize {
     let mut pos = pos.min(line.len());
@@ -313,11 +362,18 @@ mod tests {
 
     fn snapshot() -> CompletionSnapshot {
         CompletionSnapshot {
-            skills: vec!["tdd".into(), "code-reviewer".into()],
+            skills: vec![
+                ("tdd".into(), "test-driven development".into()),
+                ("code-reviewer".into(), "review the diff".into()),
+            ],
             models: vec!["qwen3-coder".into(), "deepseek-chat".into()],
             jobs: vec!["01JCF4ABC".into()],
             sessions: vec!["01JCF3XYZ".into()],
         }
+    }
+
+    fn replacements(items: &[CompletionCandidate]) -> Vec<&str> {
+        items.iter().map(|c| c.replacement.as_str()).collect()
     }
 
     #[test]
@@ -425,31 +481,56 @@ mod tests {
         let s = snapshot();
         let (start, items) = Command::complete("/s", 2, &s);
         assert_eq!(start, 0);
-        assert!(items.contains(&"/session".to_string()));
-        assert!(items.contains(&"/skills".to_string()));
-        assert!(!items.contains(&"/help".to_string()));
+        let names = replacements(&items);
+        assert!(names.contains(&"/session"));
+        assert!(names.contains(&"/skills"));
+        assert!(!names.contains(&"/help"));
         let (_, skills) = Command::complete("/t", 2, &s);
         assert!(
-            skills.contains(&"/tdd".to_string()),
+            replacements(&skills).contains(&"/tdd"),
             "skills complete too: {skills:?}"
         );
+    }
+
+    /// The listing shows what a command does; only the name is inserted.
+    #[test]
+    fn completion_displays_descriptions_but_replaces_with_names() {
+        let s = snapshot();
+        let (_, items) = Command::complete("/skills", 7, &s);
+        let skills = items
+            .iter()
+            .find(|c| c.replacement == "/skills")
+            .expect("the /skills candidate");
+        assert_eq!(skills.replacement, "/skills");
+        assert!(
+            skills.display.starts_with("/skills"),
+            "display leads with the name: {skills:?}"
+        );
+        assert!(
+            skills.display.contains("discovered skills"),
+            "display carries the description: {skills:?}"
+        );
+        let (_, items) = Command::complete("/tdd", 4, &s);
+        let tdd = items
+            .iter()
+            .find(|c| c.replacement == "/tdd")
+            .expect("the /tdd candidate");
+        assert_eq!(tdd.display, "/tdd  test-driven development");
     }
 
     #[test]
     fn completion_offers_arguments_per_command() {
         let s = snapshot();
         assert_eq!(
-            Command::complete("/model ", 7, &s).1,
-            vec!["qwen3-coder".to_string(), "deepseek-chat".to_string()]
+            replacements(&Command::complete("/model ", 7, &s).1),
+            vec!["qwen3-coder", "deepseek-chat"]
         );
         assert_eq!(
-            Command::complete("/attach ", 8, &s).1,
-            vec!["01JCF4ABC".to_string()]
+            replacements(&Command::complete("/attach ", 8, &s).1),
+            vec!["01JCF4ABC"]
         );
         assert!(
-            Command::complete("/approval ", 10, &s)
-                .1
-                .contains(&"prompt-dangerous".to_string())
+            replacements(&Command::complete("/approval ", 10, &s).1).contains(&"prompt-dangerous")
         );
         // No path completion in v1, and no guessing inside a prompt.
         assert!(Command::complete("explain the ", 12, &s).1.is_empty());
@@ -463,34 +544,40 @@ mod tests {
     #[test]
     fn completion_offers_only_the_snapshot_and_the_command_table() {
         let s = snapshot();
-        assert_eq!(Command::complete("/model ", 7, &s).1, s.models);
-        assert_eq!(Command::complete("/attach ", 8, &s).1, s.jobs);
         assert_eq!(
-            Command::complete("/approval ", 10, &s).1,
-            APPROVAL_MODES
-                .iter()
-                .map(|m| m.to_string())
-                .collect::<Vec<_>>()
+            replacements(&Command::complete("/model ", 7, &s).1),
+            ["qwen3-coder", "deepseek-chat"]
+        );
+        assert_eq!(
+            replacements(&Command::complete("/attach ", 8, &s).1),
+            ["01JCF4ABC"]
+        );
+        assert_eq!(
+            replacements(&Command::complete("/approval ", 10, &s).1),
+            APPROVAL_MODES.to_vec()
         );
         let expected: Vec<String> = COMMANDS
             .iter()
-            .map(|(name, _)| name.to_string())
-            .chain(s.skills.iter().map(|skill| format!("/{skill}")))
+            .map(|(name, _)| (*name).to_string())
+            .chain(s.skills.iter().map(|(name, _)| format!("/{name}")))
             .collect();
-        assert_eq!(Command::complete("/", 1, &s).1, expected);
+        let names: Vec<String> = replacements(&Command::complete("/", 1, &s).1)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(names, expected);
     }
 
     #[test]
     fn session_completion_offers_new_and_the_recent_sessions() {
         let s = snapshot();
         assert_eq!(
-            Command::complete("/session ", 9, &s).1,
-            vec!["new".to_string(), "01JCF3XYZ".to_string()]
+            replacements(&Command::complete("/session ", 9, &s).1),
+            vec!["new", "01JCF3XYZ"]
         );
-        assert_eq!(
-            Command::complete("/session 01J", 12, &s),
-            (9, vec!["01JCF3XYZ".to_string()])
-        );
+        let (start, items) = Command::complete("/session 01J", 12, &s);
+        assert_eq!(start, 9);
+        assert_eq!(replacements(&items), vec!["01JCF3XYZ"]);
     }
 
     /// Completion is for the *current* word only: a third token completes

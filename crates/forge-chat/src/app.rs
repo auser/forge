@@ -336,7 +336,12 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// be doing this filesystem work, scaling with session count and log
     /// size, once per event instead of once per prompt.
     fn refresh_completions(&mut self) {
-        let skills = self.host.skills().into_iter().map(|s| s.name).collect();
+        let skills = self
+            .host
+            .skills()
+            .into_iter()
+            .map(|s| (s.name, s.description))
+            .collect();
         let models = self.host.models().into_iter().map(|m| m.name).collect();
         let jobs = self
             .host
