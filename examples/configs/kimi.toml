@@ -1,0 +1,11 @@
+# Plug-and-play with Kimi: Moonshot's Kimi K2.7 Code as the model, the
+# embedded needle brain deciding underneath (the default router).
+#
+# Credential: MOONSHOT_API_KEY in .env / your shell — see env.example.
+
+model = "kimi-k2.7-code"
+execution = "native"
+approval = "prompt"
+
+# Tip: `forge model list` shows every model your keys unlock; switch any
+# time by changing this one line (or /model inside the chat).

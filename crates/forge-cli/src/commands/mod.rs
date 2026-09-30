@@ -7,6 +7,7 @@ pub mod graph_cmd;
 pub mod init;
 pub mod mcp_cmd;
 pub mod model_cmd;
+pub mod presets;
 pub mod router_cmd;
 pub mod run_cmd;
 pub mod serve_cmd;
@@ -82,7 +83,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             )
             .await
         }
-        Some(Command::Init) => init::run(&ctx),
+        Some(Command::Init { preset }) => init::run(&ctx, preset.as_deref()),
         Some(Command::Version) => {
             let name = "forge";
             let version = env!("CARGO_PKG_VERSION");

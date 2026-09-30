@@ -56,7 +56,14 @@ struct InitItem {
 
 /// Idempotent project initialization: `.forge/` directories, starter config
 /// (only when absent), and a single `.forge/` line in `.gitignore`.
-pub fn run(ctx: &Context) -> Result<(), ForgeError> {
+pub fn run(ctx: &Context, preset: Option<&str>) -> Result<(), ForgeError> {
+    // Validate the name before doing any work: an unknown preset is an
+    // error whether or not a config already exists (where it would
+    // otherwise be silently "preserved").
+    let contents = match preset {
+        Some(name) => Some(crate::commands::presets::get(name)?),
+        None => None,
+    };
     let start = match &ctx.global.project {
         Some(p) => p.clone(),
         None => std::env::current_dir().map_err(ForgeError::Io)?,
@@ -90,14 +97,18 @@ pub fn run(ctx: &Context) -> Result<(), ForgeError> {
         items.push(InitItem {
             status: ItemStatus::Unchanged,
             path: config_path,
-            note: Some("existing config preserved".to_string()),
+            note: Some(match preset {
+                Some(name) => format!("existing config preserved — `--preset {name}` did not overwrite it; delete the file or edit it by hand"),
+                None => "existing config preserved".to_string(),
+            }),
         });
     } else {
-        std::fs::write(&config_path, STARTER_CONFIG).map_err(ForgeError::Io)?;
+        let contents = contents.unwrap_or(STARTER_CONFIG);
+        std::fs::write(&config_path, contents).map_err(ForgeError::Io)?;
         items.push(InitItem {
             status: ItemStatus::Created,
             path: config_path,
-            note: None,
+            note: preset.map(|name| format!("preset: {name}")),
         });
     }
 
