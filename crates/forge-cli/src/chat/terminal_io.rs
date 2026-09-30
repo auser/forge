@@ -285,6 +285,17 @@ fn editor_thread_main(
     // and unsynchronized with an in-progress prompt, but never able to wedge
     // the next `readline()`. A notice printed awkwardly beats a chat that
     // stops accepting input.
+    //
+    // The fix for this already exists upstream: rustyline commit f2bbcc5
+    // ("Check input buffer before polling", 2026-09-12) adds exactly the
+    // guard described above to `wait_for_input`, but no release after
+    // 18.0.1 contains it yet. Verified against this module's own
+    // reproduction (burst-written line after a Ctrl-C, real
+    // `ExternalPrinter` restored, pty suite green) on a `[patch.crates-io]`
+    // build of rustyline master. When a release > 18.0.1 ships: bump the
+    // dependency and restore `editor.create_external_printer()` here
+    // (synchronized notices, prompt redraw included), keeping
+    // `StdoutPrinter` only for terminals that cannot do that.
     let printer: Box<dyn ExternalPrinter + Send> = Box::new(StdoutPrinter);
     if ready_tx.send(StartupResult::Ready(printer)).is_err() {
         return; // the caller gave up before we were ready
