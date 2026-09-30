@@ -63,11 +63,6 @@ pub enum ForgeError {
     /// "cancelled" for the log and for callers that only have a string.
     #[error("run cancelled: {0}")]
     Cancelled(String),
-
-    /// Returned by commands or backends that exist in the interface but are
-    /// scheduled for a later phase.
-    #[error("not yet implemented: {0}")]
-    NotImplemented(String),
 }
 
 impl ForgeError {
@@ -116,9 +111,5 @@ impl ForgeError {
 
     pub fn cancelled(message: impl Into<String>) -> Self {
         Self::Cancelled(message.into())
-    }
-
-    pub fn not_implemented(what: impl Into<String>) -> Self {
-        Self::NotImplemented(what.into())
     }
 }

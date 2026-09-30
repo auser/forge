@@ -158,6 +158,8 @@ async fn run_lifecycle_end_to_end() {
             "routing_decision_made",
             // v3 replay record of the model's answer
             "assistant_message",
+            // the answer's round trip is a turn too
+            "turn_completed",
             "completed"
         ]
     );
@@ -533,6 +535,7 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
             "tool_result",
             "turn_completed",
             "assistant_message",
+            "turn_completed",
             "completed"
         ],
         "event order: {types:?}"
@@ -542,7 +545,7 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
         .iter()
         .map(|e| e["seq"].as_u64().expect("seq"))
         .collect();
-    assert_eq!(seqs, (1..=11).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=12).collect::<Vec<_>>());
     assert!(
         events
             .iter()

@@ -200,30 +200,37 @@ fn parse_lang(content: &str, defs: &[DefSpec], imports: &[&'static str], lang: &
                 break;
             }
         }
-        for caps in call_re().captures_iter(line) {
-            let Some(name) = caps.get(1) else { continue };
-            let name_str = name.as_str();
-            if stop.contains(&name_str) {
-                continue;
-            }
-            // Skip call matches that are actually this line's definition.
-            if out
-                .symbols
-                .iter()
-                .any(|s| s.line == line_no && s.name == name_str)
-            {
-                continue;
-            }
-            let enclosing = out
-                .symbols
-                .iter()
-                .rfind(|s| s.line <= line_no)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            out.calls.push((enclosing, name_str.to_string(), line_no));
-        }
+        record_calls(&mut out, stop, line, line_no);
     }
     out
+}
+
+/// Record the call sites on one line: every `name(` match, minus stopwords
+/// and the line's own definition, attributed to the nearest enclosing
+/// symbol at or above the line.
+fn record_calls(out: &mut FileParse, stop: &[&str], line: &str, line_no: u32) {
+    for caps in call_re().captures_iter(line) {
+        let Some(name) = caps.get(1) else { continue };
+        let name_str = name.as_str();
+        if stop.contains(&name_str) {
+            continue;
+        }
+        // Skip call matches that are actually this line's definition.
+        if out
+            .symbols
+            .iter()
+            .any(|s| s.line == line_no && s.name == name_str)
+        {
+            continue;
+        }
+        let enclosing = out
+            .symbols
+            .iter()
+            .rfind(|s| s.line <= line_no)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        out.calls.push((enclosing, name_str.to_string(), line_no));
+    }
 }
 
 /// Go needs import-block handling, so it gets its own pass.
@@ -274,27 +281,7 @@ fn parse_go(content: &str) -> FileParse {
                 line: line_no,
             });
         }
-        for caps in call_re().captures_iter(line) {
-            let Some(name) = caps.get(1) else { continue };
-            let name_str = name.as_str();
-            if stop.contains(&name_str) {
-                continue;
-            }
-            if out
-                .symbols
-                .iter()
-                .any(|s| s.line == line_no && s.name == name_str)
-            {
-                continue;
-            }
-            let enclosing = out
-                .symbols
-                .iter()
-                .rfind(|s| s.line <= line_no)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            out.calls.push((enclosing, name_str.to_string(), line_no));
-        }
+        record_calls(&mut out, stop, line, line_no);
     }
     out
 }

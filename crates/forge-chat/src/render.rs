@@ -254,7 +254,7 @@ fn plural(n: u64) -> &'static str {
 /// interesting call (`write_file` with real content) is exactly the one cut
 /// mid-string. When the field cannot be recovered the raw summary is shown,
 /// ellipsized: a line the user can squint at beats no line at all.
-pub fn summarize_call(tool: &str, args_summary: &str) -> String {
+pub(crate) fn summarize_call(tool: &str, args_summary: &str) -> String {
     let field = |key: &str| forge_core::tool_arg_field(args_summary, key);
     let friendly = match tool {
         "read_file" | "write_file" | "edit_file" | "delete_file" => field("path"),

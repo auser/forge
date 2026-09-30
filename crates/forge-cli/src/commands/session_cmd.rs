@@ -238,7 +238,6 @@ pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
                         }
                     }
                     forge_session::Stage::Route => routed += 1,
-                    _ => {}
                 }
             }
         }

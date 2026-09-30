@@ -112,8 +112,8 @@ impl Line {
 /// The snapshot travels *inside* [`Prompt`], so the completer is a pure
 /// function of it: it never calls back into the host and never touches the
 /// filesystem from the editor thread. The commands themselves are compiled
-/// in; everything here is what only the host (or the last `/jobs`
-/// listing) can know.
+/// in; everything here is what only the host (or a `list_runs()` refresh)
+/// can know.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompletionSnapshot {
     /// Discovered skills, offered as `/name`.
@@ -122,7 +122,7 @@ pub struct CompletionSnapshot {
     /// [`crate::host::ChatHost::models`], which is the one place test-only
     /// entries are dropped.
     pub models: Vec<String>,
-    /// Run ids from the last `/jobs` snapshot.
+    /// Run ids from the latest `list_runs()` refresh.
     pub jobs: Vec<String>,
     /// The project's recent session ids.
     pub sessions: Vec<String>,

@@ -33,7 +33,6 @@ impl From<ForgeError> for ApiError {
             // The session exists and is fine; it is busy. A retry after the
             // in-flight run finishes succeeds, which is exactly 409.
             ForgeError::SessionBusy { .. } => StatusCode::CONFLICT,
-            ForgeError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ForgeError::Config(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

@@ -35,28 +35,16 @@ pub struct SessionInfo {
 /// cached in memory.
 pub struct JsonlSessionStore {
     root: PathBuf,
-    session_id: Option<String>,
     redactor: Redactor,
     /// run_id → last assigned seq.
     seq_counters: Mutex<HashMap<String, u64>>,
 }
 
 impl JsonlSessionStore {
-    /// Unbound store; `events()` reads every session file.
+    /// `events()` reads every session file under `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            session_id: None,
-            redactor: Redactor::new(),
-            seq_counters: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Store bound to one session; `events()` reads only that session.
-    pub fn for_session(root: impl Into<PathBuf>, session_id: impl Into<String>) -> Self {
-        Self {
-            root: root.into(),
-            session_id: Some(session_id.into()),
             redactor: Redactor::new(),
             seq_counters: Mutex::new(HashMap::new()),
         }
@@ -161,8 +149,7 @@ impl JsonlSessionStore {
             // `<id>.decisions.jsonl` is the decision log living beside the
             // transcript (see `decisions.rs`), not a session: skip it by
             // name, or it would surface as a phantom session whose id ends
-            // in ".decisions" — and `latest_session` would happily resume
-            // it.
+            // in ".decisions".
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -236,21 +223,6 @@ impl JsonlSessionStore {
         }
         out.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         Ok(out)
-    }
-
-    /// Most recently modified session id, if any.
-    pub fn latest_session(&self) -> Result<Option<String>, ForgeError> {
-        let mut latest: Option<(std::time::SystemTime, String)> = None;
-        for info in self.list_sessions()? {
-            let modified = std::fs::metadata(&info.path)
-                .and_then(|m| m.modified())
-                .map_err(ForgeError::Io)?;
-            let newer = latest.as_ref().is_none_or(|(ts, _)| modified > *ts);
-            if newer {
-                latest = Some((modified, info.session_id));
-            }
-        }
-        Ok(latest.map(|(_, id)| id))
     }
 
     /// Find the session containing a given run id.
@@ -329,16 +301,11 @@ impl SessionStore for JsonlSessionStore {
     }
 
     fn events(&self) -> Result<Vec<Event>, ForgeError> {
-        match &self.session_id {
-            Some(id) => self.events_for(id),
-            None => {
-                let mut all = Vec::new();
-                for info in self.list_sessions()? {
-                    all.extend(self.events_for(&info.session_id)?);
-                }
-                Ok(all)
-            }
+        let mut all = Vec::new();
+        for info in self.list_sessions()? {
+            all.extend(self.events_for(&info.session_id)?);
         }
+        Ok(all)
     }
 }
 
@@ -382,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_listed_and_latest_is_found() {
+    fn sessions_are_listed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = JsonlSessionStore::new(tmp.path());
         for (session, n) in [("sess-a", 1usize), ("sess-b", 2)] {
@@ -400,10 +367,6 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "sess-a");
         assert_eq!(sessions[1].event_count, 2);
-        assert_eq!(
-            store.latest_session().expect("latest"),
-            Some("sess-b".to_string())
-        );
     }
 
     /// The decision log lives beside the transcripts as

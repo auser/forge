@@ -246,10 +246,6 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                 // the resolution order a run uses.
                 let url = forge_providers::model_endpoint(config);
                 let check = match url {
-                    // `local_only` refuses this provider at construction, so
-                    // every run fails: Fail, and no network probe — reaching
-                    // out to the very host the setting forbids would be the
-                    // check contradicting the guarantee it reports on.
                     // The provider crate refuses this at construction, so
                     // every run fails: Fail, and no probe — reaching out to
                     // the host the setting forbids would be this check
@@ -500,7 +496,7 @@ fn check_config_file(checks: &mut Vec<Check>, label: &str, path: &Path) {
 /// Probe the embedded Needle brain and report it as **one line-pair**:
 ///
 /// ```text
-/// [warn] needle engine: backend not in this build; weights not fetched (init skips them without a backend)
+/// [warn] needle engine: backend not in this build (no engine linked); weights not fetched (…) — nothing here could use them
 /// [warn] needle brain: inactive — falling back to static routing; install a build with the brain: `cargo install …`
 /// ```
 ///

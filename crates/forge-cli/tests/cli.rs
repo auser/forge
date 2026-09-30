@@ -464,8 +464,8 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     let stdout = String::from_utf8(list.stdout).expect("utf8");
     assert!(stdout.contains(session_id), "list output: {stdout}");
     // run_started, routing_decision_made, assistant_message (the v3 replay
-    // record of the model's answer), completed.
-    assert!(stdout.contains("4 events"), "list output: {stdout}");
+    // record of the model's answer), turn_completed, completed.
+    assert!(stdout.contains("5 events"), "list output: {stdout}");
 
     // resume continues the completed run: a NEW run in the same session,
     // replaying the session's conversation, printing the new run's output.

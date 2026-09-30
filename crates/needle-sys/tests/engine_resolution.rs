@@ -399,7 +399,7 @@ fn libcxx_installed() -> CxxAvailability {
 /// namespace; nothing on a Linux target may ever name libstdc++ by default
 /// again.
 ///
-/// Evidence for the rule is on `cxx_runtime_flags` (an `nm --undefined-only`
+/// Evidence for the rule is on `cxx_plan` (an `nm --undefined-only`
 /// census of all five downloaded artifacts: libc++ symbols everywhere, zero
 /// libstdc++ ones) and was confirmed by linking and running the real engine in
 /// an `ubuntu:24.04` container.

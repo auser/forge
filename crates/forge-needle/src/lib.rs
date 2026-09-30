@@ -23,6 +23,14 @@ pub use weights::{WeightsSpec, WeightsStatus, ensure_weights, spec_for, verify, 
 /// [`engine_from_config`] picks [`backend::UnavailableBackend`] instead.
 pub const HAS_EMBEDDED_BACKEND: bool = needle_sys::ENGINE_LINKED;
 
+/// Where the weights for `needle.variant` resolve to. A path-resolution
+/// failure (e.g. an unpinned variant with no cached override) degrades to
+/// the best-effort path rather than erroring: routing built on it still
+/// falls back to the configured fallback router instead of guessing.
+fn resolved_weights_path(needle: &forge_config::NeedleConfig) -> std::path::PathBuf {
+    weights::weights_path(needle).unwrap_or_else(|_| weights::best_effort_path(needle))
+}
+
 /// Build an engine from `[needle]` config: resolve where weights for
 /// `needle.variant` should live (`weights::weights_path`), then pick a
 /// backend.
@@ -53,8 +61,7 @@ pub fn engine_from_config(
     needle: &forge_config::NeedleConfig,
 ) -> Result<NeedleEngine, forge_core::error::ForgeError> {
     if HAS_EMBEDDED_BACKEND {
-        let path =
-            weights::weights_path(needle).unwrap_or_else(|_| weights::best_effort_path(needle));
+        let path = resolved_weights_path(needle);
         Ok(NeedleEngine::spawn(ffi_backend::FfiBackend::new(path)))
     } else {
         // No engine in this build, so where the weights would live is not
@@ -106,13 +113,10 @@ pub fn select_engine(
     needle: &forge_config::NeedleConfig,
 ) -> Result<Arc<NeedleEngine>, forge_core::error::ForgeError> {
     let hash_backend = matches!(std::env::var("FORGE_NEEDLE_BACKEND").as_deref(), Ok("hash"));
-    // Mirrors `engine_from_config`'s own resolution, so two callers with the
-    // same config compute the same key.
     let key = if hash_backend {
         "hash".to_string()
     } else {
-        let path =
-            weights::weights_path(needle).unwrap_or_else(|_| weights::best_effort_path(needle));
+        let path = resolved_weights_path(needle);
         format!("config:{}", path.display())
     };
 
