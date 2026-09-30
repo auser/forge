@@ -1,0 +1,19 @@
+# Hosted decisions from meraGPT's Decider 1: typed routing answers from
+# their hosted System One model ($0.03/1M input tokens, no output charge).
+# Decider 1 speaks the System One wire contract, so forge's jev router
+# drives it by changing the endpoint and the model id.
+#
+# Credential: MERAGPT_API_KEY in .env / your shell.
+#
+# Two limits to know (meragpt.com docs): a request holds at most 4,096
+# tokens, and a choice question offers at most ten options — the default
+# model registry fits; prune [models] entries if yours has more.
+
+router = "jev"
+jev_url = "https://meragpt.com/v1/systemone"
+jev_key_env = "MERAGPT_API_KEY"
+jev_model = "sd-1"
+
+model = "deepseek-chat"      # cheapest capable hosted model for generation
+execution = "native"
+approval = "prompt"

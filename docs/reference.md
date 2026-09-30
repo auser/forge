@@ -370,7 +370,9 @@ forge init --preset claude     # writes examples/configs/claude.toml as .forge/c
 ```
 
 See [`examples/configs/`](examples/configs/) for `claude`, `codex` and
-`kimi` (plug-and-play with each tool's usual credential), plus
+`kimi` (plug-and-play with each tool's usual credential), `kev`
+(self-hosted System One routing: Kev, CLM or OpenJev on your own
+hardware) and `decider` (hosted routing from meraGPT's Decider 1), plus
 `local-first` (the default stack, made explicit), `hybrid-needle` (local
 first, hosted escalation), `budget-hosted`, and `hybrid-laya` (the
 Laya-adapter example), and an [`env.example`](examples/env.example)
@@ -918,12 +920,18 @@ Seven modes:
   brain](#embedded-needle-brain) — and falls back to static without
   it, or when weights are unavailable: unpinned variant, `--local-only`,
   no network),
-- `jev` (Jev/OpenJev System One decision model — TypeSafe's hosted API at
-  `https://api.typesafe.ai/v1/systemone` by default, or a self-hosted
-  [OpenJev](https://github.com/razorback16/openjev) server via `jev_url`;
-  bearer token from `jev_key_env`, default `TYPESAFE_API_KEY`; as primary,
-  also accepts `router_url`/`router_key_env` as a fallback; falls back to
-  static when unreachable or uncredentialed),
+- `jev` (the System One family over one wire contract — TypeSafe's hosted
+  Jev at `https://api.typesafe.ai/v1/systemone` by default; a self-hosted
+  [OpenJev](https://github.com/razorback16/openjev), **Kev** or **CLM**
+  server via `jev_url` (the `kev` preset); or meraGPT's hosted **Decider
+  1** via `jev_url = "https://meragpt.com/v1/systemone"` with
+  `jev_model = "sd-1"` (the `decider` preset). Bearer token from
+  `jev_key_env`, default `TYPESAFE_API_KEY`; as primary, also accepts
+  `router_url`/`router_key_env` as a fallback. The request's model id
+  defaults to the `jev-latest` alias; backends that validate it take
+  `jev_model`. Decider 1 caps a choice question at ten options and a
+  request at 4,096 tokens — prune `[models]` entries to fit; falls back
+  to static when unreachable or uncredentialed),
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `static` (deterministic rules),

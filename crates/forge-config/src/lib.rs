@@ -158,6 +158,12 @@ pub struct Config {
     /// `jev_url`. Escalation uses `jev_key_env` or `TYPESAFE_API_KEY` only;
     /// `router = "jev"` as primary also falls back to `router_key_env`.
     pub jev_key_env: Option<String>,
+    /// Model id sent as the request's top-level `model` field. Defaults to
+    /// `jev-latest`, the alias TypeSafe's hosted Jev and OpenJev both
+    /// accept; set it for a backend that wants its own id (meraGPT's
+    /// Decider 1 takes `sd-1`; a self-hosted Kev/CLM server may take its
+    /// own).
+    pub jev_model: Option<String>,
     pub router_timeout_ms: u64,
     pub execution: String,
     pub approval: String,
@@ -394,6 +400,7 @@ impl Default for Config {
             router_escalate: "auto".to_string(),
             jev_url: None,
             jev_key_env: None,
+            jev_model: None,
             router_timeout_ms: 5_000,
             execution: "native".to_string(),
             approval: "prompt".to_string(),
@@ -495,6 +502,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_ROUTER_ESCALATE", "router_escalate"),
     ("FORGE_JEV_URL", "jev_url"),
     ("FORGE_JEV_KEY_ENV", "jev_key_env"),
+    ("FORGE_JEV_MODEL", "jev_model"),
     ("FORGE_EXECUTION", "execution"),
     ("FORGE_APPROVAL", "approval"),
     ("FORGE_LOCAL_ONLY", "local_only"),

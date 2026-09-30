@@ -834,6 +834,7 @@ fn build_jev(
         crate::JevRouter::builder()
             .url(resolved_jev_url(config, escalation))
             .key_env(Some(resolved_jev_key_env(config, escalation)))
+            .model_id(config.jev_model.clone())
             .timeout(Duration::from_millis(config.router_timeout_ms))
             .registry(registry.to_vec())
             .egress(EgressPolicy::from_config(config))

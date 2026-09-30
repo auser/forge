@@ -33,6 +33,11 @@ pub const PRESETS: &[(&str, &str)] = &[
         "kimi",
         include_str!("../../../../examples/configs/kimi.toml"),
     ),
+    ("kev", include_str!("../../../../examples/configs/kev.toml")),
+    (
+        "decider",
+        include_str!("../../../../examples/configs/decider.toml"),
+    ),
 ];
 
 /// The preset named `name`, or an error listing the valid ones.
