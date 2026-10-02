@@ -619,6 +619,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Action::Fork(at) => self.do_fork(at),
                 Action::ListJobs => self.do_list_jobs(),
                 Action::Attach(run_id) => self.do_attach(run_id),
+                Action::Show(n) => self.do_show(n),
                 Action::CancelAllJobs => self.do_cancel_all_jobs(),
                 Action::Quit(code) => self.exit_code = Some(code),
             }
@@ -915,6 +916,35 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         }
         for skill in self.host.skills() {
             self.emit(Line::meta(format!("/{} {}", skill.name, skill.description)));
+        }
+    }
+
+    /// `/show [n]` (design §14): re-render the nth most recent recorded
+    /// tool result of the current session from its log — the one place the
+    /// payloads live, since `TranscriptState` retains none (§5). The same
+    /// synchronous store read `/session` and resume already make; mid-turn
+    /// the lines go through `notify` like every other print (`emit`).
+    fn do_show(&mut self, n: Option<usize>) {
+        let ordinal = n.unwrap_or(1);
+        match self.host.service().sessions().events_for(&self.session_id) {
+            Ok(events) => match crate::show::select(&events, ordinal) {
+                Some(selected) => {
+                    for line in crate::show::lines(&selected) {
+                        self.emit(line);
+                    }
+                }
+                None => {
+                    let total = crate::show::count(&events);
+                    self.emit(Line::meta(if total == 0 {
+                        "no tool results in this session yet".to_string()
+                    } else {
+                        format!(
+                            "no tool result {ordinal} in this session - {total} recorded (1 is the most recent)"
+                        )
+                    }));
+                }
+            },
+            Err(e) => self.emit(Line::bad(format!("error: {e}"))),
         }
     }
 
@@ -1472,6 +1502,135 @@ mod tests {
             out.contains("the first answer"),
             "history is re-rendered:\n{out}"
         );
+    }
+
+    /// `/show` (design §14): the recorded payload, on demand, through the
+    /// §4.1 grammar — which the live stream deliberately stays silent for.
+    #[tokio::test]
+    async fn show_rerenders_the_most_recent_tool_result_after_a_turn() {
+        let (host, _tmp) = FakeHost::with_script_and_read_content(
+            r#"[
+            {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "alpha.rs"}}]},
+            {"text": "alpha.rs defines parse_config"}
+        ]"#,
+            "fn parse_config() {}",
+        );
+        let mut io = ScriptedIo::new(["explain alpha.rs", "/show", "/quit"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        assert!(
+            out.contains("  - tool result 1 of 1: read_file alpha.rs (run "),
+            "the meta header names the result and its run:\n{out}"
+        );
+        assert!(
+            out.contains("    -> fn parse_config() {}"),
+            "the recorded payload, verbatim, under the result gutter:\n{out}"
+        );
+    }
+
+    /// The ticket's "works on continued sessions (backlog), not just live
+    /// runs": the source is the session log, so a chat resumed onto the
+    /// session shows the payload without any turn having run in it.
+    #[tokio::test]
+    async fn show_works_on_a_continued_session() {
+        let (host, _tmp) = FakeHost::with_script_and_read_content(
+            r#"[
+            {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "alpha.rs"}}]},
+            {"text": "read it"}
+        ]"#,
+            "fn parse_config() {}",
+        );
+        let service = host.service();
+        let mut first = ScriptedIo::new(["read alpha", "/quit"]);
+        run(first.handle(), host.clone(), Start::fresh())
+            .await
+            .expect("first chat");
+        let session = service.sessions().list_sessions().expect("sessions")[0]
+            .session_id
+            .clone();
+
+        let mut second = ScriptedIo::new(["/show", "/quit"]);
+        run(second.handle(), host, Start::named(&session))
+            .await
+            .expect("second chat");
+        let out = second.output();
+        assert!(
+            out.contains("  - tool result 1 of 1: read_file alpha.rs (run "),
+            "backlog header:\n{out}"
+        );
+        assert!(
+            out.contains("    -> fn parse_config() {}"),
+            "backlog payload:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_reports_when_there_is_nothing_to_show() {
+        let (host, _tmp) = FakeHost::with_script(r#"[{"text": "ok"}]"#);
+        let mut io = ScriptedIo::new(["/show", "/quit"]);
+        run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert!(
+            io.output()
+                .contains("  - no tool results in this session yet"),
+            "{}",
+            io.output()
+        );
+    }
+
+    /// An out-of-range (or zero) ordinal is one informational line naming
+    /// the count and the numbering — never an error, never a turn.
+    #[tokio::test]
+    async fn show_reports_an_out_of_range_ordinal() {
+        let (host, _tmp) = FakeHost::with_script_and_read_content(
+            r#"[
+            {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "alpha.rs"}}]},
+            {"text": "read it"}
+        ]"#,
+            "fn parse_config() {}",
+        );
+        let mut io = ScriptedIo::new(["read alpha", "/show 9", "/show 0", "/quit"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        for n in ["9", "0"] {
+            assert!(
+                out.contains(&format!(
+                    "  - no tool result {n} in this session - 1 recorded (1 is the most recent)"
+                )),
+                "/show {n} gets the informational line:\n{out}"
+            );
+        }
+    }
+
+    /// Read-only means mid-turn too: the show line prints while the turn is
+    /// attached, and the turn still runs to its answer and footer.
+    #[tokio::test]
+    async fn show_mid_turn_does_not_disturb_the_turn() {
+        let (host, _tmp) = FakeHost::with_slow_script();
+        let mut io = ScriptedIo::batch(["something slow", "/show"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        // The slow script makes no tool calls, so the deterministic half of
+        // the mid-turn answer is the nothing-to-show line.
+        assert!(
+            out.contains("  - no tool results in this session yet"),
+            "the mid-turn /show answered:\n{out}"
+        );
+        assert!(
+            out.contains("slow turn done"),
+            "the turn still completed:\n{out}"
+        );
+        assert!(out.contains("  = "), "and printed its footer:\n{out}");
     }
 
     /// Review Focus 4: `/attach` follows a run that finishes on its own —

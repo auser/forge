@@ -510,6 +510,7 @@ session 01JCF3...  /help for commands
 /bg         detach the running turn and keep talking
 /jobs       runs and their states
 /attach     follow a run again by id
+/show       re-render a recorded tool result: /show [n], latest first
 /quit       leave (Ctrl-D does the same)
 /exit       leave (Ctrl-D does the same)
 ```
@@ -524,6 +525,15 @@ adds anything it matches. `/model`,
 entry banner and `/model`/`/config`/`/approval` report the *active* model
 honestly even when it is one — hiding that would be a lie about what is
 running.
+
+The live stream renders a tool call as its one-line summary (`  * read_file
+src/main.rs` / `    -> ok (4 ms)`) and deliberately keeps the payload out of
+the scroll; `/show [n]` re-renders the nth most recent one on demand (`/show`
+alone = the latest). The payload comes from the session log at command time,
+so it works identically mid-turn, after a turn, and on a continued session's
+backlog — and it is exactly the recorded, redacted, ≤64 KiB form the model
+saw. For another session's payloads, or the raw JSON, `forge session show
+<id>` remains the cross-session reader; `/session <id>` + `/show` composes.
 
 ### Keybindings, and the complete Ctrl-C rule
 

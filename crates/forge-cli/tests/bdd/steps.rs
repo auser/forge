@@ -1984,6 +1984,25 @@ fn initialized_project_with_scripted_mock_writes(world: &mut BddWorld, path: Str
     world.set_config("router", "\"static\"");
 }
 
+/// Same shape as the "writes" step above (a two-entry script: a tool
+/// call, then a closing text reply), but the call is a `read_file` and the
+/// file itself is written with known content — the fixture for the `/show`
+/// scenario, which asserts on the recorded payload.
+#[given(expr = "an initialized project with a scripted mock model that reads {string}")]
+fn initialized_project_with_scripted_mock_reads(world: &mut BddWorld, path: String) {
+    let script = format!(
+        r#"[
+            {{"tool_calls": [{{"id": "call_1", "name": "read_file", "arguments": {{"path": "{path}"}}}}]}},
+            {{"text": "read it"}}
+        ]"#
+    );
+    world.write_file("script.json", &script);
+    world.write_file(&path, "fn parse_config() {}\n");
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+    world.set_config("router", "\"static\"");
+}
+
 #[when(expr = "I chat with the lines {string} and {string}")]
 async fn i_chat_with_two_lines(world: &mut BddWorld, first: String, second: String) {
     world
@@ -2191,5 +2210,23 @@ fn assistant_deltas_concatenate_to_final_message(world: &mut BddWorld) {
     assert_eq!(
         deltas, final_text,
         "deltas concatenate to the replayed answer verbatim"
+    );
+}
+
+/// The payload the live stream deliberately stayed silent for, re-rendered
+/// on demand through the result gutter.
+#[then("the chat output shows the recorded tool result")]
+fn chat_output_shows_the_recorded_tool_result(world: &mut BddWorld) {
+    assert!(
+        world
+            .last_stdout
+            .contains("  - tool result 1 of 1: read_file"),
+        "the header names the recorded result:\n{}",
+        world.last_stdout
+    );
+    assert!(
+        world.last_stdout.contains("    -> fn parse_config() {}"),
+        "the recorded payload, verbatim under the result gutter:\n{}",
+        world.last_stdout
     );
 }

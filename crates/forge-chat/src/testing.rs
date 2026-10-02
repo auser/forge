@@ -303,6 +303,9 @@ impl ChatIo for ScriptedIoHandle {
 enum Execution {
     /// Never asks for approval: every op just runs.
     Mock,
+    /// Never asks for approval, and `read_file` returns the given content —
+    /// the fixture for `/show`, which needs a known payload.
+    MockReading(String),
     /// Approval policy `prompt`, channel [`ApprovalChannel::Parked`]: a
     /// risky op always parks with `ForgeError::ApprovalRequired`, exactly
     /// what the chat's own runtime is built with (design §8.1).
@@ -380,6 +383,16 @@ impl FakeHost {
         );
         host.scripted_model = Some(recorded);
         (host, tmp)
+    }
+
+    /// A scripted model over a `MockExecution` whose `read_file` returns
+    /// `content` — the fixture for `/show`, which needs a known payload.
+    /// (`MockExecution::new` serves `Some("")` for reads, which would
+    /// exercise only the `(no output)` branch.)
+    pub fn with_script_and_read_content(json: &str, content: &str) -> (Self, TempDir) {
+        Self::build(Execution::MockReading(content.to_string()), |_root| {
+            Arc::new(ScriptedMockModel::from_json(json).expect("valid script"))
+        })
     }
 
     /// A two-reply script whose model sleeps before every reply — long
@@ -462,6 +475,9 @@ impl FakeHost {
         let model = model(&root);
         let execution: Arc<dyn ExecutionProvider> = match execution {
             Execution::Mock => Arc::new(MockExecution::new(&root)),
+            Execution::MockReading(content) => {
+                Arc::new(MockExecution::new(&root).with_read_content(content))
+            }
             Execution::Writing => Arc::new(NativeExecution::with_channel(
                 ApprovalPolicy::Prompt,
                 &root,

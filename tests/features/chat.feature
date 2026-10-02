@@ -28,3 +28,8 @@ Feature: Interactive chat
     When I chat with the lines "first" and "/fork" and "second"
     Then two sessions exist
     And the chat output says the source session is untouched
+
+  Scenario: /show re-renders a recorded tool result on demand
+    Given an initialized project with a scripted mock model that reads "alpha.rs"
+    When I chat with the lines "read alpha" and "/show"
+    Then the chat output shows the recorded tool result
