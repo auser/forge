@@ -878,3 +878,71 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
     child.wait().ok();
     reader_thread.join().expect("pty reader thread");
 }
+
+/// TICKET-4's headline, proved end to end: Tab on an `@`-word completes a
+/// real project path, at the actual prompt of the compiled binary. This
+/// needs a pty because completion only exists on a TTY — §12.3 gives piped
+/// mode none ("there is nobody to complete for") — and adds no new
+/// dependency because the `libc` pty harness above already exists for the
+/// Ctrl-C test.
+///
+/// The graph is built *before* the chat starts: `refresh_completions` at
+/// startup (`app.rs`) is what loads the file list into the snapshot, and
+/// the mtime gate only re-reads on a rebuild.
+#[cfg(unix)]
+#[test]
+fn a_tab_on_an_at_word_completes_a_project_path_on_a_real_terminal() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let built = forge(tmp.path(), &project)
+        .args(["graph", "build"])
+        .output()
+        .expect("run forge graph build");
+    assert!(
+        built.status.success(),
+        "graph build failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    // A real TERM, pinned: rustyline treats `TERM=dumb` (what a CI/agent
+    // shell may leak in) as an unsupported terminal and skips raw mode —
+    // and with it completion — which is correct behavior for a dumb
+    // terminal but is not what this test claims to prove. The same leak is
+    // why the Ctrl-C pty test above is red under a `TERM=dumb` shell even
+    // on a clean tree.
+    let mut cmd = forge(tmp.path(), &project);
+    cmd.env("TERM", "xterm-256color");
+    let (mut child, master) = pty::spawn(cmd).expect("spawn on pty");
+    let mut writer = master.try_clone().expect("clone master for writing");
+    let (output, reader_thread) = tail_stream(master);
+
+    // The two-stage wait of the Ctrl-C test above, for the reason written
+    // there: only the drawn prompt proves `readline()` is blocked in raw
+    // mode on the other end of this pty — a Tab written into the gap
+    // before it would be just a byte in the tty buffer with no completer
+    // attached yet. 30 s bounds, not 10, for the same loaded-machine
+    // reason.
+    wait_for(&output, "/help for commands", Duration::from_secs(30));
+    wait_for(&output, "> ", Duration::from_secs(30));
+
+    // Exactly one graph file starts with "al" (`alpha.rs`), so
+    // `CompletionType::List` completes immediately rather than listing.
+    writer.write_all(b"@al\t").expect("type @al then Tab");
+    // The completed text appears in rustyline's redraw of the input line.
+    // Asserting on the completed path only, never on redraw escapes (the
+    // Ctrl-C test's reasoning): `@alpha.rs` is inserted in one edit, so it
+    // arrives as one contiguous fragment.
+    wait_for(&output, "@alpha.rs", Duration::from_secs(30));
+
+    // The completed line submits as a real turn against the scripted mock,
+    // proving the completed text is what the prompt actually held.
+    writer.write_all(b"\n").expect("submit the completed line");
+    wait_for(&output, "the answer", Duration::from_secs(30));
+
+    // Killed, not asked to `/quit` — the Ctrl-C test's doc gives the
+    // reason (do not race the unrelated outstanding-read hazard).
+    drop(writer);
+    child.kill().ok();
+    child.wait().ok();
+    reader_thread.join().expect("pty reader thread");
+}

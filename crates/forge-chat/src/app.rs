@@ -329,6 +329,10 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// models, and — the two calls that matter here — `list_runs()` and
     /// `sessions().list_sessions()`, both synchronous filesystem reads, the
     /// former re-reading and re-parsing every session's whole JSONL log.
+    /// The project file list for `@`-completion arrives the same way the
+    /// models and skills do — through the host (`ChatHost::project_files`),
+    /// which is required to keep that read bounded (`CliHost` mtime-gates
+    /// the graph file, so a steady-state refresh costs one `stat`).
     /// Called once at startup and once after each *submitted line*
     /// (`on_read`'s `Line` arm), not on every loop iteration: completions
     /// are only ever read back out when a `Prompt` is built for the next
@@ -356,11 +360,13 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             .list_sessions()
             .map(|infos| infos.into_iter().map(|s| s.session_id).collect())
             .unwrap_or_default();
+        let paths = self.host.project_files();
         self.snapshot = CompletionSnapshot {
             skills,
             models,
             jobs,
             sessions,
+            paths,
         };
         self.controller.set_completions(self.snapshot.clone());
     }
@@ -1103,6 +1109,24 @@ async fn join_handle(
 mod tests {
     use super::*;
     use crate::testing::{FakeHost, ScriptedIo};
+
+    /// The host's file list reaches the editor's prompt: after one
+    /// submitted line (which refreshes the snapshot), the next read is
+    /// handed completions that carry the paths.
+    #[tokio::test]
+    async fn the_hosts_project_files_reach_the_prompt_snapshot() {
+        let (host, _tmp) = FakeHost::with_script(r#"[{"text": "ok"}]"#);
+        let host = host.with_paths(vec!["src/main.rs".to_string()]);
+        let mut io = ScriptedIo::new(["anything", "/quit"]);
+        run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(
+            io.last_completions().paths,
+            vec!["src/main.rs".to_string()],
+            "the prompt the editor saw carries the host's paths"
+        );
+    }
 
     /// One turn: the transcript shows the routing line, the tool call, and
     /// the answer exactly once.

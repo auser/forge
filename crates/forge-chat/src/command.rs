@@ -45,6 +45,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
 /// spells it out.
 const FORK_USAGE: &str = "/fork [--at <pos|run-id>]";
 
+/// At most this many path candidates per completion. The listing is
+/// `CompletionType::List`, which is unusable past a screenful; typing one
+/// more character narrows further, so a cap hides nothing reachable.
+const MAX_PATH_CANDIDATES: usize = 100;
+
 /// What one submitted line means. Deliberately data, not an effect: the
 /// controller decides what is *allowed* in the current state (§6.5), and
 /// this decides only what was said.
@@ -191,6 +196,34 @@ impl Command {
             .unwrap_or(0);
         let word = &head[word_start..];
 
+        // A word starting with `@` is a file reference and completes project
+        // paths, at any position — first word of a prompt, mid-prompt, or a
+        // command argument. The trigger is explicit intent, which is what
+        // makes offering always safe: unmarked words never complete as
+        // paths (the design doc's bar: half-working path completion is
+        // worse than none). Paths containing whitespace are never offered —
+        // they cannot round-trip this completer's own whitespace
+        // word-splitting.
+        if let Some(prefix) = word.strip_prefix('@') {
+            let candidates = snapshot
+                .paths
+                .iter()
+                .filter(|path| !path.chars().any(char::is_whitespace))
+                .filter(|path| path.starts_with(prefix))
+                .take(MAX_PATH_CANDIDATES)
+                .map(|path| {
+                    // The replacement keeps the `@`: inserting the bare
+                    // path would delete the user's trigger character.
+                    let replacement = format!("@{path}");
+                    CompletionCandidate {
+                        display: replacement.clone(),
+                        replacement,
+                    }
+                })
+                .collect();
+            return (word_start, candidates);
+        }
+
         // The first word: every command plus every discovered skill. Only
         // with a leading slash — nothing guesses inside a prompt.
         if word_start == 0 {
@@ -225,8 +258,8 @@ impl Command {
             "/session" => std::iter::once("new".to_string())
                 .chain(snapshot.sessions.iter().cloned())
                 .collect(),
-            // No file-path completion in v1: forge reads files through
-            // tools, and half-working path completion is worse than none.
+            // Path completion lives in the `@` branch above, deliberately
+            // the only in-prompt completion: nothing here guesses at paths.
             _ => Vec::new(),
         };
         // Argument candidates display as themselves — they are values, not
@@ -369,6 +402,15 @@ mod tests {
             models: vec!["qwen3-coder".into(), "deepseek-chat".into()],
             jobs: vec!["01JCF4ABC".into()],
             sessions: vec!["01JCF3XYZ".into()],
+            // Sorted, which is the host's contract: the graph's `BTreeMap`
+            // keys arrive sorted and the completer preserves that order
+            // rather than re-sorting.
+            paths: vec![
+                "docs/guide.md".into(),
+                "src/lib.rs".into(),
+                "src/main.rs".into(),
+                "with space.rs".into(),
+            ],
         }
     }
 
@@ -532,8 +574,82 @@ mod tests {
         assert!(
             replacements(&Command::complete("/approval ", 10, &s).1).contains(&"prompt-dangerous")
         );
-        // No path completion in v1, and no guessing inside a prompt.
+        // Unmarked words complete nothing — path completion is the `@`
+        // branch's job, and guessing inside a prompt is still forbidden.
         assert!(Command::complete("explain the ", 12, &s).1.is_empty());
+    }
+
+    /// Review Focus 2: the rule is total — word 0, mid-prompt, and after a
+    /// command all behave identically.
+    #[test]
+    fn an_at_word_completes_project_paths_anywhere_in_the_line() {
+        let s = snapshot();
+        for (line, pos) in [
+            ("@src/ma", 7),          // word 0
+            ("explain @src/ma", 15), // mid-prompt
+            ("/graph @src/ma", 14),  // a command argument
+        ] {
+            let (_, items) = Command::complete(line, pos, &s);
+            assert_eq!(
+                replacements(&items),
+                vec!["@src/main.rs"],
+                "completing {line:?}"
+            );
+        }
+    }
+
+    /// Review Focus 5: the replacement keeps the trigger character.
+    #[test]
+    fn path_replacements_keep_the_at_sign() {
+        let s = snapshot();
+        let (start, items) = Command::complete("explain @src/li", 15, &s);
+        assert_eq!(start, 8, "the whole @-word is replaced");
+        assert_eq!(replacements(&items), vec!["@src/lib.rs"]);
+        assert_eq!(
+            items[0].display, "@src/lib.rs",
+            "a value displays as itself"
+        );
+        assert!(items[0].replacement.starts_with('@'));
+        assert_eq!(items[0].replacement, format!("@{}", "src/lib.rs"));
+    }
+
+    /// Review Focus 1: unmarked words never complete as paths.
+    #[test]
+    fn a_bare_path_like_word_completes_nothing() {
+        let s = snapshot();
+        assert!(Command::complete("explain src/ma", 14, &s).1.is_empty());
+        assert!(Command::complete("src/ma", 6, &s).1.is_empty());
+    }
+
+    /// Review Focus 6: a path with a space cannot round-trip the word
+    /// splitting, so it is never offered.
+    #[test]
+    fn paths_with_whitespace_are_never_offered() {
+        let s = snapshot();
+        assert!(Command::complete("@with", 5, &s).1.is_empty());
+    }
+
+    /// Review Focus 3 (pure half): the listing is capped.
+    #[test]
+    fn path_candidates_are_capped() {
+        let mut s = snapshot();
+        s.paths = (0..150).map(|i| format!("src/file{i:03}.rs")).collect();
+        let (_, items) = Command::complete("@src/", 5, &s);
+        assert_eq!(items.len(), MAX_PATH_CANDIDATES);
+        // Sorted order, taken from the front: deterministic, and one more
+        // typed character narrows further.
+        assert_eq!(items[0].replacement, "@src/file000.rs");
+    }
+
+    /// A bare `@` offers the first page of the project, sorted.
+    #[test]
+    fn a_bare_at_offers_the_first_candidates() {
+        let s = snapshot();
+        let (_, items) = Command::complete("@", 1, &s);
+        assert_eq!(
+            replacements(&items),
+            vec!["@docs/guide.md", "@src/lib.rs", "@src/main.rs"]
+        );
     }
 
     /// The completer invents nothing: the argument candidates are exactly the
@@ -609,6 +725,10 @@ mod tests {
         let (start, items) = Command::complete(line, line.len() - 1, &s);
         assert!(line.is_char_boundary(start), "start {start} splits a char");
         assert!(items.is_empty(), "no model is called caf...: {items:?}");
+        // …and the same survival holds inside an `@` word.
+        let line = "@caf\u{e9}";
+        let (start, _) = Command::complete(line, line.len() - 1, &s);
+        assert!(line.is_char_boundary(start), "start {start} splits a char");
         assert!(Command::complete("", 0, &s).1.is_empty());
     }
 

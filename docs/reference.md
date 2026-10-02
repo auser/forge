@@ -549,7 +549,10 @@ an unreadable session log print a `  ! error:` line and return to the
 prompt.
 
 The rest are `rustyline` defaults: `Tab` completes a slash command, a skill
-name, or a `/attach` job id — listed with each command's description, name
+name, a `/attach` job id, or any word starting with `@` against the project
+graph's file list (case-sensitive prefix; needs `forge graph build` to have
+been run; capped, so a huge repo completes its alphabetically-first paths
+rather than stalling) — listed with each command's description, name
 and explanation aligned (`Tab` again after the bell, bash-style);
 `Up`/`Down`/`Ctrl-R` recall history;
 `Ctrl-A/E/K/U/W`, `Alt-B/F` are the usual emacs-style editing; `Ctrl-L`
@@ -1808,9 +1811,10 @@ go in `specs/adrs/`.
   to it live (the same in-process-only limit `forge serve`/`forge mcp`/
   `forge acp` already have); a skill named as a slash command
   (`/demo`) activates through the same lexical `SkillRegistry::match_task`
-  as a plain prompt, not a needle decision; and there is no path completion
-  — `Tab` completes commands, skill names and `/attach` job ids, nothing
-  filesystem-shaped.
+  as a plain prompt, not a needle decision. `@`-path completion completes
+  the built graph's files only: with no graph built it offers nothing, and
+  paths containing whitespace are never offered (they cannot round-trip the
+  prompt's word-splitting).
 
 ## Contributing
 
