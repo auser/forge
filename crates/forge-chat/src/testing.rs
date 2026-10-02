@@ -233,11 +233,16 @@ impl ScriptedIoHandle {
         ReadOutcome::Line(line)
     }
 
-    fn record(&self, text: &str) {
+    fn record(&self, text: &str, terminated: bool) {
         {
             let mut output = self.0.output.lock().unwrap_or_else(|e| e.into_inner());
             output.push_str(text);
-            output.push('\n');
+            // A fragment appends to the line in flight; everything else
+            // terminates its line — exactly what a terminal's scrollback
+            // would show, which is what every app-level assertion reads.
+            if terminated {
+                output.push('\n');
+            }
         }
         self.maybe_fire_on_output();
     }
@@ -304,11 +309,11 @@ impl ChatIo for ScriptedIoHandle {
     }
 
     fn write(&mut self, line: &Line) {
-        self.record(&line.text);
+        self.record(&line.text, !line.fragment);
     }
 
     fn notify(&mut self, line: &Line) {
-        self.record(&line.text);
+        self.record(&line.text, !line.fragment);
     }
 
     async fn interrupted(&mut self) {
@@ -448,6 +453,20 @@ impl FakeHost {
                 inner,
                 delay: Duration::from_millis(200),
                 runs_dir: root.join(".forge").join("runs"),
+            })
+        })
+    }
+
+    /// A scripted model parsed from `json` whose stream *trickles*: each
+    /// chunk lands `chunk_delay` after the last, so "the answer arrives
+    /// during the turn" is observable from a test with no TTY
+    /// (`with_slow_script`'s `SlowModel` does not override
+    /// `stream_complete`, so its turns emit no deltas at all; TICKET-1 D2).
+    pub fn with_trickled_script(json: &str, chunk_delay: Duration) -> (Self, TempDir) {
+        Self::build(Execution::Mock, move |_root| {
+            Arc::new(TrickleModel {
+                inner: ScriptedMockModel::from_json(json).expect("valid script"),
+                chunk_delay,
             })
         })
     }
@@ -638,6 +657,54 @@ impl SlowModel {
         std::fs::read_dir(&self.runs_dir)
             .map(|mut entries| entries.next().is_some())
             .unwrap_or(false)
+    }
+}
+
+/// Streams its scripted reply one chunk at a time with a real delay
+/// between chunks — the fixture that makes "the answer arrives during the
+/// turn" observable from a test (`with_slow_script`'s `SlowModel` does not
+/// override `stream_complete`, so its turns emit no deltas at all; TICKET-1
+/// D2). The scripted mock answers synchronously, so the chunks are
+/// collected first and replayed with sleeps — the staggering is what a
+/// test observes, not the collection.
+///
+/// Deliberately does *not* poll the cancel marker (that is `SlowModel`'s
+/// trick for a different job): the tests built on this fixture never
+/// interrupt a trickle.
+struct TrickleModel {
+    inner: ScriptedMockModel,
+    chunk_delay: Duration,
+}
+
+#[async_trait]
+impl ModelProvider for TrickleModel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, ForgeError> {
+        self.inner.complete(request).await
+    }
+
+    async fn stream_complete(
+        &self,
+        request: CompletionRequest,
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<CompletionResponse, ForgeError> {
+        let mut chunks = Vec::new();
+        let response = self
+            .inner
+            .stream_complete(request, &mut |d: &str| chunks.push(d.to_string()))
+            .await?;
+        for chunk in chunks {
+            tokio::time::sleep(self.chunk_delay).await;
+            on_delta(&chunk);
+        }
+        Ok(response)
     }
 }
 

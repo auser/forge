@@ -310,6 +310,7 @@ applies.
 | `ApprovalRequested` | `  ! approval needed: {command} ({risk}) - y to approve, anything else denies`, and the driver enters `AwaitingApproval` (§8) |
 | `ApprovalDecided` | `    -> approved` / `    -> denied` |
 | `AssistantMessage` | the `text`, as a Plain block with blank lines around it, when non-empty; the `tool_calls` are already narrated by the `tool_*` events, so they add nothing |
+| `AssistantDelta` | appended to the in-flight assistant block (a fragment continuing the line on screen); the closing `AssistantMessage` prints only the unshown suffix (§19) |
 | `ToolResult` | nothing. It is the replay record of what the *model* saw, capped at 64 KiB; dumping it would bury the transcript. The one-line `ToolCompleted` result is the user-facing summary, and `forge session show` is where the payload lives |
 | `TurnCompleted` | nothing at default verbosity; `  - turn {n} complete` at `-v` |
 | `InputReceived` | nothing — the user is the one who sent it |
@@ -1110,11 +1111,15 @@ mode path ever regress in a way the above cannot see.
 
 Deliberately out of scope, each with the reason and the shape of the fix:
 
-- **Token streaming.** The loop returns final text; the chat renders it
-  when it lands. When `ModelProvider` grows a streaming method, the
-  transcript gains an incremental assistant block and nothing else
-  changes — the renderer is already per-event. (Same follow-up as
-  `forge acp`'s.)
+- **Token streaming.** The render half shipped by TICKET-3 (2026-10-02):
+  `assistant_delta`s render as fragments of one growing assistant block
+  (appended text in inline scrollback, not a redrawn region — the recorded
+  architecture has no cursor addressing), the closing `assistant_message`
+  prints only the unshown suffix, and `forge acp` forwards live
+  `agent_message_chunk`s (`docs/superpowers/plans/2026-10-02-streaming-render.md`;
+  §19). Provider SSE decode (OpenAI-compatible/Anthropic) remains open as
+  TICKET-2; until then the scripted mock is the only streaming provider,
+  and §1's no-fake-streaming rule is untouched.
 - **Cross-process background runs.** Needs a daemon or a socket the
   runtime does not have (Phase A's recorded limitation). Until then the
   chat's jobs live and die with its process, and it says so.
@@ -1379,3 +1384,34 @@ header, then the verbatim payload under the `    -> ` result gutter).
 `ToolResult` stays silent in the live mapping — `/show` is a read from the
 store, not a second live render path — and no separate `/last` exists:
 `/show` with no argument is that command.
+
+## 19. Amendment (implemented 2026-10-02): streaming render ships
+
+§14 bullet 1's render half has shipped (TICKET-3). The incremental
+assistant block the bullet predicted is real, with one honest refinement
+of its mechanism: "one growing block" could never mean a redrawn region —
+the recorded inline-scrollback architecture (§2.2) has no cursor
+addressing — so it is `Line::fragment` appended to the line in flight
+(`print!` without the newline, flushed per write; piped mode writes the
+same fragments plainly, so a captured transcript is byte-identical to a
+non-streamed one). The renderer emits fragments as pure data like every
+other line, and a test pins that a streamed answer and the same answer
+printed whole are the same bytes.
+
+Three correctness rules came with it, all about the delta stream being a
+*prefix* of the answer rather than the answer: the closing
+`assistant_message` prints only the unshown suffix (a lagged broadcast
+drops deltas; §5's promise is that lagging degrades the transcript, never
+the answer); deltas never arm §4.3's answer-once flag, so a lagged final
+message is completed from the run outcome with its unshown tail, never
+reprinted and never lost; and any line that did not come from the
+transcript renderer (a `/show` answer, an error) closes an open block
+before printing. `forge acp` forwards deltas as live
+`agent_message_chunk`s, each `assistant_message` flushes its own unsent
+suffix, and the end-of-turn send became a tail that is empty in the
+common case — the needle fast path's whole-outcome send is unchanged.
+
+§1's "no fake token streaming" stance is untouched: the stream is real
+(provider-gated), and a non-streaming provider changes nothing about what
+either front end shows. Provider SSE itself (OpenAI-compatible and
+Anthropic decode) is TICKET-2.

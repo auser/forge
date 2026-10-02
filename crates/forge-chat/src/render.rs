@@ -7,6 +7,11 @@
 //! rendered or *deliberately* silent, and the `match` has no wildcard arm
 //! so a new event kind is a compile error here rather than a line the user
 //! never sees.
+//!
+//! Streaming: `assistant_delta` events render as fragments of one growing
+//! assistant block (§14's bullet 1, shipped by TICKET-3); the closing
+//! `assistant_message` prints only the suffix the stream has not already
+//! shown, so the answer is never double-printed.
 
 use std::time::Instant;
 
@@ -26,7 +31,8 @@ const NEEDLE_DISPATCH: &str = "needle-dispatch";
 
 /// What has been said so far in one run, which is all the state the §4.2
 /// mapping needs: a tool's elapsed-time anchor, whether the answer has
-/// already been printed, and the counts the footer reports.
+/// already been printed, the in-flight streamed block, and the counts the
+/// footer reports.
 ///
 /// One instance per run. It is deliberately not `Clone`: two copies would
 /// mean two opinions about whether the answer was printed.
@@ -40,6 +46,11 @@ pub struct TranscriptState {
     /// the former still times the call from something plausible.
     tool_anchor: Option<Instant>,
     rendered_assistant_text: bool,
+    /// The concatenated, already-rendered delta text of the streamed
+    /// response whose block is currently open — `Some` exactly while the
+    /// block is open, so the closing `AssistantMessage` can print only the
+    /// suffix the stream has not shown.
+    stream: Option<String>,
     tool_calls: usize,
     turns: u32,
 }
@@ -56,6 +67,7 @@ impl TranscriptState {
             started: Instant::now(),
             tool_anchor: None,
             rendered_assistant_text: false,
+            stream: None,
             tool_calls: 0,
             turns: 0,
         }
@@ -67,7 +79,17 @@ impl TranscriptState {
     /// `EventKind` must fail to compile here, so nobody can add an event the
     /// chat silently swallows.
     pub fn on_event(&mut self, event: &Event) -> Vec<Line> {
-        match &event.kind {
+        // Anything but the stream's own two kinds closes an open streamed
+        // block first, so a tool line, an error or a `  ! cancelled` never
+        // lands on the half-written line. `AssistantDelta` extends the
+        // block; `AssistantMessage` owns the close itself (it is what the
+        // block was waiting for). The prefix close is the defensive half:
+        // it covers a cancelled or failed run whose message never comes.
+        let mut lines = match &event.kind {
+            EventKind::AssistantDelta { .. } | EventKind::AssistantMessage { .. } => Vec::new(),
+            _ => self.close_stream(),
+        };
+        lines.extend(match &event.kind {
             // The user just typed it, and piped mode already echoed it.
             EventKind::RunStarted { .. } => Vec::new(),
             EventKind::RoutingDecisionMade {
@@ -128,29 +150,71 @@ impl TranscriptState {
             } else {
                 Line::failed("denied")
             }],
-            // The answer itself, with room around it. `tool_calls` are
-            // already narrated by the `tool_*` events, so they add nothing.
-            // Empty text is the on-device fast path's shape: nothing to
-            // print, and nothing recorded, so the driver prints the run
-            // outcome instead (§4.3).
+            // The answer itself, with room around it — or, when a stream
+            // preceded it, only the suffix the stream has not already
+            // shown (`strip_prefix` keeps the cut on a char boundary by
+            // construction). `tool_calls` are already narrated by the
+            // `tool_*` events, so they add nothing. Empty text is the
+            // on-device fast path's shape: nothing to print, and nothing
+            // recorded, so the driver prints the run outcome instead (§4.3).
             EventKind::AssistantMessage { text, .. } => {
                 if text.trim().is_empty() {
-                    return Vec::new();
+                    // Contract says no stream is open here (the fast path
+                    // makes no model call that could stream); close
+                    // defensively rather than assume it.
+                    self.close_stream()
+                } else {
+                    self.rendered_assistant_text = true;
+                    match self.stream.take() {
+                        None => assistant_block(text),
+                        Some(streamed) => match text.strip_prefix(&streamed) {
+                            // Normal case, and lag recovery: the stream
+                            // showed a prefix of the answer.
+                            Some(suffix) => {
+                                let mut lines = Vec::new();
+                                if !suffix.is_empty() {
+                                    lines.push(Line::fragment(suffix));
+                                }
+                                lines.extend(close_lines(text.ends_with('\n')));
+                                lines
+                            }
+                            // The stream is not a prefix of the message:
+                            // the provider broke its concat contract (the
+                            // runtime already warned), or a lagged broadcast
+                            // dropped deltas from the middle. Close the
+                            // partial line and print the whole message as a
+                            // fresh block — the answer whole and once wins
+                            // over tidy.
+                            None => {
+                                let mut lines = close_lines(streamed.ends_with('\n'));
+                                lines.extend(assistant_block(text));
+                                lines
+                            }
+                        },
+                    }
                 }
-                self.rendered_assistant_text = true;
-                let mut lines = vec![Line::plain("")];
-                // The writer writes one line at a time, so a paragraph is
-                // split here rather than handed over with newlines inside.
-                lines.extend(text.lines().map(Line::plain));
-                lines.push(Line::plain(""));
-                lines
             }
             // The replay record of what the *model* saw, capped at 64 KiB:
             // dumping it would bury the transcript. `ToolCompleted` is the
             // user-facing summary and `forge session show` has the payload.
             EventKind::ToolResult { .. } => Vec::new(),
-            // TICKET-3 renders these as one growing block; silent here.
-            EventKind::AssistantDelta { .. } => Vec::new(),
+            // A streamed answer's next piece, appended to the line in
+            // flight: the first delta of a block also emits §4.1's blank
+            // line above, once. The closing `AssistantMessage` prints only
+            // what the stream has not already shown, so the answer never
+            // double-prints. An empty delta renders nothing and opens
+            // nothing.
+            EventKind::AssistantDelta { text } => {
+                if text.is_empty() {
+                    Vec::new()
+                } else if let Some(stream) = self.stream.as_mut() {
+                    stream.push_str(text);
+                    vec![Line::fragment(text)]
+                } else {
+                    self.stream = Some(text.clone());
+                    vec![Line::plain(""), Line::fragment(text)]
+                }
+            }
             // Counted for the footer; silent on its own at default
             // verbosity, which is the only verbosity a transcript has.
             EventKind::TurnCompleted { .. } => {
@@ -174,7 +238,8 @@ impl TranscriptState {
             // Its `summary` is an 80-character digest written by the store;
             // the answer comes from `AssistantMessage` or the run outcome.
             EventKind::Completed { .. } => Vec::new(),
-        }
+        });
+        lines
     }
 
     /// Did any non-empty `AssistantMessage` text reach the transcript?
@@ -185,6 +250,47 @@ impl TranscriptState {
     /// no text and one tool call).
     pub fn rendered_assistant_text(&self) -> bool {
         self.rendered_assistant_text
+    }
+
+    /// Is a streamed answer's block currently open — deltas rendered, with
+    /// nothing yet having closed the line they are on?
+    pub fn stream_open(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// Close the in-flight streamed block, if any: terminate the
+    /// half-written line and add §4.1's blank below, so whatever prints
+    /// next lands on a line of its own. Empty when no block is open (it is
+    /// idempotent by construction — callers may close around lines whose
+    /// own rendering already closed the stream).
+    pub fn close_stream(&mut self) -> Vec<Line> {
+        match self.stream.take() {
+            None => Vec::new(),
+            Some(streamed) => close_lines(streamed.ends_with('\n')),
+        }
+    }
+
+    /// The §4.3 fallback, stream-aware: the lines to print for the run
+    /// outcome when no `AssistantMessage` rendered the answer — the fast
+    /// path's shape (no text, one tool call) *and* the lagged-stream shape
+    /// (deltas arrived, their message did not). Empty when the answer
+    /// already rendered.
+    pub fn outcome_lines(&mut self, text: &str) -> Vec<Line> {
+        if self.rendered_assistant_text || text.trim().is_empty() {
+            return Vec::new();
+        }
+        match self.stream.take() {
+            None => assistant_block(text),
+            Some(streamed) => {
+                let tail = text.strip_prefix(&streamed).unwrap_or(text);
+                let mut lines = Vec::new();
+                if !tail.is_empty() {
+                    lines.push(Line::fragment(tail));
+                }
+                lines.extend(close_lines(text.ends_with('\n')));
+                lines
+            }
+        }
     }
 
     /// The one line that closes a turn: what happened, in one short
@@ -199,6 +305,28 @@ impl TranscriptState {
             plural(calls as u64),
             self.started.elapsed().as_secs_f64()
         ))
+    }
+}
+
+/// The §4.1 assistant block: the text with a blank line above and below,
+/// one `Line` per line of text. The writer writes one line at a time, so a
+/// paragraph is split here rather than handed over with newlines inside.
+pub(crate) fn assistant_block(text: &str) -> Vec<Line> {
+    let mut lines = vec![Line::plain("")];
+    lines.extend(text.lines().map(Line::plain));
+    lines.push(Line::plain(""));
+    lines
+}
+
+/// The lines that close a streamed assistant block whose on-screen text is
+/// already line-terminated (`terminated`) or not: a text line that never
+/// ended is owed its own newline first, and every block is owed §4.1's
+/// blank line below — one empty `Line` each through the writer.
+fn close_lines(terminated: bool) -> Vec<Line> {
+    if terminated {
+        vec![Line::plain("")]
+    } else {
+        vec![Line::plain(""), Line::plain("")]
     }
 }
 
@@ -702,18 +830,250 @@ mod tests {
         }
     }
 
+    /// What a writer's captured bytes would be: fragments append, everything
+    /// else terminates its line.
+    fn written(lines: &[Line]) -> String {
+        let mut out = String::new();
+        for line in lines {
+            out.push_str(&line.text);
+            if !line.fragment {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     #[test]
-    fn a_delta_renders_nothing_until_ticket_3() {
+    fn deltas_grow_one_block_from_the_first_blank_line() {
         let mut s = TranscriptState::new();
-        let out = s.on_event(&ev(EventKind::AssistantDelta { text: "hel".into() }));
-        assert!(
-            out.is_empty(),
-            "TICKET-3 grows the incremental block; the core plumbing stays silent"
-        );
+        let first = s.on_event(&ev(EventKind::AssistantDelta {
+            text: "the ".into(),
+        }));
+        assert_eq!(first, vec![Line::plain(""), Line::fragment("the ")]);
+        let second = s.on_event(&ev(EventKind::AssistantDelta {
+            text: "answer".into(),
+        }));
+        assert_eq!(second, vec![Line::fragment("answer")]);
+        assert!(s.stream_open(), "the block stays open until its message");
         assert!(
             !s.rendered_assistant_text(),
-            "a delta is not the answer-once record"
+            "deltas alone do not disarm the outcome fallback (D4)"
         );
+    }
+
+    /// The whole point of the fragment shape: streamed and non-streamed
+    /// renderings of one answer are the same bytes.
+    #[test]
+    fn a_streamed_answer_is_byte_identical_to_the_same_answer_printed_whole() {
+        let mut streamed = TranscriptState::new();
+        let mut lines = Vec::new();
+        for text in ["the ", "answer ", "is\n", "ready"] {
+            lines.extend(streamed.on_event(&ev(EventKind::AssistantDelta { text: text.into() })));
+        }
+        lines.extend(streamed.on_event(&ev(EventKind::AssistantMessage {
+            text: "the answer is\nready".into(),
+            tool_calls: Vec::new(),
+        })));
+
+        let mut whole = TranscriptState::new();
+        let whole_lines = whole.on_event(&ev(EventKind::AssistantMessage {
+            text: "the answer is\nready".into(),
+            tool_calls: Vec::new(),
+        }));
+        assert_eq!(written(&lines), written(&whole_lines));
+        assert!(streamed.rendered_assistant_text());
+    }
+
+    /// A lagged broadcast drops deltas; the message prints only what the
+    /// stream has not shown.
+    #[test]
+    fn a_message_after_partial_deltas_prints_only_the_suffix() {
+        let mut s = TranscriptState::new();
+        let _ = s.on_event(&ev(EventKind::AssistantDelta {
+            text: "the ".into(),
+        }));
+        let lines = s.on_event(&ev(EventKind::AssistantMessage {
+            text: "the answer".into(),
+            tool_calls: Vec::new(),
+        }));
+        assert_eq!(
+            lines,
+            vec![Line::fragment("answer"), Line::plain(""), Line::plain("")],
+            "suffix, then the close"
+        );
+        assert_eq!(written(&lines), "answer\n\n");
+    }
+
+    /// A provider that broke the fragment contract gets its answer printed
+    /// whole, once, after the partial line is closed.
+    #[test]
+    fn a_message_that_does_not_extend_its_deltas_prints_whole() {
+        let mut s = TranscriptState::new();
+        let mut out = written(&s.on_event(&ev(EventKind::AssistantDelta { text: "gar".into() })));
+        out.push_str(&written(&s.on_event(&ev(EventKind::AssistantMessage {
+            text: "whole text".into(),
+            tool_calls: Vec::new(),
+        }))));
+        assert_eq!(
+            out, "\ngar\n\n\nwhole text\n\n",
+            "partial line closed, then the whole message as a fresh block"
+        );
+        assert!(s.rendered_assistant_text());
+    }
+
+    /// The defensive close: a turn that fails or is cancelled mid-stream
+    /// never leaves the next line on the half-written one.
+    #[test]
+    fn an_error_or_cancellation_closes_the_open_block_first() {
+        for kind in [
+            EventKind::Error {
+                message: "boom".into(),
+            },
+            EventKind::Cancelled {
+                reason: "cancelled by user".into(),
+            },
+        ] {
+            let mut s = TranscriptState::new();
+            let _ = s.on_event(&ev(EventKind::AssistantDelta {
+                text: "partial ".into(),
+            }));
+            let lines = s.on_event(&ev(kind));
+            assert!(
+                lines[0].text.is_empty() && !lines[0].fragment,
+                "closed first: {lines:?}"
+            );
+            assert!(!s.stream_open());
+        }
+    }
+
+    /// Text and tools alternate as closed blocks: the stream's close precedes
+    /// the tool gutter, and the next response opens a fresh block.
+    #[test]
+    fn a_tool_call_between_two_responses_sits_between_two_closed_blocks() {
+        let mut s = TranscriptState::new();
+        let mut out = String::new();
+        for kind in [
+            EventKind::AssistantDelta {
+                text: "reading ".into(),
+            },
+            EventKind::AssistantDelta { text: "it".into() },
+            EventKind::AssistantMessage {
+                text: "reading it".into(),
+                tool_calls: vec![ToolCall::new(
+                    "c1",
+                    "read_file",
+                    serde_json::json!({"path": "a.rs"}),
+                )],
+            },
+            EventKind::ToolCallRequested {
+                tool: "read_file".into(),
+                args_summary: r#"{"path":"a.rs"}"#.into(),
+            },
+            EventKind::AssistantDelta {
+                text: "done".into(),
+            },
+            EventKind::AssistantMessage {
+                text: "done".into(),
+                tool_calls: Vec::new(),
+            },
+        ] {
+            out.push_str(&written(&s.on_event(&ev(kind))));
+        }
+        assert_eq!(out, "\nreading it\n\n  * read_file a.rs\n\ndone\n\n");
+    }
+
+    /// A text that already ends in a newline is owed only the blank below.
+    #[test]
+    fn a_stream_ending_in_a_newline_closes_with_one_blank() {
+        let mut s = TranscriptState::new();
+        let _ = s.on_event(&ev(EventKind::AssistantDelta {
+            text: "line\n".into(),
+        }));
+        let lines = s.on_event(&ev(EventKind::AssistantMessage {
+            text: "line\n".into(),
+            tool_calls: Vec::new(),
+        }));
+        assert_eq!(lines, vec![Line::plain("")]);
+    }
+
+    #[test]
+    fn an_empty_delta_renders_nothing_and_opens_nothing() {
+        let mut s = TranscriptState::new();
+        assert!(
+            s.on_event(&ev(EventKind::AssistantDelta {
+                text: String::new()
+            }))
+            .is_empty()
+        );
+        assert!(!s.stream_open());
+    }
+
+    /// A resumed session's log holds deltas and the message; re-rendering the
+    /// backlog is the same bytes as the message alone — §7's one-renderer rule.
+    #[test]
+    fn a_backlog_of_deltas_and_the_message_rerenders_as_the_message() {
+        let mut s = TranscriptState::new();
+        let mut lines = Vec::new();
+        for kind in [
+            EventKind::AssistantDelta {
+                text: "the ".into(),
+            },
+            EventKind::AssistantDelta {
+                text: "first ".into(),
+            },
+            EventKind::AssistantDelta {
+                text: "answer".into(),
+            },
+            EventKind::AssistantMessage {
+                text: "the first answer".into(),
+                tool_calls: Vec::new(),
+            },
+        ] {
+            lines.extend(s.on_event(&ev(kind)));
+        }
+        assert_eq!(written(&lines), "\nthe first answer\n\n");
+    }
+
+    /// D4: deltas arrived, the message was lost to lag — the outcome completes
+    /// the open block with only the unshown tail.
+    #[test]
+    fn the_outcome_fallback_completes_a_lagged_stream_with_its_tail() {
+        let mut s = TranscriptState::new();
+        let _ = s.on_event(&ev(EventKind::AssistantDelta {
+            text: "the ".into(),
+        }));
+        let lines = s.outcome_lines("the answer");
+        assert_eq!(written(&lines), "answer\n\n");
+    }
+
+    /// …and the two shapes the fallback was built for are unchanged.
+    #[test]
+    fn the_outcome_fallback_is_today_for_the_fast_path_and_stays_silent_after_a_rendered_answer() {
+        let mut fast_path = TranscriptState::new();
+        let _ = fast_path.on_event(&ev(EventKind::AssistantMessage {
+            text: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "c1",
+                "read_file",
+                serde_json::json!({"path": "x"}),
+            )],
+        }));
+        assert_eq!(
+            written(&fast_path.outcome_lines("fn x() {}")),
+            "\nfn x() {}\n\n"
+        );
+
+        let mut answered = TranscriptState::new();
+        let _ = answered.on_event(&ev(EventKind::AssistantMessage {
+            text: "the answer".into(),
+            tool_calls: Vec::new(),
+        }));
+        assert!(
+            answered.outcome_lines("the answer").is_empty(),
+            "never twice"
+        );
+        // A blank outcome prints nothing either way.
+        assert!(TranscriptState::new().outcome_lines("").is_empty());
     }
 
     #[test]

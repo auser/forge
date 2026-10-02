@@ -345,7 +345,9 @@ else's agent; ACP exposes forge as the agent.** Same `AgentService`, same
 answered. An ACP client (Zed and friends) drives `initialize` → `session/new` →
 `session/prompt`, and gets the turn back as `session/update` notifications:
 tool calls with kinds, statuses and file locations, routing decisions as
-thoughts, and the final text as one `agent_message_chunk`.
+thoughts, and the answer as live `agent_message_chunk`s when the provider
+streams (each `assistant_message` flushes whatever its deltas missed) — one
+whole chunk when it does not.
 
 Three seams carry it. **The ACP session id *is* the forge session id**, so a
 turn driven from the editor is inspectable with `forge session show <id>` and
@@ -453,9 +455,10 @@ degradable condition.
 ## What's next (per the program spec)
 
 Shipped since this line was written: the ACP adapter and the interactive
-chat (slash commands / history replay / fork & background). Remaining:
-token streaming end-to-end (runtime plumbing landed in TICKET-1; provider
-SSE and chat/ACP rendering are TICKET-2/3 — see
+chat (slash commands / history replay / fork & background), and streaming
+render (the runtime plumbing was TICKET-1; the chat's incremental assistant
+block and ACP's live chunks are TICKET-3). Remaining: provider SSE decode
+(OpenAI-compatible and Anthropic — TICKET-2; see
 [`specs/tickets/interactive-chat-feel.md`](specs/tickets/interactive-chat-feel.md)),
 and in-process generation (`forge-llm-embedded`) — see
 [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md) §2.
