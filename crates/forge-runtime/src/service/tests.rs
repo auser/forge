@@ -3153,10 +3153,14 @@ async fn a_completion_records_usage_and_cost_in_the_decision_log() {
 }
 
 #[tokio::test]
+#[serial]
 async fn a_model_with_no_price_records_usage_but_no_cost() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Config::default() has no "scripted-mock" entry: usage must still be
     // recorded, cost must be None — never 0.0 pretending to be free.
+    // `#[serial]`: the catalogue fallback resolves from XDG_CACHE_HOME,
+    // which the catalogue-pricing test seeds process-wide — without the
+    // lock this test can observe that seeded price and fail.
     let service = scripted_service(
         tmp.path(),
         vec![text_reply("unpriced")],
