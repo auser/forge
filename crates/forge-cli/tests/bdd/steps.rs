@@ -2085,3 +2085,74 @@ fn chat_output_says_source_untouched(world: &mut BddWorld) {
         world.last_stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// streaming.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a scripted mock model that answers {string}")]
+fn scripted_mock_answers(world: &mut BddWorld, answer: String) {
+    let script = format!(r#"[{{"text": "{answer}"}}]"#);
+    world.write_file("script.json", &script);
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+}
+
+/// The scenario's session events as parsed JSON values, in log order.
+/// Remembers the session/run ids it finds, so later steps that take an id
+/// (`forge session show <id>`) have one without a `--json` run of their own.
+fn streaming_session_events(world: &mut BddWorld) -> Vec<serde_json::Value> {
+    let log = world.session_log();
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if let Some(first) = events.first() {
+        world.session_id = first["session_id"].as_str().unwrap_or_default().to_string();
+        world.run_id = first["run_id"].as_str().unwrap_or_default().to_string();
+    }
+    events
+}
+
+#[then("the session events include assistant deltas before the final assistant message")]
+fn session_events_include_assistant_deltas_before_final_message(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let events = streaming_session_events(world);
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+    let final_message = types
+        .iter()
+        .rposition(|t| *t == "assistant_message")
+        .unwrap_or_else(|| panic!("no assistant_message in: {types:?}"));
+    let last_delta = types
+        .iter()
+        .rposition(|t| *t == "assistant_delta")
+        .unwrap_or_else(|| panic!("no assistant_delta in: {types:?}"));
+    assert!(
+        last_delta < final_message,
+        "every delta precedes the final assistant_message: {types:?}"
+    );
+    for event in events.iter().filter(|e| e["type"] == "assistant_delta") {
+        let text = event["text"].as_str().expect("delta text is a string");
+        assert!(!text.is_empty(), "a delta carries text: {event}");
+    }
+}
+
+#[then("the assistant deltas concatenate to the final assistant message text")]
+fn assistant_deltas_concatenate_to_final_message(world: &mut BddWorld) {
+    let events = streaming_session_events(world);
+    let deltas: String = events
+        .iter()
+        .filter(|e| e["type"] == "assistant_delta")
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    let final_text = events
+        .iter()
+        .filter(|e| e["type"] == "assistant_message")
+        .filter_map(|e| e["text"].as_str())
+        .next_back()
+        .expect("final assistant_message");
+    assert_eq!(
+        deltas, final_text,
+        "deltas concatenate to the replayed answer verbatim"
+    );
+}
