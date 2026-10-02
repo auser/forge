@@ -8,7 +8,8 @@
 //! that service's methods are synchronous filesystem reads taken straight
 //! on the executor: [`app`]'s `refresh_completions` (`list_runs()` —
 //! which re-reads and re-parses every session's whole JSONL log — plus
-//! `list_sessions()`), `events_for`, and `fork_session`. The multi-thread
+//! `list_sessions()`), `events_for` (session resume, `/session`, and
+//! `/show`), and `fork_session`. The multi-thread
 //! runtime `forge-cli` builds keeps that off the critical path, so it is
 //! latency rather than a stall, and §14 has the bounded-listing follow-up.
 //! Stated plainly here because the earlier "no I/O syscalls" wording was
@@ -29,6 +30,9 @@
 //!   owned data.
 //! * [`render`] — the `Event` → [`Line`] mapping, as a pure function of a
 //!   [`TranscriptState`].
+//! * [`show`] — `/show`: on-demand rendering of a recorded `tool_result`
+//!   payload, selected from the session log (the live mapping in [`render`]
+//!   stays silent for it).
 //! * [`command`] — slash parsing and Tab completion: what a submitted line
 //!   *says*.
 //! * [`controller`] — the input/signal state machine: what may happen now.
@@ -48,6 +52,7 @@ pub mod controller;
 pub mod host;
 pub mod io;
 pub mod render;
+pub mod show;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 

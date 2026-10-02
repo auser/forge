@@ -37,6 +37,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/bg", "detach the running turn and keep talking"),
     ("/jobs", "runs and their states"),
     ("/attach", "follow a run again by id"),
+    (
+        "/show",
+        "re-render a recorded tool result: /show [n], latest first",
+    ),
     ("/quit", "leave (Ctrl-D does the same)"),
     ("/exit", "leave (Ctrl-D does the same)"),
 ];
@@ -80,6 +84,8 @@ pub enum Parsed {
     Background,
     Jobs,
     Attach(String),
+    /// `/show`, optionally `/show <n>`: the nth most recent tool result (1 = latest).
+    Show(Option<usize>),
 }
 
 /// Namespace for the two pure entry points. A unit struct rather than free
@@ -159,6 +165,13 @@ impl Command {
             "attach" => match argument {
                 Some(run_id) => Parsed::Attach(run_id),
                 None => Parsed::Usage("/attach <run-id>"),
+            },
+            "show" => match argument {
+                None => Parsed::Show(None),
+                Some(text) => match text.parse::<usize>() {
+                    Ok(n) => Parsed::Show(Some(n)),
+                    Err(_) => Parsed::Usage("/show [n]"),
+                },
             },
             // Commands win over skills, so a skill cannot shadow `/help`.
             _ if snapshot.skills.iter().any(|(skill, _)| skill == name) => {
@@ -451,6 +464,12 @@ mod tests {
             Command::parse("/attach 01JCF4ABC", &s),
             Parsed::Attach("01JCF4ABC".into())
         );
+        assert_eq!(Command::parse("/show", &s), Parsed::Show(None));
+        assert_eq!(Command::parse("/show 2", &s), Parsed::Show(Some(2)));
+        assert_eq!(Command::parse("  /show  3 ", &s), Parsed::Show(Some(3)));
+        // Zero parses (it is a `usize`); the *driver* answers it with the
+        // informational out-of-range line, which teaches the numbering.
+        assert_eq!(Command::parse("/show 0", &s), Parsed::Show(Some(0)));
     }
 
     /// The prompt template matters: `SkillRegistry::match_task` matches
@@ -660,6 +679,10 @@ mod tests {
             Command::parse("/fork --at-18", &s),
             Parsed::Usage(FORK_USAGE)
         );
+        // `/show`'s argument is optional, but a non-numeric one is a usage
+        // error rather than a guess at which result was meant.
+        assert_eq!(Command::parse("/show abc", &s), Parsed::Usage("/show [n]"));
+        assert_eq!(Command::parse("/show -1", &s), Parsed::Usage("/show [n]"));
     }
 
     #[test]

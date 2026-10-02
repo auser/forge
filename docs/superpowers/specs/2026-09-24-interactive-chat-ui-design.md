@@ -1127,9 +1127,6 @@ Deliberately out of scope, each with the reason and the shape of the fix:
   ACP.
 - **Path completion after `@` or inside a prompt.** Useful, and
   orthogonal; half-working path completion is worse than none.
-- **Rendering `tool_result` payloads on demand** (a `/last` or
-  `/show <n>` command). The data is in the log; `forge session show`
-  reads it today.
 - **Editing the config from the chat.** `/model` and `/approval` change
   the session, never a file. Writing config from a REPL needs a
   provenance story (which file? what about the origin `/config` reports?)
@@ -1366,3 +1363,14 @@ while the fix worth having — a bounded, incremental `list_runs` — belongs
 in the runtime, where every front end gets it (filed in §14). The rule the
 crate actually keeps, and now states, is: no terminal; filesystem access
 only through `AgentService`.
+
+## 18. Amendment (implemented 2026-10-01): `/show` ships
+
+The §14 follow-up *"Rendering `tool_result` payloads on demand (a `/last`
+or `/show <n>` command)"* shipped as `/show [n]` (TICKET-5): the nth most
+recent recorded `tool_result` of the current session, read from the session
+log at command time and rendered through the §4.1 grammar (a `  - ` meta
+header, then the verbatim payload under the `    -> ` result gutter).
+`ToolResult` stays silent in the live mapping — `/show` is a read from the
+store, not a second live render path — and no separate `/last` exists:
+`/show` with no argument is that command.

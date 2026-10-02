@@ -168,7 +168,9 @@ fn chat(tmp: &Path, project: &Path, lines: &[&str]) -> std::process::Output {
 /// a small source file so the transcript has something real to reference.
 /// `mode` doubles as both the config's `approval` value and the choice of
 /// script (an approval round trip needs one that writes a file; everything
-/// else just answers).
+/// else just answers) — except `"read"`, which keeps `approval = "auto"`
+/// but scripts a `read_file alpha.rs` call so `/show` has a recorded
+/// payload with known content to re-render.
 ///
 /// `forge-cli`'s `build_service_with` wires a *per-route model factory*
 /// (`commands/service.rs`) that re-resolves — for `scripted-mock`,
@@ -191,15 +193,27 @@ fn scaffold(tmp: &Path, mode: &str) -> PathBuf {
                 {"text": "notes written"}
             ]"#
         }
+        "read" => {
+            r#"[
+                {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "alpha.rs"}}]},
+                {"text": "alpha.rs read"}
+            ]"#
+        }
         _ => r#"[{"text": "the answer"}]"#,
     };
     std::fs::write(project.join("script.json"), script).expect("write script");
 
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
+    // `"read"` is a script choice, not an approval policy: it keeps the
+    // permissive default so the read runs without a round trip.
+    let approval = match mode {
+        "read" => "auto",
+        other => other,
+    };
     std::fs::write(
         project.join(".forge").join("config.toml"),
         format!(
-            "model = \"scripted-mock\"\nmock_script = \"script.json\"\nrouter = \"static\"\napproval = \"{mode}\"\n"
+            "model = \"scripted-mock\"\nmock_script = \"script.json\"\nrouter = \"static\"\napproval = \"{approval}\"\n"
         ),
     )
     .expect("write config");
@@ -475,6 +489,53 @@ fn an_approval_is_answered_from_the_conversation() {
         "the parked mechanism was used:\n{log}"
     );
     assert!(log.contains("\"approved\":true"), "{log}");
+}
+
+/// `/show` over pipes, against the compiled binary: the recorded payload
+/// the live stream deliberately skipped, re-rendered on demand. `/show` is
+/// a command, not a run, so the per-run model factory (see `scaffold`'s
+/// doc) never re-parses the script for it — one tool call, one `/show`,
+/// deterministic.
+///
+/// Written *after* the turn settles, not up front: piped input is read
+/// eagerly (the main loop keeps a read outstanding mid-turn, §12.3), and
+/// `/show` is immediate in every state by design — typed alongside the
+/// prompt it answers mid-turn, before the read has recorded anything.
+/// Waiting for the turn's footer first is the same race removal
+/// [`answer_one_approval`] documents.
+#[test]
+fn show_rerenders_a_recorded_tool_result_from_piped_input() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "read"); // scripted model reads alpha.rs
+    let mut child = forge(tmp.path(), &project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn forge");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let (stdout_buf, stdout_thread) = tail_stream(child.stdout.take().expect("stdout"));
+    let (_stderr_buf, stderr_thread) = tail_stream(child.stderr.take().expect("stderr"));
+
+    writeln!(stdin, "read alpha").expect("write prompt");
+    wait_for(&stdout_buf, "  = ", Duration::from_secs(10));
+    writeln!(stdin, "/show").expect("write /show");
+    drop(stdin); // EOF: drain and exit (§12.3)
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(20));
+    stdout_thread.join().expect("stdout reader thread");
+    stderr_thread.join().expect("stderr reader thread");
+    assert!(status.success());
+    let stdout = stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        stdout.contains("  - tool result 1 of 1: read_file alpha.rs (run "),
+        "the meta header names the result and its run:\n{stdout}"
+    );
+    // alpha.rs's known content, verbatim, under the result gutter.
+    assert!(
+        stdout.contains("    -> fn parse_config() {}"),
+        "the recorded payload:\n{stdout}"
+    );
 }
 
 #[test]

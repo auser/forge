@@ -110,6 +110,8 @@ pub enum Action {
     Fork(Option<String>),
     ListJobs,
     Attach(String),
+    /// `/show`, optionally `/show <n>`. Read-only: immediate in every state.
+    Show(Option<usize>),
     /// Cancel every live run, recording each cancellation (§10.2). Emitted
     /// only on the way out, and harmless when nothing is live.
     CancelAllJobs,
@@ -245,6 +247,8 @@ impl Controller {
             Parsed::Graph(query, steering) => vec![Action::Graph(query, steering)],
             // Read-only, so it answers in every state, mid-turn included.
             Parsed::Session => vec![Action::ShowSession],
+            // Read-only, so it answers in every state, mid-turn included.
+            Parsed::Show(n) => vec![Action::Show(n)],
             Parsed::SessionNew => self.move_session(Action::NewSession),
             Parsed::SessionSwitch(id) => self.move_session(Action::SwitchSession(id)),
             Parsed::Fork(at) => self.move_session(Action::Fork(at)),
@@ -964,6 +968,27 @@ mod tests {
         assert_eq!(c.on_line("/bg"), vec![Action::Background]);
         c.on_line("another long job");
         assert_eq!(c.on_line("/jobs"), vec![Action::ListJobs]);
+        // `/show` mutates nothing, so it answers mid-turn too.
+        assert_eq!(c.on_line("/show"), vec![Action::Show(None)]);
+        assert_eq!(c.on_line("/show 2"), vec![Action::Show(Some(2))]);
+    }
+
+    /// `/show` is read-only: immediate at an idle prompt, and a garbage
+    /// argument is a usage line rather than a turn or a guess.
+    #[test]
+    fn show_is_immediate_and_its_garbage_argument_is_a_usage_line() {
+        let mut c = idle();
+        assert_eq!(c.on_line("/show"), vec![Action::Show(None)]);
+        let actions = c.on_line("/show abc");
+        let msg = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Write(line) => Some(line.text.clone()),
+                _ => None,
+            })
+            .expect("a usage line is printed");
+        assert!(msg.contains("usage: /show [n]"), "{msg}");
+        assert_eq!(c.state(), ChatState::Idle, "a typo is not a turn");
     }
 
     /// Review Focus 2's neighbour: a command typed while an approval is
@@ -980,6 +1005,10 @@ mod tests {
             ChatState::AwaitingApproval,
             "still waiting for an answer"
         );
+        // `/show` starts with a slash, so it is a command here too — never
+        // a denial of the pending question.
+        assert_eq!(c.on_line("/show"), vec![Action::Show(None)]);
+        assert_eq!(c.state(), ChatState::AwaitingApproval);
         assert_eq!(c.on_line("n"), vec![Action::Approve(false)]);
     }
 
