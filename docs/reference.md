@@ -62,9 +62,10 @@ decided by a model calibrated to emit a choice plus a confidence — not by a
 chat model guessing in prose. Anything under the threshold is rejected and
 escalated rather than acted on.
 
-(Skill activation is scored lexical matching over skill names and
+(Skill discovery is scored lexical matching over skill names and
 descriptions — a name-token hit or two description hits, at most three
-skills per turn — not a needle decision. See [Skills](#skills).)
+skills per turn — and a run can also name skills explicitly. Neither is a
+needle decision. See [Skills](#skills).)
 
 **Whether you actually have a brain depends on the build.** Real on-device
 inference needs the native engine, and the engine is **on by default**: the
@@ -513,10 +514,12 @@ session 01JCF3...  /help for commands
 /exit       leave (Ctrl-D does the same)
 ```
 
-Typing a skill's name as a slash command (e.g. `/demo`) activates it the
-same way a matching plain prompt would — `/name` invocation still relies on
-`SkillRegistry::match_task`'s lexical word/substring matching, not a needle
-decision (see [Known limitations](#known-limitations-v03)). `/model`,
+Typing a skill's name as a slash command (e.g. `/demo`) activates exactly
+that skill: the name travels to the runtime as data
+(`RunOptions::activate_skills`), so activation no longer depends on how the
+name would score in `SkillRegistry::match_task`'s lexical matching — a
+two-letter skill name works. Lexical discovery still runs on the prompt and
+adds anything it matches. `/model`,
 `/approval` and `/graph` never offer a test-only mock as a choice, but the
 entry banner and `/model`/`/config`/`/approval` report the *active* model
 honestly even when it is one — hiding that would be a lie about what is
@@ -676,14 +679,15 @@ plain lexical ranking — the same degradation as outside the chat.
 
 Beyond those three, see [Known limitations](#known-limitations-v03) for the
 ones shared with the rest of forge (no token-by-token streaming, background
-runs not surviving the process, lexical-only skill matching, no path
+runs not surviving the process, lexical-only skill discovery, no path
 completion).
 
 ## Command line
 
 ```text
 forge init                          Initialize a project (idempotent)
-forge run [--max-turns N] <prompt>  Run the multi-turn agent loop
+forge run [--max-turns N] [--skill NAME]... <prompt>
+                                    Run the multi-turn agent loop
 forge chat [--continue|--session]   Open the interactive chat (also: bare forge)
 forge serve [--host --port]         Start the REST/SSE server
 forge mcp                           Serve MCP over stdio (editors, agents)
@@ -1088,7 +1092,12 @@ Progressive disclosure: `forge skill list` reads only frontmatter metadata;
 `forge skill show <name>` loads the full instructions; references/scripts load on
 demand. During `forge run`, a prompt matching a skill activates it — the
 instructions are injected into the model context and a `skill_activated` event is
-appended to the session log. `forge skill test <name>` runs the skill's
+appended to the session log. A run can also name skills explicitly, in addition
+to (never instead of) lexical discovery: `forge run --skill <name>` (repeatable),
+MCP `forge_run { "skills": [...] }`, ACP `session/prompt` with
+`"_meta": { "forge.activateSkills": [...] }`, and chat's `/name`. An unknown
+name is a typed error at the entry point — the run never starts without a skill
+the caller asked for. `forge skill test <name>` runs the skill's
 `test.sh`/`test.py` through the configured execution provider.
 
 ## Project graph
@@ -1242,7 +1251,7 @@ forge_graph_map     {}                  per-directory structure summary
 forge_skill_list    {}                  skill names + descriptions (metadata only)
 forge_skill_show    {name}              a skill's full instructions
 forge_doctor        {}                  the `forge doctor` checks as JSON
-forge_run           {prompt, max_turns?, timeout_ms?}
+forge_run           {prompt, max_turns?, timeout_ms?, skills?}
                                         run the agent loop; returns
                                         {run_id, status, text}
 forge_run_status    {run_id}            status + final text + recent events
@@ -1809,9 +1818,7 @@ go in `specs/adrs/`.
   `forge acp`); a `/bg`-detached job does not survive the process and
   another `forge` process can only see its recorded history, never attach
   to it live (the same in-process-only limit `forge serve`/`forge mcp`/
-  `forge acp` already have); a skill named as a slash command
-  (`/demo`) activates through the same lexical `SkillRegistry::match_task`
-  as a plain prompt, not a needle decision; and there is no path completion
+  `forge acp` already have); and there is no path completion
   — `Tab` completes commands, skill names and `/attach` job ids, nothing
   filesystem-shaped.
 

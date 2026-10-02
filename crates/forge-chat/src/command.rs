@@ -50,10 +50,15 @@ const FORK_USAGE: &str = "/fork [--at <pos|run-id>]";
 /// this decides only what was said.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Parsed {
-    /// A turn for the model. A `/skill` line is one of these too — it is a
-    /// normal prompt naming the skill (§9.4), not a second activation
-    /// mechanism.
+    /// A turn for the model.
     Prompt(String),
+    /// A `/skill` line (§9.4): the skill's name travels as data so the
+    /// runtime activates exactly it, never a lexical look-alike. `prompt`
+    /// stays the user-turn text the model sees.
+    Skill {
+        name: String,
+        prompt: String,
+    },
     /// A `/word` that names nothing. Carries the name *without* its slash.
     Unknown(String),
     /// A known command whose required argument is missing; carries the
@@ -161,9 +166,10 @@ impl Command {
                 None => Parsed::Usage("/attach <run-id>"),
             },
             // Commands win over skills, so a skill cannot shadow `/help`.
-            _ if snapshot.skills.iter().any(|(skill, _)| skill == name) => {
-                Parsed::Prompt(skill_prompt(name, &rest))
-            }
+            _ if snapshot.skills.iter().any(|(skill, _)| skill == name) => Parsed::Skill {
+                name: name.to_string(),
+                prompt: skill_prompt(name, &rest),
+            },
             _ => Parsed::Unknown(name.to_string()),
         }
     }
@@ -281,12 +287,16 @@ pub fn help_lines() -> Vec<Line> {
         .collect()
 }
 
-/// The prompt a `/skill` line becomes (§9.4).
+/// The prompt a `/skill` line carries (§9.4).
 ///
-/// The template matters: `SkillRegistry::match_task` matches
-/// whitespace-separated words of >= 3 characters against the skill's name
-/// and description, so the bare name has to appear as its own word for the
-/// existing activation path to fire.
+/// This is model context, not the activation mechanism: activation is the
+/// [`Parsed::Skill`] name travelling to `RunOptions::activate_skills`,
+/// which works for any name — including one shorter than the three
+/// characters `SkillRegistry::match_task`'s tokenizer requires. The
+/// template stays because it tells the model the user invoked the skill by
+/// name (the same text a working lexical match used to produce, so that
+/// case is unchanged), and because it gives a bare `/name` a non-empty
+/// prompt.
 fn skill_prompt(name: &str, rest: &str) -> String {
     if rest.is_empty() {
         format!("Use the {name} skill.")
@@ -453,19 +463,42 @@ mod tests {
         );
     }
 
-    /// The prompt template matters: `SkillRegistry::match_task` matches
-    /// whitespace-separated words of >=3 chars against the skill name, so
-    /// the bare name must appear as its own word.
+    /// A `/skill` line keeps the skill's name as data — the runtime
+    /// activates exactly it — while the template stays the prompt text.
     #[test]
-    fn a_skill_becomes_a_prompt_that_activates_it() {
+    fn a_skill_parses_as_a_skill_with_its_prompt() {
         let s = snapshot();
         assert_eq!(
             Command::parse("/tdd write the failing test", &s),
-            Parsed::Prompt("Use the tdd skill.\n\nwrite the failing test".into())
+            Parsed::Skill {
+                name: "tdd".into(),
+                prompt: "Use the tdd skill.\n\nwrite the failing test".into(),
+            }
         );
         assert_eq!(
             Command::parse("/code-reviewer", &s),
-            Parsed::Prompt("Use the code-reviewer skill.".into())
+            Parsed::Skill {
+                name: "code-reviewer".into(),
+                prompt: "Use the code-reviewer skill.".into(),
+            }
+        );
+    }
+
+    /// The case lexical matching could never serve: `match_task` drops
+    /// words under 3 characters, so a two-letter skill was unreachable as a
+    /// slash command until the name became data.
+    #[test]
+    fn a_two_character_skill_name_parses_as_a_skill() {
+        let s = CompletionSnapshot {
+            skills: vec![("xy".into(), "the two-letter skill".into())],
+            ..CompletionSnapshot::default()
+        };
+        assert_eq!(
+            Command::parse("/xy do the thing", &s),
+            Parsed::Skill {
+                name: "xy".into(),
+                prompt: "Use the xy skill.\n\ndo the thing".into(),
+            }
         );
     }
 

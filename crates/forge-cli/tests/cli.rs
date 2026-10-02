@@ -430,6 +430,110 @@ fn run_works_offline_with_mock_model() {
     );
 }
 
+/// The one session transcript of a project that ran exactly one run.
+fn session_log(project: &Path) -> String {
+    let sessions = project.join(".forge").join("sessions");
+    let transcripts: Vec<_> = std::fs::read_dir(&sessions)
+        .expect("sessions dir")
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+        })
+        .collect();
+    assert_eq!(
+        transcripts.len(),
+        1,
+        "one session transcript: {transcripts:?}"
+    );
+    std::fs::read_to_string(transcripts[0].path()).expect("read transcript")
+}
+
+/// Scaffold a mock-model project with one `demo` skill.
+fn project_with_demo_skill(tmp: &Path) -> PathBuf {
+    let project = tmp.join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"mock-local\"\n",
+    )
+    .expect("write config");
+    let skill = project.join(".forge").join("skills").join("demo");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo skill description\n---\n# Demo\n\nDo the demo thing.\n",
+    )
+    .expect("write skill");
+    project
+}
+
+/// `forge run --skill <name>` activates the skill explicitly: the prompt
+/// shares no >=3-char token with the skill's name or description, so the
+/// activation cannot have come from lexical matching.
+#[test]
+fn run_with_skill_activates_it_without_a_matching_prompt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = project_with_demo_skill(tmp.path());
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "--skill", "demo", "zz unrelated qq"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = session_log(&project);
+    let activation = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "skill_activated")
+        .unwrap_or_else(|| panic!("no skill_activated in session log: {log}"));
+    assert_eq!(activation["name"], "demo");
+}
+
+/// An unknown `--skill` name is an error, not a run without the skill:
+/// non-zero exit, the name on stderr, and no session events written.
+#[test]
+fn run_with_an_unknown_skill_fails_loudly_and_writes_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = project_with_demo_skill(tmp.path());
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        // Flag after the prompt: both orders must parse.
+        .args(["run", "zz unrelated qq", "--skill", "nosuch"])
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+    assert!(stderr.contains("unknown skill: nosuch"), "stderr: {stderr}");
+
+    // Entry validation precedes the session claim: nothing was written.
+    let sessions = project.join(".forge").join("sessions");
+    if sessions.is_dir() {
+        let transcripts = std::fs::read_dir(&sessions)
+            .expect("read sessions")
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+            })
+            .count();
+        assert_eq!(transcripts, 0, "a refused run leaves no transcript");
+    }
+}
+
 #[test]
 fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     let tmp = tempfile::tempdir().expect("tempdir");

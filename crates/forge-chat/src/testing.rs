@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use forge_config::Config;
 use forge_core::{
     ApprovalPolicy, CompletionRequest, CompletionResponse, ExecutionProvider, ForgeError,
-    ModelCapabilities, ModelProvider, ToolCall,
+    ModelCapabilities, ModelProvider, Skill, SkillMeta, SkillRegistry, ToolCall,
 };
 use forge_execution::{ApprovalChannel, MockExecution, NativeExecution};
 use forge_providers::{ScriptedMockModel, ScriptedReply, StaticRouter};
@@ -319,6 +319,36 @@ pub struct FakeHost {
     environment: Environment,
     models: Vec<ModelChoice>,
     skills: Vec<SkillChoice>,
+    /// The scripted model the service was built with, when it was one —
+    /// kept so a test can assert on what the model was actually sent.
+    scripted_model: Option<Arc<ScriptedMockModel>>,
+}
+
+/// The one-skill registry behind [`FakeHost::with_skill_and_script`]: the
+/// name is two characters, so `SkillRegistry::match_task` (which tokenizes
+/// words of >= 3) can never produce it — any activation of `xy` came
+/// through the explicit path.
+struct StubSkills;
+
+impl SkillRegistry for StubSkills {
+    fn list(&self) -> Vec<SkillMeta> {
+        vec![SkillMeta {
+            name: "xy".to_string(),
+            description: "the two-letter test skill".to_string(),
+            path: PathBuf::from("skills/xy/SKILL.md"),
+        }]
+    }
+
+    fn activate(&self, name: &str) -> Result<Skill, ForgeError> {
+        self.list()
+            .into_iter()
+            .find(|meta| meta.name == name)
+            .map(|meta| Skill {
+                instructions: "xy INSTRUCTIONS".to_string(),
+                meta,
+            })
+            .ok_or_else(|| ForgeError::skill(format!("unknown skill: {name}")))
+    }
 }
 
 impl FakeHost {
@@ -326,9 +356,30 @@ impl FakeHost {
     /// (see [`ScriptedMockModel::from_json`] for the shape) and whose
     /// execution never asks for approval.
     pub fn with_script(json: &str) -> (Self, TempDir) {
-        Self::build(Execution::Mock, |_root| {
-            Arc::new(ScriptedMockModel::from_json(json).expect("valid script"))
-        })
+        let model = Arc::new(ScriptedMockModel::from_json(json).expect("valid script"));
+        let recorded = Arc::clone(&model);
+        let (mut host, tmp) = Self::build(Execution::Mock, move |_root| model);
+        host.scripted_model = Some(recorded);
+        (host, tmp)
+    }
+
+    /// A service like [`with_script`](Self::with_script), but whose skill
+    /// registry offers `xy` — a skill no prompt can match lexically — and
+    /// whose snapshot lists it, so `/xy` parses as a skill command.
+    pub fn with_skill_and_script(json: &str) -> (Self, TempDir) {
+        let model = Arc::new(ScriptedMockModel::from_json(json).expect("valid script"));
+        let recorded = Arc::clone(&model);
+        let (mut host, tmp) = Self::build_with_skills(
+            Execution::Mock,
+            move |_root| model,
+            Arc::new(StubSkills),
+            vec![SkillChoice {
+                name: "xy".to_string(),
+                description: "the two-letter test skill".to_string(),
+            }],
+        );
+        host.scripted_model = Some(recorded);
+        (host, tmp)
     }
 
     /// A two-reply script whose model sleeps before every reply — long
@@ -387,9 +438,24 @@ impl FakeHost {
         Arc::clone(&self.service)
     }
 
+    /// The scripted model the service was built with, when it was one —
+    /// for assertions on what the model was actually sent.
+    pub fn scripted_model(&self) -> Option<Arc<ScriptedMockModel>> {
+        self.scripted_model.clone()
+    }
+
     fn build(
         execution: Execution,
         model: impl FnOnce(&std::path::Path) -> Arc<dyn ModelProvider>,
+    ) -> (Self, TempDir) {
+        Self::build_with_skills(execution, model, Arc::new(NullSkillRegistry), Vec::new())
+    }
+
+    fn build_with_skills(
+        execution: Execution,
+        model: impl FnOnce(&std::path::Path) -> Arc<dyn ModelProvider>,
+        skill_registry: Arc<dyn SkillRegistry>,
+        skills: Vec<SkillChoice>,
     ) -> (Self, TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root: PathBuf = tmp.path().to_path_buf();
@@ -408,7 +474,7 @@ impl FakeHost {
             model,
             router,
             execution,
-            Arc::new(NullSkillRegistry),
+            skill_registry,
             sessions,
             Config::default(),
         ));
@@ -429,7 +495,8 @@ impl FakeHost {
                 description: "the scripted test model".to_string(),
                 active: true,
             }],
-            skills: Vec::new(),
+            skills,
+            scripted_model: None,
         };
         (host, tmp)
     }

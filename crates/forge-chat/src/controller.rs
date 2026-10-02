@@ -76,6 +76,29 @@ pub enum Signal {
     Eof,
 }
 
+/// One turn's worth of instruction: the prompt text plus any skills the
+/// user named explicitly with `/name`. A struct rather than a bare
+/// `String` so a queued `/skill` line keeps its skill when it runs — a
+/// `String` queue was the silent way to lose exactly that.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnRequest {
+    /// The user-turn text the model sees.
+    pub prompt: String,
+    /// Skill names for `RunOptions::activate_skills`. Empty for a plain
+    /// prompt.
+    pub activate_skills: Vec<String>,
+}
+
+impl TurnRequest {
+    /// A plain prompt: lexical discovery decides what activates.
+    pub fn plain(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            activate_skills: Vec::new(),
+        }
+    }
+}
+
 /// What the driver must do, in the order given.
 ///
 /// One variant per §9.1 effect plus the signal outcomes, so the driver's job
@@ -84,7 +107,7 @@ pub enum Signal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     /// Start a turn. Only ever one of these is live at a time.
-    Prompt(String),
+    Prompt(TurnRequest),
     /// Answer the parked run's approval question.
     Approve(bool),
     /// Cancel the attached run and await its handle (§5).
@@ -145,8 +168,9 @@ pub struct Controller {
     /// Prompts typed while a run was attached. FIFO and unbounded: what the
     /// user typed is never dropped (§6.5), and running them one at a time is
     /// what keeps the chat from ever provoking the runtime's
-    /// one-live-run-per-session refusal (§10.1.1).
-    queue: VecDeque<String>,
+    /// one-live-run-per-session refusal (§10.1.1). Each entry is the whole
+    /// [`TurnRequest`], so a queued `/skill` line keeps its skill.
+    queue: VecDeque<TurnRequest>,
     /// When the last idle `Ctrl-C` arrived, if it is still armed.
     armed_at: Option<Instant>,
     /// An exit has been requested once while work was live (§10.2). Not
@@ -221,7 +245,11 @@ impl Controller {
         }
 
         match Command::parse(trimmed, &self.snapshot) {
-            Parsed::Prompt(text) => self.on_prompt(text),
+            Parsed::Prompt(text) => self.on_prompt(TurnRequest::plain(text)),
+            Parsed::Skill { name, prompt } => self.on_prompt(TurnRequest {
+                prompt,
+                activate_skills: vec![name],
+            }),
             Parsed::Unknown(name) => vec![Action::Write(Line::bad(format!(
                 "unknown command /{name} - /help lists them"
             )))],
@@ -312,20 +340,20 @@ impl Controller {
     /// Popping registers the turn, so a driver cannot take two prompts and
     /// run them at once — the queue is what means the chat never asks the
     /// runtime for a second concurrent run on one session (§10.1.1).
-    pub fn take_queued(&mut self) -> Option<String> {
+    pub fn take_queued(&mut self) -> Option<TurnRequest> {
         let next = self.queue.pop_front()?;
         self.attached = Some(Attached::Working);
         Some(next)
     }
 
-    fn on_prompt(&mut self, text: String) -> Vec<Action> {
+    fn on_prompt(&mut self, turn: TurnRequest) -> Vec<Action> {
         if self.attached.is_some() {
             // §6.5: queued as the next turn, FIFO, never dropped.
-            self.queue.push_back(text);
+            self.queue.push_back(turn);
             return Vec::new();
         }
         self.attached = Some(Attached::Working);
-        vec![Action::Prompt(text)]
+        vec![Action::Prompt(turn)]
     }
 
     fn on_background(&mut self) -> Vec<Action> {
@@ -491,7 +519,7 @@ mod tests {
         let mut c = idle();
         assert_eq!(
             c.on_line("explain the parser"),
-            vec![Action::Prompt("explain the parser".into())]
+            vec![Action::Prompt(TurnRequest::plain("explain the parser"))]
         );
         assert_eq!(c.state(), ChatState::Running);
     }
@@ -637,7 +665,7 @@ mod tests {
             "the queued prompt has not run yet: {actions:?}"
         );
         c.on_run_settled();
-        assert_eq!(c.take_queued(), Some("second".to_string()));
+        assert_eq!(c.take_queued(), Some(TurnRequest::plain("second")));
         c.on_run_settled();
         assert_eq!(c.take_queued(), None);
         assert_eq!(c.on_drained(), vec![Action::CancelAllJobs, Action::Quit(0)]);
@@ -933,13 +961,34 @@ mod tests {
         assert!(c.on_line("second").is_empty(), "nothing happens yet");
         assert!(c.on_line("third").is_empty());
         c.on_run_settled();
-        assert_eq!(c.take_queued(), Some("second".to_string()));
+        assert_eq!(c.take_queued(), Some(TurnRequest::plain("second")));
         assert_eq!(
             c.take_queued(),
-            Some("third".to_string()),
+            Some(TurnRequest::plain("third")),
             "FIFO, nothing dropped"
         );
         assert_eq!(c.take_queued(), None);
+    }
+
+    /// A `/skill` typed during a turn keeps its skill when it runs next —
+    /// the queue carries the whole `TurnRequest`, not just the text.
+    #[test]
+    fn a_queued_skill_line_keeps_its_skill() {
+        let mut c = idle();
+        c.set_completions(CompletionSnapshot {
+            skills: vec![("tdd".into(), "test-driven development".into())],
+            ..CompletionSnapshot::default()
+        });
+        c.on_line("first");
+        assert!(c.on_line("/tdd write the failing test").is_empty());
+        c.on_run_settled();
+        assert_eq!(
+            c.take_queued(),
+            Some(TurnRequest {
+                prompt: "Use the tdd skill.\n\nwrite the failing test".into(),
+                activate_skills: vec!["tdd".into()],
+            })
+        );
     }
 
     /// Taking a queued prompt starts a turn, so the driver cannot pop two of
@@ -952,7 +1001,7 @@ mod tests {
         c.on_line("second");
         c.on_run_settled();
         assert_eq!(c.state(), ChatState::Idle);
-        assert_eq!(c.take_queued(), Some("second".to_string()));
+        assert_eq!(c.take_queued(), Some(TurnRequest::plain("second")));
         assert_eq!(c.state(), ChatState::Running);
     }
 
@@ -1024,9 +1073,10 @@ mod tests {
         });
         assert_eq!(
             c.on_line("/tdd write the failing test"),
-            vec![Action::Prompt(
-                "Use the tdd skill.\n\nwrite the failing test".into()
-            )]
+            vec![Action::Prompt(TurnRequest {
+                prompt: "Use the tdd skill.\n\nwrite the failing test".into(),
+                activate_skills: vec!["tdd".into()],
+            })]
         );
     }
 

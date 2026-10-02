@@ -122,6 +122,10 @@ pub struct RunOptions {
     pub session_id: Option<String>,
     /// Turn budget override (defaults to `config.max_turns`).
     pub max_turns: Option<u32>,
+    /// Skill names to activate explicitly, in addition to any the task
+    /// matches lexically. An unknown name is a typed error at the entry
+    /// point — the caller asked for it, so never run without it.
+    pub activate_skills: Vec<String>,
 }
 
 /// Everything one run needs beyond the ids. Built by
@@ -141,18 +145,26 @@ struct RunPlan {
     history: Vec<Message>,
     /// The run this one continues, for the `input_received` link marker.
     resumed_from: Option<String>,
+    /// Skills the caller named explicitly. Empty on a resume, which has no
+    /// options and re-runs discovery on the original task.
+    activate_skills: Vec<String>,
 }
 
 impl RunPlan {
     /// A new instruction: the prompt is the task, and `history` is whatever
     /// the session it lands in already contains (empty for a fresh session).
-    fn new_prompt(prompt: impl Into<String>, history: Vec<Message>) -> Self {
+    fn new_prompt(
+        prompt: impl Into<String>,
+        history: Vec<Message>,
+        activate_skills: Vec<String>,
+    ) -> Self {
         let prompt = prompt.into();
         Self {
             task: prompt.clone(),
             prompt,
             history,
             resumed_from: None,
+            activate_skills,
         }
     }
 }
@@ -975,6 +987,39 @@ impl AgentService {
         Ok(())
     }
 
+    /// Activate one skill by name: emit its `skill_activated` event and
+    /// return the system message carrying its instructions. The one
+    /// definition of both, so the explicit and lexical activation paths in
+    /// [`run_inner`](Self::run_inner) cannot drift — only their failure
+    /// policies differ (explicit fails the run, lexical warns and
+    /// continues), and that choice stays at the call sites.
+    fn activate_skill(
+        &self,
+        sender: &broadcast::Sender<Event>,
+        collected: &mut Vec<Event>,
+        run_id: &str,
+        session_id: &str,
+        name: &str,
+    ) -> Result<Message, ForgeError> {
+        let skill = self.skills.activate(name)?;
+        self.emit(
+            sender,
+            collected,
+            Event::new(
+                run_id,
+                session_id,
+                EventKind::SkillActivated {
+                    name: skill.meta.name.clone(),
+                    path: skill.meta.path.clone(),
+                },
+            ),
+        )?;
+        Ok(Message::system(format!(
+            "Active skill `{}` instructions:\n{}",
+            skill.meta.name, skill.instructions
+        )))
+    }
+
     /// Record one model response verbatim, so the conversation can be
     /// replayed later (see [`crate::replay`]). This is the *replay* stream;
     /// the `tool_*`/`completed` events remain the short observability
@@ -1117,6 +1162,39 @@ impl AgentService {
         self.live_sessions.claim(session_id, run_id)
     }
 
+    /// Refuse an explicit skill request the registry cannot satisfy.
+    ///
+    /// Called **first** at every entry point taking [`RunOptions`] — before
+    /// the session is claimed, before any task is spawned — because the
+    /// refusal must reach the caller synchronously (a transport that has
+    /// already answered "202, here is your run id" has nowhere left to
+    /// report it; [`claim_session`](Self::claim_session)'s doc makes the same
+    /// argument for `SessionBusy`), and because a refused run must leave no
+    /// claim, no broadcaster and no events behind. The caller explicitly
+    /// asked for these skills, so running without one is never the right
+    /// answer — the same "don't silently reinterpret" rule as an unknown
+    /// slash command. Lexical discovery keeps its warn-and-continue policy
+    /// inside the run: discovery is speculative, this is requested.
+    fn validate_activate_skills(&self, names: &[String]) -> Result<(), ForgeError> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let available: Vec<String> = self.skills.list().into_iter().map(|m| m.name).collect();
+        for name in names {
+            if !available.iter().any(|a| a == name) {
+                let available = if available.is_empty() {
+                    "none discovered".to_string()
+                } else {
+                    available.join(", ")
+                };
+                return Err(ForgeError::skill(format!(
+                    "unknown skill: {name} (available: {available})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Run a prompt through the agent loop with fresh run/session ids.
     pub async fn run(&self, prompt: &str) -> Result<RunOutcome, ForgeError> {
         self.run_with_options(prompt, RunOptions::default()).await
@@ -1131,18 +1209,21 @@ impl AgentService {
     ///
     /// Naming a session that has a run *in flight* is
     /// [`ForgeError::SessionBusy`] — see
-    /// [`claim_session`](Self::claim_session).
+    /// [`claim_session`](Self::claim_session). An unknown name in
+    /// `activate_skills` is [`ForgeError::Skill`], refused just as
+    /// synchronously — see [`validate_activate_skills`](Self::validate_activate_skills).
     pub async fn run_with_options(
         &self,
         prompt: &str,
         options: RunOptions,
     ) -> Result<RunOutcome, ForgeError> {
+        self.validate_activate_skills(&options.activate_skills)?;
         let run_id = options.run_id.unwrap_or_else(new_run_id);
         let session_id = options.session_id.unwrap_or_else(new_session_id);
         let claim = self.claim_session(&session_id, &run_id)?;
         let history = self.session_history(&session_id);
         self.run_tracked(
-            RunPlan::new_prompt(prompt, history),
+            RunPlan::new_prompt(prompt, history, options.activate_skills),
             &run_id,
             &session_id,
             options.max_turns,
@@ -1205,12 +1286,14 @@ impl AgentService {
     /// The session is claimed **before** the task is spawned and before any
     /// tracking entry is created, so a refusal leaves nothing behind and the
     /// caller learns about it in time to answer with a conflict rather than an
-    /// accepted run that later fails.
+    /// accepted run that later fails. An unknown `activate_skills` name is
+    /// refused even earlier — before the claim — for the same reason.
     pub fn start_run_with_options(
         self: &Arc<Self>,
         prompt: impl Into<String>,
         options: RunOptions,
     ) -> Result<StartedRun, ForgeError> {
+        self.validate_activate_skills(&options.activate_skills)?;
         let run_id = options.run_id.unwrap_or_else(new_run_id);
         let session_id = options.session_id.unwrap_or_else(new_session_id);
         let claim = self.claim_session(&session_id, &run_id)?;
@@ -1221,11 +1304,12 @@ impl AgentService {
         let prompt = prompt.into();
         let (rid, sid) = (run_id.clone(), session_id.clone());
         let max_turns = options.max_turns;
+        let activate_skills = options.activate_skills;
         let handle = tokio::spawn(async move {
             let history = service.session_history(&sid);
             service
                 .run_tracked(
-                    RunPlan::new_prompt(prompt, history),
+                    RunPlan::new_prompt(prompt, history, activate_skills),
                     &rid,
                     &sid,
                     max_turns,
@@ -1489,6 +1573,7 @@ impl AgentService {
             task,
             history,
             resumed_from,
+            activate_skills,
         } = plan;
         let prompt = prompt.as_str();
         let task = task.as_str();
@@ -1559,9 +1644,12 @@ impl AgentService {
         // disqualify it: the second turn of a session is still a new
         // instruction, and gating on history instead of on `resumed_from`
         // would silently switch the fast path off for every continuation.
-        // All other gates and the dispatch itself live in
-        // `needle_fast_path`; `None` means "run normally", and nothing has
-        // been emitted or executed by then.
+        // An explicit-skill turn is excluded too: the fast path returns
+        // before the skill block, so dispatching one would record no
+        // activation and inject no instructions — silently dishonoring the
+        // one thing the caller asked for. All other gates and the dispatch
+        // itself live in `needle_fast_path`; `None` means "run normally",
+        // and nothing has been emitted or executed by then.
         //
         // Whatever the fast path answers is recorded — dispatched, declined
         // and (with no engine attached) unavailable alike. A decline that
@@ -1570,7 +1658,7 @@ impl AgentService {
         let decide_tools = tool_definitions();
         // `tool_definitions()` is a fixed surface, so it is always
         // non-empty and does not gate the fast path.
-        let fast = if resumed_from.is_none() {
+        let fast = if resumed_from.is_none() && activate_skills.is_empty() {
             let started = std::time::Instant::now();
             let outcome = self.needle_fast_path(prompt, &run_id, &decide_tools).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -1804,26 +1892,37 @@ impl AgentService {
         // System first is what providers expect, and the history is a real
         // user/assistant/tool transcript that must arrive in its own order.
         let mut messages = Vec::new();
-        for meta in self.skills.match_task(task) {
-            match self.skills.activate(&meta.name) {
-                Ok(skill) => {
-                    self.emit(
-                        &sender,
-                        &mut collected,
-                        Event::new(
-                            &run_id,
-                            &session_id,
-                            EventKind::SkillActivated {
-                                name: skill.meta.name.clone(),
-                                path: skill.meta.path.clone(),
-                            },
-                        ),
-                    )?;
-                    messages.push(Message::system(format!(
-                        "Active skill `{}` instructions:\n{}",
-                        skill.meta.name, skill.instructions
-                    )));
+        // Explicitly requested skills activate first, in caller order with
+        // duplicates collapsed — ahead of, never instead of, lexical
+        // discovery. The caller asked for these by name, so a failed
+        // activation fails the run (entry validation has already refused
+        // unknown names; this surfaces a skill deleted between the two
+        // resolutions). They are not budgeted against the lexical match cap.
+        let mut activated: Vec<String> = Vec::new();
+        for name in &activate_skills {
+            if activated.iter().any(|n| n == name) {
+                continue;
+            }
+            match self.activate_skill(&sender, &mut collected, &run_id, &session_id, name) {
+                Ok(message) => {
+                    messages.push(message);
+                    activated.push(name.clone());
                 }
+                Err(e) => return Err(fail(&mut collected, e)),
+            }
+        }
+        for meta in self.skills.match_task(task) {
+            if activated.iter().any(|n| n == &meta.name) {
+                continue;
+            }
+            match self.activate_skill(&sender, &mut collected, &run_id, &session_id, &meta.name) {
+                Ok(message) => {
+                    messages.push(message);
+                    activated.push(meta.name.clone());
+                }
+                // Discovery is speculative, so it keeps its
+                // warn-and-continue policy — the two failure policies
+                // differ because the two contracts differ.
                 Err(e) => {
                     tracing::warn!(skill = %meta.name, error = %e, "skill activation failed")
                 }
@@ -2339,6 +2438,9 @@ impl AgentService {
                 task,
                 history,
                 resumed_from: Some(target_run),
+                // A resume takes no options: discovery re-runs on the
+                // original task, exactly as the run being continued did.
+                activate_skills: Vec::new(),
             },
             &resumed_run,
             &session_id,

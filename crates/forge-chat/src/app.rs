@@ -46,7 +46,7 @@ use forge_runtime::{Attachment, RunOptions, RunOutcome};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::controller::{Action, Controller, Signal};
+use crate::controller::{Action, Controller, Signal, TurnRequest};
 use crate::host::{ChatHost, HostChange, NeedleState};
 use crate::io::{ChatIo, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome};
 use crate::render::TranscriptState;
@@ -583,7 +583,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     async fn execute(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::Prompt(text) => self.start_turn(text).await,
+                Action::Prompt(turn) => self.start_turn(turn).await,
                 Action::Approve(approved) => {
                     if let Some(run_id) = self.run_id.clone() {
                         let message = if approved { "y" } else { "n" };
@@ -638,7 +638,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// cancel a run it does not know exists yet — silently, since a fallible
     /// cancel here is intentionally best-effort — and the turn would run to
     /// completion uncancelled.
-    async fn start_turn(&mut self, prompt: String) {
+    async fn start_turn(&mut self, turn: TurnRequest) {
         // A loop, not a recursive call, because a turn that fails to start
         // must still hand on to whatever was queued behind it — and a
         // `async fn` cannot call itself without boxing. Every other
@@ -647,15 +647,16 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         // used to drop it, leaving `/quit`-less batch input waiting on a
         // turn that would never start. That was a spin before the EOF fix
         // and is a silent hang after it, so it is fixed here.
-        let mut pending = Some(prompt);
-        while let Some(prompt) = pending.take() {
+        let mut pending = Some(turn);
+        while let Some(turn) = pending.take() {
             let run_id = forge_session::new_run_id();
             let events = self.host.service().subscribe(&run_id);
             let started = self.host.service().start_run_with_options(
-                prompt,
+                turn.prompt,
                 RunOptions {
                     run_id: Some(run_id.clone()),
                     session_id: Some(self.session_id.clone()),
+                    activate_skills: turn.activate_skills,
                     ..RunOptions::default()
                 },
             );
@@ -1103,6 +1104,7 @@ async fn join_handle(
 mod tests {
     use super::*;
     use crate::testing::{FakeHost, ScriptedIo};
+    use forge_core::SessionStore;
 
     /// One turn: the transcript shows the routing line, the tool call, and
     /// the answer exactly once.
@@ -1135,6 +1137,49 @@ mod tests {
             out.contains("  = 2 turns"),
             "the footer reports the turns:\n{out}"
         );
+    }
+
+    /// `/name` activates exactly that skill through the explicit path: the
+    /// name `xy` is two characters, so no prompt could ever match it
+    /// lexically — the transcript line, the `skill_activated` event and the
+    /// instructions in the model's request all come from the name
+    /// travelling as data end to end.
+    #[tokio::test]
+    async fn a_slash_skill_activates_explicitly_not_by_matching() {
+        let (host, _tmp) = FakeHost::with_skill_and_script(r#"[{"text": "did the thing"}]"#);
+        let service = host.service();
+        let model = host.scripted_model().expect("scripted model");
+        let mut io = ScriptedIo::new(["/xy do the thing", "/quit"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        assert!(
+            out.contains("  - skill: xy"),
+            "the transcript shows the activation:\n{out}"
+        );
+
+        let events = service.sessions().events().expect("events");
+        let activations: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::SkillActivated { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(activations, ["xy"], "{events:?}");
+
+        let recorded = model.recorded();
+        assert_eq!(recorded.len(), 1, "one model call");
+        let systems: Vec<&str> = recorded[0]
+            .messages
+            .iter()
+            .filter(|m| m.role == forge_core::Role::System)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(systems.len(), 1, "{systems:?}");
+        assert!(systems[0].contains("xy INSTRUCTIONS"), "{}", systems[0]);
     }
 
     /// The fast path has no assistant text, so the outcome is the answer —
