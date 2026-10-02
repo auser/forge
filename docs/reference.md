@@ -62,9 +62,10 @@ decided by a model calibrated to emit a choice plus a confidence — not by a
 chat model guessing in prose. Anything under the threshold is rejected and
 escalated rather than acted on.
 
-(Skill activation is scored lexical matching over skill names and
+(Skill discovery is scored lexical matching over skill names and
 descriptions — a name-token hit or two description hits, at most three
-skills per turn — not a needle decision. See [Skills](#skills).)
+skills per turn — and a run can also name skills explicitly. Neither is a
+needle decision. See [Skills](#skills).)
 
 **Whether you actually have a brain depends on the build.** Real on-device
 inference needs the native engine, and the engine is **on by default**: the
@@ -274,6 +275,18 @@ ten-second menu above.
 `forge doctor` is always the first move — it names the config line to change.
 `forge version` is the second, if the installed binary might be stale.
 
+When every check passes but you still don't trust the stack, `forge doctor
+--live` goes one step further: after the static checks it fires one tiny
+canary prompt ("Reply with exactly: FORGE_LIVE_OK", bounded by a 120 s
+timeout) through the same run path `forge run` uses, and reports what
+actually fired — the model that answered, the router that decided, whether
+the Jev escalation tier fired, the wall-clock latency, and the session it
+leaves on disk for inspection. A failed canary is a failing check (exit
+non-zero), unlike the static checks' warn-never-fail posture: a stack that
+cannot complete a run *is* broken. `--live` composes with `--json` (the
+canary results are just more check entries) and never runs from the MCP
+`forge_doctor` tool, which serves the static checks only.
+
 **`no credential found for model …` then `401 Unauthorized: API key required`**
 
 ```text
@@ -370,7 +383,11 @@ forge init --preset claude     # writes examples/configs/claude.toml as .forge/c
 ```
 
 See [`examples/configs/`](examples/configs/) for `claude`, `codex` and
-`kimi` (plug-and-play with each tool's usual credential), plus
+`kimi` (plug-and-play with each tool's usual credential), `kev`
+(self-hosted System One routing: Kev, CLM or OpenJev on your own
+hardware), `decider` (hosted routing from meraGPT's Decider 1) and `jev`
+(hosted TypeSafe Jev as needle's escalation tier — nothing to configure;
+`export TYPESAFE_API_KEY=...` is the one step that arms it), plus
 `local-first` (the default stack, made explicit), `hybrid-needle` (local
 first, hosted escalation), `budget-hosted`, and `hybrid-laya` (the
 Laya-adapter example), and an [`env.example`](examples/env.example)
@@ -507,18 +524,30 @@ session 01JCF3...  /help for commands
 /bg         detach the running turn and keep talking
 /jobs       runs and their states
 /attach     follow a run again by id
+/show       re-render a recorded tool result: /show [n], latest first
 /quit       leave (Ctrl-D does the same)
 /exit       leave (Ctrl-D does the same)
 ```
 
-Typing a skill's name as a slash command (e.g. `/demo`) activates it the
-same way a matching plain prompt would — `/name` invocation still relies on
-`SkillRegistry::match_task`'s lexical word/substring matching, not a needle
-decision (see [Known limitations](#known-limitations-v03)). `/model`,
+Typing a skill's name as a slash command (e.g. `/demo`) activates exactly
+that skill: the name travels to the runtime as data
+(`RunOptions::activate_skills`), so activation no longer depends on how the
+name would score in `SkillRegistry::match_task`'s lexical matching — a
+two-letter skill name works. Lexical discovery still runs on the prompt and
+adds anything it matches. `/model`,
 `/approval` and `/graph` never offer a test-only mock as a choice, but the
 entry banner and `/model`/`/config`/`/approval` report the *active* model
 honestly even when it is one — hiding that would be a lie about what is
 running.
+
+The live stream renders a tool call as its one-line summary (`  * read_file
+src/main.rs` / `    -> ok (4 ms)`) and deliberately keeps the payload out of
+the scroll; `/show [n]` re-renders the nth most recent one on demand (`/show`
+alone = the latest). The payload comes from the session log at command time,
+so it works identically mid-turn, after a turn, and on a continued session's
+backlog — and it is exactly the recorded, redacted, ≤64 KiB form the model
+saw. For another session's payloads, or the raw JSON, `forge session show
+<id>` remains the cross-session reader; `/session <id>` + `/show` composes.
 
 ### Keybindings, and the complete Ctrl-C rule
 
@@ -547,7 +576,10 @@ an unreadable session log print a `  ! error:` line and return to the
 prompt.
 
 The rest are `rustyline` defaults: `Tab` completes a slash command, a skill
-name, or a `/attach` job id — listed with each command's description, name
+name, a `/attach` job id, or any word starting with `@` against the project
+graph's file list (case-sensitive prefix; needs `forge graph build` to have
+been run; capped, so a huge repo completes its alphabetically-first paths
+rather than stalling) — listed with each command's description, name
 and explanation aligned (`Tab` again after the bell, bash-style);
 `Up`/`Down`/`Ctrl-R` recall history;
 `Ctrl-A/E/K/U/W`, `Alt-B/F` are the usual emacs-style editing; `Ctrl-L`
@@ -673,15 +705,15 @@ now-async `ChatHost::graph_context`. Without an engine or index it is the
 plain lexical ranking — the same degradation as outside the chat.
 
 Beyond those three, see [Known limitations](#known-limitations-v03) for the
-ones shared with the rest of forge (no token-by-token streaming, background
-runs not surviving the process, lexical-only skill matching, no path
-completion).
+ones shared with the rest of forge (background runs not surviving the
+process, lexical-only skill discovery).
 
 ## Command line
 
 ```text
 forge init                          Initialize a project (idempotent)
-forge run [--max-turns N] <prompt>  Run the multi-turn agent loop
+forge run [--max-turns N] [--skill NAME]... <prompt>
+                                    Run the multi-turn agent loop
 forge chat [--continue|--session]   Open the interactive chat (also: bare forge)
 forge serve [--host --port]         Start the REST/SSE server
 forge mcp                           Serve MCP over stdio (editors, agents)
@@ -696,7 +728,9 @@ forge skill list|show|test
 forge router serve [--host --port]  Run the local Laya decision-router adapter
 forge model list|test
 forge config show|path|explain <key>
-forge doctor                        Environment/config health check
+forge doctor [--live]               Environment/config health check (--live adds
+                                    a real canary run: what answered, which router
+                                    decided, whether Jev escalation fired, latency)
 forge version
 ```
 
@@ -904,6 +938,12 @@ The default is `qwen3-coder` via the OpenAI-compatible endpoint at
 Capabilities (streaming, tools,
 structured output, vision, context size) are explicit per provider, never
 assumed; a provider without `tools` receives single-turn requests only.
+Both real provider families stream over SSE
+(`stream: true` for OpenAI-compatible servers; Anthropic's native event
+stream), and the runtime records the fragments as `assistant_delta`
+events (v4). A `[models.<name>]` entry may set `streaming = false` for an
+endpoint whose SSE misbehaves; that endpoint then answers whole, exactly
+as before streaming landed.
 
 ### DecisionRouter
 
@@ -918,12 +958,18 @@ Seven modes:
   brain](#embedded-needle-brain) — and falls back to static without
   it, or when weights are unavailable: unpinned variant, `--local-only`,
   no network),
-- `jev` (Jev/OpenJev System One decision model — TypeSafe's hosted API at
-  `https://api.typesafe.ai/v1/systemone` by default, or a self-hosted
-  [OpenJev](https://github.com/razorback16/openjev) server via `jev_url`;
-  bearer token from `jev_key_env`, default `TYPESAFE_API_KEY`; as primary,
-  also accepts `router_url`/`router_key_env` as a fallback; falls back to
-  static when unreachable or uncredentialed),
+- `jev` (the System One family over one wire contract — TypeSafe's hosted
+  Jev at `https://api.typesafe.ai/v1/systemone` by default; a self-hosted
+  [OpenJev](https://github.com/razorback16/openjev), **Kev** or **CLM**
+  server via `jev_url` (the `kev` preset); or meraGPT's hosted **Decider
+  1** via `jev_url = "https://meragpt.com/v1/systemone"` with
+  `jev_model = "sd-1"` (the `decider` preset). Bearer token from
+  `jev_key_env`, default `TYPESAFE_API_KEY`; as primary, also accepts
+  `router_url`/`router_key_env` as a fallback. The request's model id
+  defaults to the `jev-latest` alias; backends that validate it take
+  `jev_model`. Decider 1 caps a choice question at ten options and a
+  request at 4,096 tokens — prune `[models]` entries to fit; falls back
+  to static when unreachable or uncredentialed),
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `static` (deterministic rules),
@@ -1080,7 +1126,12 @@ Progressive disclosure: `forge skill list` reads only frontmatter metadata;
 `forge skill show <name>` loads the full instructions; references/scripts load on
 demand. During `forge run`, a prompt matching a skill activates it — the
 instructions are injected into the model context and a `skill_activated` event is
-appended to the session log. `forge skill test <name>` runs the skill's
+appended to the session log. A run can also name skills explicitly, in addition
+to (never instead of) lexical discovery: `forge run --skill <name>` (repeatable),
+MCP `forge_run { "skills": [...] }`, ACP `session/prompt` with
+`"_meta": { "forge.activateSkills": [...] }`, and chat's `/name`. An unknown
+name is a typed error at the entry point — the run never starts without a skill
+the caller asked for. `forge skill test <name>` runs the skill's
 `test.sh`/`test.py` through the configured execution provider.
 
 ## Project graph
@@ -1234,7 +1285,7 @@ forge_graph_map     {}                  per-directory structure summary
 forge_skill_list    {}                  skill names + descriptions (metadata only)
 forge_skill_show    {name}              a skill's full instructions
 forge_doctor        {}                  the `forge doctor` checks as JSON
-forge_run           {prompt, max_turns?, timeout_ms?}
+forge_run           {prompt, max_turns?, timeout_ms?, skills?}
                                         run the agent loop; returns
                                         {run_id, status, text}
 forge_run_status    {run_id}            status + final text + recent events
@@ -1327,10 +1378,14 @@ growing set of other editors, speak natively.
   means unsaved buffers in Zed are not visible to forge, and you'll want to save
   before asking about a file. (Bridging editor buffers is a planned follow-up;
   `initialize` honestly advertises that we don't use the client's filesystem.)
-* **No token-by-token streaming yet.** forge's loop produces a finished answer
-  rather than a token stream, so the reply arrives as one message rather than
-  typing itself out. Tool calls, by contrast, *are* live. We'd rather ship the
-  honest version than chop up finished text to imitate a stream.
+* **Streaming is live when the provider streams.** The answer then arrives
+  as `agent_message_chunk`s while it is being written — today the scripted
+  test double is the one streaming implementation, and real
+  OpenAI-compatible/Anthropic SSE is the recorded follow-up (TICKET-2 in
+  `specs/tickets/interactive-chat-feel.md`). A non-streaming provider's
+  answer still arrives as one chunk at the end of the turn, and tool calls
+  are live either way. What we never do is fake a stream by chopping up
+  finished text.
 * **Text prompts only** — no images or audio, and `initialize` says so rather
   than accepting them and dropping them on the floor. File mentions work
   either way: whether your editor sends a link or the file's contents, forge
@@ -1345,7 +1400,7 @@ growing set of other editors, speak natively.
 
 ## Sessions and events
 
-Every run appends versioned events (`"v": 3`, with a monotonic per-run `seq`
+Every run appends versioned events (`"v": 4`, with a monotonic per-run `seq`
 assigned by the session store on append) to
 `.forge/sessions/<session_id>.jsonl` — one JSON object per line, append-only.
 v1 logs (no `seq`, f32 confidence) and v2 logs remain readable.
@@ -1356,7 +1411,10 @@ The log carries two streams, deliberately separated:
   `run_started`, `routing_decision_made`, `skill_activated`,
   `tool_call_requested`, `tool_started`, `tool_completed`, `file_changed`,
   `approval_requested`, `approval_decided`, `turn_completed`,
-  `input_received`, `note` (v1 compat), `error`, `cancelled`, `completed`.
+  `input_received`, `note` (v1 compat), `error`, `cancelled`, `completed`;
+  plus (v4) `assistant_delta` — ordered text fragments of a streaming
+  model's in-flight answer. Rendering-only: replay ignores them and reads
+  the final `assistant_message`.
 * **Replay** (v3) — the model conversation, verbatim, so it can be
   reconstructed later: `assistant_message` (one per model response: its text
   and the tool calls it requested), `tool_result` (each tool's output as the
@@ -1793,16 +1851,14 @@ go in `specs/adrs/`.
   above.
 - **Interactive chat** (see [Interactive chat](#interactive-chat) for the
   three real gaps behind `/graph`, `notify()` and `TerminalIo::read`) shares
-  the rest of the harness's known limits rather than adding new ones: no
-  token-by-token streaming (the loop returns a finished answer, exactly like
-  `forge acp`); a `/bg`-detached job does not survive the process and
-  another `forge` process can only see its recorded history, never attach
-  to it live (the same in-process-only limit `forge serve`/`forge mcp`/
-  `forge acp` already have); a skill named as a slash command
-  (`/demo`) activates through the same lexical `SkillRegistry::match_task`
-  as a plain prompt, not a needle decision; and there is no path completion
-  — `Tab` completes commands, skill names and `/attach` job ids, nothing
-  filesystem-shaped.
+  the rest of the harness's known limits rather than adding new ones: a
+  `/bg`-detached job does not survive the process and another `forge`
+  process can only see its recorded history, never attach to it live (the
+  same in-process-only limit `forge serve`/`forge mcp`/`forge acp` already
+  have). `@`-path completion completes
+  the built graph's files only: with no graph built it offers nothing, and
+  paths containing whitespace are never offered (they cannot round-trip the
+  prompt's word-splitting).
 
 ## Contributing
 

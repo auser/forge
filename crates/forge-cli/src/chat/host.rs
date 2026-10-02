@@ -29,7 +29,7 @@ use forge_chat::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,
 };
-use forge_core::ForgeError;
+use forge_core::{ForgeError, ProjectGraph as _};
 use forge_execution::ApprovalChannel;
 use forge_needle::EngineEmbedder;
 use forge_runtime::AgentService;
@@ -66,6 +66,13 @@ pub struct CliHost {
     /// `/context` ranks lexically — the same degradation `forge graph
     /// context` has without an engine.
     embedder: Option<EngineEmbedder>,
+    /// `project_files`' cache: the loaded path list keyed by the graph
+    /// file's mtime (`None` = the file was absent at load). `refresh_
+    /// completions` calls this once per submitted line, so the steady
+    /// state must be one `stat`, not a re-parse of a graph file that can
+    /// run to megabytes on a large repo. Interior mutability because the
+    /// seam is `&self`.
+    paths_cache: std::sync::Mutex<Option<(Option<std::time::SystemTime>, Vec<String>)>>,
 }
 
 impl CliHost {
@@ -98,6 +105,7 @@ impl CliHost {
             options,
             needle,
             embedder,
+            paths_cache: std::sync::Mutex::new(None),
         })
     }
 }
@@ -167,6 +175,10 @@ impl ChatHost for CliHost {
                 description: meta.description,
             })
             .collect()
+    }
+
+    fn project_files(&self) -> Vec<String> {
+        project_files_at(&self.root, MAX_PROJECT_PATHS, &self.paths_cache)
     }
 
     fn config_summary(&self, key: Option<&str>) -> Vec<ConfigLine> {
@@ -247,6 +259,63 @@ async fn context_lines(
         .collect())
 }
 
+/// The most project paths ever loaded into a completion snapshot. Bounds
+/// the per-`readline` snapshot clones on huge repos; truncation is in the
+/// graph's sorted order, so it is deterministic, and a truncated repo
+/// completes its alphabetically-first 50k files — a bound, not a stall.
+const MAX_PROJECT_PATHS: usize = 50_000;
+
+/// `project_files`' body, free-standing so tests need no `CliHost` (the
+/// `context_lines` shape, this module). Re-reads the graph only when the
+/// file's mtime changed (or it appeared); any read/parse failure —
+/// including a corrupt `graph.json`, which `LocalGraph::open` turns into
+/// an `Err` — degrades to *no candidates* with a debug log, because a
+/// completion source must never break the prompt.
+fn project_files_at(
+    root: &Path,
+    cap: usize,
+    cache: &std::sync::Mutex<Option<(Option<std::time::SystemTime>, Vec<String>)>>,
+) -> Vec<String> {
+    // The graph's well-known file (the one `LocalGraph::open` reads),
+    // stat'd *before* any open: the mtime gate must precede the parse, or
+    // the steady state costs a multi-MB read instead of one `stat`.
+    let mtime = match std::fs::metadata(root.join(".forge/graph/graph.json")) {
+        Ok(meta) => meta.modified().ok(),
+        // Absent is a first-class cached state: an unbuilt project
+        // completes nothing, and a later `forge graph build` appears as an
+        // mtime going from `None` to `Some`, which is a cache miss.
+        Err(_) => None,
+    };
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_mtime, paths)) = &*guard
+            && *cached_mtime == mtime
+        {
+            return paths.clone();
+        }
+    } // Dropped before the graph I/O: a completion refresh must never hold
+    // the lock across a file parse a concurrent `graph_context` caller
+    // would wait behind.
+    let paths = match forge_graph::LocalGraph::open(root) {
+        Ok(graph) => graph
+            .files()
+            .into_iter()
+            // The keys are already project-relative and `/`-normalized at
+            // walk time — lossy-stringify them, never re-join.
+            .map(|path| path.to_string_lossy().into_owned())
+            .take(cap)
+            .collect(),
+        Err(e) => {
+            tracing::debug!(error = %e, "@-completion: graph unreadable, completing nothing");
+            Vec::new()
+        }
+    };
+    // Failures are cached too (mtime, empty): a corrupt graph file is paid
+    // for once per file version, not re-parsed on every submitted line.
+    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((mtime, paths.clone()));
+    paths
+}
+
 /// User-visible model choices, with every test-only mock removed (§9.3) —
 /// the one gate every `/model` listing and completion (`app.rs`) passes
 /// through, because every `ChatHost::models` implementation is meant to.
@@ -296,9 +365,8 @@ async fn needle_state(config: &forge_config::Config) -> NeedleState {
 
 #[cfg(test)]
 mod tests {
+    // `ProjectGraph` (for `LocalGraph::build`) comes in through `super::*`.
     use super::*;
-    // `LocalGraph::build` is a trait method.
-    use forge_core::ProjectGraph as _;
 
     /// The single place mocks are filtered out (§9.3). Everything the chat
     /// *offers* comes from here, so this test is the gate.
@@ -382,6 +450,69 @@ mod tests {
             .await
             .expect("context");
         assert!(hits.is_empty());
+    }
+
+    fn fresh_cache() -> std::sync::Mutex<Option<(Option<std::time::SystemTime>, Vec<String>)>> {
+        std::sync::Mutex::new(None)
+    }
+
+    /// A built graph's files complete: sorted, project-relative, and
+    /// excluding what the graph's policy excludes (`.forge/` itself).
+    #[test]
+    fn project_files_lists_the_graphs_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("mkdir");
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").expect("write");
+        std::fs::write(tmp.path().join("guide.md"), "# hi\n").expect("write");
+        let mut graph = forge_graph::LocalGraph::open(tmp.path()).expect("open");
+        graph.build().expect("build");
+
+        assert_eq!(
+            project_files_at(tmp.path(), MAX_PROJECT_PATHS, &fresh_cache()),
+            vec!["guide.md".to_string(), "src/main.rs".to_string()],
+        );
+    }
+
+    /// Review Focus 4: no graph, or a corrupt one, is silence — not an
+    /// error, not a panic, and (for the corrupt case) not a re-parse on
+    /// every call.
+    #[test]
+    fn project_files_degrades_to_empty_without_a_built_graph() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(project_files_at(tmp.path(), MAX_PROJECT_PATHS, &fresh_cache()).is_empty());
+        std::fs::create_dir_all(tmp.path().join(".forge/graph")).expect("mkdir");
+        std::fs::write(tmp.path().join(".forge/graph/graph.json"), "not json").expect("write");
+        let cache = fresh_cache();
+        assert!(project_files_at(tmp.path(), MAX_PROJECT_PATHS, &cache).is_empty());
+        assert!(
+            cache.lock().expect("cache").is_some(),
+            "the failure is cached, not re-paid"
+        );
+    }
+
+    /// Review Focus 3 (shell half): the cap is honored, and a rebuild is
+    /// picked up through the mtime gate — a file added after a rebuild
+    /// appears without restarting the chat.
+    #[test]
+    fn project_files_is_capped_and_reloads_on_rebuild() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").expect("write");
+        let mut graph = forge_graph::LocalGraph::open(tmp.path()).expect("open");
+        graph.build().expect("build");
+        let cache = fresh_cache();
+        assert_eq!(
+            project_files_at(tmp.path(), 1, &cache),
+            vec!["a.rs".to_string()]
+        );
+
+        std::fs::write(tmp.path().join("b.rs"), "fn b() {}\n").expect("write");
+        let mut graph = forge_graph::LocalGraph::open(tmp.path()).expect("reopen");
+        graph.build().expect("rebuild bumps the graph file's mtime");
+        assert_eq!(
+            project_files_at(tmp.path(), 50, &cache),
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            "the mtime gate reloaded"
+        );
     }
 
     // --- CliHost integration: the real construction/switch path ---------

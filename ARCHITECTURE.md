@@ -345,7 +345,9 @@ else's agent; ACP exposes forge as the agent.** Same `AgentService`, same
 answered. An ACP client (Zed and friends) drives `initialize` → `session/new` →
 `session/prompt`, and gets the turn back as `session/update` notifications:
 tool calls with kinds, statuses and file locations, routing decisions as
-thoughts, and the final text as one `agent_message_chunk`.
+thoughts, and the answer as live `agent_message_chunk`s when the provider
+streams (each `assistant_message` flushes whatever its deltas missed) — one
+whole chunk when it does not.
 
 Three seams carry it. **The ACP session id *is* the forge session id**, so a
 turn driven from the editor is inspectable with `forge session show <id>` and
@@ -385,7 +387,7 @@ forge run "explain the parser"
   ├─ config resolve (defaults → files → env → flags) + credential detection
   ├─ AgentService.start_run
   │    ├─ events: run_started, routing_decision_made (needle → jev → static)
-  │    ├─ skills matched, graph context seeded
+  │    ├─ skills activated (explicit, then matched), graph context seeded
   │    ├─ FAST PATH? (fresh prompt + engine + gates) ── yes ─▶ dispatch tool,
   │    │                                                       events, done
   │    └─ no ─▶ agent loop on the selected ModelProvider
@@ -409,7 +411,10 @@ lives between runs, which is why the v3 replay events are written even though
 no adapter displays them. Reconstruction also *repairs* the conversation — a
 run that died between announcing a tool call and recording its result leaves a
 call with no answer, and every chat API rejects that — so replay synthesizes
-the missing result rather than emitting a dangling call.
+the missing result rather than emitting a dangling call. Schema v4 adds
+`assistant_delta`: a streaming model's text as it arrives, broadcast and
+redacted like every event but never replayed — the final
+`assistant_message` remains the replay record.
 
 Because the store is now read back into the model's context, `SessionStore::append`
 returns **the redacted event it wrote**, not the one it was handed: the runtime
@@ -449,7 +454,12 @@ degradable condition.
 
 ## What's next (per the program spec)
 
-The ACP adapter (the other half of editor interop), the interactive TUI with
-slash commands / history replay / fork & background, and in-process
-generation (`forge-llm-embedded`) — see
+Shipped since this line was written: the ACP adapter and the interactive
+chat (slash commands / history replay / fork & background), and token
+streaming end-to-end — runtime plumbing (TICKET-1), provider SSE for both
+real families with graceful fallback to whole responses (TICKET-2; the
+runtime records `assistant_delta` events), and the chat's incremental
+assistant block plus ACP's live chunks rendering those deltas (TICKET-3;
+[`specs/tickets/interactive-chat-feel.md`](specs/tickets/interactive-chat-feel.md)).
+Remaining: in-process generation (`forge-llm-embedded`) — see
 [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md) §2.

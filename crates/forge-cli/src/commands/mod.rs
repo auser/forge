@@ -97,13 +97,17 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             }
             Ok(())
         }
-        Some(Command::Doctor) => doctor::run(&ctx).await,
+        Some(Command::Doctor { live }) => doctor::run(&ctx, live).await,
         Some(Command::Auth { command }) => match command {
             crate::cli::AuthCommand::Status => auth_cmd::status(&ctx),
         },
         Some(Command::Config { command }) => config_cmd::run(&ctx, command),
 
-        Some(Command::Run { prompt, max_turns }) => run_cmd::run(&ctx, prompt, max_turns).await,
+        Some(Command::Run {
+            prompt,
+            max_turns,
+            skills,
+        }) => run_cmd::run(&ctx, prompt, max_turns, skills).await,
         Some(Command::Resume { id }) => session_cmd::resume(&ctx, &id).await,
         Some(Command::Cancel { id }) => session_cmd::cancel(&ctx, &id),
         Some(Command::Session { command }) => match command.unwrap_or(SessionCommand::List) {

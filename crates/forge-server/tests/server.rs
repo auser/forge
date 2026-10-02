@@ -534,6 +534,10 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
             "tool_completed",
             "tool_result",
             "turn_completed",
+            // v4: the final answer streams as ordered deltas...
+            "assistant_delta",
+            "assistant_delta",
+            // ...and lands whole in the replay record
             "assistant_message",
             "turn_completed",
             "completed"
@@ -545,7 +549,7 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
         .iter()
         .map(|e| e["seq"].as_u64().expect("seq"))
         .collect();
-    assert_eq!(seqs, (1..=12).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=14).collect::<Vec<_>>());
     assert!(
         events
             .iter()

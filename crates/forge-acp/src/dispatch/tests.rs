@@ -492,6 +492,187 @@ fn a_changed_file_with_no_tool_call_in_flight_becomes_its_own_tool_call() {
 }
 
 #[test]
+fn a_delta_becomes_a_live_message_chunk() {
+    let mut state = TurnState::for_run(RUN, ROOT);
+    let out = updates(
+        &mut state,
+        vec![EventKind::AssistantDelta {
+            text: "the ".into(),
+        }],
+    );
+    assert_eq!(out.len(), 1);
+    assert!(
+        matches!(&out[0], SessionUpdate::AgentMessageChunk { content }
+            if matches!(content, ContentBlock::Text { text } if text == "the ")),
+        "{out:?}"
+    );
+}
+
+/// A fully streamed response flushes nothing at its message: the chunks
+/// were the text.
+#[test]
+fn a_fully_streamed_message_flushes_nothing() {
+    let mut state = TurnState::for_run(RUN, ROOT);
+    let out = updates(
+        &mut state,
+        vec![
+            EventKind::AssistantDelta {
+                text: "all ".into(),
+            },
+            EventKind::AssistantDelta {
+                text: "done".into(),
+            },
+            EventKind::AssistantMessage {
+                text: "all done".into(),
+                tool_calls: Vec::new(),
+            },
+        ],
+    );
+    assert_eq!(out.len(), 2, "two chunks, no flush: {out:?}");
+    assert!(state.unsent_tail("all done").is_empty(), "fully sent");
+}
+
+/// A lagged stream's gap is flushed by the message…
+#[test]
+fn a_message_flushes_the_suffix_its_deltas_missed() {
+    let mut state = TurnState::for_run(RUN, ROOT);
+    let out = updates(
+        &mut state,
+        vec![
+            EventKind::AssistantDelta {
+                text: "all ".into(),
+            },
+            EventKind::AssistantMessage {
+                text: "all done".into(),
+                tool_calls: Vec::new(),
+            },
+        ],
+    );
+    assert_eq!(out.len(), 2);
+    assert!(
+        matches!(&out[1], SessionUpdate::AgentMessageChunk { content }
+            if matches!(content, ContentBlock::Text { text } if text == "done")),
+        "the suffix, not the whole text again: {out:?}"
+    );
+    assert!(state.unsent_tail("all done").is_empty());
+}
+
+/// …and a message lost to lag is covered by the end-of-turn tail.
+#[test]
+fn the_tail_is_what_a_lost_message_never_sent() {
+    let mut state = TurnState::for_run(RUN, ROOT);
+    let _ = updates(
+        &mut state,
+        vec![EventKind::AssistantDelta {
+            text: "all ".into(),
+        }],
+    );
+    assert_eq!(state.unsent_tail("all done"), "done");
+}
+
+/// No deltas at all: the message sends the whole text (today's one chunk,
+/// moved earlier) — and the tail then has nothing left.
+#[test]
+fn a_non_streaming_response_is_one_chunk_at_message_time() {
+    let mut state = TurnState::for_run(RUN, ROOT);
+    let out = updates(
+        &mut state,
+        vec![EventKind::AssistantMessage {
+            text: "all done".into(),
+            tool_calls: Vec::new(),
+        }],
+    );
+    assert_eq!(out.len(), 1);
+    assert!(state.unsent_tail("all done").is_empty());
+}
+
+/// The fast path: the answer is a tool result carried by no message text,
+/// so the tail is the whole outcome — exactly today's send.
+#[test]
+fn the_fast_paths_outcome_is_the_whole_tail() {
+    let mut state = TurnState::for_run(RUN, ROOT);
+    let _ = updates(
+        &mut state,
+        vec![EventKind::AssistantMessage {
+            text: String::new(),
+            tool_calls: vec![forge_core::ToolCall::new(
+                "c1",
+                "read_file",
+                json!({"path": "a.rs"}),
+            )],
+        }],
+    );
+    assert_eq!(state.unsent_tail("fn a() {}"), "fn a() {}");
+}
+
+/// Two responses in one run (a tool loop): each flushes itself, and the
+/// second response's deltas do not append to the first's accounting.
+#[test]
+fn each_response_streams_and_flushes_on_its_own() {
+    let mut state = TurnState::for_run(RUN, ROOT);
+    let out = updates(
+        &mut state,
+        vec![
+            EventKind::AssistantDelta {
+                text: "reading ".into(),
+            },
+            EventKind::AssistantDelta { text: "it".into() },
+            EventKind::AssistantMessage {
+                text: "reading it".into(),
+                tool_calls: vec![forge_core::ToolCall::new(
+                    "c1",
+                    "read_file",
+                    json!({"path": "a.rs"}),
+                )],
+            },
+            EventKind::AssistantDelta {
+                text: "done".into(),
+            },
+            EventKind::AssistantMessage {
+                text: "done".into(),
+                tool_calls: Vec::new(),
+            },
+        ],
+    );
+    let texts: Vec<&str> = out
+        .iter()
+        .filter_map(|u| match u {
+            SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text { text },
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["reading ", "it", "done"], "{texts:?}");
+    assert!(state.unsent_tail("done").is_empty());
+}
+
+/// A provider that broke the concat contract gets its whole text sent at
+/// the message — duplication in the editor, explained by the runtime's own
+/// warning, rather than a lost answer.
+#[test]
+fn a_contract_violation_sends_the_whole_text() {
+    let mut state = TurnState::for_run(RUN, ROOT);
+    let _ = updates(
+        &mut state,
+        vec![EventKind::AssistantDelta { text: "gar".into() }],
+    );
+    let out = updates(
+        &mut state,
+        vec![EventKind::AssistantMessage {
+            text: "whole text".into(),
+            tool_calls: Vec::new(),
+        }],
+    );
+    assert!(
+        matches!(&out[0], SessionUpdate::AgentMessageChunk { content }
+            if matches!(content, ContentBlock::Text { text } if text == "whole text")),
+        "{out:?}"
+    );
+    assert_eq!(state.unsent_tail("whole text"), "", "accounted now");
+}
+
+#[test]
 fn bookkeeping_events_produce_no_updates() {
     // Nothing here has an honest ACP slot: inventing one would put noise
     // in the editor's transcript.

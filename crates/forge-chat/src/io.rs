@@ -35,10 +35,17 @@ pub enum Style {
 /// can invent a second one. ASCII only — no box drawing, no arrows, no
 /// emoji — so a Windows console, a `TERM=dumb` session and a CI log render
 /// identically.
+///
+/// A fragment (`fragment: true`) is the one shape that is not a whole
+/// line: the writer appends it to the line in flight, without the trailing
+/// newline. Only the renderer's incremental assistant block produces them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Line {
     pub style: Style,
     pub text: String,
+    /// Not a whole line: the writer appends this to the line in flight
+    /// instead of terminating it.
+    pub fragment: bool,
 }
 
 impl Line {
@@ -48,6 +55,18 @@ impl Line {
         Self {
             style: Style::Plain,
             text: text.into(),
+            fragment: false,
+        }
+    }
+
+    /// A piece of a streamed assistant answer: appended to the line in
+    /// flight, with no trailing newline. Only `render`'s incremental block
+    /// produces these; every other line terminates itself.
+    pub fn fragment(text: impl Into<String>) -> Self {
+        Self {
+            style: Style::Plain,
+            text: text.into(),
+            fragment: true,
         }
     }
 
@@ -103,6 +122,7 @@ impl Line {
         Self {
             style,
             text: format!("{gutter}{}", text.as_ref()),
+            fragment: false,
         }
     }
 }
@@ -127,6 +147,11 @@ pub struct CompletionSnapshot {
     pub jobs: Vec<String>,
     /// The project's recent session ids.
     pub sessions: Vec<String>,
+    /// Project-relative file paths from the built project graph, sorted,
+    /// `/`-separated, capped by the host. The source of `@`-word
+    /// completion (TICKET-4); empty when no graph is built, which degrades
+    /// `@`-completion to silence — never to an error.
+    pub paths: Vec<String>,
 }
 
 /// One completion candidate: the text inserted on acceptance, and the
@@ -239,6 +264,20 @@ mod tests {
         assert_eq!(line.style, Style::Meta);
         assert_eq!(line.text, "  - routing: needle -> qwen3-coder (conf 0.91)");
         assert!(line.text.is_ascii(), "the transcript is ASCII only");
+    }
+
+    /// A streamed answer's unit: no gutter, Plain style, and marked so the
+    /// writer appends it to the line in flight instead of terminating it.
+    #[test]
+    fn a_fragment_is_plain_text_that_does_not_end_the_line() {
+        let fragment = Line::fragment("the ans");
+        assert_eq!(fragment.style, Style::Plain);
+        assert_eq!(fragment.text, "the ans");
+        assert!(fragment.fragment);
+        assert!(
+            !Line::plain("the answer").fragment && !Line::meta("note").fragment,
+            "every other line terminates itself"
+        );
     }
 
     #[test]

@@ -6,14 +6,20 @@
 //! `FORGE_TEST_MOCKS=1` is set (see `forge_config::test_mocks`).
 //! Constructing them directly from Rust — which is what unit tests across
 //! the workspace do — is unaffected.
+//!
+//! Cancelling a streamed completion is structural: dropping the
+//! `stream_complete` future drops the HTTP response and closes the
+//! connection — there is no separate abort path to keep in step.
 
 mod anthropic;
 mod credentials;
 mod jev;
 mod local_only;
 mod model;
+pub mod openrouter;
 mod router;
 mod scripted;
+mod sse;
 
 pub use anthropic::AnthropicModel;
 pub use credentials::{

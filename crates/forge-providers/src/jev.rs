@@ -60,6 +60,11 @@ pub struct JevRouter {
     /// credential is a routing error here, not a silently-unauthenticated
     /// request (see the brief: "missing key" is a named error case).
     key_env: String,
+    /// The top-level `model` id sent on every request. Defaults to
+    /// [`JevRouter::MODEL_ALIAS`]; a backend that wants its own id
+    /// (meraGPT's `sd-1`, a self-hosted Kev/CLM server's) gets it via the
+    /// `jev_model` config key.
+    model_id: String,
     registry: Vec<(String, ModelCapabilities)>,
 }
 
@@ -87,6 +92,20 @@ impl JevRouter {
         registry: Vec<(String, ModelCapabilities)>,
         egress: EgressPolicy,
     ) -> Result<Self, ForgeError> {
+        Self::with_model_id(url, key_env, None, timeout, registry, egress)
+    }
+
+    /// [`JevRouter::new`] with an explicit request model id (`None` keeps
+    /// [`JevRouter::MODEL_ALIAS`], the value every known-compatible
+    /// backend accepts or ignores safely).
+    pub fn with_model_id(
+        url: Option<String>,
+        key_env: Option<String>,
+        model_id: Option<String>,
+        timeout: Duration,
+        registry: Vec<(String, ModelCapabilities)>,
+        egress: EgressPolicy,
+    ) -> Result<Self, ForgeError> {
         let client = egress
             .client(timeout)
             .map_err(|e| ForgeError::router(format!("building HTTP client: {e}")))?;
@@ -94,6 +113,7 @@ impl JevRouter {
             client,
             url: url.unwrap_or_else(|| Self::DEFAULT_URL.to_string()),
             key_env: key_env.unwrap_or_else(|| Self::DEFAULT_KEY_ENV.to_string()),
+            model_id: model_id.unwrap_or_else(|| Self::MODEL_ALIAS.to_string()),
             registry,
         })
     }
@@ -115,6 +135,7 @@ impl JevRouter {
 pub struct JevRouterBuilder {
     url: Option<String>,
     key_env: Option<String>,
+    model_id: Option<String>,
     timeout: Duration,
     registry: Vec<(String, ModelCapabilities)>,
     egress: Option<EgressPolicy>,
@@ -128,6 +149,11 @@ impl JevRouterBuilder {
 
     pub fn key_env(mut self, key_env: Option<String>) -> Self {
         self.key_env = key_env;
+        self
+    }
+
+    pub fn model_id(mut self, model_id: Option<String>) -> Self {
+        self.model_id = model_id;
         self
     }
 
@@ -159,7 +185,14 @@ impl JevRouterBuilder {
                  default to unrestricted",
             )
         })?;
-        JevRouter::new(self.url, self.key_env, self.timeout, self.registry, egress)
+        JevRouter::with_model_id(
+            self.url,
+            self.key_env,
+            self.model_id,
+            self.timeout,
+            self.registry,
+            egress,
+        )
     }
 }
 
@@ -218,7 +251,7 @@ impl DecisionRouter for JevRouter {
             .collect();
         let body = serde_json::json!({
             "state": task.task,
-            "model": Self::MODEL_ALIAS,
+            "model": self.model_id,
             "questions": {
                 "model": {
                     "type": "choice",
@@ -368,6 +401,44 @@ mod tests {
         assert_eq!(sent["model"], "jev-latest");
         assert_eq!(sent["questions"]["model"]["type"], "choice");
         assert!(sent["questions"]["model"]["criteria"]["cheap-a"].is_string());
+    }
+
+    /// A backend that wants its own model id (meraGPT's `sd-1`, a
+    /// self-hosted Kev/CLM server's) gets it on the wire; the alias stays
+    /// the default.
+    #[tokio::test]
+    #[serial]
+    async fn jev_router_sends_the_configured_model_id() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-jev-key") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.9)))
+            .mount(&server)
+            .await;
+
+        let router = JevRouter::with_model_id(
+            Some(server.uri()),
+            None,
+            Some("sd-1".to_string()),
+            Duration::from_secs(5),
+            vec![("cheap-a".to_string(), caps(true))],
+            EgressPolicy::default(),
+        )
+        .expect("construct");
+
+        let request = RoutingRequest {
+            task: "route me".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["cheap-a".to_string()],
+        };
+        router.route(&request).await.expect("routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        let received = server.received_requests().await.expect("requests");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("request json");
+        assert_eq!(sent["model"], "sd-1");
     }
 
     #[tokio::test]

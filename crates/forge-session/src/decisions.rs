@@ -26,6 +26,9 @@ pub enum Stage {
     Decide,
     /// Choosing which model answers.
     Route,
+    /// A model answered: the record carries the completion's usage and
+    /// cost, which is what spend budgets are enforced against.
+    Complete,
 }
 
 /// Who decided.
@@ -48,6 +51,8 @@ pub enum Outcome {
     Declined,
     Routed,
     Unavailable,
+    /// The model returned a completion (`Complete` records).
+    Answered,
 }
 
 /// One decision. Serializes to exactly one JSONL line.
@@ -71,6 +76,15 @@ pub struct DecisionRecord {
     /// True when the answer was fetched concurrently and discarded. Always
     /// false in A1; the field exists because A2 will set it.
     pub speculative: bool,
+    /// Token usage the provider reported for a `Complete` record; `None`
+    /// when it reported none (and always for `Decide`/`Route` records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<forge_core::Usage>,
+    /// USD cost computed from the resolved model entry's per-million-token
+    /// prices. `None` when usage or the price is missing — a missing price
+    /// must never be written as 0.0, which would read as "known free".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// Everything about a decision except the parts the log fills in itself.
@@ -173,11 +187,127 @@ impl DecisionLogHandle {
             outcome: draft.outcome,
             elapsed_ms: draft.elapsed_ms,
             speculative: draft.speculative,
+            usage: None,
+            cost_usd: None,
         };
         if let Err(e) = self.log.append(&record) {
             tracing::warn!(error = %e, "could not append to the decision log");
         }
     }
+
+    /// Record one model completion's usage and cost. Same never-fail
+    /// contract as [`record`](Self::record): spend accounting must not be
+    /// able to take a turn down.
+    pub fn record_usage(
+        &self,
+        turn: u32,
+        model: &str,
+        usage: Option<forge_core::Usage>,
+        cost_usd: Option<f64>,
+        elapsed_ms: u64,
+    ) {
+        let record = DecisionRecord {
+            ts: Utc::now(),
+            session: self.session.clone(),
+            turn,
+            stage: Stage::Complete,
+            // Completing is not a decision: nothing chose anything here, so
+            // the decider is None like any other absent engine.
+            decider: Decider::None,
+            question: "usage".to_string(),
+            choice: model.to_string(),
+            confidence: None,
+            probabilities: BTreeMap::new(),
+            candidates: Vec::new(),
+            outcome: Outcome::Answered,
+            elapsed_ms,
+            speculative: false,
+            usage,
+            cost_usd,
+        };
+        if let Err(e) = self.log.append(&record) {
+            tracing::warn!(error = %e, "could not append to the decision log");
+        }
+    }
+}
+
+/// Token/USD totals accumulated from `Complete` records. A cost that was
+/// never recorded simply does not accrue, so a local (zero-priced) model
+/// leaves `cost_usd` at 0.0 — which is true, not a placeholder.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpendTotals {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
+
+impl SpendTotals {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    fn add(&mut self, record: &DecisionRecord) {
+        self.calls += 1;
+        if let Some(usage) = record.usage {
+            self.input_tokens += u64::from(usage.prompt_tokens);
+            self.output_tokens += u64::from(usage.completion_tokens);
+        }
+        if let Some(cost) = record.cost_usd {
+            self.cost_usd += cost;
+        }
+    }
+}
+
+/// Sum the `Complete` records under `root` (one `<session>.decisions.jsonl`
+/// per session), twice: once scoped to `session_id` (skip with `None`) and
+/// once to records timestamped on `today` (UTC). Returns `(session, daily)`.
+///
+/// Tolerant by construction — this feeds spend ceilings, and a log that
+/// cannot be read must not make spend unaccountable *or* take the run down:
+/// an unreadable directory reads as empty, an unreadable file as skipped,
+/// and a malformed or truncated line (normal for a log that was being
+/// written when the process died) as skipped.
+pub fn scan_spend(
+    root: &Path,
+    session_id: Option<&str>,
+    today: chrono::NaiveDate,
+) -> (SpendTotals, SpendTotals) {
+    let mut session = SpendTotals::default();
+    let mut daily = SpendTotals::default();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return (session, daily);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.to_string_lossy().ends_with(".decisions.jsonl") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let Ok(record) = serde_json::from_str::<DecisionRecord>(line) else {
+                continue;
+            };
+            if record.stage != Stage::Complete {
+                continue;
+            }
+            if session_id == Some(record.session.as_str()) {
+                session.add(&record);
+            }
+            if record.ts.date_naive() == today {
+                daily.add(&record);
+            }
+        }
+    }
+    (session, daily)
+}
+
+/// [`scan_spend`] scoped to today (UTC) — the window `daily_usd` ceilings
+/// and `forge doctor` report against.
+pub fn scan_spend_today(root: &Path, session_id: Option<&str>) -> (SpendTotals, SpendTotals) {
+    scan_spend(root, session_id, Utc::now().date_naive())
 }
 
 #[cfg(test)]
@@ -203,6 +333,8 @@ mod tests {
             outcome: Outcome::Dispatched,
             elapsed_ms: 1104,
             speculative: false,
+            usage: None,
+            cost_usd: None,
         };
 
         let line = serde_json::to_string(&record).expect("serializes");
@@ -332,5 +464,106 @@ mod tests {
                 entry.path().display()
             );
         }
+    }
+
+    #[test]
+    fn old_lines_without_usage_or_cost_still_deserialize() {
+        // Written before usage accounting existed: the line must parse with
+        // the new fields defaulting to None, and re-serialize to the same
+        // shape (absent, not null).
+        let old = "{\"ts\":\"2026-09-25T03:14:07.113Z\",\"session\":\"s1\",\"turn\":1,\"stage\":\"route\",\"decider\":\"static\",\"question\":\"model\",\"choice\":\"mock\",\"confidence\":1.0,\"outcome\":\"routed\",\"elapsed_ms\":3,\"speculative\":false}";
+        let record: DecisionRecord = serde_json::from_str(old).expect("old line parses");
+        assert_eq!(record.stage, Stage::Route);
+        assert_eq!(record.usage, None);
+        assert_eq!(record.cost_usd, None);
+        let line = serde_json::to_string(&record).expect("serializes");
+        assert!(!line.contains("usage"), "absent stays absent: {line}");
+        assert!(!line.contains("cost_usd"), "absent stays absent: {line}");
+    }
+
+    #[test]
+    fn a_complete_record_carries_usage_and_cost() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log = Arc::new(DecisionLog::new(tmp.path().to_path_buf()));
+        let handle = DecisionLog::handle(&log, "sess-1");
+
+        handle.record_usage(
+            2,
+            "gpt-5",
+            Some(forge_core::Usage {
+                prompt_tokens: 1_000,
+                completion_tokens: 500,
+                total_tokens: 1_500,
+            }),
+            Some(0.00625),
+            812,
+        );
+
+        let raw = std::fs::read_to_string(tmp.path().join("sess-1.decisions.jsonl"))
+            .expect("log file exists");
+        let record: DecisionRecord = serde_json::from_str(raw.trim()).expect("line parses");
+        assert_eq!(record.stage, Stage::Complete);
+        assert_eq!(record.outcome, Outcome::Answered);
+        assert_eq!(record.choice, "gpt-5");
+        assert_eq!(record.usage.expect("usage").total_tokens, 1_500);
+        assert_eq!(record.cost_usd, Some(0.00625));
+    }
+
+    #[test]
+    fn scan_spend_scopes_by_session_and_day_and_skips_bad_lines() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log = Arc::new(DecisionLog::new(tmp.path().to_path_buf()));
+        let today = Utc::now().date_naive();
+        let usage = forge_core::Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+        };
+
+        let s1 = DecisionLog::handle(&log, "s1");
+        s1.record_usage(1, "gpt-5", Some(usage), Some(0.01), 1);
+        s1.record_usage(2, "gpt-5", Some(usage), None, 1); // no price: no cost
+        let s2 = DecisionLog::handle(&log, "s2");
+        s2.record_usage(1, "deepseek-chat", Some(usage), Some(0.02), 1);
+        // A route record contributes nothing, and neither does a malformed
+        // or truncated line.
+        s1.record(
+            1,
+            RecordDraft {
+                stage: Stage::Route,
+                decider: Decider::Static,
+                question: "model".to_string(),
+                choice: "gpt-5".to_string(),
+                confidence: Some(1.0),
+                probabilities: BTreeMap::new(),
+                candidates: Vec::new(),
+                outcome: Outcome::Routed,
+                elapsed_ms: 1,
+                speculative: false,
+            },
+        );
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp.path().join("s1.decisions.jsonl"))
+            .expect("open");
+        writeln!(file, "{{not json").expect("write garbage");
+        writeln!(file, "{{\"ts\":\"2026-09-25T03:14:07.113Z\",\"truncated").expect("write torn");
+
+        let yesterday = today - chrono::Duration::days(1);
+        let (session, daily) = scan_spend(tmp.path(), Some("s1"), today);
+        assert_eq!(session.calls, 2);
+        assert_eq!(session.input_tokens, 200);
+        assert_eq!(session.output_tokens, 100);
+        assert!((session.cost_usd - 0.01).abs() < 1e-12, "{session:?}");
+        // Daily spans sessions: all three completions happened today.
+        assert_eq!(daily.calls, 3);
+        assert!((daily.cost_usd - 0.03).abs() < 1e-12, "{daily:?}");
+        // A different day sees nothing.
+        let (_, daily_yesterday) = scan_spend(tmp.path(), Some("s1"), yesterday);
+        assert_eq!(daily_yesterday, SpendTotals::default());
+        // And a missing directory is empty, not an error.
+        let (none, _) = scan_spend(&tmp.path().join("nope"), None, today);
+        assert_eq!(none, SpendTotals::default());
     }
 }

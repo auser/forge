@@ -162,4 +162,127 @@ pub trait ModelProvider: Send + Sync {
     fn capabilities(&self) -> ModelCapabilities;
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, ForgeError>;
+
+    /// Complete one request, invoking `on_delta` with each text fragment as
+    /// it becomes available, then returning the assembled response — exactly
+    /// what `complete` would have returned, tool calls included.
+    ///
+    /// Contract: the fragments passed to `on_delta`, concatenated, equal the
+    /// returned response's `content`. A provider that cannot honor that must
+    /// not call `on_delta` at all. Tool-call deltas are reassembled inside
+    /// the provider and surface whole in the response; only text streams.
+    ///
+    /// The default is the graceful fallback: answer with `complete` and emit
+    /// no deltas, so every provider written before streaming — including one
+    /// advertising `streaming: true` — behaves byte-identically to before.
+    async fn stream_complete(
+        &self,
+        request: CompletionRequest,
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<CompletionResponse, ForgeError> {
+        let _ = on_delta;
+        self.complete(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A provider that implements only `complete` — every pre-streaming
+    /// provider is this. The default `stream_complete` must answer with the
+    /// whole response and call the delta callback *never*.
+    struct WholeOnly;
+
+    #[async_trait]
+    impl ModelProvider for WholeOnly {
+        fn name(&self) -> &str {
+            "whole-only"
+        }
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            }
+        }
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ForgeError> {
+            Ok(CompletionResponse {
+                model: "whole-only".into(),
+                content: format!("answer to {}", request.messages.len()),
+                tool_calls: Vec::new(),
+                finish_reason: Some("stop".into()),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_stream_is_a_silent_whole_response_fallback() {
+        let provider = WholeOnly;
+        let mut deltas: Vec<String> = Vec::new();
+        let response = provider
+            .stream_complete(
+                CompletionRequest::new("whole-only", vec![Message::user("hi")]),
+                &mut |d: &str| deltas.push(d.to_string()),
+            )
+            .await
+            .expect("stream falls back to complete");
+        assert_eq!(response.content, "answer to 1");
+        assert!(
+            deltas.is_empty(),
+            "the fallback emits no deltas: {deltas:?}"
+        );
+    }
+
+    /// An overriding provider receives the fragments it hands out.
+    #[tokio::test]
+    async fn an_override_delivers_fragments_then_the_assembled_response() {
+        struct Chunky;
+        #[async_trait]
+        impl ModelProvider for Chunky {
+            fn name(&self) -> &str {
+                "chunky"
+            }
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, ForgeError> {
+                unreachable!("streaming providers are called through stream_complete")
+            }
+            async fn stream_complete(
+                &self,
+                _: CompletionRequest,
+                on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+            ) -> Result<CompletionResponse, ForgeError> {
+                on_delta("he");
+                on_delta("llo");
+                Ok(CompletionResponse {
+                    model: "chunky".into(),
+                    content: "hello".into(),
+                    tool_calls: Vec::new(),
+                    finish_reason: None,
+                    usage: None,
+                })
+            }
+        }
+        let mut got = String::new();
+        let response = Chunky
+            .stream_complete(
+                CompletionRequest::new("chunky", vec![Message::user("hi")]),
+                &mut |d: &str| got.push_str(d),
+            )
+            .await
+            .expect("streamed");
+        assert_eq!(got, "hello");
+        assert_eq!(
+            response.content, "hello",
+            "fragments concatenate to the response"
+        );
+    }
 }
