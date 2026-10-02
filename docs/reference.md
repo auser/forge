@@ -706,7 +706,7 @@ plain lexical ranking — the same degradation as outside the chat.
 
 Beyond those three, see [Known limitations](#known-limitations-v03) for the
 ones shared with the rest of forge (background runs not surviving the
-process, lexical-only skill discovery, no path completion).
+process, lexical-only skill discovery).
 
 ## Command line
 
