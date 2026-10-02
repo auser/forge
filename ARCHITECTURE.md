@@ -409,7 +409,10 @@ lives between runs, which is why the v3 replay events are written even though
 no adapter displays them. Reconstruction also *repairs* the conversation — a
 run that died between announcing a tool call and recording its result leaves a
 call with no answer, and every chat API rejects that — so replay synthesizes
-the missing result rather than emitting a dangling call.
+the missing result rather than emitting a dangling call. Schema v4 adds
+`assistant_delta`: a streaming model's text as it arrives, broadcast and
+redacted like every event but never replayed — the final
+`assistant_message` remains the replay record.
 
 Because the store is now read back into the model's context, `SessionStore::append`
 returns **the redacted event it wrote**, not the one it was handed: the runtime

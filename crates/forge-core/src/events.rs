@@ -12,6 +12,10 @@ use crate::execution::RiskLevel;
 /// * v3 adds the *replay* kinds — [`EventKind::AssistantMessage`],
 ///   [`EventKind::ToolResult`] and [`EventKind::SessionForked`] — so a
 ///   session's model conversation can be reconstructed verbatim.
+/// * v4 adds `assistant_delta` — ordered text fragments of a streaming
+///   model's in-flight answer. Rendering-only: replay ignores them and
+///   reads the final `assistant_message`, so a v4 log replays exactly as
+///   its delta-free equivalent. Purely additive, like v3.
 ///
 /// The change is purely additive: no existing kind or field changed
 /// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
@@ -19,7 +23,7 @@ use crate::execution::RiskLevel;
 /// event kinds an older reader does not know; runs recorded before v3
 /// replay as well as their data allows (see
 /// `forge_runtime::replay::conversation_from_events`).
-pub const EVENT_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_SCHEMA_VERSION: u32 = 4;
 
 /// Cap on the tool output stored in an [`EventKind::ToolResult`].
 ///
@@ -180,6 +184,14 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<crate::tool::ToolCall>,
     },
+    /// One text fragment of a streaming model's in-flight answer (v4).
+    /// Ordered by `seq`, always followed by the response's verbatim
+    /// `AssistantMessage`. Rendering-only — a third, optional strand beside
+    /// the observability and replay streams above: replay ignores it, and a
+    /// non-streaming run records none.
+    AssistantDelta {
+        text: String,
+    },
     /// A tool's output as the model saw it, keyed by the call it answers.
     /// Capped by [`cap_tool_output`].
     ToolResult {
@@ -327,7 +339,7 @@ mod tests {
         );
         let value = serde_json::to_value(&assistant).expect("serialize");
         assert_eq!(value["type"], "assistant_message");
-        assert_eq!(value["v"], 3);
+        assert_eq!(value["v"], EVENT_SCHEMA_VERSION);
         assert_eq!(value["tool_calls"][0]["name"], "read_file");
 
         let result = Event::new(
@@ -404,6 +416,27 @@ mod tests {
         let capped = cap_tool_output(&wide);
         assert!(capped.starts_with('é'));
         assert!(capped.contains("truncated"));
+    }
+
+    #[test]
+    fn assistant_delta_serializes_snake_case_and_roundtrips() {
+        let event = Event::new("r", "s", EventKind::AssistantDelta { text: "hel".into() });
+        let value = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(value["type"], "assistant_delta");
+        assert_eq!(value["v"], EVENT_SCHEMA_VERSION);
+        let line = serde_json::to_string(&event).expect("ser");
+        let back: Event = serde_json::from_str(&line).expect("de");
+        assert!(matches!(back.kind, EventKind::AssistantDelta { ref text } if text == "hel"));
+    }
+
+    /// The additive convention: a v3 log line (which knows no deltas) still
+    /// parses under the new binary — deltas only ever *add* lines.
+    #[test]
+    fn a_v3_log_line_still_parses() {
+        let line = "{\"v\":3,\"seq\":4,\"ts\":\"2026-09-24T12:00:00Z\",\"run_id\":\"r\",\"session_id\":\"s\",\"type\":\"assistant_message\",\"text\":\"done\"}";
+        let event: Event = serde_json::from_str(line).expect("v3 line parses");
+        assert_eq!(event.v, 3);
+        assert!(matches!(event.kind, EventKind::AssistantMessage { .. }));
     }
 
     #[test]

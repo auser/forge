@@ -1353,7 +1353,7 @@ growing set of other editors, speak natively.
 
 ## Sessions and events
 
-Every run appends versioned events (`"v": 3`, with a monotonic per-run `seq`
+Every run appends versioned events (`"v": 4`, with a monotonic per-run `seq`
 assigned by the session store on append) to
 `.forge/sessions/<session_id>.jsonl` — one JSON object per line, append-only.
 v1 logs (no `seq`, f32 confidence) and v2 logs remain readable.
@@ -1364,7 +1364,10 @@ The log carries two streams, deliberately separated:
   `run_started`, `routing_decision_made`, `skill_activated`,
   `tool_call_requested`, `tool_started`, `tool_completed`, `file_changed`,
   `approval_requested`, `approval_decided`, `turn_completed`,
-  `input_received`, `note` (v1 compat), `error`, `cancelled`, `completed`.
+  `input_received`, `note` (v1 compat), `error`, `cancelled`, `completed`;
+  plus (v4) `assistant_delta` — ordered text fragments of a streaming
+  model's in-flight answer. Rendering-only: replay ignores them and reads
+  the final `assistant_message`.
 * **Replay** (v3) — the model conversation, verbatim, so it can be
   reconstructed later: `assistant_message` (one per model response: its text
   and the tool calls it requested), `tool_result` (each tool's output as the

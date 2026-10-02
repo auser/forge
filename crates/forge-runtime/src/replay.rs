@@ -201,6 +201,7 @@ fn run_messages(events: &[&Event]) -> RunReplay {
             | EventKind::ApprovalRequested { .. }
             | EventKind::ApprovalDecided { .. }
             | EventKind::TurnCompleted { .. }
+            | EventKind::AssistantDelta { .. }
             | EventKind::SessionForked { .. }
             | EventKind::Error { .. }
             | EventKind::Cancelled { .. } => {}

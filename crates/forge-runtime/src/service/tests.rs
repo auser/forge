@@ -89,6 +89,7 @@ fn event_kinds(outcome: &RunOutcome) -> Vec<&str> {
             EventKind::TurnCompleted { .. } => "turn_completed",
             EventKind::InputReceived { .. } => "input_received",
             EventKind::AssistantMessage { .. } => "assistant_message",
+            EventKind::AssistantDelta { .. } => "assistant_delta",
             EventKind::ToolResult { .. } => "tool_result",
             EventKind::SessionForked { .. } => "session_forked",
             EventKind::Error { .. } => "error",
@@ -130,6 +131,232 @@ async fn full_run_emits_ordered_events() {
     assert!(persisted.iter().all(|e| e.run_id == outcome.run_id));
     let seqs: Vec<u64> = persisted.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+}
+
+// --- token streaming (TICKET-1) ------------------------------------------
+
+#[tokio::test]
+async fn a_streaming_run_emits_ordered_deltas_then_the_same_terminal_events() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("the answer")],
+        forge_core::ApprovalPolicy::Deny,
+    );
+    let outcome = service.run("question").await.expect("run");
+
+    let kinds = event_kinds(&outcome);
+    assert_eq!(
+        kinds,
+        [
+            "run_started",
+            "routing_decision_made",
+            "assistant_delta",
+            "assistant_delta",
+            // the replay record, retained and unchanged
+            "assistant_message",
+            "turn_completed",
+            "completed"
+        ],
+        "deltas arrive in order, then exactly today's terminal events"
+    );
+
+    // The deltas concatenate to the final message, and the message is the
+    // same one a delta-free log would carry.
+    let deltas: String = outcome
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::AssistantDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, "the answer");
+    let final_text = outcome
+        .events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::AssistantMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("final message");
+    assert_eq!(final_text, "the answer");
+    assert_eq!(outcome.text, "the answer", "RunOutcome.text is unchanged");
+
+    // Persisted and sequenced like every event, through the one boundary.
+    let persisted = service
+        .sessions()
+        .events_for(&outcome.session_id)
+        .expect("read");
+    let seqs: Vec<u64> = persisted.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=persisted.len() as u64).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn a_non_streaming_provider_records_no_deltas() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = MockModel::new().with_capabilities(forge_core::ModelCapabilities {
+        streaming: false,
+        ..MockModel::new().capabilities()
+    });
+    let service = AgentService::new(
+        Arc::new(model),
+        Arc::new(MockRouter::selecting("mock-local")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+    let outcome = service.run("hi").await.expect("run");
+    assert_eq!(
+        event_kinds(&outcome),
+        [
+            "run_started",
+            "routing_decision_made",
+            "assistant_message",
+            "turn_completed",
+            "completed"
+        ],
+        "byte-identical to before"
+    );
+}
+
+/// A provider that advertises streaming but only implements `complete`
+/// (every pre-existing provider) takes the fallback: no deltas, same events.
+#[tokio::test]
+async fn advertising_streaming_without_an_override_is_a_silent_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(tmp.path()); // MockModel: streaming: true, no override
+    let outcome = service.run("hi").await.expect("run");
+    assert!(
+        !event_kinds(&outcome).contains(&"assistant_delta"),
+        "the default stream_complete emits nothing"
+    );
+    assert_eq!(outcome.text, "mock response to: hi");
+}
+
+/// Splits its answer at fixed byte offsets — including through a secret —
+/// to prove the runtime's hold-back, not the provider's chunking, is what
+/// lets the redaction boundary see whole tokens.
+struct SplittingModel;
+
+#[async_trait::async_trait]
+impl ModelProvider for SplittingModel {
+    fn name(&self) -> &str {
+        "splitting"
+    }
+    fn capabilities(&self) -> forge_core::ModelCapabilities {
+        forge_core::ModelCapabilities {
+            streaming: true,
+            tools: false,
+            ..Default::default()
+        }
+    }
+    async fn complete(
+        &self,
+        _: CompletionRequest,
+    ) -> Result<forge_core::CompletionResponse, ForgeError> {
+        unreachable!()
+    }
+    async fn stream_complete(
+        &self,
+        _: CompletionRequest,
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<forge_core::CompletionResponse, ForgeError> {
+        for piece in ["the key is sk-abc", "def123456 ok", " bye"] {
+            on_delta(piece);
+        }
+        Ok(forge_core::CompletionResponse {
+            model: "splitting".into(),
+            content: "the key is sk-abcdef123456 ok bye".into(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_secret_split_across_provider_chunks_is_still_redacted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = AgentService::new(
+        Arc::new(SplittingModel),
+        Arc::new(MockRouter::selecting("splitting")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+    let outcome = service.run("tell me").await.expect("run");
+
+    let raw = std::fs::read_to_string(
+        tmp.path()
+            .join(".forge")
+            .join("sessions")
+            .join(format!("{}.jsonl", outcome.session_id)),
+    )
+    .expect("log");
+    assert!(
+        !raw.contains("sk-abcdef123456"),
+        "secret leaked split across deltas: {raw}"
+    );
+    assert!(
+        raw.contains("[REDACTED]"),
+        "the boundary saw the whole token: {raw}"
+    );
+    // And what was broadcast/collected is the redacted form, like every event.
+    let deltas: String = outcome
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::AssistantDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(deltas.contains("[REDACTED]"), "{deltas}");
+}
+
+#[tokio::test]
+async fn resume_after_a_streamed_run_replays_the_final_message_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        text_reply("first streamed answer"),
+        text_reply("second"),
+    ]));
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+    let first = service.run("start").await.expect("first");
+    let resumed = service.resume(&first.run_id).await.expect("resume");
+    assert_eq!(resumed.text, "second");
+
+    // The model saw the final message, not a pile of fragments.
+    let requests = model.recorded();
+    assert_eq!(requests.len(), 2, "one model request per run");
+    let history: Vec<&str> = requests[1]
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        history.contains(&"first streamed answer"),
+        "the final message replays whole: {history:?}"
+    );
+    assert!(
+        !history.iter().any(|c| *c == "first " || *c == "streamed "),
+        "fragments never replay: {history:?}"
+    );
 }
 
 struct FailingRouter;
@@ -266,6 +493,9 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
             // v3 replay record of the tool's output
             "tool_result",
             "turn_completed",
+            // v4: the final answer streams as ordered deltas...
+            "assistant_delta",
+            "assistant_delta",
             // v3 replay record of the final answer — itself a turn
             "assistant_message",
             "turn_completed",
@@ -274,7 +504,7 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
     );
     // Sequence numbers are monotonic.
     let seqs: Vec<u64> = outcome.events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=12).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=14).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -2048,6 +2278,10 @@ async fn needle_fast_path_absent_engine_changes_nothing() {
         [
             "run_started",
             "routing_decision_made",
+            // v4: the answer streams as ordered deltas...
+            "assistant_delta",
+            "assistant_delta",
+            // ...and lands whole in the v3 replay record
             "assistant_message",
             "turn_completed",
             "completed"

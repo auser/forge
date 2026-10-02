@@ -1008,6 +1008,86 @@ impl AgentService {
         )
     }
 
+    /// One model call, streamed when the provider supports it.
+    ///
+    /// Fragments become `assistant_delta` events — rendering-only: the replay
+    /// record is the assembled `AssistantMessage` emitted by
+    /// [`emit_assistant_message`](Self::emit_assistant_message) from the
+    /// returned response, exactly as for a non-streaming call.
+    ///
+    /// A delta is emitted only up to its last whitespace boundary; the
+    /// trailing partial token is carried until more text arrives and flushed
+    /// before this returns. The redactor matches whole patterns per payload
+    /// (`forge_session`'s one boundary), and a provider chunk can split a
+    /// secret mid-token — the carry is what makes "deltas pass through the
+    /// one redaction boundary" true rather than vacuous.
+    async fn complete_streaming(
+        &self,
+        sender: &broadcast::Sender<Event>,
+        collected: &mut Vec<Event>,
+        run_id: &str,
+        session_id: &str,
+        model: &Arc<dyn ModelProvider>,
+        request: CompletionRequest,
+    ) -> Result<forge_core::CompletionResponse, ForgeError> {
+        if !model.capabilities().streaming {
+            return model.complete(request).await;
+        }
+        let mut carry = String::new();
+        let mut streamed = String::new();
+        let mut on_delta = |delta: &str| {
+            carry.push_str(delta);
+            // Emit the prefix that ends at whitespace; keep the partial token.
+            // (`rfind` yields a byte index, so step over the whole char.)
+            let Some(split) = carry
+                .rfind(char::is_whitespace)
+                .map(|i| i + carry[i..].chars().next().map_or(1, char::len_utf8))
+            else {
+                return;
+            };
+            let tail = carry.split_off(split);
+            streamed.push_str(&carry);
+            let event = Event::new(
+                run_id,
+                session_id,
+                EventKind::AssistantDelta {
+                    text: std::mem::take(&mut carry),
+                },
+            );
+            carry = tail;
+            // Best-effort: a delta that fails to persist is a rendering gap,
+            // never a run failure — the final AssistantMessage carries the
+            // same text through the same boundary a moment later.
+            if let Err(e) = self.emit(sender, collected, event) {
+                tracing::warn!(run_id, error = %e, "assistant delta not persisted");
+            }
+        };
+        let response = model.stream_complete(request, &mut on_delta).await?;
+        // The tail: the provider contract says fragments concatenate to
+        // `content`, so flush whatever is still carried.
+        streamed.push_str(&carry);
+        if !carry.is_empty() {
+            let event = Event::new(
+                run_id,
+                session_id,
+                EventKind::AssistantDelta { text: carry },
+            );
+            if let Err(e) = self.emit(sender, collected, event) {
+                tracing::warn!(run_id, error = %e, "assistant delta not persisted");
+            }
+        }
+        if streamed != response.content {
+            // A provider violating the fragment contract must not corrupt
+            // the replay record — the response is what gets recorded.
+            tracing::warn!(
+                run_id,
+                "streamed fragments do not concatenate to the response content; \
+                 the final assistant_message is unaffected"
+            );
+        }
+        Ok(response)
+    }
+
     /// Take the session for one run, or refuse: **one live run per session.**
     ///
     /// Two runs in one session are not merely racy, they corrupt data that
@@ -1789,7 +1869,17 @@ impl AgentService {
             // Single-turn path: providers without tool support behave
             // exactly as a plain completion.
             let request = CompletionRequest::new(decision.selected_model.clone(), messages);
-            let response = match model.complete(request).await {
+            let response = match self
+                .complete_streaming(
+                    &sender,
+                    &mut collected,
+                    &run_id,
+                    &session_id,
+                    &model,
+                    request,
+                )
+                .await
+            {
                 Ok(response) => response,
                 Err(e) => return Err(fail(&mut collected, e)),
             };
@@ -1835,7 +1925,17 @@ impl AgentService {
 
             let request = CompletionRequest::new(selected.clone(), messages.clone())
                 .with_tools(tools.clone());
-            let response = match model.complete(request).await {
+            let response = match self
+                .complete_streaming(
+                    &sender,
+                    &mut collected,
+                    &run_id,
+                    &session_id,
+                    &model,
+                    request,
+                )
+                .await
+            {
                 Ok(response) => response,
                 Err(e) => return Err(fail(&mut collected, e)),
             };
