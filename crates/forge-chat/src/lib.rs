@@ -53,7 +53,7 @@ pub mod testing;
 
 pub use app::{SessionStart, Start, run};
 pub use command::{APPROVAL_MODES, COMMANDS, Command, Parsed, help_lines};
-pub use controller::{Action, ChatState, Controller, Signal};
+pub use controller::{Action, ChatState, Controller, Signal, TurnRequest};
 pub use host::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,

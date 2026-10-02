@@ -385,7 +385,7 @@ forge run "explain the parser"
   ├─ config resolve (defaults → files → env → flags) + credential detection
   ├─ AgentService.start_run
   │    ├─ events: run_started, routing_decision_made (needle → jev → static)
-  │    ├─ skills matched, graph context seeded
+  │    ├─ skills activated (explicit, then matched), graph context seeded
   │    ├─ FAST PATH? (fresh prompt + engine + gates) ── yes ─▶ dispatch tool,
   │    │                                                       events, done
   │    └─ no ─▶ agent loop on the selected ModelProvider

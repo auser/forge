@@ -475,6 +475,43 @@ fn reply_is_exactly_the_mock_response(world: &mut BddWorld) {
     );
 }
 
+/// The prompt shares no >=3-char token with the skill's name ("demo") or
+/// description ("Demo skill description"), so the activation cannot have
+/// come from lexical matching — only from the explicit flag.
+#[when(expr = "I run a task that does not match the skill with --skill {string}")]
+async fn run_task_with_skill_flag(world: &mut BddWorld, skill: String) {
+    world.set_config("model", "\"mock-local\"");
+    // The mock's reply is clean by default; this scenario is about the
+    // instructions reaching the model, so it opts into the echo (same as
+    // `task_matches_skill`).
+    world
+        .env
+        .insert("FORGE_MOCK_VERBOSE".to_string(), "1".to_string());
+    world
+        .run_forge(&["run", "--skill", &skill, "zz unrelated qq"])
+        .await;
+}
+
+#[then("the chat output shows the skill activated")]
+fn chat_output_shows_the_skill_activated(world: &mut BddWorld) {
+    assert!(
+        world.last_stdout.contains("  - skill: demo"),
+        "the transcript renders the activation: {}",
+        world.last_stdout
+    );
+}
+
+#[then(expr = "the session events include a skill activation for {string}")]
+fn session_events_include_a_skill_activation(world: &mut BddWorld, name: String) {
+    let log = world.session_log();
+    let event = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "skill_activated" && e["name"] == name)
+        .unwrap_or_else(|| panic!("no skill_activated for {name} in session log: {log}"));
+    assert_eq!(event["name"], name);
+}
+
 // ---------------------------------------------------------------------------
 // tracing.feature
 // ---------------------------------------------------------------------------

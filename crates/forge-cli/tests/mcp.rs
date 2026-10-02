@@ -487,6 +487,62 @@ fn run_executes_the_agent_loop_and_everything_on_stdout_is_protocol() {
 }
 
 #[test]
+fn run_with_skills_activates_them_and_an_unknown_skill_is_invalid_params() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let mut client = McpClient::spawn(tmp.path(), &project);
+    client.initialize();
+
+    // The prompt shares no >=3-char token with the skill's name or
+    // description ("Review a diff carefully"), so the activation cannot
+    // have come from lexical matching.
+    let run = client.call_tool(
+        "forge_run",
+        serde_json::json!({ "prompt": "zz unrelated qq", "skills": ["reviewing"] }),
+    );
+    let outcome = McpClient::tool_json(&run);
+    assert_eq!(outcome["status"], "completed", "{outcome}");
+    let session_id = outcome["session_id"].as_str().expect("session id");
+
+    // The activation is on the session log.
+    let log = std::fs::read_to_string(
+        project
+            .join(".forge")
+            .join("sessions")
+            .join(format!("{session_id}.jsonl")),
+    )
+    .expect("session log");
+    assert!(
+        log.lines()
+            .any(|l| l.contains("\"skill_activated\"") && l.contains("\"reviewing\"")),
+        "expected a skill_activated for reviewing: {log}"
+    );
+
+    // An unknown name is a tool error classified invalid_params — and no
+    // run starts for it.
+    let run = client.call_tool(
+        "forge_run",
+        serde_json::json!({ "prompt": "zz unrelated qq", "skills": ["nosuch"] }),
+    );
+    assert_eq!(
+        run["result"]["isError"],
+        serde_json::json!(true),
+        "an unknown skill is a tool error: {run}"
+    );
+    let outcome = McpClient::tool_json(&run);
+    assert_eq!(outcome["code"], "invalid_params", "{outcome}");
+    assert!(
+        outcome["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown skill: nosuch"),
+        "{outcome}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
 fn an_approval_pause_is_answered_with_run_input() {
     // stdin is the protocol channel, so the loop cannot prompt on it:
     // `NativeExecution` sees a non-terminal stdin, parks the run with
