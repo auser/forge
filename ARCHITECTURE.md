@@ -452,7 +452,10 @@ degradable condition.
 
 ## What's next (per the program spec)
 
-The ACP adapter (the other half of editor interop), the interactive TUI with
-slash commands / history replay / fork & background, and in-process
-generation (`forge-llm-embedded`) — see
+Shipped since this line was written: the ACP adapter and the interactive
+chat (slash commands / history replay / fork & background). Remaining:
+token streaming end-to-end (runtime plumbing landed in TICKET-1; provider
+SSE and chat/ACP rendering are TICKET-2/3 — see
+[`specs/tickets/interactive-chat-feel.md`](specs/tickets/interactive-chat-feel.md)),
+and in-process generation (`forge-llm-embedded`) — see
 [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md) §2.
