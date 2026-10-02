@@ -183,12 +183,29 @@ impl ChatIo for TerminalIo {
     }
 
     fn write(&mut self, line: &Line) {
-        println!("{}", self.palette.paint(line.style, &line.text));
+        let text = self.palette.paint(line.style, &line.text);
+        if line.fragment {
+            print!("{text}");
+            // stdout is line-buffered (a `LineWriter`); without the flush a
+            // fragment shows nothing until the block closes — the whole
+            // point is that it shows now.
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        } else {
+            println!("{text}");
+        }
     }
 
     fn notify(&mut self, line: &Line) {
         let text = self.palette.paint(line.style, &line.text);
-        if let Err(e) = self.printer.print(format!("{text}\n")) {
+        // A fragment continues the line in flight: no trailing newline.
+        // `StdoutPrinter::print` flushes, so it shows now either way.
+        let msg = if line.fragment {
+            text
+        } else {
+            format!("{text}\n")
+        };
+        if let Err(e) = self.printer.print(msg) {
             tracing::debug!(error = %e, "notice print failed; it may be delayed or lost");
         }
     }

@@ -446,6 +446,37 @@ fn a_piped_conversation_runs_two_turns_in_one_session() {
     assert_eq!(sessions, 1, "two turns share one session");
 }
 
+/// TICKET-3's piped-mode rule (design D6): a streamed answer's fragments
+/// are written plainly, and the captured transcript is byte-identical to a
+/// non-streamed one — the answer assembled in place, exactly once.
+#[test]
+fn a_piped_chat_assembles_a_streamed_answer_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto"); // script: [{"text": "the answer"}]
+    let out = chat(tmp.path(), &project, &["what is it"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("the answer").count(),
+        1,
+        "the streamed answer, once:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  = "),
+        "the footer still closes the turn:\n{stdout}"
+    );
+    // The stream is on the log, not just the screen.
+    let log = session_log(&project);
+    assert!(
+        log.contains("\"assistant_delta\""),
+        "the turn recorded deltas:\n{log}"
+    );
+}
+
 #[test]
 fn slash_commands_answer_and_never_name_a_mock() {
     let tmp = tempfile::tempdir().expect("tempdir");

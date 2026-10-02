@@ -440,14 +440,19 @@ fn a_prompt_turn_streams_tool_calls_and_a_final_message() {
         "the tool call should reach completed: {completed:?}"
     );
 
-    // The model's answer arrives as an agent message chunk.
+    // The model's answer arrives as live message chunks that concatenate
+    // to it — the scripted mock streams since TICKET-1, and every chunk
+    // was collected before the prompt response (see `request`).
     let chunks = client.updates_of("agent_message_chunk");
-    assert!(
-        chunks
-            .iter()
-            .any(|c| c["content"]["text"] == "all done" && c["content"]["type"] == "text"),
-        "expected the final text as a message chunk: {chunks:?}"
+    let text: String = chunks
+        .iter()
+        .filter_map(|c| c["content"]["text"].as_str())
+        .collect();
+    assert_eq!(
+        text, "all done",
+        "chunks assemble to the answer: {chunks:?}"
     );
+    assert!(chunks.len() >= 2, "streamed live, not one lump: {chunks:?}");
 
     // The routing decision shows up as a thought, which is how the needle
     // fast path becomes visible in the editor.

@@ -455,7 +455,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             None => Vec::new(),
         };
         for line in lines {
-            self.emit(line);
+            self.emit_transcript(line);
         }
     }
 
@@ -520,18 +520,19 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             Ok(Ok(outcome)) => {
                 // §4.3: print the outcome's text only if nothing textual
                 // was rendered live — the fast path's shape, and the rule
-                // that keeps an ordinary turn's answer from printing twice.
-                let rendered = self
-                    .transcript
-                    .as_ref()
-                    .map(TranscriptState::rendered_assistant_text)
-                    .unwrap_or(false);
-                if !rendered && !outcome.text.trim().is_empty() {
-                    self.emit(Line::plain(String::new()));
-                    for line in outcome.text.lines() {
-                        self.emit(Line::plain(line));
-                    }
-                    self.emit(Line::plain(String::new()));
+                // that keeps an ordinary turn's answer from printing
+                // twice. `outcome_lines` is the stream-aware form: a
+                // lagged final message is completed with its unshown tail,
+                // not repeated.
+                let lines = match self.transcript.as_mut() {
+                    Some(transcript) => transcript.outcome_lines(&outcome.text),
+                    // Not reached in practice (start_turn always installs
+                    // the transcript); keep today's shape for it.
+                    None if outcome.text.trim().is_empty() => Vec::new(),
+                    None => crate::render::assistant_block(&outcome.text),
+                };
+                for line in lines {
+                    self.emit(line);
                 }
             }
             // A `ForgeError` here already has its own event (`Error` or
@@ -562,6 +563,14 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// whatever text the run had, this driver already rendered live, event
     /// by event, while attached.
     async fn settle_attached_run(&mut self) {
+        // Close a streamed block the followed run left open (its message
+        // never arrived) before the footer, so the footer does not land on
+        // the half-written line.
+        if let Some(transcript) = self.transcript.as_mut() {
+            for line in transcript.close_stream() {
+                self.emit(line);
+            }
+        }
         if let Some(transcript) = self.transcript.take() {
             self.emit(transcript.footer());
         }
@@ -573,10 +582,38 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         }
     }
 
-    /// A transcript line: `notify` while a turn is attached (it may land
-    /// while a prompt is up), `write` between turns. Both take the same
-    /// [`Line`], so the transcript is identical either way (§6.2).
+    /// A line that did *not* come from the transcript renderer: a command
+    /// answer, an error, the banner, a footer. It may arrive while a
+    /// streamed answer's block is open (a `/show` answer typed mid-turn),
+    /// so the block is closed first — the line must never land on the
+    /// half-written one. Fragments are exempt: a fragment *is* the open
+    /// block, and guarding it would close the stream it extends.
+    /// (`close_stream` is empty when nothing is open, so the common case
+    /// costs nothing.)
     fn emit(&mut self, line: Line) {
+        if !line.fragment
+            && let Some(transcript) = self.transcript.as_mut()
+        {
+            let closing = transcript.close_stream();
+            for close in closing {
+                self.emit_inner(close);
+            }
+        }
+        self.emit_inner(line);
+    }
+
+    /// A line the transcript renderer produced (`on_event`, or a backlog
+    /// re-rendered through it). These manage the streamed block themselves
+    /// — the renderer opens, extends and closes it — so they bypass
+    /// [`emit`]'s foreign-line guard, which cannot tell the block's own
+    /// opening blank line from a foreign one.
+    fn emit_transcript(&mut self, line: Line) {
+        self.emit_inner(line);
+    }
+
+    /// The notify-while-attached / write-between-turns choice (§6.2), with
+    /// no further decisions.
+    fn emit_inner(&mut self, line: Line) {
         if self.events.is_some() {
             self.io.notify(&line);
         } else {
@@ -862,7 +899,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 let mut transcript = TranscriptState::new();
                 for event in &attachment.backlog {
                     for line in transcript.on_event(event) {
-                        self.emit(line);
+                        self.emit_transcript(line);
                     }
                 }
                 if attachment.is_live() {
@@ -1053,11 +1090,11 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             )));
             let tail = lines.split_off(lines.len() - BOUND);
             for line in tail {
-                self.emit(line);
+                self.emit_transcript(line);
             }
         } else {
             for line in lines {
-                self.emit(line);
+                self.emit_transcript(line);
             }
         }
     }
@@ -1190,6 +1227,105 @@ mod tests {
         assert!(
             out.contains("  = 2 turns"),
             "the footer reports the turns:\n{out}"
+        );
+    }
+
+    /// The ticket's headline: the answer is on screen *while the turn is still
+    /// running*, and the whole answer still prints exactly once.
+    #[tokio::test]
+    async fn a_streamed_answer_arrives_during_the_turn_and_prints_once() {
+        let (host, _tmp) = FakeHost::with_trickled_script(
+            r#"[{"text": "the answer arrives word by word"}]"#,
+            Duration::from_millis(50),
+        );
+        let mut io = ScriptedIo::batch(["what is the answer"]);
+        let chat = tokio::spawn(run(io.handle(), host, Start::fresh()));
+
+        // Half-way through the trickle the partial answer is visible and the
+        // turn has not closed: no footer yet.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !io.output().contains("the answer arrives") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no partial answer ever appeared:\n{}",
+                io.output()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !io.output().contains("  = "),
+            "the turn is still streaming, so there is no footer yet:\n{}",
+            io.output()
+        );
+
+        let code = tokio::time::timeout(Duration::from_secs(10), chat)
+            .await
+            .expect("the chat exits at EOF")
+            .expect("the chat task did not panic")
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        assert_eq!(
+            out.matches("the answer arrives word by word").count(),
+            1,
+            "assembled in place, printed once:\n{out}"
+        );
+        assert!(out.contains("  = "), "a footer closes the turn:\n{out}");
+    }
+
+    /// A `/show` answer typed mid-stream must not land on the half-written
+    /// line: `emit` closes the open block before any line that did not come
+    /// from the transcript.
+    #[tokio::test]
+    async fn a_command_answered_mid_stream_closes_the_block_first() {
+        let (host, _tmp) = FakeHost::with_trickled_script(
+            r#"[{"text": "the answer arrives word by word"}]"#,
+            Duration::from_millis(60),
+        );
+        let mut io = ScriptedIo::new(["what is the answer"]);
+        let chat = tokio::spawn(run(io.handle(), host, Start::fresh()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !io.output().contains("the answer") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stream never started:\n{}",
+                io.output()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        io.push_line("/show");
+        // `/quit` is typed only once the turn has actually finished (its
+        // footer is on screen): typed mid-turn it would only arm the
+        // "still running - ask again" confirmation and the chat would wait
+        // for a second request forever.
+        while !io.output().contains("  = ") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trickle turn never finished:\n{}",
+                io.output()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        io.push_line("/quit");
+        let code = tokio::time::timeout(Duration::from_secs(10), chat)
+            .await
+            .expect("exits")
+            .expect("no panic")
+            .expect("runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        let show_at = out
+            .find("  - no tool results in this session yet")
+            .expect("the /show answer");
+        // The /show line starts at a line boundary — never mid-answer.
+        assert!(
+            out[..show_at].ends_with('\n'),
+            "the block was closed first:\n{out}"
+        );
+        assert_eq!(
+            out.matches("the answer arrives word by word").count(),
+            1,
+            "{out}"
         );
     }
 

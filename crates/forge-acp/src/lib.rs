@@ -94,10 +94,14 @@
 //!   session's `cwd`, so it never asks the editor to read or write on its
 //!   behalf. That keeps one execution path with one set of risk and
 //!   approval rules. Bridging unsaved editor buffers is a follow-up.
-//! * **It does not stream tokens.** forge's agent loop produces final text
-//!   rather than a token stream, so the answer is sent as one
-//!   `agent_message_chunk`. Faking a stream by chopping up finished text
-//!   would only look like streaming.
+//! * **It streams when the provider streams.** A provider implementing
+//!   `ModelProvider::stream_complete` has its answer forwarded as live
+//!   `agent_message_chunk`s while it is written, and the closing
+//!   `assistant_message` flushes whatever the deltas missed (today the
+//!   scripted test double is the one such provider; real OpenAI-compatible
+//!   and Anthropic SSE is the recorded follow-up). Any other provider's
+//!   answer arrives as one chunk at the end of the turn. What it never
+//!   does is fake a stream by chopping up finished text.
 //! * **No `session/load`**, and text-only prompts — both advertised
 //!   honestly in `initialize`. An embedded `resource` block is nonetheless
 //!   *degraded* to its text rather than refused: we would rather answer an

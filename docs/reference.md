@@ -705,9 +705,8 @@ now-async `ChatHost::graph_context`. Without an engine or index it is the
 plain lexical ranking — the same degradation as outside the chat.
 
 Beyond those three, see [Known limitations](#known-limitations-v03) for the
-ones shared with the rest of forge (no token-by-token streaming, background
-runs not surviving the process, lexical-only skill discovery, no path
-completion).
+ones shared with the rest of forge (background runs not surviving the
+process, lexical-only skill discovery, no path completion).
 
 ## Command line
 
@@ -1379,10 +1378,14 @@ growing set of other editors, speak natively.
   means unsaved buffers in Zed are not visible to forge, and you'll want to save
   before asking about a file. (Bridging editor buffers is a planned follow-up;
   `initialize` honestly advertises that we don't use the client's filesystem.)
-* **No token-by-token streaming yet.** forge's loop produces a finished answer
-  rather than a token stream, so the reply arrives as one message rather than
-  typing itself out. Tool calls, by contrast, *are* live. We'd rather ship the
-  honest version than chop up finished text to imitate a stream.
+* **Streaming is live when the provider streams.** The answer then arrives
+  as `agent_message_chunk`s while it is being written — today the scripted
+  test double is the one streaming implementation, and real
+  OpenAI-compatible/Anthropic SSE is the recorded follow-up (TICKET-2 in
+  `specs/tickets/interactive-chat-feel.md`). A non-streaming provider's
+  answer still arrives as one chunk at the end of the turn, and tool calls
+  are live either way. What we never do is fake a stream by chopping up
+  finished text.
 * **Text prompts only** — no images or audio, and `initialize` says so rather
   than accepting them and dropping them on the floor. File mentions work
   either way: whether your editor sends a link or the file's contents, forge
@@ -1848,12 +1851,11 @@ go in `specs/adrs/`.
   above.
 - **Interactive chat** (see [Interactive chat](#interactive-chat) for the
   three real gaps behind `/graph`, `notify()` and `TerminalIo::read`) shares
-  the rest of the harness's known limits rather than adding new ones: no
-  token-by-token streaming (the loop returns a finished answer, exactly like
-  `forge acp`); a `/bg`-detached job does not survive the process and
-  another `forge` process can only see its recorded history, never attach
-  to it live (the same in-process-only limit `forge serve`/`forge mcp`/
-  `forge acp` already have). `@`-path completion completes
+  the rest of the harness's known limits rather than adding new ones: a
+  `/bg`-detached job does not survive the process and another `forge`
+  process can only see its recorded history, never attach to it live (the
+  same in-process-only limit `forge serve`/`forge mcp`/`forge acp` already
+  have). `@`-path completion completes
   the built graph's files only: with no graph built it offers nothing, and
   paths containing whitespace are never offered (they cannot round-trip the
   prompt's word-splitting).
