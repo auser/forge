@@ -37,7 +37,7 @@ use crate::host::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,
 };
-use crate::io::{ChatIo, Interactivity, Line, Prompt, ReadOutcome};
+use crate::io::{ChatIo, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome};
 
 // --- ScriptedIo ----------------------------------------------------------
 
@@ -62,6 +62,10 @@ struct Shared {
     /// batch-mode busy-wait visible to an assertion. See
     /// [`ScriptedIo::eof_reads`].
     eof_reads: AtomicUsize,
+    /// The completions of the most recent `Prompt` handed to `read` — what
+    /// the editor would have completed against. See
+    /// [`ScriptedIo::last_completions`].
+    last_completions: Mutex<CompletionSnapshot>,
     trigger: Mutex<Trigger>,
     fired: AtomicBool,
     notify: Notify,
@@ -111,6 +115,7 @@ impl ScriptedIo {
                 interactivity,
                 reads_done: AtomicUsize::new(0),
                 eof_reads: AtomicUsize::new(0),
+                last_completions: Mutex::new(CompletionSnapshot::default()),
                 trigger: Mutex::new(Trigger::None),
                 fired: AtomicBool::new(false),
                 notify: Notify::new(),
@@ -180,6 +185,17 @@ impl ScriptedIo {
     pub fn output(&self) -> String {
         self.shared
             .output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The completion snapshot of the last `Prompt` `read` was handed —
+    /// how a test asserts what the host's data reached the editor without
+    /// a terminal in the way.
+    pub fn last_completions(&self) -> CompletionSnapshot {
+        self.shared
+            .last_completions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -254,7 +270,16 @@ impl ScriptedIoHandle {
 
 #[async_trait]
 impl ChatIo for ScriptedIoHandle {
-    async fn read(&mut self, _prompt: Prompt) -> ReadOutcome {
+    async fn read(&mut self, prompt: Prompt) -> ReadOutcome {
+        // Capture what the editor would have seen before answering: the
+        // snapshot travels inside the prompt precisely so the completer
+        // never calls back into the host, and a test asserting on wiring
+        // needs the same view.
+        *self
+            .0
+            .last_completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = prompt.completions;
         // A genuine yield, even when a line is already queued: without it
         // a queue with several lines ready at once would be drained in one
         // synchronous burst, never giving the run's own spawned task a
@@ -325,6 +350,9 @@ pub struct FakeHost {
     /// The scripted model the service was built with, when it was one —
     /// kept so a test can assert on what the model was actually sent.
     scripted_model: Option<Arc<ScriptedMockModel>>,
+    /// What `project_files` returns — the `@`-completion source, empty by
+    /// default (an unbuilt graph degrades to silence).
+    paths: Vec<String>,
 }
 
 /// The one-skill registry behind [`FakeHost::with_skill_and_script`]: the
@@ -457,6 +485,13 @@ impl FakeHost {
         self.scripted_model.clone()
     }
 
+    /// Set the project file list `project_files` reports (the
+    /// `@`-completion source), builder-style.
+    pub fn with_paths(mut self, paths: Vec<String>) -> Self {
+        self.paths = paths;
+        self
+    }
+
     fn build(
         execution: Execution,
         model: impl FnOnce(&std::path::Path) -> Arc<dyn ModelProvider>,
@@ -513,6 +548,7 @@ impl FakeHost {
             }],
             skills,
             scripted_model: None,
+            paths: Vec::new(),
         };
         (host, tmp)
     }
@@ -538,6 +574,10 @@ impl ChatHost for FakeHost {
 
     fn skills(&self) -> Vec<SkillChoice> {
         self.skills.clone()
+    }
+
+    fn project_files(&self) -> Vec<String> {
+        self.paths.clone()
     }
 
     fn config_summary(&self, _key: Option<&str>) -> Vec<ConfigLine> {

@@ -706,12 +706,14 @@ unit-tested. Rules:
 - after `/approval `: the four policies;
 - after `/attach `: run ids from the last `/jobs` snapshot;
 - after `/session `: `new`, plus the project's recent session ids;
-- anywhere else: nothing. No file-path completion in v1 — forge reads
-  files through tools, and half-working path completion is worse than
-  none. Recorded as a follow-up.
+- a word starting with `@`, at any position: the built project graph's
+  file list, by case-sensitive prefix, capped — shipped by TICKET-4
+  (2026-10-01; `docs/superpowers/plans/2026-10-01-path-completion.md`);
+- anywhere else: nothing. Unmarked words never complete as paths —
+  half-working path completion is worse than none.
 
 The snapshot travels *inside* `Prompt` (`CompletionSnapshot`: commands are
-compiled in, skills/models/jobs/sessions come from the host), so the
+compiled in, skills/models/jobs/sessions/paths come from the host), so the
 completer never calls back into the host and never touches the filesystem
 on the editor thread.
 
@@ -1125,8 +1127,11 @@ Deliberately out of scope, each with the reason and the shape of the fix:
   `match_task`. The fix is `RunOptions::activate_skills` in the runtime,
   which also fixes the same weakness for `forge run`, `forge mcp` and
   ACP.
-- **Path completion after `@` or inside a prompt.** Useful, and
-  orthogonal; half-working path completion is worse than none.
+- **Path completion after `@` or inside a prompt.** Shipped by TICKET-4
+  (2026-10-01): the `@`-word rule of §9.2 over the built graph's file
+  list, bounded and mtime-gated
+  (`docs/superpowers/plans/2026-10-01-path-completion.md`). `@`-expansion
+  into attached file contents at submission remains open.
 - **Editing the config from the chat.** `/model` and `/approval` change
   the session, never a file. Writing config from a REPL needs a
   provenance story (which file? what about the origin `/config` reports?)
