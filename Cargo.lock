@@ -612,6 +612,7 @@ name = "forge-cli"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "clap",
  "cucumber",
  "dotenvy",
@@ -647,11 +648,14 @@ dependencies = [
 name = "forge-config"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "forge-core",
  "serde",
+ "serde_json",
  "serial_test",
  "tempfile",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -740,6 +744,7 @@ name = "forge-providers"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "forge-config",
  "forge-core",
  "forge-needle",

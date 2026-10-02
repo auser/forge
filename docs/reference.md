@@ -274,6 +274,18 @@ ten-second menu above.
 `forge doctor` is always the first move — it names the config line to change.
 `forge version` is the second, if the installed binary might be stale.
 
+When every check passes but you still don't trust the stack, `forge doctor
+--live` goes one step further: after the static checks it fires one tiny
+canary prompt ("Reply with exactly: FORGE_LIVE_OK", bounded by a 120 s
+timeout) through the same run path `forge run` uses, and reports what
+actually fired — the model that answered, the router that decided, whether
+the Jev escalation tier fired, the wall-clock latency, and the session it
+leaves on disk for inspection. A failed canary is a failing check (exit
+non-zero), unlike the static checks' warn-never-fail posture: a stack that
+cannot complete a run *is* broken. `--live` composes with `--json` (the
+canary results are just more check entries) and never runs from the MCP
+`forge_doctor` tool, which serves the static checks only.
+
 **`no credential found for model …` then `401 Unauthorized: API key required`**
 
 ```text
@@ -372,7 +384,9 @@ forge init --preset claude     # writes examples/configs/claude.toml as .forge/c
 See [`examples/configs/`](examples/configs/) for `claude`, `codex` and
 `kimi` (plug-and-play with each tool's usual credential), `kev`
 (self-hosted System One routing: Kev, CLM or OpenJev on your own
-hardware) and `decider` (hosted routing from meraGPT's Decider 1), plus
+hardware), `decider` (hosted routing from meraGPT's Decider 1) and `jev`
+(hosted TypeSafe Jev as needle's escalation tier — nothing to configure;
+`export TYPESAFE_API_KEY=...` is the one step that arms it), plus
 `local-first` (the default stack, made explicit), `hybrid-needle` (local
 first, hosted escalation), `budget-hosted`, and `hybrid-laya` (the
 Laya-adapter example), and an [`env.example`](examples/env.example)
@@ -698,7 +712,9 @@ forge skill list|show|test
 forge router serve [--host --port]  Run the local Laya decision-router adapter
 forge model list|test
 forge config show|path|explain <key>
-forge doctor                        Environment/config health check
+forge doctor [--live]               Environment/config health check (--live adds
+                                    a real canary run: what answered, which router
+                                    decided, whether Jev escalation fired, latency)
 forge version
 ```
 

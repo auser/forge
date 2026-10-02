@@ -26,6 +26,11 @@ const FORGE_ENV_VARS: &[&str] = &[
     // is set; scrubbed here and set back below, so the value is this
     // harness's, never the developer's shell's.
     "FORGE_TEST_MOCKS",
+    // OpenRouter catalogue endpoint override (see
+    // `forge_providers::openrouter::BASE_URL_ENV`): scrubbed, then pointed
+    // at a dead port below, so `forge init`'s best-effort catalogue refresh
+    // fails fast instead of reaching openrouter.ai.
+    "FORGE_OPENROUTER_BASE_URL",
 ];
 
 /// A `forge` invocation isolated from the developer's real user
@@ -48,6 +53,10 @@ fn forge(tmp: &Path) -> Command {
     cmd.env("HOME", tmp.join("home"));
     cmd.env("XDG_CONFIG_HOME", tmp.join("xdg"));
     cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
+    // `forge init` also refreshes the OpenRouter catalogue (best-effort):
+    // a dead port fails that fast and offline, and a test wanting a real
+    // refresh overrides this with its own wiremock URI via `.env(...)`.
+    cmd.env("FORGE_OPENROUTER_BASE_URL", "http://127.0.0.1:9");
     // These tests configure `model = "mock-local"` / `"scripted-mock"`,
     // which `model_from_config` refuses without the explicit opt-in.
     cmd.env("FORGE_TEST_MOCKS", "1");
@@ -1802,4 +1811,242 @@ fn session_decisions_summarises_the_decision_log() {
     assert_eq!(value["decide"]["decline_rate"], 0.5);
     assert_eq!(value["decide"]["mean_elapsed_ms"], 1000);
     assert_eq!(value["route"]["total"], 0);
+}
+
+// --- OpenRouter catalogue: `model list --catalogue` / `model add` / `model refresh` ---
+
+/// Write a catalogue cache into the sandbox HOME, in the on-disk shape
+/// `forge_config::catalogue` reads.
+fn seed_catalogue_cache(tmp: &Path, fetched_at: &str, models: serde_json::Value) {
+    let path = tmp.join("home/.cache/forge/openrouter/models.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        path,
+        serde_json::json!({ "fetched_at": fetched_at, "models": models }).to_string(),
+    )
+    .expect("seed catalogue");
+}
+
+fn catalogue_model(id: &str, context: u64, input: f64, output: f64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "context_length": context,
+        "cost_input_per_mtok": input,
+        "cost_output_per_mtok": output,
+    })
+}
+
+#[test]
+fn model_list_catalogue_lists_the_seeded_cache_with_prices_and_context() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Far-future fetch time: a fresh cache regardless of the clock.
+    seed_catalogue_cache(
+        tmp.path(),
+        "2099-01-01T00:00:00Z",
+        serde_json::json!([catalogue_model(
+            "anthropic/claude-sonnet-4.5",
+            200000,
+            3.0,
+            15.0
+        ),]),
+    );
+
+    let output = forge(tmp.path())
+        .args(["model", "list", "--catalogue"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(stdout.contains("anthropic/claude-sonnet-4.5"), "{stdout}");
+    assert!(stdout.contains("cost_in=$3/1M"), "{stdout}");
+    assert!(stdout.contains("cost_out=$15/1M"), "{stdout}");
+    assert!(stdout.contains("max_context=200000"), "{stdout}");
+}
+
+#[test]
+fn model_list_catalogue_without_a_cache_is_a_note_not_an_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = forge(tmp.path())
+        .args(["model", "list", "--catalogue"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(stdout.contains("forge model refresh"), "{stdout}");
+}
+
+#[test]
+fn model_list_catalogue_warns_naming_the_age_when_the_cache_is_stale() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_catalogue_cache(
+        tmp.path(),
+        "2020-01-01T00:00:00Z",
+        serde_json::json!([catalogue_model("a/b", 1000, 1.0, 1.0)]),
+    );
+
+    let output = forge(tmp.path())
+        .args(["model", "list", "--catalogue"])
+        .output()
+        .expect("run");
+    // Stale is still *used*: the model lists, and the warning names the age.
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("a/b"));
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+    assert!(stderr.contains("days old"), "stderr: {stderr}");
+    assert!(stderr.contains("stale"), "stderr: {stderr}");
+}
+
+#[test]
+fn model_add_writes_a_prefilled_entry_and_refuses_a_duplicate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    seed_catalogue_cache(
+        tmp.path(),
+        "2099-01-01T00:00:00Z",
+        serde_json::json!([catalogue_model("test/model-a", 100000, 0.5, 1.5)]),
+    );
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["model", "add", "test/model-a"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config = std::fs::read_to_string(project.join(".forge/config.toml")).expect("config");
+    assert!(config.contains("[models.\"test/model-a\"]"), "{config}");
+    assert!(
+        config.contains("key_env = \"OPENROUTER_API_KEY\""),
+        "{config}"
+    );
+    assert!(config.contains("max_context = 100000"), "{config}");
+    assert!(config.contains("cost_input_per_mtok = 0.5"), "{config}");
+    assert!(config.contains("cost_output_per_mtok = 1.5"), "{config}");
+    assert!(
+        !config.contains("tools"),
+        "tool support must be left to the operator: {config}"
+    );
+    // The note says why.
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(stdout.contains("tools"), "{stdout}");
+
+    // A second add must not clobber the entry it just wrote.
+    let again = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["model", "add", "test/model-a"])
+        .output()
+        .expect("run");
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("already declared"),
+        "{:?}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+}
+
+#[test]
+fn model_add_without_a_cache_fails_naming_the_fix() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["model", "add", "test/model-a"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+    assert!(stderr.contains("forge model refresh"), "{stderr}");
+    assert!(!project.join(".forge/config.toml").exists());
+}
+
+#[tokio::test]
+async fn model_refresh_fetches_offline_and_the_cache_then_lists() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {
+                    "id": "anthropic/claude-sonnet-4.5",
+                    "context_length": 200000,
+                    "pricing": { "prompt": "0.000003", "completion": "0.000015" }
+                },
+                {
+                    "id": "free/model-no-pricing",
+                    "context_length": 8192
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = forge(tmp.path())
+        .args(["model", "refresh"])
+        .env("FORGE_OPENROUTER_BASE_URL", server.uri())
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(
+        stdout.contains("refreshed OpenRouter catalogue: 2 models"),
+        "{stdout}"
+    );
+    assert!(
+        tmp.path()
+            .join("home/.cache/forge/openrouter/models.json")
+            .is_file(),
+        "the cache file was written"
+    );
+
+    // …and what was fetched is what `--catalogue` shows (per-token strings
+    // converted to per-million-token prices).
+    let list = forge(tmp.path())
+        .args(["model", "list", "--catalogue"])
+        .output()
+        .expect("run");
+    assert!(list.status.success());
+    let stdout = String::from_utf8(list.stdout).expect("utf8");
+    assert!(stdout.contains("cost_in=$3/1M"), "{stdout}");
+    assert!(
+        stdout.contains("free/model-no-pricing — unpriced"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn model_refresh_refuses_under_local_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = forge(tmp.path())
+        .args(["--local-only", "model", "refresh"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+    assert!(stderr.contains("local_only"), "{stderr}");
+    assert!(
+        !tmp.path().join("home/.cache/forge/openrouter").exists(),
+        "no fetch, no cache directory"
+    );
 }

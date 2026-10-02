@@ -18,3 +18,12 @@ Feature: First-run diagnostics
     Given a project config names the model key env var "FORGE_BDD_UNSET_KEY"
     When I run forge doctor
     Then the doctor output mentions "export FORGE_BDD_UNSET_KEY=..."
+
+  Scenario: Doctor --live fires a real canary and reports what answered
+    Given a project config sets the model to "mock-local"
+    When I run forge doctor with --live
+    Then the doctor output mentions "doctor: healthy"
+    And the doctor output mentions "live run"
+    And the doctor output mentions "live model"
+    And the doctor output mentions "live router"
+    And the doctor output mentions "live jev"

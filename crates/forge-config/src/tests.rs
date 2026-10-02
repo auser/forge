@@ -68,8 +68,8 @@ fn defaults_when_nothing_set() {
     // Built-in model registry with cost metadata.
     let models = resolved.config.model_entries();
     assert_eq!(models.len(), 6);
-    assert_eq!(models["qwen3-coder"].cost_input_per_mtok, 0.0);
-    assert_eq!(models["deepseek-chat"].cost_input_per_mtok, 0.14);
+    assert_eq!(models["qwen3-coder"].cost_input_per_mtok, Some(0.0));
+    assert_eq!(models["deepseek-chat"].cost_input_per_mtok, Some(0.14));
     assert_eq!(
         models["kimi-k2.7-code"].key_env.as_deref(),
         Some("MOONSHOT_API_KEY")
@@ -357,13 +357,13 @@ fn models_table_deep_merges_by_name() {
     // 6 built-in defaults + 3 from the layered files.
     assert_eq!(models.len(), 9);
     // Project entry replaces the same-named user entry entirely.
-    assert_eq!(models["shared"].cost_input_per_mtok, 9.0);
+    assert_eq!(models["shared"].cost_input_per_mtok, Some(9.0));
     assert_eq!(
         models["shared"].description.as_deref(),
         Some("project wins")
     );
-    assert_eq!(models["user-only"].cost_input_per_mtok, 2.0);
-    assert_eq!(models["proj-only"].cost_input_per_mtok, 0.5);
+    assert_eq!(models["user-only"].cost_input_per_mtok, Some(2.0));
+    assert_eq!(models["proj-only"].cost_input_per_mtok, Some(0.5));
     assert_eq!(
         resolved.explain("models").map(|(_, o)| o),
         Some(Origin::ProjectFile)
@@ -396,7 +396,7 @@ fn models_override_does_not_leak_stale_dotted_source() {
     // The override is correctly applied to the resolved config...
     assert_eq!(
         resolved.config.models["qwen3-coder"].cost_input_per_mtok,
-        999.0
+        Some(999.0)
     );
     // ...and the per-model dotted key reports the layer that actually won,
     // never a stale `Origin::Default` from the defaults layer. (The dotted
@@ -692,4 +692,105 @@ fn every_shipped_preset_parses_and_validates() {
         );
     }
     assert!(seen >= 4, "expected the shipped presets, found {seen}");
+}
+
+#[test]
+fn budget_defaults_to_no_ceilings_and_prompt() {
+    let c = Config::default();
+    assert_eq!(c.budget.session_tokens, None);
+    assert_eq!(c.budget.session_usd, None);
+    assert_eq!(c.budget.daily_usd, None);
+    assert_eq!(c.budget.on_exceeded, "prompt");
+    assert!(!c.budget.has_ceilings());
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn budget_section_parses_and_validates() {
+    let c: Config = toml::from_str(
+        "[budget]\nsession_tokens = 500_000\nsession_usd = 5.0\ndaily_usd = 25.0\non_exceeded = \"stop\"",
+    )
+    .expect("parses");
+    assert_eq!(c.budget.session_tokens, Some(500_000));
+    assert_eq!(c.budget.session_usd, Some(5.0));
+    assert_eq!(c.budget.daily_usd, Some(25.0));
+    assert_eq!(c.budget.on_exceeded, "stop");
+    assert!(c.budget.has_ceilings());
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn budget_invalid_on_exceeded_names_valid_values() {
+    let c: Config = toml::from_str("[budget]\non_exceeded = \"ignore\"").expect("parses");
+    let err = c
+        .validate()
+        .expect_err("invalid on_exceeded rejected")
+        .to_string();
+    assert!(
+        err.contains("ignore") && err.contains("prompt") && err.contains("stop"),
+        "err: {err}"
+    );
+}
+
+#[test]
+#[serial]
+fn budget_env_overrides_and_explain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.budget.daily_usd, None);
+
+    unsafe {
+        std::env::set_var("FORGE_BUDGET_DAILY_USD", "25.0");
+        std::env::set_var("FORGE_BUDGET_SESSION_TOKENS", "500000");
+        std::env::set_var("FORGE_BUDGET_ON_EXCEEDED", "stop");
+    }
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.budget.daily_usd, Some(25.0));
+    assert_eq!(resolved.config.budget.session_tokens, Some(500_000));
+    assert_eq!(resolved.config.budget.on_exceeded, "stop");
+    assert_eq!(
+        resolved.explain("budget.daily_usd"),
+        Some(("25.0".to_string(), Origin::Environment))
+    );
+    assert_eq!(
+        resolved.explain("budget.session_tokens"),
+        Some(("500000".to_string(), Origin::Environment))
+    );
+    assert_eq!(
+        resolved.explain("budget.on_exceeded"),
+        Some(("\"stop\"".to_string(), Origin::Environment))
+    );
+
+    unsafe { std::env::set_var("FORGE_BUDGET_DAILY_USD", "lots") };
+    let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
+    assert!(matches!(err, ForgeError::Config(_)));
+
+    unsafe { std::env::set_var("FORGE_BUDGET_DAILY_USD", "25.0") };
+    unsafe { std::env::set_var("FORGE_BUDGET_ON_EXCEEDED", "bogus") };
+    let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
+    assert!(matches!(err, ForgeError::Config(_)));
+}
+
+#[test]
+#[serial]
+fn budget_from_a_project_file_reports_provenance() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_project_config(tmp.path(), "[budget]\nsession_usd = 5.0\n");
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.budget.session_usd, Some(5.0));
+    // The other fields survive the partial table, and provenance is dotted
+    // per field like [needle]'s.
+    assert_eq!(resolved.config.budget.on_exceeded, "prompt");
+    assert_eq!(
+        resolved.explain("budget.session_usd"),
+        Some(("5.0".to_string(), Origin::ProjectFile))
+    );
+    assert_eq!(
+        resolved.explain("budget.on_exceeded"),
+        Some(("\"prompt\"".to_string(), Origin::Default))
+    );
 }

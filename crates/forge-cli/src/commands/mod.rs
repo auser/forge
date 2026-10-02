@@ -97,7 +97,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             }
             Ok(())
         }
-        Some(Command::Doctor) => doctor::run(&ctx).await,
+        Some(Command::Doctor { live }) => doctor::run(&ctx, live).await,
         Some(Command::Auth { command }) => match command {
             crate::cli::AuthCommand::Status => auth_cmd::status(&ctx),
         },

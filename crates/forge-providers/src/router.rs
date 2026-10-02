@@ -325,9 +325,13 @@ impl DecisionRouter for FallbackRouter {
 }
 
 /// Cost-aware router: among capability-satisfying candidates, pick the
-/// lowest `cost_input_per_mtok` (tie-break: output cost, then name
-/// ascending). Deterministic (confidence 1.0). Candidates absent from the
-/// cost table count as free (0.0).
+/// lowest-priced one by input cost (tie-break: output cost, then name
+/// ascending). Deterministic (confidence 1.0). Only *priced* candidates
+/// rank on price: a candidate absent from the cost table is **unpriced**,
+/// and unpriced must never read as free — treating unknown as 0.0 is how
+/// a router picks the most expensive model in the pool by accident. An
+/// unpriced candidate can only be selected when no priced capable
+/// candidate exists, and the reason says so.
 pub struct CheapestRouter {
     costs: std::collections::HashMap<String, (f64, f64)>,
     registry: Vec<(String, ModelCapabilities)>,
@@ -369,18 +373,41 @@ impl DecisionRouter for CheapestRouter {
                 task.required_capabilities
             )));
         }
-        let cost_of = |name: &str| self.costs.get(name).copied().unwrap_or((0.0, 0.0));
-        let mut ranked = capable;
-        ranked.sort_by(|a, b| {
-            cost_of(a)
-                .0
-                .total_cmp(&cost_of(b).0)
-                .then_with(|| cost_of(a).1.total_cmp(&cost_of(b).1))
+        let cost_of = |name: &str| self.costs.get(name).copied();
+        let mut priced: Vec<String> = capable
+            .iter()
+            .filter(|name| cost_of(name).is_some())
+            .cloned()
+            .collect();
+        if priced.is_empty() {
+            // No priced candidate at all: price cannot rank, so fall back
+            // to a deterministic choice (name ascending) and say plainly
+            // that the choice was not made on price.
+            let mut unpriced = capable;
+            unpriced.sort();
+            let selected = unpriced[0].clone();
+            return Ok(RoutingDecision {
+                selected_model: selected.clone(),
+                confidence: 1.0,
+                router_name: "cheapest".to_string(),
+                fallback_used: false,
+                reason: format!(
+                    "no priced candidate among {} capable; selected {selected} with unknown \
+                     price (unpriced models are never ranked on price)",
+                    unpriced.len()
+                ),
+            });
+        }
+        priced.sort_by(|a, b| {
+            let (a_in, a_out) = cost_of(a).unwrap_or((0.0, 0.0));
+            let (b_in, b_out) = cost_of(b).unwrap_or((0.0, 0.0));
+            a_in.total_cmp(&b_in)
+                .then_with(|| a_out.total_cmp(&b_out))
                 .then_with(|| a.cmp(b))
         });
-        let selected = ranked[0].clone();
-        let n = ranked.len();
-        let (input, _output) = cost_of(&selected);
+        let selected = priced[0].clone();
+        let n = capable.len();
+        let (input, _output) = cost_of(&selected).unwrap_or((0.0, 0.0));
         Ok(RoutingDecision {
             selected_model: selected.clone(),
             confidence: 1.0,
@@ -703,10 +730,18 @@ fn build_cheapest(
     config: &Config,
     registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
-    let costs = config
-        .model_entries()
-        .iter()
-        .map(|(name, entry)| (name.clone(), entry.costs()))
+    // Reads the cache only — never fetches (a routing decision must not
+    // block on the network). No cache / local_only → config prices alone,
+    // exactly pre-catalogue behaviour. Prices resolve through the same
+    // `CostBook` the budget accounting uses, so routing and spend agree.
+    let catalogue = forge_config::catalogue::load_for_routing(config);
+    let book = forge_config::CostBook::new(
+        config.model_entries(),
+        catalogue.as_ref().map(|cached| &cached.catalogue),
+    );
+    let costs = book
+        .priced()
+        .map(|(name, costs)| (name.to_string(), costs))
         .collect();
     Ok(Arc::new(CheapestRouter::new(costs, registry.to_vec())))
 }
@@ -2143,6 +2178,199 @@ mod tests {
             router.route(&request).await,
             Err(ForgeError::Router(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn cheapest_never_ranks_an_unpriced_model_as_free() {
+        // The inverted-logic trap the catalogue spec calls out: a candidate
+        // absent from the cost table used to read as (0.0, 0.0) — "free" —
+        // so an unpriced model beat every priced one. Unpriced must lose
+        // to anything priced.
+        let router = cheapest(&[("priced", 1.0, 1.0)]);
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["mystery-unpriced".to_string(), "priced".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "priced");
+        assert!(
+            decision.reason.contains("cheapest of 2 capable candidates"),
+            "reason: {}",
+            decision.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn cheapest_selects_unpriced_only_when_nothing_is_priced_and_says_so() {
+        // No priced candidate at all: an unpriced one may win, but the
+        // choice is deterministic (name ascending) and the reason must say
+        // the selection was not made on price.
+        let router = cheapest(&[]);
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["zeta".to_string(), "alpha".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "alpha");
+        assert!(
+            decision.reason.contains("no priced candidate"),
+            "reason: {}",
+            decision.reason
+        );
+        assert!(
+            decision.reason.contains("unknown price"),
+            "reason: {}",
+            decision.reason
+        );
+    }
+
+    // --- cheapest + the cached catalogue ---
+
+    /// Seed a catalogue cache under a temp XDG_CACHE_HOME. Callers must be
+    /// `#[serial]` (env mutation) and clear the var afterwards.
+    fn seed_catalogue(
+        tmp: &tempfile::TempDir,
+        models: Vec<forge_config::catalogue::CatalogueModel>,
+    ) {
+        unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
+        let catalogue = forge_config::catalogue::Catalogue {
+            fetched_at: chrono::Utc::now(),
+            models,
+        };
+        forge_config::catalogue::save(&forge_config::catalogue::cache_path(), &catalogue)
+            .expect("seed catalogue cache");
+    }
+
+    fn catalogue_model(
+        id: &str,
+        input: f64,
+        output: f64,
+    ) -> forge_config::catalogue::CatalogueModel {
+        forge_config::catalogue::CatalogueModel {
+            id: id.to_string(),
+            context_length: Some(100_000),
+            cost_input_per_mtok: Some(input),
+            cost_output_per_mtok: Some(output),
+        }
+    }
+
+    fn unpriced_entry() -> forge_config::ModelEntry {
+        forge_config::ModelEntry::default()
+    }
+
+    fn priced_entry(input: f64, output: f64) -> forge_config::ModelEntry {
+        forge_config::ModelEntry {
+            cost_input_per_mtok: Some(input),
+            cost_output_per_mtok: Some(output),
+            ..forge_config::ModelEntry::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_cheapest_prices_from_the_cached_catalogue_when_config_has_none() {
+        // Config declares both models but prices neither; the catalogue
+        // prices only "cat-model", at less than any hand-typed default.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_catalogue(&tmp, vec![catalogue_model("cat-model", 0.05, 0.05)]);
+        let mut config = Config {
+            router: "cheapest".to_string(),
+            ..Config::default()
+        };
+        config
+            .models
+            .insert("cat-model".to_string(), unpriced_entry());
+        config
+            .models
+            .insert("other-unpriced".to_string(), unpriced_entry());
+        let router = router_from_config(&config, &[]).expect("builds");
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["other-unpriced".to_string(), "cat-model".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "cat-model");
+        assert!(
+            decision.reason.contains("$0.05"),
+            "catalogue price in the reason: {}",
+            decision.reason
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_cheapest_config_price_beats_the_catalogue_for_the_same_id() {
+        // The catalogue would price "cfg-model" at 9.0; the operator typed
+        // 0.01. The typed number wins, so cfg-model beats a model the
+        // catalogue prices at 0.05.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_catalogue(
+            &tmp,
+            vec![
+                catalogue_model("cfg-model", 9.0, 9.0),
+                catalogue_model("cat-model", 0.05, 0.05),
+            ],
+        );
+        let mut config = Config {
+            router: "cheapest".to_string(),
+            ..Config::default()
+        };
+        config
+            .models
+            .insert("cfg-model".to_string(), priced_entry(0.01, 0.01));
+        config
+            .models
+            .insert("cat-model".to_string(), unpriced_entry());
+        let router = router_from_config(&config, &[]).expect("builds");
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["cfg-model".to_string(), "cat-model".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "cfg-model");
+        assert!(
+            decision.reason.contains("$0.01"),
+            "config price in the reason: {}",
+            decision.reason
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_cheapest_without_a_cache_routes_config_only_and_still_routes() {
+        // Absent cache is not an error: ranking falls back to config
+        // prices alone (and unpriced still never wins on price).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
+        let mut config = Config {
+            router: "cheapest".to_string(),
+            ..Config::default()
+        };
+        config
+            .models
+            .insert("cfg-model".to_string(), priced_entry(0.01, 0.01));
+        config
+            .models
+            .insert("cat-model".to_string(), unpriced_entry());
+        let router = router_from_config(&config, &[]).expect("builds");
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![],
+            candidates: vec!["cat-model".to_string(), "cfg-model".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "cfg-model");
+        assert_eq!(decision.router_name, "cheapest");
     }
 
     // --- threshold ---

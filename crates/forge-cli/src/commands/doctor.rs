@@ -1,8 +1,10 @@
 use std::path::Path;
+use std::time::Duration;
 
 use forge_core::ForgeError;
 
 use crate::commands::Context;
+use crate::commands::service::build_run_service;
 
 #[derive(Debug, PartialEq)]
 pub enum Level {
@@ -405,6 +407,7 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
                 detail: e.to_string(),
             }),
         }
+        checks.push(budget_check(&root, config));
     }
 
     Ok(checks)
@@ -433,8 +436,16 @@ pub fn report_json(checks: &[Check]) -> serde_json::Value {
 
 /// Environment and configuration health report. Exits non-zero (via
 /// `ForgeError`) only when something is actually broken.
-pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
-    let checks = collect_checks(ctx).await?;
+///
+/// `live` is the CLI-only opt-in (`forge doctor --live`): after the static
+/// checks, one canary run through the real stack is appended as more
+/// checks. It stays out of [`collect_checks`] so the MCP `forge_doctor`
+/// tool — which serves that list — can never start a model call.
+pub async fn run(ctx: &Context, live: bool) -> Result<(), ForgeError> {
+    let mut checks = collect_checks(ctx).await?;
+    if live {
+        checks.extend(live_checks(ctx).await);
+    }
     let failures = failures(&checks);
     let healthy = failures == 0;
 
@@ -464,6 +475,220 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
         Err(ForgeError::config(format!(
             "doctor found {failures} failing check(s)"
         )))
+    }
+}
+
+// --- doctor --live ----------------------------------------------------------
+
+/// The canary prompt `--live` sends. Any working model answers it in one
+/// turn without touching a tool — the point is to exercise the stack
+/// (routing → model → events), not the model's intelligence.
+const LIVE_CANARY_PROMPT: &str = "Reply with exactly: FORGE_LIVE_OK";
+
+/// Bound on the whole canary run, model latency included. Generous on
+/// purpose: `--live` exists to prove a slow stack still works, so only a
+/// genuinely hung one should ever hit this.
+const LIVE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Turn budget for the canary: one turn to answer, plus slack for a model
+/// that spends a turn on a tool call first.
+const LIVE_MAX_TURNS: u32 = 3;
+
+/// The opt-in half of the report: one real canary run through the same
+/// service construction `forge run` uses, reported as what actually fired —
+/// read from the run's own events, never from what the config *says* should
+/// happen.
+///
+/// Unlike every static check (warn, never fail, on anything degradable), a
+/// failure here is `Level::Fail` with the typed error: the canary *is* the
+/// whole stack, so a failed canary is a failed stack.
+async fn live_checks(ctx: &Context) -> Vec<Check> {
+    let service = match build_run_service(ctx).await {
+        Ok(service) => service,
+        Err(e) => return vec![live_failure(format!("could not build the run stack: {e}"))],
+    };
+
+    // Ids up front, so a timeout can still name and cancel the run.
+    let run_id = forge_session::new_run_id();
+    let session_id = forge_session::new_session_id();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        LIVE_TIMEOUT,
+        service.run_with_options(
+            LIVE_CANARY_PROMPT,
+            forge_runtime::RunOptions {
+                run_id: Some(run_id.clone()),
+                session_id: Some(session_id.clone()),
+                max_turns: Some(LIVE_MAX_TURNS),
+            },
+        ),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(outcome)) => live_success_checks(&outcome, started.elapsed(), service.config()),
+        Ok(Err(e)) => vec![live_failure(format!("{e} (canary session {session_id})"))],
+        Err(_) => {
+            // The timed-out future is dropped, which stops the loop's
+            // in-flight work; `cancel` then records the Cancelled event so
+            // the on-disk session ends terminal rather than mid-run.
+            // Best-effort: a run that never reached its first event has
+            // nothing to record, and the timeout is the report either way.
+            let _ = service.cancel(&run_id);
+            vec![live_failure(format!(
+                "canary run timed out after {} s and was cancelled (canary session {session_id})",
+                LIVE_TIMEOUT.as_secs()
+            ))]
+        }
+    }
+}
+
+/// One `Level::Fail` line for the canary — the live check's only failing
+/// shape, so all three failure paths (construction, run, timeout) agree on
+/// the label.
+fn live_failure(detail: String) -> Check {
+    Check {
+        level: Level::Fail,
+        label: "live run".into(),
+        detail,
+    }
+}
+
+/// What the canary's events say actually fired: the model that answered,
+/// the router that decided, whether the Jev tier fired, the wall-clock
+/// latency, and the session the run leaves on disk (kept on purpose —
+/// being inspectable with `forge session show` is a feature).
+fn live_success_checks(
+    outcome: &forge_runtime::RunOutcome,
+    elapsed: Duration,
+    config: &forge_config::Config,
+) -> Vec<Check> {
+    let routing = outcome.events.iter().find_map(|e| match &e.kind {
+        forge_core::EventKind::RoutingDecisionMade {
+            router,
+            selected_model,
+            confidence,
+            fallback_used,
+            ..
+        } => Some((
+            router.clone(),
+            selected_model.clone(),
+            *confidence,
+            *fallback_used,
+        )),
+        _ => None,
+    });
+
+    let mut checks = vec![Check {
+        level: Level::Ok,
+        label: "live run".into(),
+        detail: format!(
+            "completed in {} ms ({} turn{}); session {} — inspect with `forge session show {}`",
+            elapsed.as_millis(),
+            outcome.turns,
+            if outcome.turns == 1 { "" } else { "s" },
+            outcome.session_id,
+            outcome.session_id
+        ),
+    }];
+
+    match &routing {
+        // The direct-dispatch fast path answers with no model at all
+        // (`selected_model` is the literal "none"): say that, rather than
+        // reporting "none" as if it were a model name.
+        Some((router, selected, ..)) if selected == "none" => checks.push(Check {
+            level: Level::Ok,
+            label: "live model".into(),
+            detail: format!("no model call — {router} answered on-device"),
+        }),
+        Some((_, selected, ..)) => {
+            let mut detail = format!("{selected} answered");
+            if *selected != config.model {
+                detail.push_str(&format!(" (configured model is {})", config.model));
+            }
+            checks.push(Check {
+                level: Level::Ok,
+                label: "live model".into(),
+                detail,
+            });
+        }
+        None => checks.push(Check {
+            level: Level::Warn,
+            label: "live model".into(),
+            detail: "no routing decision in the run's events; cannot tell what answered".into(),
+        }),
+    }
+
+    match &routing {
+        Some((router, _, confidence, fallback)) => checks.push(Check {
+            level: Level::Ok,
+            label: "live router".into(),
+            detail: format!(
+                "{router} decided (confidence {confidence:.2}, fallback_used {fallback})"
+            ),
+        }),
+        None => checks.push(Check {
+            level: Level::Warn,
+            label: "live router".into(),
+            detail: "no routing decision in the run's events".into(),
+        }),
+    }
+
+    checks.push(live_jev_check(
+        routing.as_ref().map(|(router, ..)| router.as_str()),
+        config,
+    ));
+    checks
+}
+
+/// Whether the canary's decision came from the Jev tier — and, when it did
+/// not, whether it could have. "Armed" means the needle → Jev ladder was
+/// wired into this run's router stack, under exactly the conditions
+/// `router_from_config`'s escalation tier checks (needle primary,
+/// escalation on, `--local-only` off, credential present), so this line can
+/// never claim the tier was ready when the run had already skipped it.
+fn live_jev_check(decided_by: Option<&str>, config: &forge_config::Config) -> Check {
+    const LABEL: &str = "live jev";
+    let ok = |detail: String| Check {
+        level: Level::Ok,
+        label: LABEL.into(),
+        detail,
+    };
+
+    if decided_by == Some("jev") {
+        return ok(if config.router == "jev" {
+            "answered as the primary router".to_string()
+        } else {
+            format!(
+                "escalation fired — {} yielded to the Jev tier",
+                config.router
+            )
+        });
+    }
+
+    let armed = config.router == "needle"
+        && config.router_escalate == "auto"
+        && !config.local_only
+        && forge_providers::jev_credential_present(config, true);
+    if armed {
+        let decided = decided_by.unwrap_or("an unknown router");
+        ok(format!(
+            "armed (credential present) but did not fire — {decided} answered"
+        ))
+    } else {
+        let why = if config.router != "needle" {
+            format!("router = {:?} has no escalation tier", config.router)
+        } else if config.router_escalate != "auto" {
+            format!("router_escalate = {:?}", config.router_escalate)
+        } else if config.local_only {
+            "--local-only prunes the tier".to_string()
+        } else {
+            format!(
+                "no {} credential",
+                forge_providers::resolved_jev_key_env(config, true)
+            )
+        };
+        ok(format!("did not fire — not armed ({why})"))
     }
 }
 
@@ -1021,6 +1246,44 @@ fn router_note(router: &str) -> &'static str {
             "Jev/OpenJev System One router (TYPESAFE_API_KEY or router_url for self-hosted OpenJev)"
         }
         _ => "unrecognized router name",
+    }
+}
+
+/// The active `[budget]` and today's accumulated spend, read from the same
+/// decision logs the agent loop enforces against (UTC day). Never fails:
+/// an absent budget is the default configuration, and the scan skips
+/// malformed log lines rather than erroring.
+fn budget_check(root: &Path, config: &forge_config::Config) -> Check {
+    let budget = &config.budget;
+    let mut ceilings = Vec::new();
+    if let Some(tokens) = budget.session_tokens {
+        ceilings.push(format!("session_tokens = {tokens}"));
+    }
+    if let Some(usd) = budget.session_usd {
+        ceilings.push(format!("session_usd = ${usd:.2}"));
+    }
+    if let Some(usd) = budget.daily_usd {
+        ceilings.push(format!("daily_usd = ${usd:.2}"));
+    }
+    let sessions = root.join(".forge").join("sessions");
+    let (_, daily) = forge_session::scan_spend_today(&sessions, None);
+    let detail = if ceilings.is_empty() {
+        format!(
+            "no budget configured ([budget] absent); spent ${:.4} today",
+            daily.cost_usd
+        )
+    } else {
+        format!(
+            "{}; on_exceeded = {:?}; spent ${:.4} today",
+            ceilings.join(", "),
+            budget.on_exceeded,
+            daily.cost_usd
+        )
+    };
+    Check {
+        level: Level::Ok,
+        label: "budget".into(),
+        detail,
     }
 }
 
@@ -1763,6 +2026,57 @@ mod tests {
         assert!(credential_env_checks(&config).is_empty());
     }
 
+    // --- budget ---
+
+    #[test]
+    fn budget_check_reports_ceilings_and_todays_spend() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join(".forge").join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let log = std::sync::Arc::new(forge_session::DecisionLog::new(&sessions));
+        let handle = forge_session::DecisionLog::handle(&log, "s1");
+        handle.record_usage(1, "gpt-5", None, Some(1.5), 1);
+
+        let config = forge_config::Config {
+            budget: forge_config::BudgetConfig {
+                session_usd: Some(5.0),
+                on_exceeded: "stop".to_string(),
+                ..forge_config::BudgetConfig::default()
+            },
+            ..forge_config::Config::default()
+        };
+        let check = budget_check(tmp.path(), &config);
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("session_usd = $5.00"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("stop"), "{}", check.detail);
+        assert!(
+            check.detail.contains("spent $1.5000 today"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn budget_check_without_a_budget_says_so_and_never_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let check = budget_check(tmp.path(), &forge_config::Config::default());
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("no budget configured"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("spent $0.0000 today"),
+            "{}",
+            check.detail
+        );
+    }
+
     // --- legacy router setting ---
 
     #[test]
@@ -1826,5 +2140,357 @@ mod tests {
             check.detail
         );
         assert!(!check.detail.contains("poisoned.example.internal"));
+    }
+
+    // --- doctor --live ---
+
+    /// Config resolution in the live tests must not see the developer's
+    /// machine: the user-config layer is redirected into a tempdir, the
+    /// mock gate is opened (the deterministic canary uses `mock-local`),
+    /// and the needle backend override is scrubbed so
+    /// `engine_if_available` cannot light up a backend the test did not
+    /// ask for. Drop restores the unset state, even on panic.
+    struct HermeticEnv {
+        _xdg: tempfile::TempDir,
+    }
+
+    impl HermeticEnv {
+        fn new() -> Self {
+            let xdg = tempfile::tempdir().expect("xdg tempdir");
+            // SAFETY: test-only env mutation, serialized via #[serial]
+            // against every other env-touching test in this crate.
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+                std::env::set_var("FORGE_TEST_MOCKS", "1");
+                std::env::remove_var("FORGE_NEEDLE_BACKEND");
+            }
+            Self { _xdg: xdg }
+        }
+    }
+
+    impl Drop for HermeticEnv {
+        fn drop(&mut self) {
+            // SAFETY: same serialization as `new`.
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+                std::env::remove_var("FORGE_TEST_MOCKS");
+            }
+        }
+    }
+
+    /// A temp project whose needle weights point nowhere, so
+    /// `engine_if_available` stays unavailable even on a machine that has
+    /// the real weights cached: the canary must reach the *model* loop
+    /// deterministically, never the direct-dispatch fast path.
+    fn mock_project(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+        std::fs::write(
+            project.join(".forge/config.toml"),
+            "[needle]\nweights_path = \"/nonexistent/forge-doctor-test-weights.cact\"\n",
+        )
+        .expect("write config");
+        project
+    }
+
+    /// Model/router as CLI overrides (not the config file) so they win over
+    /// any `FORGE_*` a developer's shell happens to export.
+    fn mock_ctx(project: &Path) -> Context {
+        Context {
+            global: crate::cli::GlobalOpts {
+                project: Some(project.to_path_buf()),
+                model: Some("mock-local".to_string()),
+                router: Some("static".to_string()),
+                ..crate::cli::GlobalOpts::default()
+            },
+        }
+    }
+
+    /// The flag gate: `collect_checks` is shared with the MCP
+    /// `forge_doctor` tool and must stay static and fast, so the live
+    /// canary exists only in the CLI command, behind `--live`.
+    #[tokio::test]
+    #[serial]
+    async fn collect_checks_never_includes_the_live_canary() {
+        let _env = HermeticEnv::new();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = mock_ctx(&mock_project(&tmp));
+
+        let checks = collect_checks(&ctx).await.expect("checks");
+        assert!(
+            !labels(&checks).iter().any(|l| l.starts_with("live")),
+            "no live checks without --live: {:?}",
+            labels(&checks)
+        );
+    }
+
+    /// A full canary against the deterministic mock stack: the real service
+    /// construction, the real run path, real events on disk — offline.
+    #[tokio::test]
+    #[serial]
+    async fn live_checks_run_a_deterministic_canary_against_the_mock_stack() {
+        let _env = HermeticEnv::new();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = mock_project(&tmp);
+        let ctx = mock_ctx(&project);
+
+        let checks = live_checks(&ctx).await;
+        let text = pair_text(&checks);
+
+        assert_eq!(
+            labels(&checks),
+            vec!["live run", "live model", "live router", "live jev"],
+            "{text}"
+        );
+        for check in &checks {
+            assert_eq!(check.level, Level::Ok, "{text}");
+        }
+        assert!(
+            find(&checks, "live run").detail.contains("completed in"),
+            "{text}"
+        );
+        assert!(
+            find(&checks, "live model")
+                .detail
+                .contains("mock-local answered"),
+            "{text}"
+        );
+        assert!(
+            find(&checks, "live router")
+                .detail
+                .contains("static decided"),
+            "{text}"
+        );
+        assert!(
+            find(&checks, "live router")
+                .detail
+                .contains("fallback_used false"),
+            "{text}"
+        );
+        assert!(
+            find(&checks, "live jev").detail.contains("did not fire"),
+            "{text}"
+        );
+
+        // The canary session stays on disk, inspectable — that is a
+        // feature, and the report must name the file that exists.
+        let sessions = project.join(".forge").join("sessions");
+        let logs: Vec<_> = std::fs::read_dir(&sessions)
+            .expect("sessions dir")
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+            })
+            .collect();
+        assert_eq!(logs.len(), 1, "exactly the canary session: {text}");
+        let stem = logs[0]
+            .file_name()
+            .to_string_lossy()
+            .trim_end_matches(".jsonl")
+            .to_string();
+        assert!(
+            find(&checks, "live run").detail.contains(&stem),
+            "the report names the session on disk: {text}"
+        );
+        let log = std::fs::read_to_string(logs[0].path()).expect("read session");
+        assert!(log.contains("FORGE_LIVE_OK"), "canary recorded: {log}");
+        assert!(log.contains("\"routing_decision_made\""), "{log}");
+        assert!(log.contains("\"completed\""), "{log}");
+    }
+
+    /// A canary that cannot even build is a failing check, not an early
+    /// exit: the mock model with the gate *closed* makes provider
+    /// construction refuse, deterministically and offline.
+    #[tokio::test]
+    #[serial]
+    async fn a_live_run_that_cannot_build_reports_fail_with_the_typed_error() {
+        let _env = HermeticEnv::new();
+        // SAFETY: same serialization as HermeticEnv.
+        unsafe { std::env::remove_var("FORGE_TEST_MOCKS") };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = mock_ctx(&mock_project(&tmp));
+
+        let checks = live_checks(&ctx).await;
+
+        assert_eq!(checks.len(), 1, "{:?}", labels(&checks));
+        assert_eq!(checks[0].level, Level::Fail);
+        assert_eq!(checks[0].label, "live run");
+        assert!(
+            checks[0].detail.contains("could not build the run stack"),
+            "{}",
+            checks[0].detail
+        );
+        // The provider crate's own refusal, not a paraphrase.
+        assert!(
+            checks[0].detail.contains("FORGE_TEST_MOCKS"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    fn fake_live_outcome(
+        router: &str,
+        selected: &str,
+        confidence: f64,
+        fallback: bool,
+    ) -> forge_runtime::RunOutcome {
+        let events = vec![
+            forge_core::Event::new(
+                "run-1",
+                "sess-1",
+                forge_core::EventKind::RunStarted {
+                    provider: "test-provider".into(),
+                    model: "configured-model".into(),
+                    prompt: LIVE_CANARY_PROMPT.into(),
+                },
+            ),
+            forge_core::Event::new(
+                "run-1",
+                "sess-1",
+                forge_core::EventKind::RoutingDecisionMade {
+                    router: router.into(),
+                    selected_model: selected.into(),
+                    confidence,
+                    fallback_used: fallback,
+                    reason: "test".into(),
+                },
+            ),
+            forge_core::Event::new(
+                "run-1",
+                "sess-1",
+                forge_core::EventKind::Completed {
+                    summary: "done".into(),
+                },
+            ),
+        ];
+        forge_runtime::RunOutcome {
+            run_id: "run-1".into(),
+            session_id: "sess-1".into(),
+            text: "FORGE_LIVE_OK".into(),
+            turns: 1,
+            tool_calls: 0,
+            events,
+        }
+    }
+
+    /// The formatting contract: every fact the task lists is in the report,
+    /// in the labels a reader scans for.
+    #[test]
+    fn live_success_checks_report_model_router_fallback_latency_and_session() {
+        let outcome = fake_live_outcome("needle", "qwen3-coder", 0.91, false);
+        let checks = live_success_checks(
+            &outcome,
+            Duration::from_millis(812),
+            &forge_config::Config::default(),
+        );
+
+        assert_eq!(
+            labels(&checks),
+            vec!["live run", "live model", "live router", "live jev"]
+        );
+        let run = find(&checks, "live run");
+        assert!(run.detail.contains("812 ms"), "{}", run.detail);
+        assert!(run.detail.contains("1 turn"), "{}", run.detail);
+        assert!(run.detail.contains("sess-1"), "{}", run.detail);
+        assert!(
+            run.detail.contains("forge session show sess-1"),
+            "{}",
+            run.detail
+        );
+        assert_eq!(find(&checks, "live model").detail, "qwen3-coder answered");
+        assert_eq!(
+            find(&checks, "live router").detail,
+            "needle decided (confidence 0.91, fallback_used false)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn live_jev_reports_an_escalation_that_fired() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let outcome = fake_live_outcome("jev", "gpt-5", 0.88, false);
+        // router = "needle" (the default): a jev decision IS the escalation.
+        let checks = live_success_checks(
+            &outcome,
+            Duration::from_millis(100),
+            &forge_config::Config::default(),
+        );
+        assert!(
+            find(&checks, "live jev")
+                .detail
+                .contains("escalation fired"),
+            "{}",
+            find(&checks, "live jev").detail
+        );
+        // The router picked a model other than the configured one: both
+        // are named, or "what answered" is a guess.
+        assert!(
+            find(&checks, "live model")
+                .detail
+                .contains("(configured model is qwen3-coder)"),
+            "{}",
+            find(&checks, "live model").detail
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn live_jev_reports_armed_but_not_needed() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "dummy-value-for-test") };
+        let outcome = fake_live_outcome("needle", "qwen3-coder", 0.91, false);
+        let checks = live_success_checks(
+            &outcome,
+            Duration::from_millis(100),
+            &forge_config::Config::default(),
+        );
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert_eq!(
+            find(&checks, "live jev").detail,
+            "armed (credential present) but did not fire — needle answered"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn live_jev_reports_not_armed_without_a_credential() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let outcome = fake_live_outcome("static", "mock-local", 1.0, true);
+        let checks = live_success_checks(
+            &outcome,
+            Duration::from_millis(100),
+            &forge_config::Config::default(),
+        );
+        assert_eq!(
+            find(&checks, "live jev").detail,
+            "did not fire — not armed (no TYPESAFE_API_KEY credential)"
+        );
+    }
+
+    /// The direct-dispatch fast path ends a run with `selected_model` set
+    /// to the literal "none": the report must say *that*, not name "none"
+    /// as if a model answered.
+    #[test]
+    #[serial]
+    fn a_needle_dispatch_canary_names_the_absent_model_call() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let outcome = fake_live_outcome("needle-dispatch", "none", 0.95, false);
+        let checks = live_success_checks(
+            &outcome,
+            Duration::from_millis(40),
+            &forge_config::Config::default(),
+        );
+        assert!(
+            find(&checks, "live model").detail.contains("no model call"),
+            "{}",
+            find(&checks, "live model").detail
+        );
+        assert!(
+            find(&checks, "live model")
+                .detail
+                .contains("needle-dispatch"),
+            "{}",
+            find(&checks, "live model").detail
+        );
     }
 }

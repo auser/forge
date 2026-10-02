@@ -2522,3 +2522,307 @@ async fn run_command_tool_executes_and_clamps_risk() {
         "model hint 'safe' must be clamped up to risky"
     );
 }
+
+// --- budget accounting and ceilings ---
+
+/// A service whose config prices the scripted mock, for cost assertions.
+fn priced_scripted_service(
+    root: &std::path::Path,
+    replies: Vec<ScriptedReply>,
+    budget: forge_config::BudgetConfig,
+) -> AgentService {
+    let mut config = Config {
+        budget,
+        ..Config::default()
+    };
+    config.models.insert(
+        "scripted-mock".to_string(),
+        forge_config::ModelEntry {
+            cost_input_per_mtok: Some(2.0),
+            cost_output_per_mtok: Some(4.0),
+            ..forge_config::ModelEntry::default()
+        },
+    );
+    AgentService::new(
+        Arc::new(ScriptedMockModel::new(replies)),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(MockExecution::new(root)),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions"))),
+        config,
+    )
+}
+
+#[tokio::test]
+async fn a_completion_records_usage_and_cost_in_the_decision_log() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = priced_scripted_service(
+        tmp.path(),
+        vec![text_reply("the answer")],
+        forge_config::BudgetConfig::default(),
+    );
+
+    let outcome = service.run("question").await.expect("run");
+    let records = decision_records(tmp.path(), &outcome.session_id);
+    let complete = records
+        .iter()
+        .find(|r| r.stage == forge_session::Stage::Complete)
+        .expect("a complete record per model call");
+    assert_eq!(complete.choice, "scripted-mock");
+    assert_eq!(complete.outcome, forge_session::Outcome::Answered);
+    let usage = complete.usage.expect("the mock reports usage");
+    assert_eq!(usage.completion_tokens, 10, "len of \"the answer\"");
+    // 0 in / 10 out at $2.00/$4.00 per Mtok = $0.00004.
+    let cost = complete.cost_usd.expect("priced model entry");
+    assert!((cost - 0.00004).abs() < 1e-12, "{cost}");
+}
+
+#[tokio::test]
+async fn a_model_with_no_price_records_usage_but_no_cost() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Config::default() has no "scripted-mock" entry: usage must still be
+    // recorded, cost must be None — never 0.0 pretending to be free.
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("unpriced")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+
+    let outcome = service.run("question").await.expect("run");
+    let records = decision_records(tmp.path(), &outcome.session_id);
+    let complete = records
+        .iter()
+        .find(|r| r.stage == forge_session::Stage::Complete)
+        .expect("a complete record");
+    assert!(complete.usage.is_some());
+    assert_eq!(complete.cost_usd, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_model_unpriced_in_config_is_priced_from_the_cached_catalogue() {
+    // Precedence, as routed into spend accounting: config price wins when
+    // present (covered above); the cached OpenRouter catalogue prices what
+    // config leaves unset. `#[serial]` + a temp XDG_CACHE_HOME because the
+    // cache path resolves from the environment.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_home = tempfile::tempdir().expect("cache home");
+    unsafe { std::env::set_var("XDG_CACHE_HOME", cache_home.path()) };
+    forge_config::catalogue::save(
+        &forge_config::catalogue::cache_path(),
+        &forge_config::catalogue::Catalogue {
+            fetched_at: chrono::Utc::now(),
+            models: vec![forge_config::catalogue::CatalogueModel {
+                id: "scripted-mock".to_string(),
+                context_length: Some(100_000),
+                cost_input_per_mtok: Some(2.0),
+                cost_output_per_mtok: Some(4.0),
+            }],
+        },
+    )
+    .expect("seed catalogue");
+
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("catalogue priced")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let outcome = service.run("question").await;
+    unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+    let outcome = outcome.expect("run");
+
+    let records = decision_records(tmp.path(), &outcome.session_id);
+    let complete = records
+        .iter()
+        .find(|r| r.stage == forge_session::Stage::Complete)
+        .expect("a complete record");
+    // 0 in / 16 out at the catalogue's $2.00/$4.00 per Mtok = $0.000064.
+    let cost = complete.cost_usd.expect("catalogue prices the model");
+    assert!((cost - 0.000064).abs() < 1e-12, "{cost}");
+}
+
+#[tokio::test]
+async fn budget_stop_fails_the_turn_before_the_next_call() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        ScriptedReply {
+            // 7 tokens of text plus a tool call, so the ceiling trips
+            // before the second turn.
+            text: Some("working".to_string()),
+            tool_calls: vec![ToolCall::new(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "f.txt"}),
+            )],
+        },
+        text_reply("unreachable"),
+    ]));
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config {
+            budget: forge_config::BudgetConfig {
+                session_tokens: Some(1),
+                on_exceeded: "stop".to_string(),
+                ..forge_config::BudgetConfig::default()
+            },
+            ..Config::default()
+        },
+    );
+
+    let err = service.run("task").await.expect_err("budget halts the run");
+    assert!(matches!(err, ForgeError::Agent(_)), "got: {err}");
+    assert!(err.to_string().contains("session_tokens"), "got: {err}");
+    assert_eq!(model.recorded().len(), 1, "the second call never ran");
+}
+
+#[tokio::test]
+async fn budget_prompt_without_anyone_to_answer_degrades_to_stop() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = priced_scripted_service(
+        tmp.path(),
+        vec![
+            ScriptedReply {
+                text: Some("working".to_string()),
+                tool_calls: vec![ToolCall::new(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": "f.txt"}),
+                )],
+            },
+            text_reply("unreachable"),
+        ],
+        forge_config::BudgetConfig {
+            session_tokens: Some(1),
+            // "prompt" is the default; set it loudly for the test.
+            on_exceeded: "prompt".to_string(),
+            ..forge_config::BudgetConfig::default()
+        },
+    );
+    let run_id = "budget-run".to_string();
+    service.close_input(&run_id);
+
+    let err = service
+        .run_with_options(
+            "task",
+            RunOptions {
+                run_id: Some(run_id.clone()),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("no one can approve, so the budget stops the run");
+    assert!(err.to_string().contains("session_tokens"), "got: {err}");
+    assert!(
+        err.to_string().contains("no one can answer"),
+        "the degradation must be explicit: {err}"
+    );
+
+    let events = service.events(&run_id).expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ApprovalRequested { command, .. } if command.contains("session_tokens"))),
+        "the prompt was issued: {events:?}"
+    );
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::ApprovalDecided {
+            approved: false,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn budget_prompt_approved_lets_the_run_continue() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = priced_scripted_service(
+        tmp.path(),
+        vec![
+            ScriptedReply {
+                text: Some("working".to_string()),
+                tool_calls: vec![ToolCall::new(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": "f.txt"}),
+                )],
+            },
+            text_reply("done"),
+        ],
+        forge_config::BudgetConfig {
+            session_tokens: Some(1),
+            on_exceeded: "prompt".to_string(),
+            ..forge_config::BudgetConfig::default()
+        },
+    );
+    let run_id = "budget-approved-run".to_string();
+    service.send_input(&run_id, "y").expect("queue approval");
+
+    let outcome = service
+        .run_with_options(
+            "task",
+            RunOptions {
+                run_id: Some(run_id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("approved once, the run finishes");
+    assert_eq!(outcome.text, "done");
+    assert!(
+        outcome
+            .events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ApprovalDecided { approved: true, .. }))
+    );
+}
+
+#[tokio::test]
+async fn the_session_ceiling_counts_spend_from_prior_runs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Three single-turn replies of 5 tokens each; the ceiling trips at the
+    // start of run 3 because runs 1+2 already spent 10.
+    let service = priced_scripted_service(
+        tmp.path(),
+        vec![
+            text_reply("aaaaa"),
+            text_reply("bbbbb"),
+            text_reply("ccccc"),
+        ],
+        forge_config::BudgetConfig {
+            session_tokens: Some(10),
+            on_exceeded: "stop".to_string(),
+            ..forge_config::BudgetConfig::default()
+        },
+    );
+
+    let first = service.run("one").await.expect("run 1");
+    let second = service
+        .run_with_options(
+            "two",
+            RunOptions {
+                session_id: Some(first.session_id.clone()),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("run 2");
+    let err = service
+        .run_with_options(
+            "three",
+            RunOptions {
+                session_id: Some(second.session_id.clone()),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("run 3 starts over the ceiling");
+    assert!(err.to_string().contains("session_tokens"), "got: {err}");
+    assert!(err.to_string().contains("10 tokens spent"), "got: {err}");
+}

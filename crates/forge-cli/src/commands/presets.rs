@@ -38,6 +38,7 @@ pub const PRESETS: &[(&str, &str)] = &[
         "decider",
         include_str!("../../../../examples/configs/decider.toml"),
     ),
+    ("jev", include_str!("../../../../examples/configs/jev.toml")),
 ];
 
 /// The preset named `name`, or an error listing the valid ones.

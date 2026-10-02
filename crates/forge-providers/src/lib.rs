@@ -12,6 +12,7 @@ mod credentials;
 mod jev;
 mod local_only;
 mod model;
+pub mod openrouter;
 mod router;
 mod scripted;
 

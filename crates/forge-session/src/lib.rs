@@ -7,6 +7,7 @@ mod redact;
 mod store;
 
 pub use decisions::{
-    Decider, DecisionLog, DecisionLogHandle, DecisionRecord, Outcome, RecordDraft, Stage,
+    Decider, DecisionLog, DecisionLogHandle, DecisionRecord, Outcome, RecordDraft, SpendTotals,
+    Stage, scan_spend, scan_spend_today,
 };
 pub use store::{JsonlSessionStore, SessionInfo, new_run_id, new_session_id};

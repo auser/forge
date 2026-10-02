@@ -1,0 +1,26 @@
+# Hosted TypeSafe Jev decisions with zero router setup: the embedded
+# needle brain still routes on-device first, and TypeSafe's hosted Jev
+# sits above it as the escalation tier for tasks needle declines or
+# answers without confidence. There is nothing to set for that here —
+# the built-in defaults (router = "needle", router_escalate = "auto")
+# already compose the needle → Jev → static ladder, and forge wires the
+# Jev tier in only when it finds the credential.
+#
+# The ONE step that arms Jev:
+#
+#     export TYPESAFE_API_KEY=...
+#
+# `forge doctor`'s `jev` line confirms it ("credential detected"), and
+# `forge doctor --live` shows whether a real run escalated. Without the
+# key this file is just the default local stack: on-device routing only,
+# nothing leaves your machine. The endpoint is the hosted default
+# (https://api.typesafe.ai/v1/systemone); point jev_url at a self-hosted
+# OpenJev/Kev server instead if you run one (see the kev preset), or set
+# router_escalate = "off" to disarm the tier without unsetting the key.
+
+model = "qwen3-coder"        # generation stays local (oMLX)
+# Prefer hosted generation? Declare a [models.<name>] entry with its own
+# base_url + key_env and name it here — hybrid-needle.toml has ready-made
+# examples (deepseek-chat, kimi-k2.7-code).
+execution = "native"
+approval = "prompt"

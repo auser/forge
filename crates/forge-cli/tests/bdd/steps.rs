@@ -813,6 +813,55 @@ fn run_fails_with_turn_budget_error(world: &mut BddWorld) {
 }
 
 // ---------------------------------------------------------------------------
+// budget.feature
+// ---------------------------------------------------------------------------
+
+#[given("a scripted mock model that talks and calls a tool")]
+fn scripted_mock_talks_and_calls(world: &mut BddWorld) {
+    // The first reply carries 7 tokens of text plus a tool call, so a
+    // 1-token ceiling trips before the second model call.
+    world.write_file(
+        "script.json",
+        r#"[
+            {"text": "working", "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {"path": "f.txt"}}]},
+            {"text": "done"}
+        ]"#,
+    );
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+    world.set_config("approval", "\"auto\"");
+}
+
+#[given(expr = "the session token budget is {int} with on_exceeded {string}")]
+fn session_token_budget(world: &mut BddWorld, tokens: u64, on_exceeded: String) {
+    world.add_config_block(format!(
+        "[budget]\nsession_tokens = {tokens}\non_exceeded = \"{on_exceeded}\""
+    ));
+}
+
+#[given(expr = "the budget is {float} USD per session")]
+fn session_usd_budget(world: &mut BddWorld, usd: f64) {
+    // TOML floats need a decimal point; `{usd}` alone prints `5` (an
+    // integer, which Option<f64> refuses).
+    world.add_config_block(format!("[budget]\nsession_usd = {usd:.2}"));
+}
+
+#[then(expr = "the run fails with a budget error naming {string}")]
+fn run_fails_with_budget_error(world: &mut BddWorld, needle: String) {
+    assert_ne!(world.last_code, Some(0), "run must fail");
+    assert!(
+        world.last_stderr.contains("budget exceeded"),
+        "stderr: {}",
+        world.last_stderr
+    );
+    assert!(
+        world.last_stderr.contains(&needle),
+        "stderr: {}",
+        world.last_stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
 // approval.feature
 // ---------------------------------------------------------------------------
 
@@ -1256,6 +1305,130 @@ fn router_mode(world: &mut BddWorld, mode: String) {
     world.set_config("router", &format!("\"{mode}\""));
 }
 
+#[given(expr = "a seeded OpenRouter catalogue pricing {string} at {float} and {string} at {float}")]
+fn seeded_openrouter_catalogue(
+    world: &mut BddWorld,
+    cheap: String,
+    cheap_cost: f64,
+    pricey: String,
+    pricey_cost: f64,
+) {
+    // Pre-seed the catalogue cache in the sandbox HOME (<root>/home — see
+    // `run_forge`), in the on-disk shape `forge_config::catalogue` reads:
+    // per-million-token prices and a fresh fetch timestamp. Routing only
+    // ever reads this file; nothing here fetches.
+    let fetched = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    world.write_file(
+        "home/.cache/forge/openrouter/models.json",
+        &serde_json::json!({
+            "fetched_at": fetched,
+            "models": [
+                { "id": cheap, "context_length": 100000, "cost_input_per_mtok": cheap_cost, "cost_output_per_mtok": cheap_cost },
+                { "id": pricey, "context_length": 100000, "cost_input_per_mtok": pricey_cost, "cost_output_per_mtok": pricey_cost },
+            ]
+        })
+        .to_string(),
+    );
+}
+
+/// The cheap model's wiremock + the config blocks shared by the catalogue
+/// scenarios: both models declared (the candidate pool stays
+/// operator-declared) with the cheap one served offline, and the two free
+/// built-ins repriced out of the ranking. `cheap_block` builds the cheap
+/// entry's TOML from the mock's URL (cost keys or not, per scenario).
+async fn declare_cheap_and_pricey(
+    world: &mut BddWorld,
+    cheap: &str,
+    pricey: &str,
+    cheap_block: impl FnOnce(&str) -> String,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "cheap answer" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    let chat_url = server.uri();
+    world.chat_mock = Some(server);
+    world.set_config("model", &format!("\"{cheap}\""));
+    world.add_config_block(cheap_block(&chat_url));
+    world.add_config_block(format!(
+        "[models.{pricey}]\ndescription = \"pricey test model\"\nbase_url = \"http://127.0.0.1:9\""
+    ));
+    // The built-in local model and the subscription Claude are explicitly
+    // free ($0) and would win "cheapest"; reprice them so the fixture's own
+    // entries decide the ranking.
+    world.add_config_block(
+        "[models.qwen3-coder]\ncost_input_per_mtok = 99.9\ncost_output_per_mtok = 99.9".to_string(),
+    );
+    world.add_config_block(
+        "[models.claude-sonnet]\ncost_input_per_mtok = 99.9\ncost_output_per_mtok = 99.9"
+            .to_string(),
+    );
+}
+
+#[given(expr = "models {string} and {string} with no config prices")]
+async fn models_with_no_config_prices(world: &mut BddWorld, cheap: String, pricey: String) {
+    // No cost keys at all: config-only ranking would leave both unpriced,
+    // so only the seeded catalogue can rank them.
+    declare_cheap_and_pricey(world, &cheap, &pricey, |url| {
+        format!(
+            "[models.{cheap}]\ndescription = \"catalogue-priced test model\"\nbase_url = \"{url}\""
+        )
+    })
+    .await;
+}
+
+#[given(expr = "models {string} costing {float} and {string} costing nothing")]
+async fn priced_and_unpriced_models(
+    world: &mut BddWorld,
+    priced: String,
+    cost: f64,
+    unpriced: String,
+) {
+    // The second entry is declared, served by nothing, and — the point of
+    // the scenario — priced by nothing: no config costs, no catalogue.
+    declare_cheap_and_pricey(
+        world,
+        &priced,
+        &unpriced,
+        |url| {
+            format!(
+                "[models.{priced}]\ncost_input_per_mtok = {cost}\ndescription = \"priced test model\"\nbase_url = \"{url}\""
+            )
+        },
+    )
+    .await;
+}
+
+#[then(expr = "the cheapest model {string} is selected costing {string}")]
+fn cheapest_model_selected_costing(world: &mut BddWorld, model: String, price: String) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let outcome: serde_json::Value =
+        serde_json::from_str(world.last_stdout.trim()).expect("run json");
+    let decision = outcome["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|e| e["type"] == "routing_decision_made")
+        .expect("routing decision");
+    assert_eq!(decision["selected_model"], model);
+    assert_eq!(decision["router"], "cheapest");
+    let reason = decision["reason"].as_str().expect("reason");
+    assert!(reason.contains("cheapest"), "reason: {reason}");
+    assert!(reason.contains(&price), "reason: {reason}");
+    // The selected (cheap) endpoint actually served the completion.
+    assert_eq!(outcome["text"], "cheap answer");
+}
+
 #[then(expr = "the cheapest model {string} is selected with a cost reason")]
 fn cheapest_model_selected(world: &mut BddWorld, model: String) {
     assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
@@ -1500,6 +1673,11 @@ fn session_events_routing_decision_from_router(world: &mut BddWorld, router: Str
 #[when("I run forge doctor")]
 async fn run_forge_doctor(world: &mut BddWorld) {
     world.run_forge(&["doctor"]).await;
+}
+
+#[when("I run forge doctor with --live")]
+async fn run_forge_doctor_live(world: &mut BddWorld) {
+    world.run_forge(&["doctor", "--live"]).await;
 }
 
 #[then(expr = "the doctor output mentions {string}")]

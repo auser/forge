@@ -13,13 +13,14 @@ use forge_core::{
 };
 use forge_needle::NeedleEngine;
 use forge_session::{
-    Decider, DecisionLog, JsonlSessionStore, Outcome, RecordDraft, Stage, new_run_id,
-    new_session_id,
+    Decider, DecisionLog, DecisionLogHandle, JsonlSessionStore, Outcome, RecordDraft, Stage,
+    new_run_id, new_session_id,
 };
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::{SpendTracker, completion_cost};
 use crate::tools::{ToolDispatcher, ToolOutcome, minimum_dispatch_risk, tool_definitions};
 
 /// Skill registry for runtimes without skills (tests).
@@ -73,6 +74,19 @@ struct FastPathDispatch {
     call: ToolCall,
     outcome: ToolOutcome,
     confidence: f64,
+}
+
+/// The plumbing a pause-for-approval inside the agent loop needs: how to
+/// emit events for this run, and how to wait for the answer. Bundled so
+/// the gates that use it (the budget gate today) don't each grow a
+/// seven-parameter signature.
+struct RunGate<'a> {
+    sender: &'a broadcast::Sender<Event>,
+    collected: &'a mut Vec<Event>,
+    run_id: &'a str,
+    session_id: &'a str,
+    input_rx: &'a mut mpsc::Receiver<String>,
+    token: &'a CancellationToken,
 }
 
 /// Result of a completed run.
@@ -1008,6 +1022,121 @@ impl AgentService {
         )
     }
 
+    /// Record one completion's usage and cost in the decision log, and
+    /// accrue both into the spend tracker the budget gate reads. The price
+    /// comes from the [`forge_config::CostBook`] — the resolved model
+    /// entry's own per-million-token costs first, the cached OpenRouter
+    /// catalogue when the entry declares none — so a model with no price
+    /// anywhere (or a response with no usage) stays `None`, never 0.0
+    /// pretending to be free.
+    #[allow(clippy::too_many_arguments)]
+    fn account_completion(
+        &self,
+        decisions: &DecisionLogHandle,
+        spend: &mut SpendTracker,
+        turn: u32,
+        model_name: &str,
+        response: &forge_core::CompletionResponse,
+        elapsed_ms: u64,
+        costs: &forge_config::CostBook,
+    ) {
+        let cost_usd = completion_cost(response.usage, costs.price(model_name));
+        spend.record(response.usage, cost_usd);
+        decisions.record_usage(turn, model_name, response.usage, cost_usd, elapsed_ms);
+    }
+
+    /// Enforce `[budget]` before a model call: when a configured ceiling
+    /// has been reached, `on_exceeded = "stop"` fails the turn naming the
+    /// ceiling and the spend, and `"prompt"` asks on the run's input
+    /// channel — the same path tool approvals take. A channel with nobody
+    /// to answer (headless run, closed stdin) degrades `"prompt"` to
+    /// `"stop"`: a ceiling that silently lets everything through is worse
+    /// than one that halts. Zero-cost (local) models never reach this with
+    /// a USD ceiling tripped — they accrue no USD.
+    async fn gate_budget(
+        &self,
+        gate: &mut RunGate<'_>,
+        spend: &SpendTracker,
+    ) -> Result<(), ForgeError> {
+        let Some(trip) = spend.tripped(&self.config.budget) else {
+            return Ok(());
+        };
+        let description = trip.describe();
+        if self.config.budget.on_exceeded == "stop" {
+            return Err(ForgeError::agent(format!(
+                "budget exceeded: {description} (budget.on_exceeded = \"stop\")"
+            )));
+        }
+        self.emit(
+            gate.sender,
+            gate.collected,
+            Event::new(
+                gate.run_id,
+                gate.session_id,
+                EventKind::ApprovalRequested {
+                    command: description.clone(),
+                    risk: RiskLevel::Risky,
+                },
+            ),
+        )?;
+        match self
+            .await_approval(
+                gate.run_id,
+                gate.input_rx,
+                gate.token,
+                &description,
+                RiskLevel::Risky,
+            )
+            .await
+        {
+            Ok(approved) => {
+                self.emit(
+                    gate.sender,
+                    gate.collected,
+                    Event::new(
+                        gate.run_id,
+                        gate.session_id,
+                        EventKind::ApprovalDecided {
+                            command: description.clone(),
+                            approved,
+                        },
+                    ),
+                )?;
+                if approved {
+                    Ok(())
+                } else {
+                    Err(ForgeError::agent(format!(
+                        "budget exceeded: {description}; continuing was denied"
+                    )))
+                }
+            }
+            Err(ForgeError::ApprovalRequired { .. }) => {
+                // Input channel closed with no answer: nobody can approve,
+                // so prompt behaves as stop (mirroring the tool-approval
+                // flow above).
+                self.emit(
+                    gate.sender,
+                    gate.collected,
+                    Event::new(
+                        gate.run_id,
+                        gate.session_id,
+                        EventKind::ApprovalDecided {
+                            command: description.clone(),
+                            approved: false,
+                        },
+                    ),
+                )?;
+                Err(ForgeError::agent(format!(
+                    "budget exceeded: {description} and no one can answer the budget prompt; \
+                     treating budget.on_exceeded = \"prompt\" as \"stop\""
+                )))
+            }
+            // Cancellation: the Cancelled event was already recorded by
+            // cancel(); no Error event.
+            Err(e) => Err(e),
+        }
+    }
+
     /// Take the session for one run, or refuse: **one live run per session.**
     ///
     /// Two runs in one session are not merely racy, they corrupt data that
@@ -1422,6 +1551,19 @@ impl AgentService {
         let mut tool_call_count = 0usize;
         let decisions = DecisionLog::handle(&self.decision_log, &session_id);
         let turn_no = self.next_turn(&session_id);
+        // Spend so far, scanned from the decision logs this session (and
+        // today, across sessions) has already written — see
+        // `crate::budget`. Skipped entirely when no ceiling is configured.
+        let mut spend =
+            SpendTracker::scan_if_budgeted(self.sessions.root(), &session_id, &self.config.budget);
+        // Prices for every completion this run records, resolved once:
+        // config first, cached OpenRouter catalogue second (read, never
+        // fetched — the hot path sees no network), unpriced stays unpriced.
+        let catalogue = forge_config::catalogue::load_for_routing(&self.config);
+        let cost_book = forge_config::CostBook::new(
+            self.config.model_entries(),
+            catalogue.as_ref().map(|cached| &cached.catalogue),
+        );
 
         let fail = |collected: &mut Vec<Event>, error: ForgeError| -> ForgeError {
             let event = Event::new(
@@ -1788,11 +1930,40 @@ impl AgentService {
         if tools.is_empty() {
             // Single-turn path: providers without tool support behave
             // exactly as a plain completion.
+            match self
+                .gate_budget(
+                    &mut RunGate {
+                        sender: &sender,
+                        collected: &mut collected,
+                        run_id: &run_id,
+                        session_id: &session_id,
+                        input_rx: &mut input_rx,
+                        token: &token,
+                    },
+                    &spend,
+                )
+                .await
+            {
+                Ok(()) => {}
+                // Cancellation: the Cancelled event was already recorded.
+                Err(e @ ForgeError::Cancelled(_)) => return Err(e),
+                Err(e) => return Err(fail(&mut collected, e)),
+            }
             let request = CompletionRequest::new(decision.selected_model.clone(), messages);
+            let complete_started = std::time::Instant::now();
             let response = match model.complete(request).await {
                 Ok(response) => response,
                 Err(e) => return Err(fail(&mut collected, e)),
             };
+            self.account_completion(
+                &decisions,
+                &mut spend,
+                turn_no,
+                &decision.selected_model,
+                &response,
+                complete_started.elapsed().as_millis() as u64,
+                &cost_book,
+            );
             self.emit_assistant_message(&sender, &mut collected, &run_id, &session_id, &response)?;
             let summary: String = response.content.chars().take(80).collect();
             // Same accounting as the loop's final iteration: one model
@@ -1833,12 +2004,42 @@ impl AgentService {
                 return Err(ForgeError::cancelled("cancellation requested"));
             }
 
+            match self
+                .gate_budget(
+                    &mut RunGate {
+                        sender: &sender,
+                        collected: &mut collected,
+                        run_id: &run_id,
+                        session_id: &session_id,
+                        input_rx: &mut input_rx,
+                        token: &token,
+                    },
+                    &spend,
+                )
+                .await
+            {
+                Ok(()) => {}
+                // Cancellation: the Cancelled event was already recorded.
+                Err(e @ ForgeError::Cancelled(_)) => return Err(e),
+                Err(e) => return Err(fail(&mut collected, e)),
+            }
+
             let request = CompletionRequest::new(selected.clone(), messages.clone())
                 .with_tools(tools.clone());
+            let complete_started = std::time::Instant::now();
             let response = match model.complete(request).await {
                 Ok(response) => response,
                 Err(e) => return Err(fail(&mut collected, e)),
             };
+            self.account_completion(
+                &decisions,
+                &mut spend,
+                turn_no,
+                &selected,
+                &response,
+                complete_started.elapsed().as_millis() as u64,
+                &cost_book,
+            );
 
             self.emit_assistant_message(&sender, &mut collected, &run_id, &session_id, &response)?;
 

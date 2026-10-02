@@ -174,7 +174,14 @@ pub enum Command {
     },
 
     /// Check environment and configuration health.
-    Doctor,
+    Doctor {
+        /// After the static checks, fire one tiny canary prompt through the
+        /// real run path and report what actually answered (model, router,
+        /// escalation, latency). Takes as long as a slow model takes,
+        /// bounded by a 120 s timeout.
+        #[arg(long)]
+        live: bool,
+    },
 
     /// Print name and version.
     Version,
@@ -259,7 +266,21 @@ pub enum SkillCommand {
 #[derive(Subcommand)]
 pub enum ModelCommand {
     /// List configured/available models.
-    List,
+    List {
+        /// List the cached OpenRouter catalogue instead: every brokered
+        /// model with its prices and context length.
+        #[arg(long)]
+        catalogue: bool,
+    },
+    /// Declare a model from the cached OpenRouter catalogue: writes a
+    /// `[models.<id>]` entry to the project config pre-filled with the
+    /// catalogue's prices and context length.
+    Add {
+        #[arg(value_name = "MODEL_ID")]
+        id: String,
+    },
+    /// Re-fetch the OpenRouter catalogue into the local cache.
+    Refresh,
     /// Test a model (default: the configured model).
     Test {
         #[arg(value_name = "MODEL")]

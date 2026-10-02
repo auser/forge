@@ -13,21 +13,27 @@ use std::path::{Path, PathBuf};
 use forge_core::ForgeError;
 use serde::{Deserialize, Serialize};
 
+pub mod catalogue;
+pub mod costs;
 pub mod test_mocks;
 
+pub use costs::{CostBook, PriceSource};
 pub use test_mocks::{TEST_MOCKS_ENV, ensure_test_mocks_allowed, test_mocks_allowed};
 
 /// A `[models.<name>]` entry: cost metadata, optional endpoint, and
-/// capability overrides. Cost is USD per million tokens; unset costs mean
-/// free (0.0). Entries without any capability override are treated as
-/// "unknown capabilities" (optimistic) by routers.
+/// capability overrides. Cost is USD per million tokens; an unset cost
+/// means *unpriced* (never ranked on price by `cheapest`, and priced from
+/// the cached OpenRouter catalogue when one matches — see
+/// [`crate::costs::CostBook`]), not free. An explicitly free model (a local
+/// one) writes `0.0`. Entries without any capability override are treated
+/// as "unknown capabilities" (optimistic) by routers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelEntry {
     /// Free-text routing criteria (used by laya-style routers).
     pub description: Option<String>,
-    pub cost_input_per_mtok: f64,
-    pub cost_output_per_mtok: f64,
+    pub cost_input_per_mtok: Option<f64>,
+    pub cost_output_per_mtok: Option<f64>,
     pub base_url: Option<String>,
     pub key_env: Option<String>,
     /// Provider family for the endpoint: "openai" (default) or
@@ -48,8 +54,18 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
-    pub fn costs(&self) -> (f64, f64) {
-        (self.cost_input_per_mtok, self.cost_output_per_mtok)
+    /// The entry's own per-million-token prices when it declares any —
+    /// `Some` when at least one of the two costs is set (the unset half
+    /// reads as 0.0), `None` when neither is, which is what "unpriced"
+    /// means everywhere costs are resolved.
+    pub fn costs(&self) -> Option<(f64, f64)> {
+        if self.cost_input_per_mtok.is_none() && self.cost_output_per_mtok.is_none() {
+            return None;
+        }
+        Some((
+            self.cost_input_per_mtok.unwrap_or(0.0),
+            self.cost_output_per_mtok.unwrap_or(0.0),
+        ))
     }
 
     /// Capabilities when the entry declares at least one override
@@ -73,6 +89,48 @@ impl ModelEntry {
         })
     }
 }
+
+/// `[budget]`: spend ceilings, enforced by the agent loop against the usage
+/// and cost recorded in the decision log (see `forge_session::decisions`).
+/// Every ceiling is optional; an absent `[budget]` (the default) means no
+/// budget — today's behaviour. Ceilings are checked *before* each model
+/// call against spend already recorded, so a call that lands exactly on a
+/// ceiling is the last one that runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BudgetConfig {
+    /// Total tokens (input + output) one session may consume.
+    pub session_tokens: Option<u64>,
+    /// Total USD one session may spend.
+    pub session_usd: Option<f64>,
+    /// Total USD across all sessions per day (UTC).
+    pub daily_usd: Option<f64>,
+    /// What an exceeded ceiling does: "prompt" asks before continuing (and
+    /// degrades to "stop" where no one can answer); "stop" fails the turn.
+    pub on_exceeded: String,
+}
+
+impl BudgetConfig {
+    /// Whether any ceiling is set — when none is, the loop skips the whole
+    /// accounting scan.
+    pub fn has_ceilings(&self) -> bool {
+        self.session_tokens.is_some() || self.session_usd.is_some() || self.daily_usd.is_some()
+    }
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            session_tokens: None,
+            session_usd: None,
+            daily_usd: None,
+            on_exceeded: "prompt".to_string(),
+        }
+    }
+}
+
+/// Valid values for `budget.on_exceeded`.
+const BUDGET_ON_EXCEEDED_VALUES: &[&str] = &["prompt", "stop"];
 
 /// `[needle]`: the embedded on-device Needle brain (weights variant, an
 /// optional override path, and whether `forge init` may fetch weights).
@@ -187,6 +245,13 @@ pub struct Config {
     /// `router = "needle"`. When the weights are missing, routing built on
     /// it degrades to `router_fallback`.
     pub needle: NeedleConfig,
+    /// Spend ceilings enforced by the agent loop (`[budget]`); all ceilings
+    /// absent means no budget.
+    pub budget: BudgetConfig,
+    /// Days a cached OpenRouter model catalogue counts as fresh (see
+    /// [`crate::catalogue`]). A stale cache is still used — with a warning
+    /// naming its age — because stale prices beat no prices; must be >= 1.
+    pub catalogue_ttl_days: u64,
     /// Which keys a real configuration layer set, rather than the
     /// compiled-in defaults (see [`ExplicitKeys`]). Deliberately not part of
     /// the serialized configuration: it records *where* values came from,
@@ -280,8 +345,8 @@ impl Default for Config {
         let models = [
             ModelEntry {
                 description: Some("local coding model via oMLX (Qwen3-Coder)".to_string()),
-                cost_input_per_mtok: 0.0,
-                cost_output_per_mtok: 0.0,
+                cost_input_per_mtok: Some(0.0),
+                cost_output_per_mtok: Some(0.0),
                 base_url: Some("http://127.0.0.1:8080/v1".to_string()),
                 key_env: None,
                 provider: None,
@@ -295,8 +360,8 @@ impl Default for Config {
             },
             ModelEntry {
                 description: Some("DeepSeek V4-class chat/coding model, very low cost".to_string()),
-                cost_input_per_mtok: 0.14,
-                cost_output_per_mtok: 0.28,
+                cost_input_per_mtok: Some(0.14),
+                cost_output_per_mtok: Some(0.28),
                 base_url: Some("https://api.deepseek.com/v1".to_string()),
                 key_env: Some("DEEPSEEK_API_KEY".to_string()),
                 provider: None,
@@ -314,8 +379,8 @@ impl Default for Config {
                         .to_string(),
                 ),
                 // Subscription-served: no per-token cost here.
-                cost_input_per_mtok: 0.0,
-                cost_output_per_mtok: 0.0,
+                cost_input_per_mtok: Some(0.0),
+                cost_output_per_mtok: Some(0.0),
                 base_url: Some("https://api.anthropic.com".to_string()),
                 key_env: Some("ANTHROPIC_API_KEY".to_string()),
                 provider: Some("anthropic".to_string()),
@@ -332,8 +397,8 @@ impl Default for Config {
                     "OpenAI GPT-5 via API key (Codex CLI auth.json is detected)".to_string(),
                 ),
                 // Prices as of Sept 2026; check provider pages.
-                cost_input_per_mtok: 1.25,
-                cost_output_per_mtok: 10.0,
+                cost_input_per_mtok: Some(1.25),
+                cost_output_per_mtok: Some(10.0),
                 base_url: Some("https://api.openai.com/v1".to_string()),
                 key_env: Some("OPENAI_API_KEY".to_string()),
                 provider: Some("openai".to_string()),
@@ -347,8 +412,8 @@ impl Default for Config {
             },
             ModelEntry {
                 description: Some("Moonshot Kimi K2.7 Code, frontier-quality coding".to_string()),
-                cost_input_per_mtok: 0.95,
-                cost_output_per_mtok: 4.00,
+                cost_input_per_mtok: Some(0.95),
+                cost_output_per_mtok: Some(4.00),
                 base_url: Some("https://api.moonshot.ai/v1".to_string()),
                 key_env: Some("MOONSHOT_API_KEY".to_string()),
                 provider: None,
@@ -375,8 +440,8 @@ impl Default for Config {
                 description: Some(
                     "Claude Sonnet 4.5 via OpenRouter, one key for many models".to_string(),
                 ),
-                cost_input_per_mtok: 3.00,
-                cost_output_per_mtok: 15.00,
+                cost_input_per_mtok: Some(3.00),
+                cost_output_per_mtok: Some(15.00),
                 base_url: Some("https://openrouter.ai/api/v1".to_string()),
                 key_env: Some("OPENROUTER_API_KEY".to_string()),
                 provider: None,
@@ -422,6 +487,8 @@ impl Default for Config {
             .into_iter()
             .collect(),
             needle: NeedleConfig::default(),
+            budget: BudgetConfig::default(),
+            catalogue_ttl_days: 7,
             // Nothing here was explicitly configured — this *is* the
             // defaults layer.
             explicit: ExplicitKeys::default(),
@@ -518,6 +585,11 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_NEEDLE_VARIANT", "needle.variant"),
     ("FORGE_NEEDLE_AUTOFETCH", "needle.autofetch"),
     ("FORGE_NEEDLE_WEIGHTS_SHA256", "needle.weights_sha256"),
+    ("FORGE_BUDGET_SESSION_TOKENS", "budget.session_tokens"),
+    ("FORGE_BUDGET_SESSION_USD", "budget.session_usd"),
+    ("FORGE_BUDGET_DAILY_USD", "budget.daily_usd"),
+    ("FORGE_BUDGET_ON_EXCEEDED", "budget.on_exceeded"),
+    ("FORGE_CATALOGUE_TTL_DAYS", "catalogue_ttl_days"),
 ];
 
 impl Config {
@@ -564,12 +636,26 @@ impl Config {
                 self.needle.variant
             )));
         }
+        if !BUDGET_ON_EXCEEDED_VALUES.contains(&self.budget.on_exceeded.as_str()) {
+            return Err(ForgeError::config(format!(
+                "budget.on_exceeded must be one of {} (got {:?})",
+                BUDGET_ON_EXCEEDED_VALUES.join(", "),
+                self.budget.on_exceeded
+            )));
+        }
         let sha = &self.needle.weights_sha256;
         if !sha.is_empty() && !(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())) {
             return Err(ForgeError::config(format!(
                 "needle.weights_sha256 must be empty or 64 hex characters (got {:?})",
                 sha
             )));
+        }
+        if self.catalogue_ttl_days == 0 {
+            return Err(ForgeError::config(
+                "catalogue_ttl_days must be at least 1 (a 0-day TTL would make every cached \
+                 catalogue stale on arrival)"
+                    .to_string(),
+            ));
         }
         for (name, entry) in &self.models {
             for (wrong, right) in WRONG_MODEL_ENTRY_KEYS {
@@ -783,9 +869,21 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
                     "{env_name} must be a positive integer, got {raw:?}"
                 ))
             })?),
+            "budget.session_tokens" | "catalogue_ttl_days" => {
+                toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
+                    ForgeError::config(format!(
+                        "{env_name} must be a non-negative integer, got {raw:?}"
+                    ))
+                })?)
+            }
             "router_confidence_threshold" => {
                 toml::Value::Float(raw.parse::<f64>().map_err(|_| {
                     ForgeError::config(format!("{env_name} must be a number in [0,1], got {raw:?}"))
+                })?)
+            }
+            "budget.session_usd" | "budget.daily_usd" => {
+                toml::Value::Float(raw.parse::<f64>().map_err(|_| {
+                    ForgeError::config(format!("{env_name} must be a number, got {raw:?}"))
                 })?)
             }
             _ => toml::Value::String(raw),

@@ -207,6 +207,10 @@ pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
     let mut unavailable = 0u64;
     let mut elapsed_ms_total = 0u64;
     let mut routed = 0u64;
+    // Per-model totals from Complete records, keyed by model name. BTreeMap
+    // so the report's order is stable.
+    let mut models: std::collections::BTreeMap<String, forge_session::SpendTotals> =
+        std::collections::BTreeMap::new();
 
     if root.is_dir() {
         for entry in std::fs::read_dir(&root)
@@ -238,6 +242,17 @@ pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
                         }
                     }
                     forge_session::Stage::Route => routed += 1,
+                    forge_session::Stage::Complete => {
+                        let totals = models.entry(record.choice.clone()).or_default();
+                        totals.calls += 1;
+                        if let Some(usage) = record.usage {
+                            totals.input_tokens += u64::from(usage.prompt_tokens);
+                            totals.output_tokens += u64::from(usage.completion_tokens);
+                        }
+                        if let Some(cost) = record.cost_usd {
+                            totals.cost_usd += cost;
+                        }
+                    }
                 }
             }
         }
@@ -260,6 +275,12 @@ pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
             "mean_elapsed_ms": mean_ms,
         },
         "route": { "total": routed },
+        "models": models.iter().map(|(name, t)| (name.clone(), serde_json::json!({
+            "calls": t.calls,
+            "input_tokens": t.input_tokens,
+            "output_tokens": t.output_tokens,
+            "cost_usd": t.cost_usd,
+        }))).collect::<serde_json::Map<String, serde_json::Value>>(),
     });
 
     if ctx.global.json {
@@ -277,6 +298,14 @@ pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
             decline_rate * 100.0
         );
         println!("route   {routed} total");
+        for (name, t) in &models {
+            // Six decimals: per-call costs are often below a cent, and
+            // "$0.0000" for real spend would read as "free".
+            println!(
+                "model   {name}: {} calls, {} in / {} out tokens, ${:.6}",
+                t.calls, t.input_tokens, t.output_tokens, t.cost_usd
+            );
+        }
     }
     Ok(())
 }
