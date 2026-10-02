@@ -493,6 +493,83 @@ fn the_acp_session_id_is_a_forge_session_id() {
 }
 
 #[test]
+fn a_prompt_turn_activates_skills_named_in_meta() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let skill_dir = project.join(".forge").join("skills").join("demo");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo skill description\n---\n\nDo the demo thing.\n",
+    )
+    .expect("write skill");
+    let mut client = AcpClient::spawn(tmp.path(), &project);
+    client.initialize();
+    let session_id = client.new_session(&project);
+
+    // "zz unrelated qq" shares no token with the skill's name or
+    // description, so the activation can only have come from `_meta`.
+    let response = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "zz unrelated qq" }],
+            "_meta": { "forge.activateSkills": ["demo"] },
+        }),
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+
+    // The ACP session id is the forge session id, so the activation is on
+    // the inspectable session log.
+    let log = std::fs::read_to_string(
+        project
+            .join(".forge")
+            .join("sessions")
+            .join(format!("{session_id}.jsonl")),
+    )
+    .expect("session log");
+    assert!(
+        log.lines()
+            .any(|l| l.contains("\"skill_activated\"") && l.contains("\"demo\"")),
+        "expected a skill_activated for demo: {log}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn a_prompt_with_an_unknown_meta_skill_is_an_error_response() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let mut client = AcpClient::spawn(tmp.path(), &project);
+    client.initialize();
+    let session_id = client.new_session(&project);
+
+    let response = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "zz unrelated qq" }],
+            "_meta": { "forge.activateSkills": ["nosuch"] },
+        }),
+    );
+    assert_eq!(
+        response["error"]["code"],
+        serde_json::json!(-32600),
+        "the runtime refusal reaches the client: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown skill: nosuch"),
+        "{response}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
 fn a_risky_operation_asks_the_editor_for_permission_and_proceeds_when_allowed() {
     // stdin is the protocol channel, so the loop cannot prompt on it:
     // `NativeExecution` sees a non-terminal stdin, parks the run, and the

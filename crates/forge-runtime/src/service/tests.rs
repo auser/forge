@@ -89,6 +89,7 @@ fn event_kinds(outcome: &RunOutcome) -> Vec<&str> {
             EventKind::TurnCompleted { .. } => "turn_completed",
             EventKind::InputReceived { .. } => "input_received",
             EventKind::AssistantMessage { .. } => "assistant_message",
+            EventKind::AssistantDelta { .. } => "assistant_delta",
             EventKind::ToolResult { .. } => "tool_result",
             EventKind::SessionForked { .. } => "session_forked",
             EventKind::Error { .. } => "error",
@@ -130,6 +131,232 @@ async fn full_run_emits_ordered_events() {
     assert!(persisted.iter().all(|e| e.run_id == outcome.run_id));
     let seqs: Vec<u64> = persisted.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+}
+
+// --- token streaming (TICKET-1) ------------------------------------------
+
+#[tokio::test]
+async fn a_streaming_run_emits_ordered_deltas_then_the_same_terminal_events() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("the answer")],
+        forge_core::ApprovalPolicy::Deny,
+    );
+    let outcome = service.run("question").await.expect("run");
+
+    let kinds = event_kinds(&outcome);
+    assert_eq!(
+        kinds,
+        [
+            "run_started",
+            "routing_decision_made",
+            "assistant_delta",
+            "assistant_delta",
+            // the replay record, retained and unchanged
+            "assistant_message",
+            "turn_completed",
+            "completed"
+        ],
+        "deltas arrive in order, then exactly today's terminal events"
+    );
+
+    // The deltas concatenate to the final message, and the message is the
+    // same one a delta-free log would carry.
+    let deltas: String = outcome
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::AssistantDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, "the answer");
+    let final_text = outcome
+        .events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::AssistantMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("final message");
+    assert_eq!(final_text, "the answer");
+    assert_eq!(outcome.text, "the answer", "RunOutcome.text is unchanged");
+
+    // Persisted and sequenced like every event, through the one boundary.
+    let persisted = service
+        .sessions()
+        .events_for(&outcome.session_id)
+        .expect("read");
+    let seqs: Vec<u64> = persisted.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=persisted.len() as u64).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn a_non_streaming_provider_records_no_deltas() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = MockModel::new().with_capabilities(forge_core::ModelCapabilities {
+        streaming: false,
+        ..MockModel::new().capabilities()
+    });
+    let service = AgentService::new(
+        Arc::new(model),
+        Arc::new(MockRouter::selecting("mock-local")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+    let outcome = service.run("hi").await.expect("run");
+    assert_eq!(
+        event_kinds(&outcome),
+        [
+            "run_started",
+            "routing_decision_made",
+            "assistant_message",
+            "turn_completed",
+            "completed"
+        ],
+        "byte-identical to before"
+    );
+}
+
+/// A provider that advertises streaming but only implements `complete`
+/// (every pre-existing provider) takes the fallback: no deltas, same events.
+#[tokio::test]
+async fn advertising_streaming_without_an_override_is_a_silent_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(tmp.path()); // MockModel: streaming: true, no override
+    let outcome = service.run("hi").await.expect("run");
+    assert!(
+        !event_kinds(&outcome).contains(&"assistant_delta"),
+        "the default stream_complete emits nothing"
+    );
+    assert_eq!(outcome.text, "mock response to: hi");
+}
+
+/// Splits its answer at fixed byte offsets — including through a secret —
+/// to prove the runtime's hold-back, not the provider's chunking, is what
+/// lets the redaction boundary see whole tokens.
+struct SplittingModel;
+
+#[async_trait::async_trait]
+impl ModelProvider for SplittingModel {
+    fn name(&self) -> &str {
+        "splitting"
+    }
+    fn capabilities(&self) -> forge_core::ModelCapabilities {
+        forge_core::ModelCapabilities {
+            streaming: true,
+            tools: false,
+            ..Default::default()
+        }
+    }
+    async fn complete(
+        &self,
+        _: CompletionRequest,
+    ) -> Result<forge_core::CompletionResponse, ForgeError> {
+        unreachable!()
+    }
+    async fn stream_complete(
+        &self,
+        _: CompletionRequest,
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<forge_core::CompletionResponse, ForgeError> {
+        for piece in ["the key is sk-abc", "def123456 ok", " bye"] {
+            on_delta(piece);
+        }
+        Ok(forge_core::CompletionResponse {
+            model: "splitting".into(),
+            content: "the key is sk-abcdef123456 ok bye".into(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_secret_split_across_provider_chunks_is_still_redacted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = AgentService::new(
+        Arc::new(SplittingModel),
+        Arc::new(MockRouter::selecting("splitting")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+    let outcome = service.run("tell me").await.expect("run");
+
+    let raw = std::fs::read_to_string(
+        tmp.path()
+            .join(".forge")
+            .join("sessions")
+            .join(format!("{}.jsonl", outcome.session_id)),
+    )
+    .expect("log");
+    assert!(
+        !raw.contains("sk-abcdef123456"),
+        "secret leaked split across deltas: {raw}"
+    );
+    assert!(
+        raw.contains("[REDACTED]"),
+        "the boundary saw the whole token: {raw}"
+    );
+    // And what was broadcast/collected is the redacted form, like every event.
+    let deltas: String = outcome
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::AssistantDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(deltas.contains("[REDACTED]"), "{deltas}");
+}
+
+#[tokio::test]
+async fn resume_after_a_streamed_run_replays_the_final_message_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        text_reply("first streamed answer"),
+        text_reply("second"),
+    ]));
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+    let first = service.run("start").await.expect("first");
+    let resumed = service.resume(&first.run_id).await.expect("resume");
+    assert_eq!(resumed.text, "second");
+
+    // The model saw the final message, not a pile of fragments.
+    let requests = model.recorded();
+    assert_eq!(requests.len(), 2, "one model request per run");
+    let history: Vec<&str> = requests[1]
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        history.contains(&"first streamed answer"),
+        "the final message replays whole: {history:?}"
+    );
+    assert!(
+        !history.iter().any(|c| *c == "first " || *c == "streamed "),
+        "fragments never replay: {history:?}"
+    );
 }
 
 struct FailingRouter;
@@ -266,6 +493,9 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
             // v3 replay record of the tool's output
             "tool_result",
             "turn_completed",
+            // v4: the final answer streams as ordered deltas...
+            "assistant_delta",
+            "assistant_delta",
             // v3 replay record of the final answer — itself a turn
             "assistant_message",
             "turn_completed",
@@ -274,7 +504,7 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
     );
     // Sequence numbers are monotonic.
     let seqs: Vec<u64> = outcome.events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=12).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=14).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -1955,6 +2185,347 @@ async fn graph_tools_work_and_report_unavailable() {
     assert_eq!(outcome.text, "no graph, fine");
 }
 
+// --- explicit skill activation (RunOptions::activate_skills) ---
+
+/// Two skills: `beta` lexically matches any prompt containing the word
+/// "beta", and `xy` never can — `match_task` tokenizes words of >= 3
+/// characters, so a two-character name is unreachable by discovery. The
+/// explicit path is the only way `xy` can ever activate.
+struct StubSkills;
+
+impl StubSkills {
+    fn meta(name: &str) -> SkillMeta {
+        SkillMeta {
+            name: name.to_string(),
+            description: format!("{name} skill description"),
+            path: PathBuf::from(format!("skills/{name}/SKILL.md")),
+        }
+    }
+}
+
+impl SkillRegistry for StubSkills {
+    fn list(&self) -> Vec<SkillMeta> {
+        vec![Self::meta("xy"), Self::meta("beta")]
+    }
+
+    fn activate(&self, name: &str) -> Result<Skill, ForgeError> {
+        self.list()
+            .into_iter()
+            .find(|meta| meta.name == name)
+            .map(|meta| Skill {
+                instructions: format!("{name} INSTRUCTIONS"),
+                meta,
+            })
+            .ok_or_else(|| ForgeError::skill(format!("unknown skill: {name}")))
+    }
+
+    fn match_task(&self, prompt: &str) -> Vec<SkillMeta> {
+        if prompt.split_whitespace().any(|word| word == "beta") {
+            vec![Self::meta("beta")]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn skilled_service(root: &std::path::Path, model: Arc<MockModel>) -> AgentService {
+    AgentService::new(
+        model,
+        Arc::new(MockRouter::selecting("mock-local")),
+        Arc::new(MockExecution::new(root)),
+        Arc::new(StubSkills),
+        Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions"))),
+        Config::default(),
+    )
+}
+
+fn activated_skill_names(outcome: &RunOutcome) -> Vec<&str> {
+    outcome
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::SkillActivated { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The system messages the model was actually sent, across its recorded
+/// requests — where skill instructions have to land to matter.
+fn skill_system_messages(model: &MockModel) -> Vec<String> {
+    model
+        .recorded()
+        .iter()
+        .flat_map(|request| &request.messages)
+        .filter(|m| m.role == forge_core::Role::System)
+        .map(|m| m.content.clone())
+        .collect()
+}
+
+/// AC1: a run naming a skill activates exactly it — no lexical match
+/// involved (`xy` can never match), one event, instructions injected.
+#[tokio::test]
+async fn explicit_skill_activates_without_lexical_match() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(MockModel::new());
+    let service = skilled_service(tmp.path(), model.clone());
+
+    let outcome = service
+        .run_with_options(
+            "unrelated words only",
+            RunOptions {
+                activate_skills: vec!["xy".to_string()],
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(activated_skill_names(&outcome), ["xy"]);
+    let systems = skill_system_messages(&model);
+    assert_eq!(systems.len(), 1, "one system message: {systems:?}");
+    assert!(
+        systems[0].starts_with("Active skill `xy` instructions:\n"),
+        "{}",
+        systems[0]
+    );
+    assert!(systems[0].contains("xy INSTRUCTIONS"), "{}", systems[0]);
+    assert_eq!(outcome.text, "mock response to: unrelated words only");
+}
+
+/// AC2: explicit adds to lexical discovery, never replaces it — and the
+/// explicit activations come first, in caller order.
+#[tokio::test]
+async fn explicit_adds_to_lexical_never_replaces() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(MockModel::new());
+    let service = skilled_service(tmp.path(), model.clone());
+
+    let outcome = service
+        .run_with_options(
+            "please run the beta flow",
+            RunOptions {
+                activate_skills: vec!["xy".to_string()],
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(
+        activated_skill_names(&outcome),
+        ["xy", "beta"],
+        "explicit first, then the lexical match"
+    );
+    let systems = skill_system_messages(&model);
+    assert_eq!(systems.len(), 2, "both instruction bodies: {systems:?}");
+    assert!(systems[0].contains("xy INSTRUCTIONS"), "{}", systems[0]);
+    assert!(systems[1].contains("beta INSTRUCTIONS"), "{}", systems[1]);
+}
+
+/// AC2: a skill reached both ways activates exactly once — one event, one
+/// system message — and a duplicated explicit name collapses to one.
+#[tokio::test]
+async fn explicit_and_lexical_same_name_activates_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(MockModel::new());
+    let service = skilled_service(tmp.path(), model.clone());
+
+    let outcome = service
+        .run_with_options(
+            "please run the beta flow",
+            RunOptions {
+                activate_skills: vec!["beta".to_string(), "beta".to_string()],
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(activated_skill_names(&outcome), ["beta"]);
+    let systems = skill_system_messages(&model);
+    assert_eq!(systems.len(), 1, "{systems:?}");
+}
+
+/// AC3: an unknown explicit name is a synchronous, typed error at both
+/// entry points — and it leaves nothing behind: no claim, no events.
+#[tokio::test]
+async fn unknown_explicit_skill_is_a_synchronous_error_and_writes_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(MockModel::new());
+    let service = Arc::new(skilled_service(tmp.path(), model.clone()));
+
+    let err = service
+        .run_with_options(
+            "anything",
+            RunOptions {
+                activate_skills: vec!["nosuch".to_string()],
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("unknown skill must refuse the run");
+    let message = match err {
+        ForgeError::Skill(message) => message,
+        other => panic!("expected ForgeError::Skill, got {other:?}"),
+    };
+    assert!(message.contains("unknown skill: nosuch"), "{message}");
+    assert!(message.contains("xy"), "available skills listed: {message}");
+    assert!(
+        message.contains("beta"),
+        "available skills listed: {message}"
+    );
+
+    let err = service
+        .start_run_with_options(
+            "anything",
+            RunOptions {
+                activate_skills: vec!["nosuch".to_string()],
+                ..RunOptions::default()
+            },
+        )
+        .expect_err("unknown skill must refuse the start");
+    assert!(matches!(err, ForgeError::Skill(_)), "{err:?}");
+
+    // The refusal happened at the door: the session store holds nothing.
+    assert!(
+        service.sessions().events().expect("read").is_empty(),
+        "a refused run writes no events"
+    );
+    assert!(model.recorded().is_empty(), "the model never ran");
+
+    // A skills-less runtime refuses the same way, and says it has nothing
+    // to offer.
+    let bare_tmp = tempfile::tempdir().expect("tempdir");
+    let bare = test_service(bare_tmp.path());
+    let err = bare
+        .run_with_options(
+            "anything",
+            RunOptions {
+                activate_skills: vec!["xy".to_string()],
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("no registry, no skill");
+    let message = match err {
+        ForgeError::Skill(message) => message,
+        other => panic!("expected ForgeError::Skill, got {other:?}"),
+    };
+    assert!(message.contains("none discovered"), "{message}");
+}
+
+/// AC3's other half: a skill that passed entry validation but cannot be
+/// read at run time fails the run — never silently continuing without the
+/// requested instructions.
+#[tokio::test]
+async fn explicit_skill_whose_activate_fails_fails_the_run() {
+    /// `list()` knows the name (entry validation passes) but `activate()`
+    /// cannot read it — the delete-between-the-two-resolutions case
+    /// without a filesystem race.
+    struct FailingSkills;
+
+    impl SkillRegistry for FailingSkills {
+        fn list(&self) -> Vec<SkillMeta> {
+            vec![StubSkills::meta("xy")]
+        }
+
+        fn activate(&self, name: &str) -> Result<Skill, ForgeError> {
+            Err(ForgeError::skill(format!("skill {name} vanished")))
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(MockModel::new());
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("mock-local")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(FailingSkills),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+
+    let err = service
+        .run_with_options(
+            "unrelated words only",
+            RunOptions {
+                activate_skills: vec!["xy".to_string()],
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("the run fails with the activation error");
+
+    let message = match err {
+        ForgeError::Skill(message) => message,
+        other => panic!("expected ForgeError::Skill, got {other:?}"),
+    };
+    assert!(message.contains("vanished"), "{message}");
+    assert!(model.recorded().is_empty(), "the model never ran");
+    // The failure is on the record: the run started, then errored.
+    let events = service.sessions().events().expect("read");
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| match &e.kind {
+            EventKind::RunStarted { .. } => "run_started",
+            EventKind::RoutingDecisionMade { .. } => "routing_decision_made",
+            EventKind::Error { .. } => "error",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["run_started", "routing_decision_made", "error"]);
+}
+
+/// The fast path returns before the skill block, so an explicit-skill
+/// turn must never dispatch through it — the activation and the
+/// instructions are the one thing the caller asked for.
+#[tokio::test]
+async fn explicit_skill_skips_the_fast_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply(
+        "the model answered",
+    )]));
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("fn main() {}\n"));
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        exec,
+        Arc::new(StubSkills),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    )
+    .with_needle(Some(Arc::new(forge_needle::NeedleEngine::spawn(
+        forge_needle::HashBackend::new(),
+    ))));
+
+    // The prompt is in the one shape HashBackend dispatches — without the
+    // gate this run would return before the skill block.
+    let outcome = service
+        .run_with_options(
+            "read_file: {\"path\": \"Cargo.toml\"}",
+            RunOptions {
+                activate_skills: vec!["xy".to_string()],
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("run succeeds");
+
+    assert!(
+        !has_needle_dispatch(&outcome),
+        "an explicit-skill turn never dispatches: {:?}",
+        event_kinds(&outcome)
+    );
+    assert_eq!(activated_skill_names(&outcome), ["xy"]);
+    assert_eq!(model.recorded().len(), 1, "the model loop ran");
+    assert_eq!(outcome.text, "the model answered");
+}
+
 // --- needle direct-dispatch fast path ---
 
 fn has_needle_dispatch(outcome: &RunOutcome) -> bool {
@@ -2048,6 +2619,10 @@ async fn needle_fast_path_absent_engine_changes_nothing() {
         [
             "run_started",
             "routing_decision_made",
+            // v4: the answer streams as ordered deltas...
+            "assistant_delta",
+            "assistant_delta",
+            // ...and lands whole in the v3 replay record
             "assistant_message",
             "turn_completed",
             "completed"

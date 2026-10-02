@@ -75,6 +75,10 @@ fn format_event(event: &Event) -> String {
         EventKind::Note { message } => format!("note message={message}"),
         EventKind::Error { message } => format!("error message={message}"),
         EventKind::Cancelled { reason } => format!("cancelled reason={reason}"),
+        EventKind::AssistantDelta { text } => {
+            let head: String = text.chars().take(40).collect();
+            format!("assistant_delta text={head}")
+        }
         EventKind::Completed { summary } => format!("completed summary={summary}"),
     };
     format!("{ts} [{}] {detail}", event.run_id)

@@ -149,6 +149,8 @@ impl TranscriptState {
             // dumping it would bury the transcript. `ToolCompleted` is the
             // user-facing summary and `forge session show` has the payload.
             EventKind::ToolResult { .. } => Vec::new(),
+            // TICKET-3 renders these as one growing block; silent here.
+            EventKind::AssistantDelta { .. } => Vec::new(),
             // Counted for the footer; silent on its own at default
             // verbosity, which is the only verbosity a transcript has.
             EventKind::TurnCompleted { .. } => {
@@ -698,6 +700,20 @@ mod tests {
         ] {
             assert!(texts(&mut s, kind).is_empty(), "this kind must stay silent");
         }
+    }
+
+    #[test]
+    fn a_delta_renders_nothing_until_ticket_3() {
+        let mut s = TranscriptState::new();
+        let out = s.on_event(&ev(EventKind::AssistantDelta { text: "hel".into() }));
+        assert!(
+            out.is_empty(),
+            "TICKET-3 grows the incremental block; the core plumbing stays silent"
+        );
+        assert!(
+            !s.rendered_assistant_text(),
+            "a delta is not the answer-once record"
+        );
     }
 
     #[test]

@@ -100,6 +100,10 @@ pub enum Command {
         /// Agent-loop turn budget (overrides config `max_turns`).
         #[arg(long, value_name = "N")]
         max_turns: Option<u32>,
+        /// Activate this skill explicitly (repeatable), in addition to any
+        /// the prompt matches. An unknown name is an error.
+        #[arg(long = "skill", value_name = "NAME")]
+        skills: Vec<String>,
     },
 
     /// Serve the Model Context Protocol over stdio (for editors and agent

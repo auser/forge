@@ -520,6 +520,7 @@ async fn live_checks(ctx: &Context) -> Vec<Check> {
                 run_id: Some(run_id.clone()),
                 session_id: Some(session_id.clone()),
                 max_turns: Some(LIVE_MAX_TURNS),
+                activate_skills: Vec::new(),
             },
         ),
     )

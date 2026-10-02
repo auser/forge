@@ -475,6 +475,43 @@ fn reply_is_exactly_the_mock_response(world: &mut BddWorld) {
     );
 }
 
+/// The prompt shares no >=3-char token with the skill's name ("demo") or
+/// description ("Demo skill description"), so the activation cannot have
+/// come from lexical matching — only from the explicit flag.
+#[when(expr = "I run a task that does not match the skill with --skill {string}")]
+async fn run_task_with_skill_flag(world: &mut BddWorld, skill: String) {
+    world.set_config("model", "\"mock-local\"");
+    // The mock's reply is clean by default; this scenario is about the
+    // instructions reaching the model, so it opts into the echo (same as
+    // `task_matches_skill`).
+    world
+        .env
+        .insert("FORGE_MOCK_VERBOSE".to_string(), "1".to_string());
+    world
+        .run_forge(&["run", "--skill", &skill, "zz unrelated qq"])
+        .await;
+}
+
+#[then("the chat output shows the skill activated")]
+fn chat_output_shows_the_skill_activated(world: &mut BddWorld) {
+    assert!(
+        world.last_stdout.contains("  - skill: demo"),
+        "the transcript renders the activation: {}",
+        world.last_stdout
+    );
+}
+
+#[then(expr = "the session events include a skill activation for {string}")]
+fn session_events_include_a_skill_activation(world: &mut BddWorld, name: String) {
+    let log = world.session_log();
+    let event = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "skill_activated" && e["name"] == name)
+        .unwrap_or_else(|| panic!("no skill_activated for {name} in session log: {log}"));
+    assert_eq!(event["name"], name);
+}
+
 // ---------------------------------------------------------------------------
 // tracing.feature
 // ---------------------------------------------------------------------------
@@ -2125,6 +2162,25 @@ fn initialized_project_with_scripted_mock_writes(world: &mut BddWorld, path: Str
     world.set_config("router", "\"static\"");
 }
 
+/// Same shape as the "writes" step above (a two-entry script: a tool
+/// call, then a closing text reply), but the call is a `read_file` and the
+/// file itself is written with known content — the fixture for the `/show`
+/// scenario, which asserts on the recorded payload.
+#[given(expr = "an initialized project with a scripted mock model that reads {string}")]
+fn initialized_project_with_scripted_mock_reads(world: &mut BddWorld, path: String) {
+    let script = format!(
+        r#"[
+            {{"tool_calls": [{{"id": "call_1", "name": "read_file", "arguments": {{"path": "{path}"}}}}]}},
+            {{"text": "read it"}}
+        ]"#
+    );
+    world.write_file("script.json", &script);
+    world.write_file(&path, "fn parse_config() {}\n");
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+    world.set_config("router", "\"static\"");
+}
+
 #[when(expr = "I chat with the lines {string} and {string}")]
 async fn i_chat_with_two_lines(world: &mut BddWorld, first: String, second: String) {
     world
@@ -2260,6 +2316,95 @@ fn chat_output_says_source_untouched(world: &mut BddWorld) {
     assert!(
         world.last_stdout.contains("is untouched"),
         "stdout: {}",
+        world.last_stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
+// streaming.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a scripted mock model that answers {string}")]
+fn scripted_mock_answers(world: &mut BddWorld, answer: String) {
+    let script = format!(r#"[{{"text": "{answer}"}}]"#);
+    world.write_file("script.json", &script);
+    world.set_config("model", "\"scripted-mock\"");
+    world.set_config("mock_script", "\"script.json\"");
+}
+
+/// The scenario's session events as parsed JSON values, in log order.
+/// Remembers the session/run ids it finds, so later steps that take an id
+/// (`forge session show <id>`) have one without a `--json` run of their own.
+fn streaming_session_events(world: &mut BddWorld) -> Vec<serde_json::Value> {
+    let log = world.session_log();
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if let Some(first) = events.first() {
+        world.session_id = first["session_id"].as_str().unwrap_or_default().to_string();
+        world.run_id = first["run_id"].as_str().unwrap_or_default().to_string();
+    }
+    events
+}
+
+#[then("the session events include assistant deltas before the final assistant message")]
+fn session_events_include_assistant_deltas_before_final_message(world: &mut BddWorld) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let events = streaming_session_events(world);
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+    let final_message = types
+        .iter()
+        .rposition(|t| *t == "assistant_message")
+        .unwrap_or_else(|| panic!("no assistant_message in: {types:?}"));
+    let last_delta = types
+        .iter()
+        .rposition(|t| *t == "assistant_delta")
+        .unwrap_or_else(|| panic!("no assistant_delta in: {types:?}"));
+    assert!(
+        last_delta < final_message,
+        "every delta precedes the final assistant_message: {types:?}"
+    );
+    for event in events.iter().filter(|e| e["type"] == "assistant_delta") {
+        let text = event["text"].as_str().expect("delta text is a string");
+        assert!(!text.is_empty(), "a delta carries text: {event}");
+    }
+}
+
+#[then("the assistant deltas concatenate to the final assistant message text")]
+fn assistant_deltas_concatenate_to_final_message(world: &mut BddWorld) {
+    let events = streaming_session_events(world);
+    let deltas: String = events
+        .iter()
+        .filter(|e| e["type"] == "assistant_delta")
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    let final_text = events
+        .iter()
+        .filter(|e| e["type"] == "assistant_message")
+        .filter_map(|e| e["text"].as_str())
+        .next_back()
+        .expect("final assistant_message");
+    assert_eq!(
+        deltas, final_text,
+        "deltas concatenate to the replayed answer verbatim"
+    );
+}
+
+/// The payload the live stream deliberately stayed silent for, re-rendered
+/// on demand through the result gutter.
+#[then("the chat output shows the recorded tool result")]
+fn chat_output_shows_the_recorded_tool_result(world: &mut BddWorld) {
+    assert!(
+        world
+            .last_stdout
+            .contains("  - tool result 1 of 1: read_file"),
+        "the header names the recorded result:\n{}",
+        world.last_stdout
+    );
+    assert!(
+        world.last_stdout.contains("    -> fn parse_config() {}"),
+        "the recorded payload, verbatim under the result gutter:\n{}",
         world.last_stdout
     );
 }

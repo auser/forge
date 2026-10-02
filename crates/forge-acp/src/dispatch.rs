@@ -409,7 +409,10 @@ impl TurnState {
             // already gets the turn's text as one `agent_message_chunk`
             // and its tool calls as `tool_call` updates, so narrating the
             // replay records as well would duplicate the transcript.
+            //
+            // TICKET-3 forwards these as live agent_message_chunks.
             EventKind::AssistantMessage { .. }
+            | EventKind::AssistantDelta { .. }
             | EventKind::ToolResult { .. }
             | EventKind::SessionForked { .. }
             | EventKind::RunStarted { .. }

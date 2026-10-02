@@ -8,13 +8,18 @@
 //! that service's methods are synchronous filesystem reads taken straight
 //! on the executor: [`app`]'s `refresh_completions` (`list_runs()` —
 //! which re-reads and re-parses every session's whole JSONL log — plus
-//! `list_sessions()`), `events_for`, and `fork_session`. The multi-thread
+//! `list_sessions()`), `events_for` (session resume, `/session`, and
+//! `/show`), and `fork_session`. `refresh_completions` also takes the
+//! project file list for `@`-completion through [`ChatHost::project_files`]
+//! — a graph-state read the shell performs and bounds, arriving here as
+//! plain data like everything else behind the host seam. The multi-thread
 //! runtime `forge-cli` builds keeps that off the critical path, so it is
 //! latency rather than a stall, and §14 has the bounded-listing follow-up.
 //! Stated plainly here because the earlier "no I/O syscalls" wording was
 //! not true and would mislead whoever next adds a `ChatHost` method: the
 //! rule this crate actually keeps is **no terminal**, and filesystem
-//! access **only** through `AgentService`.
+//! access **only** through `AgentService` or behind the host seam as
+//! plain data.
 //!
 //! This is `forge-acp`'s split applied again — there, `dispatch` is pure
 //! and `server` owns the I/O, which is why the whole forge→ACP mapping is
@@ -29,6 +34,9 @@
 //!   owned data.
 //! * [`render`] — the `Event` → [`Line`] mapping, as a pure function of a
 //!   [`TranscriptState`].
+//! * [`show`] — `/show`: on-demand rendering of a recorded `tool_result`
+//!   payload, selected from the session log (the live mapping in [`render`]
+//!   stays silent for it).
 //! * [`command`] — slash parsing and Tab completion: what a submitted line
 //!   *says*.
 //! * [`controller`] — the input/signal state machine: what may happen now.
@@ -48,12 +56,13 @@ pub mod controller;
 pub mod host;
 pub mod io;
 pub mod render;
+pub mod show;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 pub use app::{SessionStart, Start, run};
 pub use command::{APPROVAL_MODES, COMMANDS, Command, Parsed, help_lines};
-pub use controller::{Action, ChatState, Controller, Signal};
+pub use controller::{Action, ChatState, Controller, Signal, TurnRequest};
 pub use host::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,

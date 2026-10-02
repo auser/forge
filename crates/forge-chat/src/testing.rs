@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use forge_config::Config;
 use forge_core::{
     ApprovalPolicy, CompletionRequest, CompletionResponse, ExecutionProvider, ForgeError,
-    ModelCapabilities, ModelProvider, ToolCall,
+    ModelCapabilities, ModelProvider, Skill, SkillMeta, SkillRegistry, ToolCall,
 };
 use forge_execution::{ApprovalChannel, MockExecution, NativeExecution};
 use forge_providers::{ScriptedMockModel, ScriptedReply, StaticRouter};
@@ -37,7 +37,7 @@ use crate::host::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,
 };
-use crate::io::{ChatIo, Interactivity, Line, Prompt, ReadOutcome};
+use crate::io::{ChatIo, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome};
 
 // --- ScriptedIo ----------------------------------------------------------
 
@@ -62,6 +62,10 @@ struct Shared {
     /// batch-mode busy-wait visible to an assertion. See
     /// [`ScriptedIo::eof_reads`].
     eof_reads: AtomicUsize,
+    /// The completions of the most recent `Prompt` handed to `read` — what
+    /// the editor would have completed against. See
+    /// [`ScriptedIo::last_completions`].
+    last_completions: Mutex<CompletionSnapshot>,
     trigger: Mutex<Trigger>,
     fired: AtomicBool,
     notify: Notify,
@@ -111,6 +115,7 @@ impl ScriptedIo {
                 interactivity,
                 reads_done: AtomicUsize::new(0),
                 eof_reads: AtomicUsize::new(0),
+                last_completions: Mutex::new(CompletionSnapshot::default()),
                 trigger: Mutex::new(Trigger::None),
                 fired: AtomicBool::new(false),
                 notify: Notify::new(),
@@ -180,6 +185,17 @@ impl ScriptedIo {
     pub fn output(&self) -> String {
         self.shared
             .output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The completion snapshot of the last `Prompt` `read` was handed —
+    /// how a test asserts what the host's data reached the editor without
+    /// a terminal in the way.
+    pub fn last_completions(&self) -> CompletionSnapshot {
+        self.shared
+            .last_completions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -254,7 +270,16 @@ impl ScriptedIoHandle {
 
 #[async_trait]
 impl ChatIo for ScriptedIoHandle {
-    async fn read(&mut self, _prompt: Prompt) -> ReadOutcome {
+    async fn read(&mut self, prompt: Prompt) -> ReadOutcome {
+        // Capture what the editor would have seen before answering: the
+        // snapshot travels inside the prompt precisely so the completer
+        // never calls back into the host, and a test asserting on wiring
+        // needs the same view.
+        *self
+            .0
+            .last_completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = prompt.completions;
         // A genuine yield, even when a line is already queued: without it
         // a queue with several lines ready at once would be drained in one
         // synchronous burst, never giving the run's own spawned task a
@@ -303,6 +328,9 @@ impl ChatIo for ScriptedIoHandle {
 enum Execution {
     /// Never asks for approval: every op just runs.
     Mock,
+    /// Never asks for approval, and `read_file` returns the given content —
+    /// the fixture for `/show`, which needs a known payload.
+    MockReading(String),
     /// Approval policy `prompt`, channel [`ApprovalChannel::Parked`]: a
     /// risky op always parks with `ForgeError::ApprovalRequired`, exactly
     /// what the chat's own runtime is built with (design §8.1).
@@ -319,6 +347,39 @@ pub struct FakeHost {
     environment: Environment,
     models: Vec<ModelChoice>,
     skills: Vec<SkillChoice>,
+    /// The scripted model the service was built with, when it was one —
+    /// kept so a test can assert on what the model was actually sent.
+    scripted_model: Option<Arc<ScriptedMockModel>>,
+    /// What `project_files` returns — the `@`-completion source, empty by
+    /// default (an unbuilt graph degrades to silence).
+    paths: Vec<String>,
+}
+
+/// The one-skill registry behind [`FakeHost::with_skill_and_script`]: the
+/// name is two characters, so `SkillRegistry::match_task` (which tokenizes
+/// words of >= 3) can never produce it — any activation of `xy` came
+/// through the explicit path.
+struct StubSkills;
+
+impl SkillRegistry for StubSkills {
+    fn list(&self) -> Vec<SkillMeta> {
+        vec![SkillMeta {
+            name: "xy".to_string(),
+            description: "the two-letter test skill".to_string(),
+            path: PathBuf::from("skills/xy/SKILL.md"),
+        }]
+    }
+
+    fn activate(&self, name: &str) -> Result<Skill, ForgeError> {
+        self.list()
+            .into_iter()
+            .find(|meta| meta.name == name)
+            .map(|meta| Skill {
+                instructions: "xy INSTRUCTIONS".to_string(),
+                meta,
+            })
+            .ok_or_else(|| ForgeError::skill(format!("unknown skill: {name}")))
+    }
 }
 
 impl FakeHost {
@@ -326,7 +387,38 @@ impl FakeHost {
     /// (see [`ScriptedMockModel::from_json`] for the shape) and whose
     /// execution never asks for approval.
     pub fn with_script(json: &str) -> (Self, TempDir) {
-        Self::build(Execution::Mock, |_root| {
+        let model = Arc::new(ScriptedMockModel::from_json(json).expect("valid script"));
+        let recorded = Arc::clone(&model);
+        let (mut host, tmp) = Self::build(Execution::Mock, move |_root| model);
+        host.scripted_model = Some(recorded);
+        (host, tmp)
+    }
+
+    /// A service like [`with_script`](Self::with_script), but whose skill
+    /// registry offers `xy` — a skill no prompt can match lexically — and
+    /// whose snapshot lists it, so `/xy` parses as a skill command.
+    pub fn with_skill_and_script(json: &str) -> (Self, TempDir) {
+        let model = Arc::new(ScriptedMockModel::from_json(json).expect("valid script"));
+        let recorded = Arc::clone(&model);
+        let (mut host, tmp) = Self::build_with_skills(
+            Execution::Mock,
+            move |_root| model,
+            Arc::new(StubSkills),
+            vec![SkillChoice {
+                name: "xy".to_string(),
+                description: "the two-letter test skill".to_string(),
+            }],
+        );
+        host.scripted_model = Some(recorded);
+        (host, tmp)
+    }
+
+    /// A scripted model over a `MockExecution` whose `read_file` returns
+    /// `content` — the fixture for `/show`, which needs a known payload.
+    /// (`MockExecution::new` serves `Some("")` for reads, which would
+    /// exercise only the `(no output)` branch.)
+    pub fn with_script_and_read_content(json: &str, content: &str) -> (Self, TempDir) {
+        Self::build(Execution::MockReading(content.to_string()), |_root| {
             Arc::new(ScriptedMockModel::from_json(json).expect("valid script"))
         })
     }
@@ -387,15 +479,40 @@ impl FakeHost {
         Arc::clone(&self.service)
     }
 
+    /// The scripted model the service was built with, when it was one —
+    /// for assertions on what the model was actually sent.
+    pub fn scripted_model(&self) -> Option<Arc<ScriptedMockModel>> {
+        self.scripted_model.clone()
+    }
+
+    /// Set the project file list `project_files` reports (the
+    /// `@`-completion source), builder-style.
+    pub fn with_paths(mut self, paths: Vec<String>) -> Self {
+        self.paths = paths;
+        self
+    }
+
     fn build(
         execution: Execution,
         model: impl FnOnce(&std::path::Path) -> Arc<dyn ModelProvider>,
+    ) -> (Self, TempDir) {
+        Self::build_with_skills(execution, model, Arc::new(NullSkillRegistry), Vec::new())
+    }
+
+    fn build_with_skills(
+        execution: Execution,
+        model: impl FnOnce(&std::path::Path) -> Arc<dyn ModelProvider>,
+        skill_registry: Arc<dyn SkillRegistry>,
+        skills: Vec<SkillChoice>,
     ) -> (Self, TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root: PathBuf = tmp.path().to_path_buf();
         let model = model(&root);
         let execution: Arc<dyn ExecutionProvider> = match execution {
             Execution::Mock => Arc::new(MockExecution::new(&root)),
+            Execution::MockReading(content) => {
+                Arc::new(MockExecution::new(&root).with_read_content(content))
+            }
             Execution::Writing => Arc::new(NativeExecution::with_channel(
                 ApprovalPolicy::Prompt,
                 &root,
@@ -408,7 +525,7 @@ impl FakeHost {
             model,
             router,
             execution,
-            Arc::new(NullSkillRegistry),
+            skill_registry,
             sessions,
             Config::default(),
         ));
@@ -429,7 +546,9 @@ impl FakeHost {
                 description: "the scripted test model".to_string(),
                 active: true,
             }],
-            skills: Vec::new(),
+            skills,
+            scripted_model: None,
+            paths: Vec::new(),
         };
         (host, tmp)
     }
@@ -455,6 +574,10 @@ impl ChatHost for FakeHost {
 
     fn skills(&self) -> Vec<SkillChoice> {
         self.skills.clone()
+    }
+
+    fn project_files(&self) -> Vec<String> {
+        self.paths.clone()
     }
 
     fn config_summary(&self, _key: Option<&str>) -> Vec<ConfigLine> {

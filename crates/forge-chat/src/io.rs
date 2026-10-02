@@ -127,6 +127,11 @@ pub struct CompletionSnapshot {
     pub jobs: Vec<String>,
     /// The project's recent session ids.
     pub sessions: Vec<String>,
+    /// Project-relative file paths from the built project graph, sorted,
+    /// `/`-separated, capped by the host. The source of `@`-word
+    /// completion (TICKET-4); empty when no graph is built, which degrades
+    /// `@`-completion to silence — never to an error.
+    pub paths: Vec<String>,
 }
 
 /// One completion candidate: the text inserted on acceptance, and the
