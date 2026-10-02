@@ -320,6 +320,179 @@ async fn a_secret_split_across_provider_chunks_is_still_redacted() {
     assert!(deltas.contains("[REDACTED]"), "{deltas}");
 }
 
+/// Splits its answer between `Bearer` and its token — the one boundary the
+/// whitespace hold-back alone could not defend: the redactor's
+/// `Bearer\s+\S+` pattern spans whitespace, so the token half used to leave
+/// in a delta that matched nothing alone.
+struct BearerSplittingModel;
+
+#[async_trait::async_trait]
+impl ModelProvider for BearerSplittingModel {
+    fn name(&self) -> &str {
+        "bearer-splitting"
+    }
+    fn capabilities(&self) -> forge_core::ModelCapabilities {
+        forge_core::ModelCapabilities {
+            streaming: true,
+            tools: false,
+            ..Default::default()
+        }
+    }
+    async fn complete(
+        &self,
+        _: CompletionRequest,
+    ) -> Result<forge_core::CompletionResponse, ForgeError> {
+        unreachable!()
+    }
+    async fn stream_complete(
+        &self,
+        _: CompletionRequest,
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<forge_core::CompletionResponse, ForgeError> {
+        // `tok.en-123` matches no whole-token pattern on its own: only the
+        // pattern-aware hold-back keeps it from leaving unredacted.
+        for piece in ["header Authorization: Bearer ", "tok.en-123 done"] {
+            on_delta(piece);
+        }
+        Ok(forge_core::CompletionResponse {
+            model: "bearer-splitting".into(),
+            content: "header Authorization: Bearer tok.en-123 done".into(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_bearer_token_split_at_the_whitespace_boundary_never_leaks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = AgentService::new(
+        Arc::new(BearerSplittingModel),
+        Arc::new(MockRouter::selecting("bearer-splitting")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+    let outcome = service.run("tell me").await.expect("run");
+
+    // No emitted delta carries the token fragment.
+    for event in &outcome.events {
+        if let EventKind::AssistantDelta { text } = &event.kind {
+            assert!(
+                !text.contains("tok.en-123"),
+                "token fragment leaked in a delta: {text:?}"
+            );
+        }
+    }
+    // The boundary saw the whole `Bearer <token>` pair and redacted it.
+    let deltas: String = outcome
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::AssistantDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(deltas.contains("[REDACTED]"), "{deltas}");
+    let raw = std::fs::read_to_string(
+        tmp.path()
+            .join(".forge")
+            .join("sessions")
+            .join(format!("{}.jsonl", outcome.session_id)),
+    )
+    .expect("log");
+    assert!(
+        !raw.contains("tok.en-123"),
+        "token leaked into the log: {raw}"
+    );
+    assert!(raw.contains("[REDACTED]"), "{raw}");
+}
+
+/// The oMLX path, end to end: a real OpenAI-compatible client against a
+/// local SSE server, driven by the runtime — deltas in the log, then the
+/// same terminal events as any other run.
+#[tokio::test]
+async fn an_openai_compatible_sse_server_streams_deltas_end_to_end() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            // Recorded shape, OpenAI chat completions streaming.
+            wiremock::ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the \"},\"finish_reason\":null}]}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n\
+                 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n\
+                 data: [DONE]\n\n",
+                "text/event-stream",
+            ),
+        )
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = forge_providers::OpenAiCompatibleModel::new(
+        server.uri(),
+        "qwen3-coder",
+        None,
+        forge_core::ModelCapabilities {
+            streaming: true,
+            tools: false, // single-turn path: the simplest streaming run
+            ..Default::default()
+        },
+        std::time::Duration::from_secs(5),
+        forge_providers::EgressPolicy::default(),
+    )
+    .expect("construct");
+    let service = AgentService::new(
+        Arc::new(model),
+        Arc::new(forge_providers::MockRouter::selecting("qwen3-coder")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+    let outcome = service.run("hi").await.expect("run");
+
+    assert_eq!(
+        event_kinds(&outcome),
+        [
+            "run_started",
+            "routing_decision_made",
+            "assistant_delta", // "the " — the runtime's hold-back emits at whitespace
+            "assistant_delta", // "answer" — flushed at stream end
+            "assistant_message",
+            "turn_completed",
+            "completed"
+        ],
+        "the runtime streams the real provider exactly like the scripted mock"
+    );
+    let deltas: String = outcome
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::AssistantDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, "the answer");
+    assert_eq!(outcome.text, "the answer");
+    // Persisted, not just broadcast.
+    let raw = std::fs::read_to_string(
+        tmp.path()
+            .join(".forge")
+            .join("sessions")
+            .join(format!("{}.jsonl", outcome.session_id)),
+    )
+    .expect("log");
+    assert!(raw.contains("\"assistant_delta\""), "{raw}");
+}
+
 #[tokio::test]
 async fn resume_after_a_streamed_run_replays_the_final_message_only() {
     let tmp = tempfile::tempdir().expect("tempdir");

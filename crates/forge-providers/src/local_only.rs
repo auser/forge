@@ -160,22 +160,45 @@ impl EgressPolicy {
         let builder = reqwest::Client::builder().timeout(timeout);
         match self {
             Self::Unrestricted => builder,
-            Self::LocalOnly => builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
-                let hop = attempt.url().to_string();
-                if !endpoint_is_local(&hop) {
-                    return attempt.error(RedirectRefused::NotLocal { url: hop });
-                }
-                // Local, but possibly in a circle: bound the chain the way
-                // the replaced default did, and fail fast with a reason
-                // instead of burning the caller's whole timeout.
-                if attempt.previous().len() >= MAX_REDIRECT_HOPS {
-                    return attempt.error(RedirectRefused::TooManyHops { url: hop });
-                }
-                attempt.follow()
-            })),
+            Self::LocalOnly => builder.redirect(local_redirect_policy()),
         }
         .build()
     }
+
+    /// An HTTP client for *streaming* requests: no total deadline (reqwest's
+    /// `timeout` runs connect → body-end, which would guillotine a long
+    /// stream); stalls are bounded per read instead, and SSE keepalives are
+    /// reads. The redirect policy is identical to `client()`'s — every hop
+    /// is still re-checked.
+    pub fn streaming_client(self, timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+        let builder = reqwest::Client::builder()
+            .connect_timeout(timeout)
+            .read_timeout(timeout);
+        match self {
+            Self::Unrestricted => builder,
+            Self::LocalOnly => builder.redirect(local_redirect_policy()),
+        }
+        .build()
+    }
+}
+
+/// The redirect policy every client this module builds shares: each hop is
+/// re-checked against [`endpoint_is_local`], and the hop limit reqwest's
+/// replaced default provided ([`MAX_REDIRECT_HOPS`]) is re-imposed.
+fn local_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let hop = attempt.url().to_string();
+        if !endpoint_is_local(&hop) {
+            return attempt.error(RedirectRefused::NotLocal { url: hop });
+        }
+        // Local, but possibly in a circle: bound the chain the way the
+        // replaced default did, and fail fast with a reason instead of
+        // burning the caller's whole timeout.
+        if attempt.previous().len() >= MAX_REDIRECT_HOPS {
+            return attempt.error(RedirectRefused::TooManyHops { url: hop });
+        }
+        attempt.follow()
+    })
 }
 
 /// A reqwest error plus its source chain.
@@ -311,6 +334,40 @@ mod tests {
         assert!(
             EgressPolicy::Unrestricted
                 .client(Duration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_streaming_client_refuses_an_off_device_redirect() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("location", "https://evil.example.com/x"),
+            )
+            .mount(&server)
+            .await;
+        let client = EgressPolicy::LocalOnly
+            .streaming_client(Duration::from_secs(5))
+            .expect("client");
+        let err = client.get(server.uri()).send().await.expect_err("refused");
+        assert!(err.is_redirect(), "{err}");
+        let detail = error_detail(&err);
+        assert!(detail.contains("evil.example.com"), "{detail}");
+        assert!(detail.contains("local_only refused"), "{detail}");
+    }
+
+    #[test]
+    fn both_policies_build_a_streaming_client() {
+        assert!(
+            EgressPolicy::LocalOnly
+                .streaming_client(Duration::from_secs(1))
+                .is_ok()
+        );
+        assert!(
+            EgressPolicy::Unrestricted
+                .streaming_client(Duration::from_secs(1))
                 .is_ok()
         );
     }

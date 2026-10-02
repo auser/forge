@@ -453,9 +453,10 @@ degradable condition.
 ## What's next (per the program spec)
 
 Shipped since this line was written: the ACP adapter and the interactive
-chat (slash commands / history replay / fork & background). Remaining:
-token streaming end-to-end (runtime plumbing landed in TICKET-1; provider
-SSE and chat/ACP rendering are TICKET-2/3 — see
+chat (slash commands / history replay / fork & background), plus provider
+SSE streaming (both real families, with graceful fallback to whole
+responses — TICKET-2; the runtime records `assistant_delta` events).
+Remaining: chat/ACP *rendering* of those deltas (TICKET-3 — see
 [`specs/tickets/interactive-chat-feel.md`](specs/tickets/interactive-chat-feel.md)),
 and in-process generation (`forge-llm-embedded`) — see
 [`docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md`](docs/superpowers/specs/2026-09-23-needle-embedded-brain-design.md) §2.

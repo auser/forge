@@ -1194,7 +1194,11 @@ impl AgentService {
     /// before this returns. The redactor matches whole patterns per payload
     /// (`forge_session`'s one boundary), and a provider chunk can split a
     /// secret mid-token — the carry is what makes "deltas pass through the
-    /// one redaction boundary" true rather than vacuous.
+    /// one redaction boundary" true rather than vacuous. The boundary is
+    /// also *pattern-aware*: a candidate prefix that ends where a
+    /// whitespace-spanning pattern (`Bearer <token>`) could still be
+    /// completed is held back from the pattern's start, or the token would
+    /// leave in a later delta that matches nothing alone.
     async fn complete_streaming(
         &self,
         sender: &broadcast::Sender<Event>,
@@ -1213,12 +1217,21 @@ impl AgentService {
             carry.push_str(delta);
             // Emit the prefix that ends at whitespace; keep the partial token.
             // (`rfind` yields a byte index, so step over the whole char.)
-            let Some(split) = carry
+            let Some(mut split) = carry
                 .rfind(char::is_whitespace)
                 .map(|i| i + carry[i..].chars().next().map_or(1, char::len_utf8))
             else {
                 return;
             };
+            // Pattern-aware: never emit a prefix that ends where a
+            // whitespace-spanning secret pattern could still be completed by
+            // later text.
+            if let Some(start) = self.sessions.secret_prefix_start(&carry[..split]) {
+                split = start;
+            }
+            if split == 0 {
+                return;
+            }
             let tail = carry.split_off(split);
             streamed.push_str(&carry);
             let event = Event::new(

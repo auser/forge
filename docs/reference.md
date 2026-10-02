@@ -939,6 +939,12 @@ The default is `qwen3-coder` via the OpenAI-compatible endpoint at
 Capabilities (streaming, tools,
 structured output, vision, context size) are explicit per provider, never
 assumed; a provider without `tools` receives single-turn requests only.
+Both real provider families stream over SSE
+(`stream: true` for OpenAI-compatible servers; Anthropic's native event
+stream), and the runtime records the fragments as `assistant_delta`
+events (v4). A `[models.<name>]` entry may set `streaming = false` for an
+endpoint whose SSE misbehaves; that endpoint then answers whole, exactly
+as before streaming landed.
 
 ### DecisionRouter
 

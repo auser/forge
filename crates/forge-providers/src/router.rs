@@ -1124,6 +1124,69 @@ mod tests {
         }
     }
 
+    fn caps_streaming(streaming: bool) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming,
+            tools: true,
+            structured_output: false,
+            vision: false,
+            max_context: 8_192,
+        }
+    }
+
+    #[tokio::test]
+    async fn static_router_never_selects_a_non_streaming_model_when_streaming_is_required() {
+        let router = StaticRouter::new("silent").with_registry(vec![
+            ("silent".to_string(), caps_streaming(false)),
+            ("live".to_string(), caps_streaming(true)),
+        ]);
+        let request = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![Capability::Streaming],
+            candidates: vec!["silent".to_string(), "live".to_string()],
+        };
+        let decision = router.route(&request).await.expect("routes");
+        assert_eq!(decision.selected_model, "live");
+        assert!(decision.fallback_used, "the default was filtered out");
+
+        // And with no capable candidate at all, the router says so (the
+        // `errors_when_nothing_is_capable` shape).
+        let only_silent = RoutingRequest {
+            task: "x".to_string(),
+            required_capabilities: vec![Capability::Streaming],
+            candidates: vec!["silent".to_string()],
+        };
+        let err = router.route(&only_silent).await.expect_err("must fail");
+        assert!(matches!(err, ForgeError::Router(_)));
+    }
+
+    #[tokio::test]
+    async fn cheapest_router_filters_non_streaming_candidates_too() {
+        let costs = [
+            (String::from("silent"), (0.0, 0.0)),
+            (String::from("live"), (1.0, 1.0)),
+        ]
+        .into_iter()
+        .collect();
+        let router = CheapestRouter::new(
+            costs,
+            vec![
+                ("silent".to_string(), caps_streaming(false)),
+                ("live".to_string(), caps_streaming(true)),
+            ],
+        );
+        let decision = router
+            .route(&RoutingRequest {
+                task: "x".to_string(),
+                required_capabilities: vec![Capability::Streaming],
+                candidates: vec!["silent".to_string(), "live".to_string()],
+            })
+            .await
+            .expect("routes");
+        // Cheaper but silent must lose to the streaming candidate.
+        assert_eq!(decision.selected_model, "live");
+    }
+
     #[test]
     fn filter_candidates_drops_incapable_models() {
         let candidates = vec![

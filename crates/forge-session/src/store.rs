@@ -54,6 +54,15 @@ impl JsonlSessionStore {
         &self.root
     }
 
+    /// Where a trailing fragment of `text` could still grow into a
+    /// redactable secret (see [`Redactor::secret_prefix_start`]). The
+    /// streaming runtime holds deltas back from that point, so a
+    /// whitespace-spanning pattern (`Bearer <token>`) is never split across
+    /// two emissions: the redactor matches the pattern only whole.
+    pub fn secret_prefix_start(&self, text: &str) -> Option<usize> {
+        self.redactor.secret_prefix_start(text)
+    }
+
     fn file_for(&self, session_id: &str) -> PathBuf {
         self.root.join(format!("{session_id}.jsonl"))
     }

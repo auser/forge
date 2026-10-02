@@ -61,6 +61,33 @@ impl Redactor {
         out
     }
 
+    /// Byte index from which a trailing fragment of `text` could still grow
+    /// into a redactable secret, if any: `text` ends with the *start* of one
+    /// of the whitespace-spanning patterns — `Bearer` followed only by
+    /// whitespace, its token not yet arrived.
+    ///
+    /// A streaming caller holds everything from this index back until more
+    /// text arrives, so the token is never emitted without the pattern's
+    /// start: `redact` matches `Bearer\s+\S+` only whole, and a fragment
+    /// boundary between `Bearer` and its token would let the token leave
+    /// unredacted (the fragment alone matches nothing).
+    ///
+    /// Scope, honestly stated: the whole-token shapes (`sk-…`, `ghp_…`,
+    /// `xox…`) need no help — a whitespace-based hold-back already keeps a
+    /// token whole. The env-snapshot secrets are whitespace-free tokens in
+    /// practice and ride the same rule; a whitespace-*containing* env secret
+    /// is out of scope. If a new whitespace-spanning pattern is added to
+    /// `patterns` above, extend this method — `bearer_prefix_is_held_back`
+    /// in the tests is the drift tripwire.
+    pub fn secret_prefix_start(&self, text: &str) -> Option<usize> {
+        let head = text.trim_end();
+        let prefix = head.strip_suffix("Bearer")?;
+        // The pattern needs no word boundary (`fooBearer x` redacts too), so
+        // the hold-back needs none either — a false positive costs one held
+        // word, a false negative leaks a token.
+        Some(prefix.len())
+    }
+
     /// Deep-redact every string inside a JSON value.
     pub fn redact_value(&self, value: &mut serde_json::Value) {
         match value {
@@ -97,5 +124,24 @@ mod tests {
     fn keeps_short_and_benign_strings() {
         let redactor = Redactor::new();
         assert_eq!(redactor.redact("hello world"), "hello world");
+    }
+
+    /// The hold-back rule a streaming caller applies: a text ending in
+    /// `Bearer` + whitespace is a pattern start whose token hasn't arrived.
+    #[test]
+    fn bearer_prefix_is_held_back() {
+        let redactor = Redactor::new();
+        assert_eq!(redactor.secret_prefix_start("auth: Bearer "), Some(6));
+        assert_eq!(redactor.secret_prefix_start("Bearer "), Some(0));
+        assert_eq!(redactor.secret_prefix_start("Bearer\n"), Some(0));
+        // No boundary required — the regex matches mid-word too.
+        assert_eq!(redactor.secret_prefix_start("fooBearer "), Some(3));
+        // A completed pair is not a prefix: the pattern matches it whole.
+        assert_eq!(redactor.secret_prefix_start("Bearer tok.en-123 "), None);
+        assert_eq!(redactor.secret_prefix_start("Bearer\ntok "), None);
+        assert_eq!(redactor.secret_prefix_start("plain text "), None);
+        // Partial spellings of "Bearer" are whitespace-held upstream; this
+        // method only guards the pattern's internal whitespace seam.
+        assert_eq!(redactor.secret_prefix_start("x Bea"), None);
     }
 }
