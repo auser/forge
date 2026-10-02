@@ -2082,15 +2082,19 @@ fn acp_client_saw_tool_call_and_message(world: &mut BddWorld) {
         "expected the tool call to reach completed, saw {:?}",
         world.acp_updates
     );
+    // The scripted mock streams since TICKET-1, so the answer arrives as
+    // live chunks that concatenate to it rather than one lump at turn end.
+    let chunks: Vec<&str> = world
+        .acp_updates
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["content"]["text"].as_str())
+        .collect();
     assert!(
-        world
-            .acp_updates
-            .iter()
-            .any(|u| u["sessionUpdate"] == "agent_message_chunk"
-                && u["content"]["text"] == "all done"),
-        "expected the final text as an agent_message_chunk, saw {:?}",
-        world.acp_updates
+        chunks.len() >= 2,
+        "the answer streamed live, not as one lump: {chunks:?}"
     );
+    assert_eq!(chunks.concat(), "all done", "{chunks:?}");
 }
 
 #[then("nothing but JSON-RPC reached the ACP stdout")]
@@ -2389,6 +2393,23 @@ fn assistant_deltas_concatenate_to_final_message(world: &mut BddWorld) {
         deltas, final_text,
         "deltas concatenate to the replayed answer verbatim"
     );
+}
+
+/// The payload the live stream deliberately stayed silent for, re-rendered
+/// on demand through the result gutter.
+#[then("the ACP client saw the answer stream in more than one chunk")]
+fn acp_client_saw_the_answer_stream(world: &mut BddWorld) {
+    let chunks: Vec<&str> = world
+        .acp_updates
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["content"]["text"].as_str())
+        .collect();
+    assert!(
+        chunks.len() >= 2,
+        "the answer streamed live, not as one lump: {chunks:?}"
+    );
+    assert_eq!(chunks.concat(), "the answer is ready", "{chunks:?}");
 }
 
 /// The payload the live stream deliberately stayed silent for, re-rendered

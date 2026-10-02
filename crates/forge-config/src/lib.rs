@@ -386,7 +386,7 @@ impl Default for Config {
                 provider: Some("anthropic".to_string()),
                 max_output_tokens: None,
                 tools: Some(true),
-                streaming: Some(false),
+                streaming: Some(true),
                 structured_output: None,
                 vision: None,
                 max_context: Some(200_000),

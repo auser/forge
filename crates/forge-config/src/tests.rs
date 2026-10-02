@@ -91,6 +91,15 @@ fn defaults_when_nothing_set() {
 }
 
 #[test]
+fn the_builtin_anthropic_entry_declares_streaming() {
+    // The Anthropic client streams (forge-providers, TICKET-2); the
+    // registry must say so, or `Capability::Streaming` filters lie.
+    let config = Config::default();
+    let entry = &config.model_entries()["claude-sonnet"];
+    assert_eq!(entry.streaming, Some(true));
+}
+
+#[test]
 #[serial]
 fn project_file_overrides_user_file_and_defaults() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -221,6 +221,12 @@ pub enum TurnAction {
 /// honest ACP slot maps to nothing: an editor transcript full of invented
 /// updates would be worse than a quiet one.
 ///
+/// The text side is streamed: `AssistantDelta`s go out as live
+/// `agent_message_chunk`s, tracked in `streamed` so the closing
+/// `AssistantMessage` can flush only the suffix the stream missed (a lagged
+/// broadcast's gap), and `accounted` so the end-of-turn send
+/// ([`TurnState::unsent_tail`]) is just that — a tail, usually empty.
+///
 /// The sequencing is an observation about the loop, not a guarantee we can
 /// enforce from here — so [`TurnState::transition`] also checks the tool
 /// *name* before attributing a status change, and opens a fresh tool call
@@ -236,6 +242,16 @@ pub struct TurnState {
     root: PathBuf,
     next_id: u64,
     current: Option<CurrentCall>,
+    /// The chunk text already sent for the response currently streaming
+    /// (its `assistant_delta`s, concatenated), so the closing
+    /// `AssistantMessage` flushes only what the stream did not deliver.
+    streamed: String,
+    /// The text of the last `AssistantMessage` seen — that response is
+    /// fully sent (its chunks plus the flush). `Some("")` for the fast
+    /// path's empty-text message, which never equals a non-empty outcome —
+    /// which is exactly what keeps the fast path's whole-outcome tail
+    /// flowing (see [`TurnState::unsent_tail`]).
+    accounted: Option<String>,
 }
 
 /// The tool call we are currently narrating. `tool` is `None` for calls we
@@ -262,6 +278,8 @@ impl TurnState {
             root: root.into(),
             next_id: 0,
             current: None,
+            streamed: String::new(),
+            accounted: None,
         }
     }
 
@@ -399,21 +417,58 @@ impl TurnState {
                 actions
             }
 
+            // A streamed answer's next piece, forwarded live: the editor
+            // shows the answer as it is written.
+            EventKind::AssistantDelta { text } => {
+                if self.accounted.is_some() {
+                    // A new response is streaming; the previous one was
+                    // fully sent.
+                    self.accounted = None;
+                    self.streamed.clear();
+                }
+                self.streamed.push_str(text);
+                vec![TurnAction::Notify(SessionUpdate::AgentMessageChunk {
+                    content: ContentBlock::text(text.clone()),
+                })]
+            }
+
+            // The replay record doubles as the flush point: whatever of
+            // this response's text the stream did not deliver (a lagged
+            // broadcast's gap) goes out now, as one chunk. Non-streaming
+            // providers take the same path with an empty `streamed` —
+            // their whole text, here, at message time. Flushing here
+            // rather than only at turn end is what covers *intermediate*
+            // responses (a tool-loop run's "Let me read that file" before
+            // its tool calls): their text never appears in
+            // `RunOutcome.text`, so a turn-end-only flush could never
+            // recover their lagged gaps.
+            EventKind::AssistantMessage { text, .. } => {
+                let suffix = text
+                    .strip_prefix(&self.streamed)
+                    .unwrap_or(text)
+                    .to_string();
+                self.streamed.clear();
+                self.accounted = Some(text.clone());
+                if suffix.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![TurnAction::Notify(SessionUpdate::AgentMessageChunk {
+                        content: ContentBlock::text(suffix),
+                    })]
+                }
+            }
+
             // Deliberately unmapped. `Completed`'s summary is truncated to
             // 80 characters by the session store, so the turn's final text
             // comes from the run outcome instead (see `server.rs`); the
             // rest is bookkeeping the editor has no use for.
             //
-            // The v3 replay kinds (`AssistantMessage`, `ToolResult`,
-            // `SessionForked`) are deliberately silent too: the editor
-            // already gets the turn's text as one `agent_message_chunk`
-            // and its tool calls as `tool_call` updates, so narrating the
+            // The other replay kinds (`ToolResult`, `SessionForked`) are
+            // deliberately silent too: the editor already gets the turn's
+            // text as live `agent_message_chunk`s (the two arms above) and
+            // its tool calls as `tool_call` updates, so narrating the
             // replay records as well would duplicate the transcript.
-            //
-            // TICKET-3 forwards these as live agent_message_chunks.
-            EventKind::AssistantMessage { .. }
-            | EventKind::AssistantDelta { .. }
-            | EventKind::ToolResult { .. }
+            EventKind::ToolResult { .. }
             | EventKind::SessionForked { .. }
             | EventKind::RunStarted { .. }
             | EventKind::ApprovalDecided { .. }
@@ -424,6 +479,24 @@ impl TurnState {
             | EventKind::Cancelled { .. }
             | EventKind::Completed { .. } => Vec::new(),
         }
+    }
+
+    /// The part of the run's final text the client has not been sent: empty
+    /// when the final `AssistantMessage` was seen (its chunks plus the
+    /// flush covered it whole); the outcome's unstreamed tail when that
+    /// message was lost to lag; the whole outcome when the answer was never
+    /// a message at all — the needle fast path's text is a tool result,
+    /// carried by no `AssistantMessage` (its empty-text message sets
+    /// `accounted` to `""`, which never equals a non-empty outcome, so the
+    /// tail is the whole text).
+    pub fn unsent_tail(&self, outcome_text: &str) -> String {
+        if self.accounted.as_deref() == Some(outcome_text) {
+            return String::new();
+        }
+        outcome_text
+            .strip_prefix(&self.streamed)
+            .unwrap_or(outcome_text)
+            .to_string()
     }
 
     /// Move a named tool call to a new status.
