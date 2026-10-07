@@ -740,9 +740,10 @@ fn approval_fixture() -> (tempfile::TempDir, ForgeTools) {
     let service = Arc::new(AgentService::new(
         Arc::new(forge_providers::ScriptedMockModel::new(script)),
         Arc::new(MockRouter::selecting("scripted-mock")),
-        Arc::new(forge_execution::NativeExecution::new(
+        Arc::new(forge_execution::NativeExecution::with_channel(
             forge_core::ApprovalPolicy::Prompt,
             tmp.path(),
+            forge_execution::ApprovalChannel::Parked,
         )),
         Arc::new(FsSkillRegistry::with_roots(vec![], None)),
         Arc::new(JsonlSessionStore::new(

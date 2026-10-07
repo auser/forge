@@ -468,7 +468,7 @@ impl Default for Config {
             jev_model: None,
             router_timeout_ms: 5_000,
             execution: "native".to_string(),
-            approval: "prompt".to_string(),
+            approval: "prompt-dangerous".to_string(),
             local_only: false,
             server_host: "127.0.0.1".to_string(),
             server_port: 7_341,

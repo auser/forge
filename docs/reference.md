@@ -602,7 +602,7 @@ live there.
 
 ### Approvals, inline
 
-Under `approval = "prompt"` (the default), a risky tool call stops and asks
+Under `approval = "prompt"`, a risky tool call stops and asks
 as a transcript line, answered at the same prompt that is already up — no
 swapped prompt, no separate reader on stdin:
 
@@ -790,7 +790,7 @@ Key settings (all optional):
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` |
-| `approval` | `prompt` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny` |
+| `approval` | `prompt-dangerous` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny`; the default lets ordinary project edits and validation run while still asking before destructive operations |
 | `local_only` | `false` | `FORGE_LOCAL_ONLY` | Restrict to local providers — a model whose endpoint is not local is refused at construction, and network decision routers are pruned. See [What `--local-only` restricts](#what---local-only-restricts) |
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |

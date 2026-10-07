@@ -4,6 +4,7 @@ pub mod chat_cmd;
 pub mod config_cmd;
 pub mod doctor;
 pub mod graph_cmd;
+pub mod guidance;
 pub mod init;
 pub mod mcp_cmd;
 pub mod model_cmd;
@@ -67,12 +68,20 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
     match cli.command {
         // No subcommand: the interactive chat. Deliberately the same code
         // path as `forge chat`, so the two can never drift.
-        None => chat_cmd::run(&ctx, chat_cmd::ChatArgs::default()).await,
+        None => {
+            if init::ensure(&ctx)? {
+                init::report_first_run(&ctx)?;
+            }
+            chat_cmd::run(&ctx, chat_cmd::ChatArgs::default()).await
+        }
         Some(Command::Chat {
             prompt,
             continue_session,
             session,
         }) => {
+            if init::ensure(&ctx)? {
+                init::report_first_run(&ctx)?;
+            }
             chat_cmd::run(
                 &ctx,
                 chat_cmd::ChatArgs {

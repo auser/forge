@@ -3,6 +3,7 @@ Feature: ACP agent
   Scenario: An ACP client runs a forge turn over stdio
     Given a project with a built graph
     And a scripted mock model that writes "notes.txt"
+    And approval mode "prompt"
     When an ACP client starts a session over stdio
     And the ACP client prompts "write the notes"
     Then the ACP client was asked for permission in the editor

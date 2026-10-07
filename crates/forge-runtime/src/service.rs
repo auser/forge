@@ -381,6 +381,9 @@ pub struct AgentService {
     sessions: Arc<JsonlSessionStore>,
     config: Config,
     graph: Option<Arc<dyn ProjectGraph>>,
+    /// Stable coding contract and project guidance supplied by the host.
+    /// Kept separate from replay: it is current run context, not conversation.
+    system_context: Vec<Message>,
     /// Resolves a provider for the routed model name; defaults to the
     /// single configured model for every selection.
     model_factory: Option<ModelFactory>,
@@ -432,6 +435,7 @@ impl AgentService {
             sessions,
             config,
             graph: None,
+            system_context: Vec::new(),
             model_factory: None,
             needle: None,
             needle_warmed: AtomicBool::new(false),
@@ -448,6 +452,12 @@ impl AgentService {
     /// Attach a project graph for context seeding and graph tools.
     pub fn with_graph(mut self, graph: Option<Arc<dyn ProjectGraph>>) -> Self {
         self.graph = graph;
+        self
+    }
+
+    /// Attach host/project guidance that starts every model conversation.
+    pub fn with_system_context(mut self, messages: Vec<Message>) -> Self {
+        self.system_context = messages;
         self
     }
 
@@ -2046,7 +2056,7 @@ impl AgentService {
         // then the replayed history of this session, then the user prompt.
         // System first is what providers expect, and the history is a real
         // user/assistant/tool transcript that must arrive in its own order.
-        let mut messages = Vec::new();
+        let mut messages = self.system_context.clone();
         // Explicitly requested skills activate first, in caller order with
         // duplicates collapsed — ahead of, never instead of, lexical
         // discovery. The caller asked for these by name, so a failed

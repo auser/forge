@@ -3,7 +3,7 @@ use std::sync::Arc;
 use forge_config::Config;
 use forge_core::ToolCall;
 use forge_core::{DecisionRouter, EventKind, ForgeError, RiskLevel, RoutingRequest};
-use forge_execution::{MockExecution, NativeExecution};
+use forge_execution::{ApprovalChannel, MockExecution, NativeExecution};
 use forge_providers::{MockModel, MockRouter, ScriptedMockModel, ScriptedReply};
 use forge_session::JsonlSessionStore;
 use serial_test::serial;
@@ -29,7 +29,11 @@ fn scripted_service(
     AgentService::new(
         Arc::new(ScriptedMockModel::new(replies)),
         Arc::new(MockRouter::selecting("scripted-mock")),
-        Arc::new(NativeExecution::new(approval, root)),
+        Arc::new(NativeExecution::with_channel(
+            approval,
+            root,
+            ApprovalChannel::Parked,
+        )),
         Arc::new(NullSkillRegistry),
         Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions"))),
         Config::default(),
@@ -1216,9 +1220,10 @@ async fn a_cancelled_run_does_not_poison_the_next_runs_replay() {
     let service = Arc::new(AgentService::new(
         model.clone(),
         Arc::new(MockRouter::selecting("scripted-mock")),
-        Arc::new(NativeExecution::new(
+        Arc::new(NativeExecution::with_channel(
             forge_core::ApprovalPolicy::Prompt,
             tmp.path(),
+            ApprovalChannel::Parked,
         )),
         Arc::new(NullSkillRegistry),
         Arc::new(JsonlSessionStore::new(
@@ -2830,9 +2835,10 @@ async fn needle_fast_path_never_attempts_a_non_read_only_operation() {
     // Same prompt against a provider that does gate: still no write, and
     // the loop — not the fast path — owns the approval decision.
     let tmp2 = tempfile::tempdir().expect("tempdir");
-    let native = Arc::new(NativeExecution::new(
+    let native = Arc::new(NativeExecution::with_channel(
         forge_core::ApprovalPolicy::Prompt,
         tmp2.path(),
+        ApprovalChannel::Parked,
     ));
     let service = needle_service(
         tmp2.path(),
@@ -2857,9 +2863,10 @@ async fn needle_fast_path_dispatches_safe_reads_under_prompt_approval() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::fs::write(tmp.path().join("notes.txt"), "read me\n").expect("write");
     let model = Arc::new(ScriptedMockModel::new(vec![text_reply("never used")]));
-    let exec = Arc::new(NativeExecution::new(
+    let exec = Arc::new(NativeExecution::with_channel(
         forge_core::ApprovalPolicy::Prompt,
         tmp.path(),
+        ApprovalChannel::Parked,
     ));
     let service = needle_service(tmp.path(), model.clone(), exec);
 

@@ -57,7 +57,7 @@ fn defaults_when_nothing_set() {
     assert_eq!(resolved.config.router, "needle");
     assert_eq!(resolved.config.router_timeout_ms, 5_000);
     assert_eq!(resolved.config.execution, "native");
-    assert_eq!(resolved.config.approval, "prompt");
+    assert_eq!(resolved.config.approval, "prompt-dangerous");
     assert!(!resolved.config.local_only);
     assert_eq!(resolved.config.server_host, "127.0.0.1");
     assert_eq!(resolved.config.server_port, 7_341);

@@ -172,6 +172,76 @@ fn init_is_idempotent() {
     assert!(project.join(".forge/config.toml").is_file());
 }
 
+#[test]
+fn bare_forge_bootstraps_a_fresh_project_before_chat() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).expect("mkdir");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["--model", "mock-local"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(project.join(".forge/config.toml").is_file());
+    assert!(project.join(".forge/graph/graph.json").is_file());
+    assert!(project.join(".forge/sessions").is_dir());
+}
+
+#[test]
+fn dogfood_agent_edits_and_validates_a_project_in_one_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(project.join("main.rs"), "fn value() -> u8 { 1 }\n").expect("source");
+    std::fs::write(
+        project.join("script.json"),
+        r#"[
+          {"tool_calls":[{"id":"edit-1","name":"edit_file","arguments":{
+            "path":"main.rs",
+            "old":"fn value() -> u8 { 1 }",
+            "new":"fn value() -> u8 { 2 }"
+          }}]},
+          {"tool_calls":[{"id":"check-1","name":"run_command","arguments":{
+            "command":"sh",
+            "args":["-c","grep -q 'value() -> u8 { 2 }' main.rs"],
+            "risk":"risky"
+          }}]},
+          {"text":"Implemented and validated the change."}
+        ]"#,
+    )
+    .expect("script");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"scripted-mock\"\nmock_script = \"script.json\"\n\
+         router = \"static\"\napproval = \"prompt-dangerous\"\n",
+    )
+    .expect("config");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "make value return two and validate it"])
+        .output()
+        .expect("run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("main.rs")).expect("changed source"),
+        "fn value() -> u8 { 2 }\n"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Implemented and validated"));
+}
+
 /// `forge init` must never fetch the ~35 MB needle weights artifact in a
 /// build that has no inference engine to use it — when the workspace built
 /// engine-less (`needle-sys` resolved nothing), it should report the skip

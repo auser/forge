@@ -29,7 +29,8 @@ pub use credentials::{
 pub use jev::JevRouter;
 pub use local_only::{EgressPolicy, endpoint_is_local};
 pub use model::{
-    MockModel, OpenAiCompatibleModel, is_mock_model, model_endpoint, model_from_config,
+    AvailableModel, MockModel, OpenAiCompatibleModel, automatic_model, available_models,
+    is_mock_model, model_endpoint, model_from_config,
 };
 pub use router::{
     CheapestRouter, FallbackRouter, HttpRouter, LayaRouter, MockRouter, StaticRouter,

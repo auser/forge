@@ -22,7 +22,7 @@ const MOCK_VERBOSE_ENV: &str = "FORGE_MOCK_VERBOSE";
 /// the zero-setup first impression, and echoing the assembled system
 /// context (skill instructions, graph context) into it made that output
 /// look like a leak. Set `FORGE_MOCK_VERBOSE=1` to append
-/// `(system context: <first 120 chars>)` when you need context plumbing
+/// `(system context: <120 chars>)` when you need context plumbing
 /// visible in a reply; tests that own the provider should prefer
 /// [`MockModel::recorded`], which shows the whole request, untruncated.
 pub struct MockModel {
@@ -92,13 +92,22 @@ impl ModelProvider for MockModel {
         // Opt-in only (see the type docs): echoing the assembled system
         // context turns the one zero-setup command into a wall of internals.
         let system: String = if mock_verbose() {
-            request
+            let systems: Vec<&str> = request
                 .messages
                 .iter()
                 .filter(|m| m.role == forge_core::Role::System)
                 .map(|m| m.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect();
+            // Verbose mode exists for context-plumbing tests. Once the
+            // permanent coding contract precedes skills, echo the activated
+            // skill when present rather than truncating before it.
+            systems
+                .iter()
+                .find(|message| message.starts_with("Active skill `"))
+                .copied()
+                .or_else(|| systems.first().copied())
+                .unwrap_or_default()
+                .to_string()
         } else {
             String::new()
         };
@@ -162,6 +171,107 @@ pub(crate) const FIELD_ENTRY_KEY_ENV: &str = "the model entry's key_env";
 /// time. Loopback by design — an unconfigured model must not become a
 /// `local_only` refusal, it is simply not wired up yet.
 const UNCONFIGURED_BASE_URL: &str = "http://127.0.0.1:9";
+
+/// A generation model that can be offered to a router without setting the
+/// user up for a predictable credential failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableModel {
+    pub name: String,
+    pub local: bool,
+    pub credential: Option<crate::credentials::CredentialSource>,
+}
+
+/// Resolve the models that are usable in the current environment.
+///
+/// Local endpoints need no credential but must accept a short TCP probe.
+/// Remote endpoints are candidates only when their configured or conventional
+/// credential resolves. This is the generation plane's source of truth;
+/// routing must never advertise a model that provider construction already
+/// knows it cannot reach or authenticate.
+pub fn available_models(config: &Config) -> Vec<AvailableModel> {
+    let mut out = Vec::new();
+    for name in config.model_entries().keys() {
+        let Some(endpoint) = resolve_endpoint(config, name) else {
+            continue;
+        };
+        let local = crate::local_only::endpoint_is_local(&endpoint.url);
+        if config.local_only && !local {
+            continue;
+        }
+        let entry = config.models.get(name);
+        let key_env = entry
+            .and_then(|entry| entry.key_env.as_deref())
+            .or(config.model_key_env.as_deref());
+        let hint = entry
+            .and_then(|entry| entry.provider.as_deref())
+            .map(str::to_string)
+            .or_else(|| infer_provider_hint(&endpoint.url));
+        let credential =
+            crate::credentials::resolve_credential(key_env, hint.as_deref()).map(|c| c.source);
+        if (local && local_endpoint_reachable(config, name)) || credential.is_some() {
+            out.push(AvailableModel {
+                name: name.clone(),
+                local,
+                credential,
+            });
+        }
+    }
+    out
+}
+
+/// Pick the zero-config generation model.
+///
+/// A reachable local endpoint wins. Otherwise an already-authenticated CLI
+/// subscription wins, then an API-key-backed hosted provider. Stable name
+/// ordering makes the choice reproducible when several providers tie.
+pub fn automatic_model(config: &Config) -> Option<String> {
+    let mut available = available_models(config);
+    available.sort_by(|a, b| {
+        automatic_model_rank(a)
+            .cmp(&automatic_model_rank(b))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    available.into_iter().next().map(|candidate| candidate.name)
+}
+
+fn automatic_model_rank(model: &AvailableModel) -> u8 {
+    if model.local {
+        0
+    } else if matches!(
+        model.credential,
+        Some(
+            crate::credentials::CredentialSource::ClaudeCodeCredentials
+                | crate::credentials::CredentialSource::CodexAuthJson
+        )
+    ) {
+        1
+    } else {
+        2
+    }
+}
+
+fn local_endpoint_reachable(config: &Config, name: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let Some(endpoint) = resolve_endpoint(config, name) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(&endpoint.url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return false;
+    };
+    let Ok(addresses) = (host.trim_matches(['[', ']']), port).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .into_iter()
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok())
+}
 
 /// The one-line fix for a credential problem, safe to print anywhere: it
 /// names the env var the configuration points at, never a value.
@@ -1182,6 +1292,46 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    #[serial]
+    fn available_models_exclude_uncredentialed_hosted_entries() {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "OPENROUTER_API_KEY",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+        let mut config = Config::default();
+        config.models.retain(|name, _| {
+            matches!(name.as_str(), "qwen3-coder" | "anthropic/claude-sonnet-4.5")
+        });
+        let available = available_models(&config);
+        assert!(
+            !available
+                .iter()
+                .any(|model| model.name == "anthropic/claude-sonnet-4.5")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn configured_hosted_credential_makes_model_available() {
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "test-key") };
+        let config = Config::default();
+        let available = available_models(&config);
+        assert!(
+            available
+                .iter()
+                .any(|model| model.name == "anthropic/claude-sonnet-4.5")
+        );
+        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+    }
 
     #[tokio::test]
     async fn mock_model_echoes_prompt_and_records() {

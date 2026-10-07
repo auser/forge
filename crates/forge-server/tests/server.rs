@@ -376,7 +376,7 @@ async fn serves_on_a_real_ephemeral_port() {
 // v0.3: scripted-mock loop over HTTP, SSE v2 events, approval + cancel
 // ---------------------------------------------------------------------------
 
-use forge_execution::NativeExecution;
+use forge_execution::{ApprovalChannel, NativeExecution};
 use forge_providers::ScriptedMockModel;
 
 fn scripted_app(project: &std::path::Path, script_json: &str, approval: &str) -> Router {
@@ -385,9 +385,10 @@ fn scripted_app(project: &std::path::Path, script_json: &str, approval: &str) ->
     test_app_with(
         project,
         Arc::new(model),
-        Arc::new(NativeExecution::new(
+        Arc::new(NativeExecution::with_channel(
             forge_core::ApprovalPolicy::parse(approval).expect("policy"),
             project,
+            ApprovalChannel::Parked,
         )),
         Config {
             approval: approval.to_string(),
