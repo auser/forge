@@ -134,14 +134,8 @@ pub fn build_service_with(
     // providers proven usable in this environment so a first run does not
     // assume a particular local server is already running.
     let auto_selected = !resolved.config.explicit.contains("model");
-    if auto_selected {
-        config.model = forge_providers::automatic_model(&config).ok_or_else(|| {
-            ForgeError::config(
-                "no usable generation model found; start a supported local OpenAI-compatible \
-                 server or provide a hosted credential (run `forge auth status` and \
-                 `forge model list` for detected options)",
-            )
-        })?;
+    if auto_selected && let Some(model) = forge_providers::automatic_model(&config) {
+        config.model = model;
     }
 
     // One availability resolution feeds both routing and provider creation.
