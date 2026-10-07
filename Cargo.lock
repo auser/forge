@@ -572,7 +572,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "forge-acp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "forge-config",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "forge-chat"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "forge-config",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "forge-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "forge-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "forge-core",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "forge-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "forge-execution"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "forge-core",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "forge-graph"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "forge-core",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "forge-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "forge-config",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "forge-needle"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "forge-config",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "forge-providers"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "forge-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "forge-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "forge-config",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "forge-session"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "forge-core",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "forge-skills"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "forge-core",
  "forge-execution",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "needle-sys"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sha2",
  "tempfile",
