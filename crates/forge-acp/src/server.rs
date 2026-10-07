@@ -82,6 +82,8 @@ struct TurnClaim {
     session: Arc<Session>,
     run_id: String,
     prompt: String,
+    /// Skill names the client asked for via `_meta.forge.activateSkills`.
+    activate_skills: Vec<String>,
 }
 
 /// Releases a session's turn slot when the turn's future ends — including
@@ -456,6 +458,7 @@ impl ForgeAcpServer {
             .ok_or_else(|| RpcError::invalid_params("session/prompt requires a `sessionId`"))?;
         let session = self.session(&session_id)?;
         let prompt = prompt_text(&request.prompt)?;
+        let activate_skills = activate_skills_meta(request.meta.as_ref())?;
 
         // The id is generated here so claiming the slot and naming its
         // occupant happen in the *same* critical section.
@@ -477,6 +480,7 @@ impl ForgeAcpServer {
             session,
             run_id,
             prompt,
+            activate_skills,
         })
     }
 
@@ -487,6 +491,7 @@ impl ForgeAcpServer {
             session,
             run_id,
             prompt,
+            activate_skills,
         } = claim;
         // Releasing the slot is a guard rather than a statement after the
         // await: a panic inside the turn (or the task being dropped) would
@@ -495,7 +500,8 @@ impl ForgeAcpServer {
         let _slot = TurnSlotGuard {
             session: Arc::clone(&session),
         };
-        self.run_turn(&session_id, &session, &run_id, prompt).await
+        self.run_turn(&session_id, &session, &run_id, prompt, activate_skills)
+            .await
     }
 
     async fn run_turn(
@@ -504,6 +510,7 @@ impl ForgeAcpServer {
         session: &Arc<Session>,
         run_id: &str,
         prompt: String,
+        activate_skills: Vec<String>,
     ) -> Result<Value, RpcError> {
         // Subscribe *before* the run task exists. `subscribe` creates the
         // broadcast channel on demand, so there is no window in which an
@@ -525,6 +532,7 @@ impl ForgeAcpServer {
                 // The ACP session id is the forge session id, so every turn
                 // in this session continues the same conversation.
                 session_id: Some(session_id.to_string()),
+                activate_skills,
                 ..RunOptions::default()
             },
         ) {
@@ -541,9 +549,12 @@ impl ForgeAcpServer {
                         self.apply(session_id, session, run_id, &mut state, &event).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
-                        // Still live, just behind: keep going. Some updates
-                        // are lost, which is why the turn's final text comes
-                        // from the run outcome and not from the event log.
+                        // Still live, just behind: keep going. Deltas lost
+                        // to lag are flushed by the closing
+                        // `AssistantMessage` (or, if the message itself was
+                        // lost, recovered by the end-of-turn tail below) —
+                        // lagging degrades how live the answer is, never
+                        // the answer.
                         tracing::warn!(missed, "event stream lagged during an ACP turn");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -569,19 +580,24 @@ impl ForgeAcpServer {
             turn.cancel_seen
         };
 
-        // The model's answer, as one chunk. forge's loop produces final
-        // text rather than a token stream, so streaming it token by token
-        // would be theatre; one honest chunk is what the protocol gets.
+        // The part of the answer the client has not already been sent:
+        // empty in the common case (the final `AssistantMessage` flushed
+        // whatever its deltas missed at message time); the unstreamed tail
+        // when that message was lost to lag; the whole outcome for the
+        // fast path, whose text is a tool result carried by no message.
         if let Ok(text) = run_result.as_ref()
             && !text.trim().is_empty()
         {
-            self.notify_update(
-                session_id,
-                SessionUpdate::AgentMessageChunk {
-                    content: ContentBlock::text(text.clone()),
-                },
-            )
-            .await;
+            let tail = state.unsent_tail(text);
+            if !tail.is_empty() {
+                self.notify_update(
+                    session_id,
+                    SessionUpdate::AgentMessageChunk {
+                        content: ContentBlock::text(tail),
+                    },
+                )
+                .await;
+            }
         }
 
         match turn_end(run_result, cancel_seen) {
@@ -776,6 +792,27 @@ impl ForgeAcpServer {
             )),
         };
         let _ = waiting.send(payload);
+    }
+}
+
+/// The `forge.activateSkills` extension of a prompt's `_meta` (ACP's
+/// sanctioned per-request extension point). Absent or null means none; an
+/// array of strings is the names; anything else is refused as
+/// `invalid_params` — protocol validation, so it happens synchronously on
+/// the reader task, before the turn slot is claimed.
+fn activate_skills_meta(meta: Option<&Value>) -> Result<Vec<String>, RpcError> {
+    let Some(value) = meta.and_then(|m| m.get("forge.activateSkills")) else {
+        return Ok(Vec::new());
+    };
+    let malformed =
+        || RpcError::invalid_params("`_meta.forge.activateSkills` must be an array of skill names");
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string).ok_or_else(malformed))
+            .collect(),
+        _ => Err(malformed()),
     }
 }
 
@@ -1058,6 +1095,70 @@ mod tests {
         assert_eq!(settle(Ok(Ok(outcome))).expect("completed"), "all done");
     }
 
+    /// TICKET-3's ACP half: a provider that streams (the scripted mock)
+    /// has its answer on the wire as live `agent_message_chunk`s, in order,
+    /// before the `session/prompt` response.
+    #[tokio::test]
+    async fn a_streaming_turn_sends_the_answer_as_live_chunks_before_responding() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (tx, mut rx) = mpsc::channel(64);
+        let factory = Arc::new(FnFactory(|root: &Path| {
+            Ok(Arc::new(AgentService::new(
+                Arc::new(
+                    forge_providers::ScriptedMockModel::from_json(r#"[{"text": "all done here"}]"#)
+                        .expect("script"),
+                ),
+                Arc::new(forge_providers::MockRouter::selecting("scripted-mock")),
+                Arc::new(forge_execution::MockExecution::new(root)),
+                Arc::new(forge_skills::FsSkillRegistry::with_roots(vec![], None)),
+                Arc::new(forge_session::JsonlSessionStore::new(
+                    root.join(".forge").join("sessions"),
+                )),
+                forge_config::Config::default(),
+            )))
+        }));
+        let server = Arc::new(ForgeAcpServer::new(factory, tx));
+
+        let created = server
+            .new_session(json!({ "cwd": tmp.path(), "mcpServers": [] }))
+            .await
+            .expect("session created");
+        let session_id = created["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        // `prompt` resolves with the turn's response; every chunk was
+        // already in the channel — i.e. on the wire — before it (run_turn
+        // drains its events before answering).
+        let response = prompt(
+            &server,
+            json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "hi" }] }),
+        )
+        .await
+        .expect("turn completed");
+        assert_eq!(response["stopReason"], "end_turn", "{response}");
+
+        let mut chunks = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            let value = serde_json::to_value(&message).expect("serialize");
+            if value["params"]["update"]["sessionUpdate"] == "agent_message_chunk" {
+                chunks.push(
+                    value["params"]["update"]["content"]["text"]
+                        .as_str()
+                        .expect("text")
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(
+            chunks,
+            ["all ", "done ", "here"],
+            "streamed live, in order: {chunks:?}"
+        );
+        assert_eq!(chunks.concat(), "all done here");
+    }
+
     #[tokio::test]
     async fn session_new_then_prompt_drives_a_run_and_ends_the_turn() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1096,6 +1197,180 @@ mod tests {
             }
         }
         assert!(chunks >= 1, "expected the final text as a message chunk");
+    }
+
+    #[test]
+    fn activate_skills_meta_parses_the_extension_and_rejects_other_shapes() {
+        let empty = Vec::<String>::new();
+        assert_eq!(activate_skills_meta(None).expect("absent"), empty);
+        assert_eq!(
+            activate_skills_meta(Some(&json!({}))).expect("no key"),
+            empty
+        );
+        assert_eq!(
+            activate_skills_meta(Some(&json!({ "forge.activateSkills": null }))).expect("null"),
+            empty
+        );
+        assert_eq!(
+            activate_skills_meta(Some(&json!({ "forge.activateSkills": ["xy", "demo"] })))
+                .expect("names"),
+            vec!["xy".to_string(), "demo".to_string()]
+        );
+
+        for bad in [
+            json!({ "forge.activateSkills": "xy" }),
+            json!({ "forge.activateSkills": [1] }),
+            json!({ "forge.activateSkills": { "name": "xy" } }),
+        ] {
+            let error = activate_skills_meta(Some(&bad)).expect_err("malformed");
+            assert_eq!(error.code, -32602, "{bad}");
+        }
+    }
+
+    /// `_meta.forge.activateSkills` reaches the runtime: the prompt shares
+    /// no token with the skill's name or description, so the activation
+    /// can only have come through the extension.
+    #[tokio::test]
+    async fn a_prompt_can_name_skills_to_activate_via_meta() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical root");
+        let skill_dir = root.join(".forge").join("skills").join("xy");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: xy\ndescription: the two-letter skill\n---\n\nDo the xy thing.\n",
+        )
+        .expect("write skill");
+
+        let (tx, _rx) = mpsc::channel(64);
+        let factory = Arc::new(FnFactory(|root: &Path| {
+            Ok(Arc::new(AgentService::new(
+                Arc::new(forge_providers::MockModel::new()),
+                Arc::new(forge_providers::MockRouter::selecting("mock-local")),
+                Arc::new(forge_execution::MockExecution::new(root)),
+                Arc::new(forge_skills::FsSkillRegistry::with_roots(
+                    vec![(
+                        forge_skills::SkillSource::ProjectForge,
+                        root.join(".forge").join("skills"),
+                    )],
+                    None,
+                )),
+                Arc::new(forge_session::JsonlSessionStore::new(
+                    root.join(".forge").join("sessions"),
+                )),
+                forge_config::Config::default(),
+            )))
+        }));
+        let server = Arc::new(ForgeAcpServer::new(factory, tx));
+
+        let created = server
+            .new_session(json!({ "cwd": root, "mcpServers": [] }))
+            .await
+            .expect("session created");
+        let session_id = created["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let response = prompt(
+            &server,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "zz unrelated qq" }],
+                "_meta": { "forge.activateSkills": ["xy"] },
+            }),
+        )
+        .await
+        .expect("turn completed");
+        assert_eq!(response["stopReason"], "end_turn", "{response}");
+
+        // The ACP session id is the forge session id, so the activation is
+        // on the inspectable session log.
+        let log = std::fs::read_to_string(
+            root.join(".forge")
+                .join("sessions")
+                .join(format!("{session_id}.jsonl")),
+        )
+        .expect("session log");
+        assert!(
+            log.lines()
+                .any(|l| l.contains("\"skill_activated\"") && l.contains("\"xy\"")),
+            "expected a skill_activated for xy: {log}"
+        );
+    }
+
+    /// A malformed `forge.activateSkills` is refused at claim time — so the
+    /// turn slot is free for the next prompt.
+    #[tokio::test]
+    async fn a_malformed_activate_skills_meta_is_invalid_params_before_the_claim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (server, _rx) = server();
+        let created = server
+            .new_session(json!({ "cwd": tmp.path(), "mcpServers": [] }))
+            .await
+            .expect("session created");
+        let session_id = created["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let error = prompt(
+            &server,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "hi" }],
+                "_meta": { "forge.activateSkills": "xy" },
+            }),
+        )
+        .await
+        .expect_err("malformed activateSkills");
+        assert_eq!(error.code, -32602, "{error}");
+
+        // The refusal preceded the claim: a follow-up turn is free to run.
+        let response = prompt(
+            &server,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "hi" }],
+            }),
+        )
+        .await
+        .expect("the next turn is not blocked");
+        assert_eq!(response["stopReason"], "end_turn", "{response}");
+    }
+
+    /// A well-formed but unknown skill name is the runtime's entry-point
+    /// refusal, carried to the client — and nothing is written.
+    #[tokio::test]
+    async fn an_unknown_activate_skills_name_is_an_error_and_starts_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (server, _rx) = server();
+        let created = server
+            .new_session(json!({ "cwd": tmp.path(), "mcpServers": [] }))
+            .await
+            .expect("session created");
+        let session_id = created["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let error = prompt(
+            &server,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "hi" }],
+                "_meta": { "forge.activateSkills": ["nosuch"] },
+            }),
+        )
+        .await
+        .expect_err("unknown skill");
+        assert!(error.message.contains("unknown skill: nosuch"), "{error}");
+
+        let sessions = tmp.path().join(".forge").join("sessions");
+        let transcripts = std::fs::read_dir(&sessions)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(transcripts, 0, "a refused turn writes nothing");
     }
 
     #[tokio::test]

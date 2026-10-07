@@ -127,20 +127,41 @@ pub fn build_service_with(
 ) -> Result<AgentService, ForgeError> {
     let root = ctx.project_root()?;
     let resolved = forge_config::Config::load(Some(&root), &overrides_for(ctx, &options))?;
+    let mut config = resolved.config.clone();
 
-    let model = forge_providers::model_from_config(&resolved.config, &root)?;
+    // A model named by a real config layer is a deliberate choice and must
+    // never be silently replaced. With only built-in defaults, choose from
+    // providers proven usable in this environment so a first run does not
+    // assume a particular local server is already running.
+    let auto_selected = !resolved.config.explicit.contains("model");
+    if auto_selected && let Some(model) = forge_providers::automatic_model(&config) {
+        config.model = model;
+    }
+
+    // One availability resolution feeds both routing and provider creation.
+    // Keep an explicitly selected model so its construction can return the
+    // precise credential/endpoint error the user asked for.
+    let available: std::collections::BTreeSet<String> = forge_providers::available_models(&config)
+        .into_iter()
+        .map(|model| model.name)
+        .collect();
+    let selected_model = config.model.clone();
+    config
+        .models
+        .retain(|name, _| available.contains(name) || name == &selected_model);
+
+    let model = forge_providers::model_from_config(&config, &root)?;
     // Routing registry: `[models]` entries that declare capabilities are
     // known; the rest stay optimistic-unknown.
-    let mut registry: Vec<(String, forge_core::ModelCapabilities)> = resolved
-        .config
+    let mut registry: Vec<(String, forge_core::ModelCapabilities)> = config
         .model_entries()
         .iter()
         .filter_map(|(name, entry)| entry.capabilities_if_known().map(|c| (name.clone(), c)))
         .collect();
     registry.push((model.name().to_string(), model.capabilities()));
-    let router = forge_providers::router_from_config(&resolved.config, &registry)?;
+    let router = forge_providers::router_from_config(&config, &registry)?;
 
-    let execution = build_execution_with(&resolved.config, &root, options.approvals)?;
+    let execution = build_execution_with(&config, &root, options.approvals)?;
     let skills = Arc::new(FsSkillRegistry::new(&root, Some(execution.clone())));
 
     let sessions = Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions")));
@@ -155,7 +176,7 @@ pub fn build_service_with(
     // Resolve a provider per routed model name: `[models]` entries supply
     // endpoint/key/capability overrides; anything else falls back to the
     // global model_* settings or the built-in mock.
-    let cfg = resolved.config.clone();
+    let cfg = config.clone();
     let root_for_factory = root.clone();
     let factory = move |name: &str| -> Result<Arc<dyn forge_core::ModelProvider>, ForgeError> {
         let mut cfg = cfg.clone();
@@ -164,8 +185,9 @@ pub fn build_service_with(
     };
 
     Ok(
-        AgentService::new(model, router, execution, skills, sessions, resolved.config)
+        AgentService::new(model, router, execution, skills, sessions, config)
             .with_graph(graph)
+            .with_system_context(crate::commands::guidance::system_context(&root))
             .with_model_factory(Arc::new(factory)),
     )
 }

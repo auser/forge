@@ -26,6 +26,11 @@ pub trait ChatHost: Send + Sync {
     /// filtered out, in one place (§9.3).
     fn models(&self) -> Vec<ModelChoice>;
     fn skills(&self) -> Vec<SkillChoice>;
+    /// Project-relative file paths for `@`-completion: sorted,
+    /// `/`-separated, and already capped by the implementation. Empty when
+    /// no project graph has been built — `@`-completion degrades to
+    /// silence, never to an error, so this returns data, not a `Result`.
+    fn project_files(&self) -> Vec<String>;
     /// `forge config show`/`explain` data: key, value, origin.
     fn config_summary(&self, key: Option<&str>) -> Vec<ConfigLine>;
     /// Ranked project-graph hits for `/graph`. Async so that semantic

@@ -256,11 +256,28 @@ impl ChatIo for PipedIo {
     }
 
     fn write(&mut self, line: &Line) {
-        println!("{}", self.palette.paint(line.style, &line.text));
+        let text = self.palette.paint(line.style, &line.text);
+        if line.fragment {
+            print!("{text}");
+            // stdout is line-buffered (a `LineWriter`); without the flush a
+            // fragment shows nothing until the block closes — the whole
+            // point is that it shows now.
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        } else {
+            println!("{text}");
+        }
     }
 
     fn notify(&mut self, line: &Line) {
-        println!("{}", self.palette.paint(line.style, &line.text));
+        let text = self.palette.paint(line.style, &line.text);
+        if line.fragment {
+            print!("{text}");
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        } else {
+            println!("{text}");
+        }
     }
 
     /// A second, harmless line of defence for the narrow window between

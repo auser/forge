@@ -326,6 +326,11 @@ pub struct PromptRequest {
     pub session_id: Option<String>,
     #[serde(default)]
     pub prompt: Vec<ContentBlock>,
+    /// The ACP per-request `_meta` extension point. forge reads
+    /// `forge.activateSkills` (an array of skill names) out of it; anything
+    /// else is ignored, and absent means none.
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
 }
 
 /// A prompt content block. `text` and `resource_link` are the two all

@@ -68,6 +68,12 @@ pub const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_NEEDLE_BACKEND",
     "FORGE_NEEDLE_WEIGHTS_BASE_URL",
     "FORGE_NEEDLE_TEST_SHA256",
+    // OpenRouter catalogue endpoint override (see
+    // `forge_providers::openrouter::BASE_URL_ENV`): scrubbed, then pointed
+    // at a dead port wherever this world sets FORGE_NEEDLE_AUTOFETCH, for
+    // the same reason — `forge init`'s best-effort catalogue refresh must
+    // fail fast and offline, never reach openrouter.ai.
+    "FORGE_OPENROUTER_BASE_URL",
     // Mock providers are test-only and gated (see forge-providers'
     // `test_mocks`). Scrubbed then set back to "1" below, so a scenario
     // runs with mocks unlocked no matter what the developer's shell says.
@@ -196,6 +202,7 @@ impl BddWorld {
             // autofetch can still opt in via `world.env`, which is applied
             // after this and wins.
             .env("FORGE_NEEDLE_AUTOFETCH", "false")
+            .env("FORGE_OPENROUTER_BASE_URL", "http://127.0.0.1:9")
             // Scenarios drive the agent loop with mock/scripted models,
             // which configuration refuses to resolve without this.
             .env("FORGE_TEST_MOCKS", "1");
@@ -264,6 +271,7 @@ impl BddWorld {
             .env("XDG_CONFIG_HOME", &xdg)
             .env("NO_COLOR", "1")
             .env("FORGE_NEEDLE_AUTOFETCH", "false")
+            .env("FORGE_OPENROUTER_BASE_URL", "http://127.0.0.1:9")
             .env("FORGE_TEST_MOCKS", "1");
         for (key, value) in &self.env {
             cmd.env(key, value);
@@ -398,6 +406,7 @@ impl BddWorld {
             cmd.env_remove(var);
         }
         cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
+        cmd.env("FORGE_OPENROUTER_BASE_URL", "http://127.0.0.1:9");
         cmd.env("FORGE_TEST_MOCKS", "1");
         for (key, value) in &self.env {
             cmd.env(key, value);
@@ -525,6 +534,7 @@ impl BddWorld {
             cmd.env_remove(var);
         }
         cmd.env("FORGE_NEEDLE_AUTOFETCH", "false");
+        cmd.env("FORGE_OPENROUTER_BASE_URL", "http://127.0.0.1:9");
         cmd.env("FORGE_TEST_MOCKS", "1");
         for (key, value) in &self.env {
             cmd.env(key, value);

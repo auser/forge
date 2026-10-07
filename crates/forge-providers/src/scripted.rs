@@ -57,6 +57,61 @@ impl ScriptedMockModel {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+
+    /// Record the request and pop the next scripted reply, assembled into a
+    /// response. Shared by `complete` and `stream_complete`, so a call is
+    /// recorded exactly once and the queue pops exactly once either way.
+    fn next_reply(&self, request: CompletionRequest) -> CompletionResponse {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request.clone());
+
+        let reply = self
+            .replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+            .unwrap_or_else(|| ScriptedReply {
+                text: Some("script exhausted".to_string()),
+                tool_calls: Vec::new(),
+            });
+
+        let content = reply.text.unwrap_or_default();
+        CompletionResponse {
+            model: "scripted-mock".to_string(),
+            tool_calls: reply.tool_calls,
+            usage: Some(Usage {
+                prompt_tokens: 0,
+                completion_tokens: content.len() as u32,
+                total_tokens: content.len() as u32,
+            }),
+            finish_reason: Some("stop".to_string()),
+            content,
+        }
+    }
+}
+
+/// Each chunk is a word plus its trailing whitespace, so concatenation
+/// reproduces the input exactly and a whitespace-free token is never split.
+fn word_chunks(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut prev_whitespace = true;
+    for (i, ch) in text.char_indices() {
+        // A new word starting after whitespace closes the previous chunk:
+        // the boundary lands *after* the whitespace run, so each chunk
+        // keeps its own trailing whitespace.
+        if !ch.is_whitespace() && prev_whitespace && i > start {
+            chunks.push(&text[start..i]);
+            start = i;
+        }
+        prev_whitespace = ch.is_whitespace();
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
 }
 
 #[async_trait]
@@ -76,33 +131,19 @@ impl ModelProvider for ScriptedMockModel {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, ForgeError> {
-        self.requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(request.clone());
+        Ok(self.next_reply(request))
+    }
 
-        let reply = self
-            .replies
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front()
-            .unwrap_or_else(|| ScriptedReply {
-                text: Some("script exhausted".to_string()),
-                tool_calls: Vec::new(),
-            });
-
-        let content = reply.text.unwrap_or_default();
-        Ok(CompletionResponse {
-            model: "scripted-mock".to_string(),
-            tool_calls: reply.tool_calls,
-            usage: Some(Usage {
-                prompt_tokens: 0,
-                completion_tokens: content.len() as u32,
-                total_tokens: content.len() as u32,
-            }),
-            finish_reason: Some("stop".to_string()),
-            content,
-        })
+    async fn stream_complete(
+        &self,
+        request: CompletionRequest,
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<CompletionResponse, ForgeError> {
+        let response = self.next_reply(request);
+        for chunk in word_chunks(&response.content) {
+            on_delta(chunk);
+        }
+        Ok(response)
     }
 }
 
@@ -146,6 +187,97 @@ mod tests {
         let r4 = model.complete(req()).await.expect("still exhausted");
         assert_eq!(r4.content, "script exhausted");
         assert_eq!(model.recorded().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn streaming_splits_a_text_reply_into_word_chunks() {
+        let model = ScriptedMockModel::new(vec![ScriptedReply {
+            text: Some("the answer is ready".to_string()),
+            tool_calls: Vec::new(),
+        }]);
+        let mut deltas: Vec<String> = Vec::new();
+        let response = model
+            .stream_complete(
+                CompletionRequest::new("scripted-mock", vec![Message::user("x")]),
+                &mut |d: &str| deltas.push(d.to_string()),
+            )
+            .await
+            .expect("streamed");
+        // Each chunk is a word plus its trailing whitespace; concatenation is exact.
+        assert_eq!(deltas, vec!["the ", "answer ", "is ", "ready"]);
+        assert_eq!(deltas.concat(), response.content);
+        assert_eq!(response.content, "the answer is ready");
+    }
+
+    #[tokio::test]
+    async fn streaming_a_tool_call_reply_emits_no_deltas() {
+        let model = ScriptedMockModel::new(vec![ScriptedReply {
+            text: None,
+            tool_calls: vec![ToolCall::new(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "a.rs"}),
+            )],
+        }]);
+        let mut deltas = 0;
+        let response = model
+            .stream_complete(
+                CompletionRequest::new("scripted-mock", vec![Message::user("x")]),
+                &mut |_: &str| deltas += 1,
+            )
+            .await
+            .expect("streamed");
+        assert_eq!(deltas, 0, "tool calls surface whole, in the response");
+        assert_eq!(response.tool_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_pops_the_queue_once_and_records_one_request() {
+        let model = ScriptedMockModel::from_json(r#"[{"text": "one here"}, {"text": "two"}]"#)
+            .expect("parse");
+        let mut sink = |_: &str| {};
+        let first = model
+            .stream_complete(
+                CompletionRequest::new("scripted-mock", vec![Message::user("a")]),
+                &mut sink,
+            )
+            .await
+            .expect("first");
+        assert_eq!(first.content, "one here");
+        let second = model
+            .stream_complete(
+                CompletionRequest::new("scripted-mock", vec![Message::user("b")]),
+                &mut sink,
+            )
+            .await
+            .expect("second");
+        assert_eq!(second.content, "two");
+        assert_eq!(
+            model.recorded().len(),
+            2,
+            "exactly one recorded request per call"
+        );
+    }
+
+    /// A whitespace-free token is never split — a key-shaped fragment must
+    /// reach the redaction boundary whole (the runtime additionally holds
+    /// back partial trailing tokens; see `complete_streaming` in
+    /// forge-runtime's service).
+    #[tokio::test]
+    async fn a_token_without_whitespace_is_one_chunk() {
+        let model = ScriptedMockModel::new(vec![ScriptedReply {
+            text: Some("key sk-abcdef123456 end".to_string()),
+            tool_calls: Vec::new(),
+        }]);
+        let mut deltas: Vec<String> = Vec::new();
+        let _ = model
+            .stream_complete(
+                CompletionRequest::new("scripted-mock", vec![Message::user("x")]),
+                &mut |d: &str| deltas.push(d.to_string()),
+            )
+            .await
+            .expect("streamed");
+        assert!(deltas.iter().any(|d| d == "sk-abcdef123456 "), "{deltas:?}");
     }
 
     #[test]

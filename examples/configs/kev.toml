@@ -1,0 +1,20 @@
+# Self-hosted System One decisions: a model YOU run (Kev, CLM, or OpenJev)
+# does the routing, on your own hardware, under the System One wire
+# contract forge's jev router already speaks.
+#
+# Kev (Apache-2.0, 0.8B-27B, runs on GPU or Mac) and CLM-8B both serve a
+# TypeSafe-compatible /v1/systemone endpoint, as does OpenJev. Start the
+# server your model's README gives you, then point jev_url at it.
+
+router = "jev"
+jev_url = "http://127.0.0.1:8000/v1/systemone"   # your server's endpoint
+# jev_model = "kev-4b"   # only if your server validates the model id;
+                         # the default alias (jev-latest) is accepted by
+                         # TypeSafe and OpenJev and ignored by most others
+# jev_key_env is deliberately unset: a local server still gets the
+# default TYPESAFE_API_KEY lookup, and these servers accept any bearer
+# token (often ignoring it) — set one anyway, e.g. TYPESAFE_API_KEY=local.
+
+model = "qwen3-coder"        # generation stays local too (oMLX)
+execution = "native"
+approval = "prompt"

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use forge_core::{ForgeError, find_project_root};
@@ -7,13 +8,14 @@ use crate::commands::Context;
 
 const STARTER_CONFIG: &str = "\
 # Forge project configuration.
-# Defaults: local oMLX model + embedded Needle 3 decision router.
+# Forge auto-selects a reachable local model or an authenticated hosted model.
+# Set `model = \"...\"` here only when you want to pin one.
+# The embedded Needle 3 decision router is the default.
 # Precedence: user config -> this file -> FORGE_* env -> CLI flags.
 # See `forge config explain <key>`.
-model = \"qwen3-coder\"        # served by oMLX at model_base_url
 router = \"needle\"            # on-device decisions; falls back to static when unavailable
 execution = \"native\"
-approval = \"prompt\"
+approval = \"prompt-dangerous\" # ordinary project edits run; destructive operations ask
 ";
 
 const GITIGNORE_ENTRY: &str = ".forge/";
@@ -57,6 +59,38 @@ struct InitItem {
 /// Idempotent project initialization: `.forge/` directories, starter config
 /// (only when absent), and a single `.forge/` line in `.gitignore`.
 pub fn run(ctx: &Context, preset: Option<&str>) -> Result<(), ForgeError> {
+    run_inner(ctx, preset, true)
+}
+
+/// Bootstrap the safe project-local state needed by an interactive first run.
+/// Existing projects are untouched; explicit `forge init` remains the verbose,
+/// configurable form.
+pub fn ensure(ctx: &Context) -> Result<bool, ForgeError> {
+    let root = ctx.project_root()?;
+    if root.join(".forge").join("config.toml").is_file() {
+        return Ok(false);
+    }
+    run_inner(ctx, None, false)?;
+    Ok(true)
+}
+
+/// Print the one-time, human-facing result of an automatic bootstrap.
+/// Protocol/JSON output and non-interactive callers stay silent.
+pub fn report_first_run(ctx: &Context) -> Result<(), ForgeError> {
+    if ctx.global.json || !std::io::stderr().is_terminal() {
+        return Ok(());
+    }
+    let resolved = ctx.resolve_config()?;
+    let model = forge_providers::automatic_model(&resolved.config)
+        .unwrap_or_else(|| "none detected — run `forge model list`".to_string());
+    eprintln!("Forge initialized this project");
+    eprintln!("  graph       ready");
+    eprintln!("  generation  {model} (auto-selected)");
+    eprintln!("  approval    {}", resolved.config.approval);
+    Ok(())
+}
+
+fn run_inner(ctx: &Context, preset: Option<&str>, print_report: bool) -> Result<(), ForgeError> {
     // Validate the name before doing any work: an unknown preset is an
     // error whether or not a config already exists (where it would
     // otherwise be silently "preserved").
@@ -118,10 +152,15 @@ pub fn run(ctx: &Context, preset: Option<&str>) -> Result<(), ForgeError> {
     let resolved = ctx.resolve_config()?;
     items.extend(legacy_config_item(&root, &resolved.config));
     items.push(needle_weights_item(&root, &resolved.config));
+    items.push(catalogue_item(&resolved.config));
 
     items.extend(detect_environment(&root));
 
-    report(&root, &items, ctx.global.json)
+    if print_report {
+        report(&root, &items, ctx.global.json)
+    } else {
+        Ok(())
+    }
 }
 
 /// Pre-needle settings that a config written against an older Forge still
@@ -247,6 +286,60 @@ fn needle_weights_item(root: &Path, config: &forge_config::Config) -> InitItem {
                 path: root.to_path_buf(),
                 note: Some(format!(
                     "needle weights: could not run fetch ({e}); static routing continues"
+                )),
+            }
+        }
+    }
+}
+
+/// `forge init`'s catalogue step: refresh the cached OpenRouter model
+/// catalogue (`~/.cache/forge/openrouter/models.json`), the price/context
+/// facts `cheapest` routing and budget accounting read. Best-effort like
+/// the weights fetch: offline init must not fail, so every failure
+/// degrades to an informational item and routing simply falls back to
+/// hand-typed config prices. Skipped under `--local-only` (the catalogue
+/// is a network source and prunes like every other one).
+fn catalogue_item(config: &forge_config::Config) -> InitItem {
+    let path = forge_config::catalogue::cache_path();
+    if config.local_only {
+        return InitItem {
+            status: ItemStatus::Detected,
+            path,
+            note: Some(
+                "openrouter catalogue: skipped (--local-only); cheapest routes on config prices only"
+                    .to_string(),
+            ),
+        };
+    }
+    let existed = path.is_file();
+    let owned = config.clone();
+    match run_async(async move { forge_providers::openrouter::refresh_cache(&owned).await }) {
+        Ok(Ok((count, path))) => InitItem {
+            status: if existed {
+                ItemStatus::Updated
+            } else {
+                ItemStatus::Created
+            },
+            path,
+            note: Some(format!("openrouter catalogue: {count} models")),
+        },
+        Ok(Err(e)) => {
+            warn!(error = %e, "openrouter catalogue refresh failed");
+            InitItem {
+                status: ItemStatus::Detected,
+                path,
+                note: Some(format!(
+                    "openrouter catalogue: refresh failed ({e}); config prices still apply"
+                )),
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "could not run the catalogue refresh");
+            InitItem {
+                status: ItemStatus::Detected,
+                path,
+                note: Some(format!(
+                    "openrouter catalogue: could not run refresh ({e}); config prices still apply"
                 )),
             }
         }

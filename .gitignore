@@ -5,6 +5,9 @@
 # verify` never need — fetch on demand, see crates/needle-sys/build.rs.
 # `crates/needle-sys/needle.h` (the API contract) IS committed.
 /crates/needle-sys/vendor/
+
+# Parallel-development worktrees (`git worktree add worktrees/<name>`)
+/worktrees/
 .cursorindexingignore
 .specstory/
 specs/scratch.md

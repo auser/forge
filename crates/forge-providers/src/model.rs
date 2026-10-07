@@ -22,7 +22,7 @@ const MOCK_VERBOSE_ENV: &str = "FORGE_MOCK_VERBOSE";
 /// the zero-setup first impression, and echoing the assembled system
 /// context (skill instructions, graph context) into it made that output
 /// look like a leak. Set `FORGE_MOCK_VERBOSE=1` to append
-/// `(system context: <first 120 chars>)` when you need context plumbing
+/// `(system context: <120 chars>)` when you need context plumbing
 /// visible in a reply; tests that own the provider should prefer
 /// [`MockModel::recorded`], which shows the whole request, untruncated.
 pub struct MockModel {
@@ -92,13 +92,22 @@ impl ModelProvider for MockModel {
         // Opt-in only (see the type docs): echoing the assembled system
         // context turns the one zero-setup command into a wall of internals.
         let system: String = if mock_verbose() {
-            request
+            let systems: Vec<&str> = request
                 .messages
                 .iter()
                 .filter(|m| m.role == forge_core::Role::System)
                 .map(|m| m.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect();
+            // Verbose mode exists for context-plumbing tests. Once the
+            // permanent coding contract precedes skills, echo the activated
+            // skill when present rather than truncating before it.
+            systems
+                .iter()
+                .find(|message| message.starts_with("Active skill `"))
+                .copied()
+                .or_else(|| systems.first().copied())
+                .unwrap_or_default()
+                .to_string()
         } else {
             String::new()
         };
@@ -163,6 +172,107 @@ pub(crate) const FIELD_ENTRY_KEY_ENV: &str = "the model entry's key_env";
 /// `local_only` refusal, it is simply not wired up yet.
 const UNCONFIGURED_BASE_URL: &str = "http://127.0.0.1:9";
 
+/// A generation model that can be offered to a router without setting the
+/// user up for a predictable credential failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableModel {
+    pub name: String,
+    pub local: bool,
+    pub credential: Option<crate::credentials::CredentialSource>,
+}
+
+/// Resolve the models that are usable in the current environment.
+///
+/// Local endpoints need no credential but must accept a short TCP probe.
+/// Remote endpoints are candidates only when their configured or conventional
+/// credential resolves. This is the generation plane's source of truth;
+/// routing must never advertise a model that provider construction already
+/// knows it cannot reach or authenticate.
+pub fn available_models(config: &Config) -> Vec<AvailableModel> {
+    let mut out = Vec::new();
+    for name in config.model_entries().keys() {
+        let Some(endpoint) = resolve_endpoint(config, name) else {
+            continue;
+        };
+        let local = crate::local_only::endpoint_is_local(&endpoint.url);
+        if config.local_only && !local {
+            continue;
+        }
+        let entry = config.models.get(name);
+        let key_env = entry
+            .and_then(|entry| entry.key_env.as_deref())
+            .or(config.model_key_env.as_deref());
+        let hint = entry
+            .and_then(|entry| entry.provider.as_deref())
+            .map(str::to_string)
+            .or_else(|| infer_provider_hint(&endpoint.url));
+        let credential =
+            crate::credentials::resolve_credential(key_env, hint.as_deref()).map(|c| c.source);
+        if (local && local_endpoint_reachable(config, name)) || credential.is_some() {
+            out.push(AvailableModel {
+                name: name.clone(),
+                local,
+                credential,
+            });
+        }
+    }
+    out
+}
+
+/// Pick the zero-config generation model.
+///
+/// A reachable local endpoint wins. Otherwise an already-authenticated CLI
+/// subscription wins, then an API-key-backed hosted provider. Stable name
+/// ordering makes the choice reproducible when several providers tie.
+pub fn automatic_model(config: &Config) -> Option<String> {
+    let mut available = available_models(config);
+    available.sort_by(|a, b| {
+        automatic_model_rank(a)
+            .cmp(&automatic_model_rank(b))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    available.into_iter().next().map(|candidate| candidate.name)
+}
+
+fn automatic_model_rank(model: &AvailableModel) -> u8 {
+    if model.local {
+        0
+    } else if matches!(
+        model.credential,
+        Some(
+            crate::credentials::CredentialSource::ClaudeCodeCredentials
+                | crate::credentials::CredentialSource::CodexAuthJson
+        )
+    ) {
+        1
+    } else {
+        2
+    }
+}
+
+fn local_endpoint_reachable(config: &Config, name: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let Some(endpoint) = resolve_endpoint(config, name) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(&endpoint.url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return false;
+    };
+    let Ok(addresses) = (host.trim_matches(['[', ']']), port).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .into_iter()
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok())
+}
+
 /// The one-line fix for a credential problem, safe to print anywhere: it
 /// names the env var the configuration points at, never a value.
 ///
@@ -189,6 +299,9 @@ pub(crate) fn credential_hint(key_env: Option<&str>, config_field: &str) -> Stri
 /// none was found, requests go out unauthenticated with a one-time warn.
 pub struct OpenAiCompatibleModel {
     client: reqwest::Client,
+    /// The streaming twin of `client`: no total deadline (D7 — see
+    /// [`EgressPolicy::streaming_client`]).
+    stream_client: reqwest::Client,
     base_url: String,
     model: String,
     credential: Option<crate::credentials::ResolvedCredential>,
@@ -216,8 +329,12 @@ impl OpenAiCompatibleModel {
         let client = egress
             .client(timeout)
             .map_err(|e| ForgeError::provider(format!("building HTTP client: {e}")))?;
+        let stream_client = egress
+            .streaming_client(timeout)
+            .map_err(|e| ForgeError::provider(format!("building streaming HTTP client: {e}")))?;
         Ok(Self {
             client,
+            stream_client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             credential,
@@ -247,6 +364,21 @@ struct ChatRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// `stream: false` must serialize identically to a request without the
+    /// key — the non-streaming wire body is byte-identical to before
+    /// streaming landed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
+}
+
+/// Ask for the terminal usage chunk (D9). Sent on every streaming request:
+/// free where supported, ignored where unknown, and a server that *rejects*
+/// it falls under the non-streaming fallback.
+#[derive(Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -299,19 +431,16 @@ fn role_name(role: forge_core::Role) -> &'static str {
     }
 }
 
-#[async_trait]
-impl ModelProvider for OpenAiCompatibleModel {
-    fn name(&self) -> &str {
-        &self.model
+impl OpenAiCompatibleModel {
+    fn chat_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
     }
 
-    fn capabilities(&self) -> ModelCapabilities {
-        self.capabilities
-    }
-
-    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, ForgeError> {
-        reject_tools_without_capability(&request, self.capabilities)?;
-        let body = ChatRequest {
+    /// The request wire body; `stream` adds `stream: true` and the
+    /// usage-chunk request (D9), nothing else — with `stream: false` the
+    /// body is byte-identical to the pre-streaming one.
+    fn chat_body<'a>(&'a self, request: &'a CompletionRequest, stream: bool) -> ChatRequest<'a> {
+        ChatRequest {
             model: &self.model,
             messages: request
                 .messages
@@ -348,15 +477,25 @@ impl ModelProvider for OpenAiCompatibleModel {
                 .collect(),
             max_tokens: request.max_tokens,
             temperature: request.temperature,
-        };
-        let url = format!("{}/chat/completions", self.base_url);
+            stream,
+            stream_options: stream.then_some(ChatStreamOptions {
+                include_usage: true,
+            }),
+        }
+    }
 
-        let mut http = self.client.post(&url).json(&body);
+    /// POST the body with the resolved credential. No credential resolved:
+    /// send unauthenticated but warn loudly — this is the classic
+    /// silent-401 cause. Sources only, never values, plus the exact fix.
+    fn authed_chat_post(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        body: &ChatRequest<'_>,
+    ) -> reqwest::RequestBuilder {
+        let mut http = client.post(url).json(body);
         match &self.credential {
             Some(credential) => http = http.bearer_auth(&credential.secret),
-            // No credential resolved: send unauthenticated but warn loudly
-            // — this is the classic silent-401 cause. Sources only, never
-            // values, plus the exact fix.
             None => tracing::warn!(
                 "no credential resolved for model {}; requests will be sent \
                  without authentication (see `forge auth status`) — {}",
@@ -364,31 +503,258 @@ impl ModelProvider for OpenAiCompatibleModel {
                 credential_hint(self.key_env.as_deref(), self.key_env_field)
             ),
         }
+        http
+    }
+}
 
-        let response = http.send().await.map_err(|e| {
-            if e.is_timeout() {
-                ForgeError::provider(format!("model request to {url} timed out"))
-            } else if e.is_redirect() {
-                // `local_only` refusing a hop lands here. The reason (and the
-                // host declined) is in the source chain, not in reqwest's own
-                // Display — without it this reads as an unexplained failure
-                // against the endpoint the user configured.
-                ForgeError::provider(format!(
-                    "model request to {url} was not completed: {}",
-                    crate::local_only::error_detail(&e)
-                ))
-            } else if e.is_connect() {
-                ForgeError::provider(format!(
-                    "cannot reach OpenAI-compatible server at {url} (connection refused); \
-                     start your model server (e.g. oMLX) or set model = \"mock-local\" for offline use"
-                ))
-            } else {
-                ForgeError::provider(format!(
-                    "model request to {url} failed: {}",
-                    crate::local_only::error_detail(&e)
-                ))
-            }
+/// The transport failure mapping shared by the buffered and streaming send
+/// paths. A `local_only` redirect refusal lands in `is_redirect`; the reason
+/// (and the host declined) is in the source chain, not in reqwest's own
+/// Display — without it this reads as an unexplained failure against the
+/// endpoint the user configured.
+fn send_error(url: &str, e: reqwest::Error) -> ForgeError {
+    if e.is_timeout() {
+        ForgeError::provider(format!("model request to {url} timed out"))
+    } else if e.is_redirect() {
+        ForgeError::provider(format!(
+            "model request to {url} was not completed: {}",
+            crate::local_only::error_detail(&e)
+        ))
+    } else if e.is_connect() {
+        ForgeError::provider(format!(
+            "cannot reach OpenAI-compatible server at {url} (connection refused); \
+             start your model server (e.g. oMLX) or set model = \"mock-local\" for offline use"
+        ))
+    } else {
+        ForgeError::provider(format!(
+            "model request to {url} failed: {}",
+            crate::local_only::error_detail(&e)
+        ))
+    }
+}
+
+fn parse_usage(value: &serde_json::Value) -> Option<Usage> {
+    Some(Usage {
+        prompt_tokens: value.get("prompt_tokens")?.as_u64()? as u32,
+        completion_tokens: value.get("completion_tokens")?.as_u64()? as u32,
+        total_tokens: value.get("total_tokens")?.as_u64()? as u32,
+    })
+}
+
+/// Parse OpenAI tool_calls: function.arguments arrives as a JSON string;
+/// tolerate invalid JSON by keeping it as a string value.
+fn parse_tool_calls(message: &serde_json::Value) -> Vec<forge_core::ToolCall> {
+    message
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    let id = call.get("id")?.as_str()?;
+                    let name = call.pointer("/function/name")?.as_str()?;
+                    let raw = call
+                        .pointer("/function/arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("{}");
+                    let arguments = serde_json::from_str(raw)
+                        .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+                    Some(forge_core::ToolCall::new(id, name, arguments))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The whole-body response shape `complete()` parses — also the shape a
+/// server that ignores `stream: true` answers a streaming request with, so
+/// both paths share the one parser and cannot drift.
+fn parse_chat_completion(
+    model: &str,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<CompletionResponse, ForgeError> {
+    let message = body.pointer("/choices/0/message").ok_or_else(|| {
+        ForgeError::provider(format!(
+            "model response from {url} missing choices[0].message"
+        ))
+    })?;
+    let content = message
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(CompletionResponse {
+        model: model.to_string(),
+        content,
+        tool_calls: parse_tool_calls(message),
+        finish_reason: body
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        usage: body.get("usage").and_then(parse_usage),
+    })
+}
+
+/// Reassembly of one OpenAI-compatible stream. Text fragments are handed to
+/// `on_delta` verbatim (only text streams — the TICKET-1 contract);
+/// tool-call argument fragments accumulate per `index` and surface whole in
+/// the response (D6). Usage comes from the terminal `include_usage` chunk
+/// when the server honors it, and stays `None` when it doesn't (D9).
+#[derive(Default)]
+struct OpenAiStream {
+    content: String,
+    calls: std::collections::BTreeMap<u64, PartialToolCall>,
+    finish_reason: Option<String>,
+    usage: Option<Usage>,
+    saw_done: bool,
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl OpenAiStream {
+    fn apply(
+        &mut self,
+        event: &crate::sse::SseEvent,
+        url: &str,
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<(), ForgeError> {
+        // Compare the sentinel against the trimmed payload, but JSON-parse
+        // the raw data (never trim into a string that gets parsed).
+        if event.data.trim() == "[DONE]" {
+            self.saw_done = true;
+            return Ok(());
+        }
+        let chunk: serde_json::Value = serde_json::from_str(&event.data).map_err(|e| {
+            ForgeError::provider(format!("malformed SSE data chunk from {url}: {e}"))
         })?;
+        // A mid-stream error payload (D5): the partial text is discarded
+        // with the response — the runtime records a typed Error event and
+        // no half-answer.
+        if let Some(error) = chunk.get("error") {
+            let message = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            let kind = error
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|k| format!(" (type {k})"))
+                .unwrap_or_default();
+            return Err(ForgeError::provider(format!(
+                "model stream from {url} failed after {} answer bytes: {message}{kind}",
+                self.content.len()
+            )));
+        }
+        // The terminal usage chunk carries `choices: []`; every other chunk
+        // carries `usage: null` when include_usage is honored at all.
+        if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
+            self.usage = parse_usage(usage);
+        }
+        let Some(choices) = chunk.get("choices").and_then(serde_json::Value::as_array) else {
+            return Ok(());
+        };
+        for choice in choices {
+            if let Some(reason) = choice
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                self.finish_reason = Some(reason.to_string());
+            }
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
+            if let Some(content) = delta.get("content").and_then(serde_json::Value::as_str)
+                && !content.is_empty()
+            {
+                self.content.push_str(content);
+                on_delta(content);
+            }
+            if let Some(calls) = delta
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+            {
+                for call in calls {
+                    // `index` identifies the call across chunks; a degenerate
+                    // server that omits it collapses onto 0.
+                    let index = call
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let entry = self.calls.entry(index).or_default();
+                    // id/name arrive on the index's first chunk.
+                    if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
+                        entry.id = Some(id.to_string());
+                    }
+                    if let Some(function) = call.get("function") {
+                        if let Some(name) = function.get("name").and_then(serde_json::Value::as_str)
+                        {
+                            entry.name = Some(name.to_string());
+                        }
+                        if let Some(args) = function
+                            .get("arguments")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            entry.arguments.push_str(args);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_response(self, model: &str) -> CompletionResponse {
+        let tool_calls = self
+            .calls
+            .into_values() // BTreeMap: index order, not arrival order
+            .filter_map(|call| {
+                // A call whose id or name never arrived is dropped, exactly
+                // like the non-streaming parse.
+                let id = call.id?;
+                let name = call.name?;
+                let arguments = if call.arguments.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&call.arguments)
+                        .unwrap_or(serde_json::Value::String(call.arguments))
+                };
+                Some(forge_core::ToolCall::new(id, name, arguments))
+            })
+            .collect();
+        CompletionResponse {
+            model: model.to_string(),
+            content: self.content,
+            tool_calls,
+            finish_reason: self.finish_reason,
+            usage: self.usage,
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OpenAiCompatibleModel {
+    fn name(&self) -> &str {
+        &self.model
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        self.capabilities
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, ForgeError> {
+        reject_tools_without_capability(&request, self.capabilities)?;
+        let url = self.chat_url();
+        let response = self
+            .authed_chat_post(&self.client, &url, &self.chat_body(&request, false))
+            .send()
+            .await
+            .map_err(|e| send_error(&url, e))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -412,57 +778,101 @@ impl ModelProvider for OpenAiCompatibleModel {
             .json()
             .await
             .map_err(|e| ForgeError::provider(format!("reading model response from {url}: {e}")))?;
+        parse_chat_completion(&self.model, &url, &body)
+    }
 
-        let message = body.pointer("/choices/0/message").ok_or_else(|| {
-            ForgeError::provider(format!(
-                "model response from {url} missing choices[0].message"
-            ))
-        })?;
-        let content = message
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+    async fn stream_complete(
+        &self,
+        request: CompletionRequest,
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<CompletionResponse, ForgeError> {
+        reject_tools_without_capability(&request, self.capabilities)?;
+        let url = self.chat_url();
+        // Scoped so the body's borrow of `request` ends here: the fallback
+        // below moves `request` into `complete`.
+        let response = {
+            let body = self.chat_body(&request, true);
+            self.authed_chat_post(&self.stream_client, &url, &body)
+                .send()
+                .await
+                .map_err(|e| send_error(&url, e))?
+        };
 
-        // Parse OpenAI tool_calls: function.arguments arrives as a JSON
-        // string; tolerate invalid JSON by keeping it as a string value.
-        let tool_calls = message
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .map(|calls| {
-                calls
-                    .iter()
-                    .filter_map(|call| {
-                        let id = call.get("id")?.as_str()?;
-                        let name = call.pointer("/function/name")?.as_str()?;
-                        let raw = call
-                            .pointer("/function/arguments")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("{}");
-                        let arguments = serde_json::from_str(raw)
-                            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
-                        Some(forge_core::ToolCall::new(id, name, arguments))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let status = response.status();
+        if !status.is_success() {
+            // Nothing was shown yet, so exactly one non-streaming retry is
+            // safe and cheap — a server that doesn't know `stream_options`
+            // (older llama.cpp, older LM Studio) answers 400 here.
+            let text = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                model = %self.model,
+                %status,
+                "streaming request rejected ({text}); answering whole instead — \
+                 set streaming = false in [models.{}] to skip the extra round-trip",
+                self.model
+            );
+            return self.complete(request).await;
+        }
 
-        Ok(CompletionResponse {
-            model: self.model.clone(),
-            content,
-            tool_calls,
-            finish_reason: body
-                .pointer("/choices/0/finish_reason")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            usage: body.get("usage").and_then(|u| {
-                Some(Usage {
-                    prompt_tokens: u.get("prompt_tokens")?.as_u64()? as u32,
-                    completion_tokens: u.get("completion_tokens")?.as_u64()? as u32,
-                    total_tokens: u.get("total_tokens")?.as_u64()? as u32,
-                })
-            }),
-        })
+        // A server that ignored `stream: true` answers a whole JSON body:
+        // parse it exactly as `complete` would, and emit no deltas — the
+        // contract forbids deltas that don't concatenate to the response.
+        let is_sse = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.trim()
+                    .to_ascii_lowercase()
+                    .starts_with("text/event-stream")
+            });
+        if !is_sse {
+            let body: serde_json::Value = response.json().await.map_err(|e| {
+                ForgeError::provider(format!("reading model response from {url}: {e}"))
+            })?;
+            return parse_chat_completion(&self.model, &url, &body);
+        }
+
+        let mut parser = crate::sse::SseParser::new();
+        let mut stream = OpenAiStream::default();
+        let mut response = response;
+        loop {
+            match response.chunk().await {
+                Ok(Some(bytes)) => {
+                    for event in parser.feed(&bytes) {
+                        stream.apply(&event, &url, on_delta)?;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(ForgeError::provider(format!(
+                        "model stream from {url} failed after {} answer bytes: {}",
+                        stream.content.len(),
+                        crate::local_only::error_detail(&e)
+                    )));
+                }
+            }
+        }
+        for event in parser.finish() {
+            stream.apply(&event, &url, on_delta)?;
+        }
+        // EOF with no terminal signal at all is truncation, never a silent
+        // partial answer; EOF after a finish_reason without the [DONE]
+        // sentinel is accepted — real servers omit it.
+        if !stream.saw_done && stream.finish_reason.is_none() {
+            return Err(ForgeError::provider(format!(
+                "model stream from {url} ended early: EOF after {} answer bytes with no \
+                 finish_reason and no [DONE] sentinel",
+                stream.content.len()
+            )));
+        }
+        if !stream.saw_done {
+            tracing::debug!(
+                model = %self.model,
+                "stream ended after finish_reason without the [DONE] sentinel; accepting"
+            );
+        }
+        Ok(stream.into_response(&self.model))
     }
 }
 
@@ -695,6 +1105,10 @@ pub fn model_endpoint(config: &Config) -> Option<String> {
 /// failure surfaces as a typed provider error at request time — after
 /// routing decisions have been recorded.
 ///
+/// Both real families stream (`stream: true` on the wire) unless an entry
+/// sets `streaming = false`, which keeps the runtime on whole responses for
+/// that endpoint.
+///
 /// This is also where `local_only` is enforced: it is the single place a
 /// configured model name becomes a provider, so a refusal here is a refusal
 /// everywhere — including the per-decision model factory that resolves a
@@ -878,6 +1292,46 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    #[serial]
+    fn available_models_exclude_uncredentialed_hosted_entries() {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "OPENROUTER_API_KEY",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+        let mut config = Config::default();
+        config.models.retain(|name, _| {
+            matches!(name.as_str(), "qwen3-coder" | "anthropic/claude-sonnet-4.5")
+        });
+        let available = available_models(&config);
+        assert!(
+            !available
+                .iter()
+                .any(|model| model.name == "anthropic/claude-sonnet-4.5")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn configured_hosted_credential_makes_model_available() {
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "test-key") };
+        let config = Config::default();
+        let available = available_models(&config);
+        assert!(
+            available
+                .iter()
+                .any(|model| model.name == "anthropic/claude-sonnet-4.5")
+        );
+        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+    }
 
     #[tokio::test]
     async fn mock_model_echoes_prompt_and_records() {
@@ -1871,6 +2325,27 @@ mod tests {
         assert_eq!(model.name(), "claude-sonnet");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn an_anthropic_family_model_reports_a_truthful_streaming_capability() {
+        // SAFETY: test-only env mutation, serialized via #[serial].
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key-not-a-real-secret") };
+        let config = Config {
+            model: "claude-sonnet".to_string(),
+            model_base_url: Some("http://127.0.0.1:11434".to_string()),
+            local_only: true,
+            ..Config::default()
+        }
+        .with_explicit([forge_config::keys::MODEL_BASE_URL]);
+        let built = model_from_config(&config, std::path::Path::new("."));
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        let model = built.expect("builds");
+        assert!(
+            model.capabilities().streaming,
+            "the client streams; the bit must say so"
+        );
+    }
+
     /// An inferable-from-nothing family is not a contradiction: a local
     /// OpenAI-compatible server for an `openai`-family entry is ordinary.
     #[test]
@@ -2111,5 +2586,391 @@ mod tests {
             .await
             .expect_err("unroutable endpoint must fail");
         assert!(matches!(err, ForgeError::Provider(_)));
+    }
+
+    // --- SSE streaming (TICKET-2) ------------------------------------------
+
+    /// Recorded shape, OpenAI chat completions streaming: role chunk, two
+    /// content chunks, the finish chunk, the `include_usage` chunk
+    /// (`choices: []`), then the `[DONE]` sentinel.
+    const SSE_TEXT_THEN_USAGE: &str = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1759334400,\"model\":\"qwen3-coder\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1759334400,\"model\":\"qwen3-coder\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1759334400,\"model\":\"qwen3-coder\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" is ready\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1759334400,\"model\":\"qwen3-coder\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1759334400,\"model\":\"qwen3-coder\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":7,\"total_tokens\":16}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// A streaming-capable client pointed at a wiremock server.
+    fn streaming_model(uri: &str) -> OpenAiCompatibleModel {
+        OpenAiCompatibleModel::new(
+            uri,
+            "qwen3-coder",
+            None,
+            ModelCapabilities {
+                streaming: true,
+                tools: true,
+                ..ModelCapabilities::default()
+            },
+            Duration::from_secs(5),
+            EgressPolicy::default(),
+        )
+        .expect("construct")
+    }
+
+    async fn stream_with(
+        model: &OpenAiCompatibleModel,
+    ) -> (Vec<String>, Result<CompletionResponse, ForgeError>) {
+        let mut deltas: Vec<String> = Vec::new();
+        let response = model
+            .stream_complete(
+                CompletionRequest::new("qwen3-coder", vec![Message::user("ping")]),
+                &mut |d: &str| deltas.push(d.to_string()),
+            )
+            .await;
+        (deltas, response)
+    }
+
+    fn sse_server(body: &'static str) -> ResponseTemplate {
+        // `set_body_raw` carries the content type: `set_body_string` would
+        // stamp text/plain over any inserted header (wiremock 0.6).
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_deltas_then_the_assembled_response_and_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_server(SSE_TEXT_THEN_USAGE))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (deltas, response) = stream_with(&model).await;
+        let response = response.expect("streams");
+
+        // The role chunk's empty content must not become an empty delta.
+        assert_eq!(deltas, vec!["The answer", " is ready"]);
+        // The contract the runtime's hold-back relies on.
+        assert_eq!(deltas.concat(), response.content);
+        assert_eq!(response.content, "The answer is ready");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(response.usage.map(|u| u.total_tokens), Some(16));
+
+        // The request asked for the stream, and for usage (D9).
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request json");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    /// Recorded shape: one text delta, then two parallel tool calls whose
+    /// `function.arguments` strings arrive in fragments, interleaved by
+    /// index (D6).
+    const SSE_TOOL_CALL_FRAGMENTS: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Checking the file.\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" \\\"a.rs\\\"\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"path\\\": \\\"b.rs\\\"}\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\", \\\"content\\\": \\\"fn a() {}\\\"}\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[tokio::test]
+    async fn streaming_reassembles_tool_calls_from_argument_fragments() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(sse_server(SSE_TOOL_CALL_FRAGMENTS))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (deltas, response) = stream_with(&model).await;
+        let response = response.expect("streams");
+
+        assert_eq!(deltas, vec!["Checking the file."], "no tool JSON streams");
+        assert_eq!(response.content, "Checking the file.");
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(response.tool_calls.len(), 2, "index order, not arrival");
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "write_file");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"path": "a.rs", "content": "fn a() {}"})
+        );
+        assert_eq!(response.tool_calls[1].id, "call_2");
+        assert_eq!(response.tool_calls[1].name, "read_file");
+        assert_eq!(
+            response.tool_calls[1].arguments,
+            serde_json::json!({"path": "b.rs"})
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_without_a_usage_chunk_leaves_usage_none() {
+        // A server ignoring `stream_options.include_usage` (older LM Studio):
+        // the usage chunk simply never arrives.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(sse_server(concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" is ready\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+                "data: [DONE]\n\n",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (deltas, response) = stream_with(&model).await;
+        let response = response.expect("streams");
+        assert_eq!(deltas.concat(), response.content);
+        assert_eq!(response.content, "The answer is ready");
+        assert!(
+            response.usage.is_none(),
+            "absent usage stays None, never fabricated"
+        );
+    }
+
+    /// D4a: a server that ignores `stream: true` answers a whole JSON body.
+    #[tokio::test]
+    async fn a_server_ignoring_stream_returns_a_whole_json_body_with_no_deltas() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": "whole answer" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
+            })))
+            .expect(1) // exactly one request: no retry, no second guess
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (deltas, response) = stream_with(&model).await;
+        let response = response.expect("a whole body is a valid answer");
+        assert!(deltas.is_empty(), "degradation is delta-free: {deltas:?}");
+        assert_eq!(response.content, "whole answer");
+        assert_eq!(response.usage.map(|u| u.total_tokens), Some(5));
+    }
+
+    /// D4b: a server that rejects the streaming request gets exactly one
+    /// non-streaming fallback.
+    #[tokio::test]
+    async fn a_server_rejecting_stream_falls_back_to_complete_once() {
+        let server = MockServer::start().await;
+        // The rejecting shape first (priority: lower numbers match first).
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_string_contains("\"stream\":true"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": "unknown field stream_options"}
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "answered whole" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (deltas, response) = stream_with(&model).await;
+        let response = response.expect("the fallback delivers");
+        assert!(deltas.is_empty());
+        assert_eq!(response.content, "answered whole");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 2, "exactly one fallback request");
+        let first: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("first body");
+        let second: serde_json::Value =
+            serde_json::from_slice(&requests[1].body).expect("second body");
+        assert_eq!(first["stream"], true, "the rejected request streamed");
+        assert!(
+            second.get("stream").is_none(),
+            "the fallback must not retry the stream: {second}"
+        );
+        assert!(second.get("stream_options").is_none());
+    }
+
+    /// D5: an error payload mid-stream is a typed error; the partial text is
+    /// discarded from the record (there is no response at all).
+    #[tokio::test]
+    async fn an_error_payload_mid_stream_is_a_typed_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(sse_server(concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+                "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}\n\n",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (_deltas, response) = stream_with(&model).await;
+        let err = response.expect_err("a mid-stream error must fail the call");
+        let ForgeError::Provider(message) = err else {
+            panic!("expected a provider error");
+        };
+        assert!(message.contains("overloaded"), "{message}");
+    }
+
+    /// D5: EOF with no terminal marker at all is truncation, never a silent
+    /// partial answer.
+    #[tokio::test]
+    async fn a_truncated_stream_without_a_terminal_marker_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(sse_server(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (_deltas, response) = stream_with(&model).await;
+        let err = response.expect_err("truncation must fail");
+        let ForgeError::Provider(message) = err else {
+            panic!("expected a provider error");
+        };
+        assert!(message.contains("ended early"), "{message}");
+        assert!(
+            message.contains("10 answer bytes"),
+            "names how much had arrived: {message}"
+        );
+    }
+
+    /// D5 tolerance: real servers omit the `[DONE]` sentinel; EOF after a
+    /// finish_reason is accepted.
+    #[tokio::test]
+    async fn a_stream_ending_after_finish_reason_without_done_is_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(sse_server(concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (deltas, response) = stream_with(&model).await;
+        let response = response.expect("finish_reason seen; [DONE] is optional");
+        assert_eq!(deltas.concat(), response.content);
+        assert_eq!(response.content, "The answer");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// The oMLX/llama.cpp/DeepSeek class of deviations, all in one
+    /// transcript: keepalive comment lines, CRLF endings, a `timings` chunk
+    /// (llama.cpp), `delta.reasoning_content` (DeepSeek — ignored), and a
+    /// `content: null` delta.
+    #[tokio::test]
+    async fn openai_compat_tolerances() {
+        const TOLERANCES: &str = concat!(
+            ": keepalive\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\",\"content\":\"real\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" text\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"timings\":{\"prompt_per_second\":42}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(sse_server(TOLERANCES))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (deltas, response) = stream_with(&model).await;
+        let response = response.expect("streams");
+        assert_eq!(
+            deltas,
+            vec!["real", " text"],
+            "only real content streams — reasoning and nulls are skipped"
+        );
+        assert_eq!(response.content, "real text");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// The `EgressPolicy` redirect re-check holds on the streaming client
+    /// exactly like the buffered one: an off-device hop is refused and never
+    /// contacted.
+    #[tokio::test]
+    async fn streaming_requests_honor_the_local_only_redirect_recheck() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            // The whole point: this server must never be reached.
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let elsewhere_url = format!(
+            "http://api.localhost:{}/chat/completions",
+            elsewhere.address().port()
+        );
+
+        let approved = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", elsewhere_url.as_str()),
+            )
+            .mount(&approved)
+            .await;
+
+        let model = OpenAiCompatibleModel::new(
+            approved.uri(),
+            "local-model",
+            None,
+            ModelCapabilities {
+                streaming: true,
+                ..ModelCapabilities::default()
+            },
+            Duration::from_secs(5),
+            EgressPolicy::LocalOnly,
+        )
+        .expect("construct");
+        let mut deltas: Vec<String> = Vec::new();
+        let err = model
+            .stream_complete(
+                CompletionRequest::new("local-model", vec![Message::user("SECRET SOURCE CODE")]),
+                &mut |d: &str| deltas.push(d.to_string()),
+            )
+            .await
+            .expect_err("the redirect must not be followed off the approved endpoint");
+        let message = err.to_string();
+        assert!(
+            message.contains("local_only refused to follow a redirect"),
+            "the failure must name the refusal: {message}"
+        );
+        assert!(message.contains("api.localhost"), "{message}");
+        assert!(deltas.is_empty());
+        assert!(
+            elsewhere
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty(),
+            "the stream reached the other authority"
+        );
     }
 }

@@ -271,6 +271,27 @@ async fn an_empty_prompt_is_rejected_before_a_run_starts() {
     assert_eq!(outcome.value["code"], "invalid_params");
 }
 
+#[test]
+fn opt_str_array_parses_string_arrays_and_rejects_other_shapes() {
+    let empty = Vec::<String>::new();
+    assert_eq!(opt_str_array(&json!({}), "skills").expect("absent"), empty);
+    assert_eq!(
+        opt_str_array(&json!({ "skills": null }), "skills").expect("null"),
+        empty
+    );
+    assert_eq!(
+        opt_str_array(&json!({ "skills": ["a", "b"] }), "skills").expect("strings"),
+        vec!["a".to_string(), "b".to_string()]
+    );
+
+    let outcome = opt_str_array(&json!({ "skills": "a" }), "skills").expect_err("not an array");
+    assert!(outcome.is_error);
+    assert_eq!(outcome.value["code"], "invalid_params");
+    let outcome = opt_str_array(&json!({ "skills": [1] }), "skills").expect_err("not strings");
+    assert!(outcome.is_error);
+    assert_eq!(outcome.value["code"], "invalid_params");
+}
+
 // --- graph tools --------------------------------------------------------
 
 #[tokio::test]
@@ -471,6 +492,69 @@ async fn run_completes_and_reports_text_and_router() {
     assert_eq!(outcome.value["router"], "mock");
 }
 
+/// `skills` names a skill the prompt never matches: the fixture's
+/// "reviewing" skill shares no token with "zz unrelated qq", so the
+/// activation can only have come through the explicit path.
+#[tokio::test]
+async fn run_with_explicit_skills_activates_them() {
+    let (_tmp, tools) = fixture();
+    let outcome = tools
+        .call(
+            "forge_run",
+            &json!({ "prompt": "zz unrelated qq", "skills": ["reviewing"] }),
+        )
+        .await
+        .expect("run");
+    assert!(!outcome.is_error, "{:?}", outcome.value);
+    assert_eq!(outcome.value["status"], "completed");
+
+    let run_id = outcome.value["run_id"].as_str().expect("run id");
+    let status = tools
+        .call("forge_run_status", &json!({ "run_id": run_id }))
+        .await
+        .expect("status");
+    let events = status.value["last_events"].as_array().expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "skill_activated" && e["name"] == "reviewing"),
+        "expected a skill_activated event for reviewing: {events:?}"
+    );
+}
+
+/// An unknown skill name is the caller's bad argument: a tool error
+/// classified `invalid_params`, and no run is started.
+#[tokio::test]
+async fn run_with_an_unknown_skill_is_invalid_params_and_starts_nothing() {
+    let (tmp, tools) = fixture();
+    let outcome = tools
+        .call(
+            "forge_run",
+            &json!({ "prompt": "zz unrelated qq", "skills": ["nosuch"] }),
+        )
+        .await
+        .expect("run");
+    assert!(outcome.is_error, "{:?}", outcome.value);
+    assert_eq!(outcome.value["code"], "invalid_params");
+    let message = outcome.value["error"].as_str().unwrap_or_default();
+    assert!(message.contains("unknown skill: nosuch"), "{message}");
+
+    // The refusal happened at the entry point: no transcript was written.
+    let sessions = tmp.path().join(".forge").join("sessions");
+    let transcripts = std::fs::read_dir(&sessions)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(transcripts, 0, "a refused run leaves no transcript");
+}
+
 #[tokio::test]
 async fn run_status_reports_a_completed_run_with_its_events() {
     let (_tmp, tools) = fixture();
@@ -656,9 +740,10 @@ fn approval_fixture() -> (tempfile::TempDir, ForgeTools) {
     let service = Arc::new(AgentService::new(
         Arc::new(forge_providers::ScriptedMockModel::new(script)),
         Arc::new(MockRouter::selecting("scripted-mock")),
-        Arc::new(forge_execution::NativeExecution::new(
+        Arc::new(forge_execution::NativeExecution::with_channel(
             forge_core::ApprovalPolicy::Prompt,
             tmp.path(),
+            forge_execution::ApprovalChannel::Parked,
         )),
         Arc::new(FsSkillRegistry::with_roots(vec![], None)),
         Arc::new(JsonlSessionStore::new(

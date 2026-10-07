@@ -372,6 +372,10 @@ mod tests {
         NativeExecution::new(policy, std::env::temp_dir())
     }
 
+    fn parked_exec(policy: ApprovalPolicy) -> NativeExecution {
+        NativeExecution::with_channel(policy, std::env::temp_dir(), ApprovalChannel::Parked)
+    }
+
     #[tokio::test]
     async fn native_runs_safe_command_and_captures_output() {
         let exec = exec(ApprovalPolicy::Prompt);
@@ -439,9 +443,9 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_without_terminal_requires_approval() {
-        // Tests never run with a terminal stdin, so Prompt must pause.
-        assert!(!std::io::stdin().is_terminal());
-        let exec = exec(ApprovalPolicy::Prompt);
+        // Make the no-inline-reader contract explicit: test runners may
+        // themselves allocate a PTY.
+        let exec = parked_exec(ApprovalPolicy::Prompt);
         let err = exec
             .execute(ExecRequest {
                 risk: RiskLevel::Risky,
@@ -454,8 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_dangerous_allows_risky_but_pauses_destructive() {
-        assert!(!std::io::stdin().is_terminal());
-        let exec = exec(ApprovalPolicy::PromptDestructive);
+        let exec = parked_exec(ApprovalPolicy::PromptDestructive);
         // Risky runs without asking.
         let result = exec
             .execute(ExecRequest {
@@ -716,10 +719,13 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_dangerous_allows_risky_write_but_pauses_destructive_delete() {
-        assert!(!std::io::stdin().is_terminal());
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("doomed.txt"), "x\n").expect("write");
-        let exec = NativeExecution::new(ApprovalPolicy::PromptDestructive, tmp.path());
+        let exec = NativeExecution::with_channel(
+            ApprovalPolicy::PromptDestructive,
+            tmp.path(),
+            ApprovalChannel::Parked,
+        );
 
         // Risky write proceeds.
         exec.file_op(FileOp::Write {

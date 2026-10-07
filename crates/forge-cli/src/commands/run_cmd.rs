@@ -13,10 +13,15 @@ use crate::commands::service::build_run_service;
 /// the run's input channel so approvals can be answered non-interactively
 /// (`echo y | forge run ...`). At stdin EOF the channel is closed and a
 /// pending approval fails the run cleanly instead of hanging.
+///
+/// `--skill <NAME>` asks for a skill explicitly; an unknown name is the
+/// runtime's `ForgeError::Skill` on stderr with a non-zero exit — the
+/// CLI's ordinary error path, nothing printed here.
 pub async fn run(
     ctx: &Context,
     prompt: Vec<String>,
     max_turns: Option<u32>,
+    skills: Vec<String>,
 ) -> Result<(), ForgeError> {
     let prompt = prompt.join(" ");
     let service = Arc::new(build_run_service(ctx).await?);
@@ -30,6 +35,7 @@ pub async fn run(
             RunOptions {
                 run_id: Some(run_id),
                 max_turns,
+                activate_skills: skills,
                 ..RunOptions::default()
             },
         )

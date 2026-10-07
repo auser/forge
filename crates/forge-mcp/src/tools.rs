@@ -170,6 +170,11 @@ fn run_schema() -> Value {
                 "maximum": MAX_RUN_TIMEOUT_MS,
                 "default": DEFAULT_RUN_TIMEOUT_MS,
                 "description": "How long to wait synchronously. Returns sooner if the run needs an approval decision. If the budget runs out the run keeps going — poll forge_run_status with the returned run_id."
+            },
+            "skills": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Skill names to activate explicitly (as forge_skill_list reports them), in addition to any the task matches automatically."
             }
         },
         "required": ["prompt"],
@@ -548,6 +553,12 @@ impl ForgeTools {
                 .clamp(1, MAX_RUN_TIMEOUT_MS),
             Err(outcome) => return outcome,
         };
+        // Argument errors are all settled before the first side effect
+        // (the subscribe below), so a refused call leaves nothing behind.
+        let skills = match opt_str_array(args, "skills") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
 
         // Generate the run id here so we can subscribe to its event stream
         // *before* the run task exists. `subscribe` creates the broadcast
@@ -561,16 +572,21 @@ impl ForgeTools {
         // the one-live-run-per-session guard cannot fire here. Reported
         // rather than unwrapped: this tool must never panic the server, and
         // if the schema ever grows a `session_id` the refusal is already
-        // handled.
+        // handled. An unknown skill name is the caller's bad argument, so
+        // it is classified honestly as `invalid_params`, not `session_busy`.
         let started = match self.service.start_run_with_options(
             prompt,
             RunOptions {
                 run_id: Some(run_id),
                 max_turns,
+                activate_skills: skills,
                 ..RunOptions::default()
             },
         ) {
             Ok(started) => started,
+            Err(e @ ForgeError::Skill(_)) => {
+                return ToolOutcome::invalid_params(e.to_string());
+            }
             Err(e) => return ToolOutcome::error("session_busy", e.to_string()),
         };
         let (run_id, session_id, handle) = (started.run_id, started.session_id, started.handle);
@@ -868,6 +884,26 @@ fn opt_bool(args: &Value, key: &str) -> Result<Option<bool>, ToolOutcome> {
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(other) => Err(ToolOutcome::invalid_params(format!(
             "argument {key:?} must be a boolean (got {})",
+            type_name(other)
+        ))),
+    }
+}
+
+fn opt_str_array(args: &Value, key: &str) -> Result<Vec<String>, ToolOutcome> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    ToolOutcome::invalid_params(format!(
+                        "argument {key:?} must be an array of strings"
+                    ))
+                })
+            })
+            .collect(),
+        Some(other) => Err(ToolOutcome::invalid_params(format!(
+            "argument {key:?} must be an array of strings (got {})",
             type_name(other)
         ))),
     }

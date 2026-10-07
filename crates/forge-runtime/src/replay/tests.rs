@@ -733,6 +733,41 @@ fn an_empty_log_replays_as_nothing() {
     assert!(!replay.degraded);
 }
 
+#[test]
+fn deltas_are_never_replayed() {
+    // A streamed run's log interleaves deltas with the replay record; the
+    // reconstructed conversation must be identical to the delta-free log.
+    let with_deltas = vec![
+        run_started("r1", 1, "hi"),
+        event(
+            "r1",
+            2,
+            EventKind::AssistantDelta {
+                text: "the ".into(),
+            },
+        ),
+        event(
+            "r1",
+            3,
+            EventKind::AssistantDelta {
+                text: "answer".into(),
+            },
+        ),
+        assistant("r1", 4, "the answer", Vec::new()),
+        completed("r1", 5, "the answer"),
+    ];
+    let without: Vec<Event> = with_deltas
+        .iter()
+        .filter(|e| !matches!(e.kind, EventKind::AssistantDelta { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        conversation_from_events(&with_deltas),
+        conversation_from_events(&without),
+        "deltas are rendering-only; replay reads the final assistant_message"
+    );
+}
+
 // --- budget -------------------------------------------------------------
 
 #[test]

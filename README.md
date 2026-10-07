@@ -1,6 +1,8 @@
 # forge
 
-An AI agent harness for your projects, built around two planes:
+A one-command, local-first AI coding harness that combines Needle 3,
+a semantic project graph, optional Jev escalation, and your choice of local
+or hosted generation models. It is built around two planes:
 
 - a **decision plane** — a small on-device model (needle) that answers
   "which tool, which model, if any" in milliseconds, locally, before any
@@ -28,19 +30,35 @@ binaries and an install script are in
 
 ## Quickstart
 
+One-command quickstart (recommended):
+
 ```bash
 cd your-project
-forge init                          # starter config, project graph, brain weights
-forge run "Explain this project"    # the agent loop
-forge chat                          # the same loop, interactive
+forge                                # auto-bootstraps this project and opens the chat
 ```
 
-Then point forge at a model you have — `forge model list` shows what your
-keys unlock (it reads `.env`, your shell, and the usual credential
-files). Set it in `.forge/config.toml`:
+On the first run Forge creates its local state, builds the project graph,
+prepares Needle 3 when the embedded engine is available, and prints the
+generation model it selected. Selection is deterministic: a reachable local
+model wins, followed by an authenticated CLI subscription, then an API-key
+hosted provider. Models without working endpoints or credentials are never
+offered to the router.
+
+Or the explicit steps:
+
+```bash
+cd your-project
+forge init                            # starter config, project graph, brain weights
+forge run "Explain this project"      # the agent loop (non-interactive)
+forge chat                            # the same loop, interactive
+```
+
+When Forge auto-bootstraps it chooses a reachable local model or a
+credentialed hosted model for you; use `forge model list` to inspect
+what it detected and `forge model add` / `.forge/config.toml` to pin one.
 
 ```toml
-model = "qwen3-coder"   # or any name from `forge model list`
+model = "..."   # or any name from `forge model list`
 ```
 
 Anything looks wrong: **`forge doctor`** — it probes the model, the
@@ -97,12 +115,13 @@ everything. The three keys you'll actually touch:
 ```toml
 model = "..."            # from `forge model list`
 router = "needle"        # default; also static, cheapest, jev, laya
-approval = "prompt"      # or "auto" (never asks), "deny" (never runs risky)
+approval = "prompt-dangerous" # ordinary edits run; destructive operations ask
 ```
 
 Presets live in [`examples/configs/`](examples/configs/) — or let init
-write one: `forge init --preset claude` (also `codex`, `kimi`,
-`local-first`, `hybrid-needle`, `budget-hosted`, `hybrid-laya`).
+write one: `forge init --preset claude` (also `codex`, `kimi`, `kev`,
+`decider`, `jev`, `local-first`, `hybrid-needle`, `budget-hosted`,
+`hybrid-laya`).
 
 ## Where to read more
 

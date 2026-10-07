@@ -5,6 +5,11 @@
 **Scope:** sub-project F. Required by the REPL (B) and editor integration (E);
 independent of the Session core's decision plane.
 
+**Provider support (the table below) landed in TICKET-2 (2026-10-02), on
+TICKET-1's callback contract rather than this doc's `BoxStream` sketch; tool
+calls surface whole, as §'Tool calls are not streamed' specifies. Reasoning
+channels remain open (see Open Questions).**
+
 ## The problem
 
 `ModelProvider` has exactly one method for generation:

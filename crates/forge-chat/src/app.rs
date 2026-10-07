@@ -46,7 +46,7 @@ use forge_runtime::{Attachment, RunOptions, RunOutcome};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::controller::{Action, Controller, Signal};
+use crate::controller::{Action, Controller, Signal, TurnRequest};
 use crate::host::{ChatHost, HostChange, NeedleState};
 use crate::io::{ChatIo, CompletionSnapshot, Interactivity, Line, Prompt, ReadOutcome};
 use crate::render::TranscriptState;
@@ -329,6 +329,10 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// models, and — the two calls that matter here — `list_runs()` and
     /// `sessions().list_sessions()`, both synchronous filesystem reads, the
     /// former re-reading and re-parsing every session's whole JSONL log.
+    /// The project file list for `@`-completion arrives the same way the
+    /// models and skills do — through the host (`ChatHost::project_files`),
+    /// which is required to keep that read bounded (`CliHost` mtime-gates
+    /// the graph file, so a steady-state refresh costs one `stat`).
     /// Called once at startup and once after each *submitted line*
     /// (`on_read`'s `Line` arm), not on every loop iteration: completions
     /// are only ever read back out when a `Prompt` is built for the next
@@ -356,11 +360,13 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             .list_sessions()
             .map(|infos| infos.into_iter().map(|s| s.session_id).collect())
             .unwrap_or_default();
+        let paths = self.host.project_files();
         self.snapshot = CompletionSnapshot {
             skills,
             models,
             jobs,
             sessions,
+            paths,
         };
         self.controller.set_completions(self.snapshot.clone());
     }
@@ -449,7 +455,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             None => Vec::new(),
         };
         for line in lines {
-            self.emit(line);
+            self.emit_transcript(line);
         }
     }
 
@@ -514,18 +520,19 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             Ok(Ok(outcome)) => {
                 // §4.3: print the outcome's text only if nothing textual
                 // was rendered live — the fast path's shape, and the rule
-                // that keeps an ordinary turn's answer from printing twice.
-                let rendered = self
-                    .transcript
-                    .as_ref()
-                    .map(TranscriptState::rendered_assistant_text)
-                    .unwrap_or(false);
-                if !rendered && !outcome.text.trim().is_empty() {
-                    self.emit(Line::plain(String::new()));
-                    for line in outcome.text.lines() {
-                        self.emit(Line::plain(line));
-                    }
-                    self.emit(Line::plain(String::new()));
+                // that keeps an ordinary turn's answer from printing
+                // twice. `outcome_lines` is the stream-aware form: a
+                // lagged final message is completed with its unshown tail,
+                // not repeated.
+                let lines = match self.transcript.as_mut() {
+                    Some(transcript) => transcript.outcome_lines(&outcome.text),
+                    // Not reached in practice (start_turn always installs
+                    // the transcript); keep today's shape for it.
+                    None if outcome.text.trim().is_empty() => Vec::new(),
+                    None => crate::render::assistant_block(&outcome.text),
+                };
+                for line in lines {
+                    self.emit(line);
                 }
             }
             // A `ForgeError` here already has its own event (`Error` or
@@ -556,6 +563,14 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// whatever text the run had, this driver already rendered live, event
     /// by event, while attached.
     async fn settle_attached_run(&mut self) {
+        // Close a streamed block the followed run left open (its message
+        // never arrived) before the footer, so the footer does not land on
+        // the half-written line.
+        if let Some(transcript) = self.transcript.as_mut() {
+            for line in transcript.close_stream() {
+                self.emit(line);
+            }
+        }
         if let Some(transcript) = self.transcript.take() {
             self.emit(transcript.footer());
         }
@@ -567,10 +582,38 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         }
     }
 
-    /// A transcript line: `notify` while a turn is attached (it may land
-    /// while a prompt is up), `write` between turns. Both take the same
-    /// [`Line`], so the transcript is identical either way (§6.2).
+    /// A line that did *not* come from the transcript renderer: a command
+    /// answer, an error, the banner, a footer. It may arrive while a
+    /// streamed answer's block is open (a `/show` answer typed mid-turn),
+    /// so the block is closed first — the line must never land on the
+    /// half-written one. Fragments are exempt: a fragment *is* the open
+    /// block, and guarding it would close the stream it extends.
+    /// (`close_stream` is empty when nothing is open, so the common case
+    /// costs nothing.)
     fn emit(&mut self, line: Line) {
+        if !line.fragment
+            && let Some(transcript) = self.transcript.as_mut()
+        {
+            let closing = transcript.close_stream();
+            for close in closing {
+                self.emit_inner(close);
+            }
+        }
+        self.emit_inner(line);
+    }
+
+    /// A line the transcript renderer produced (`on_event`, or a backlog
+    /// re-rendered through it). These manage the streamed block themselves
+    /// — the renderer opens, extends and closes it — so they bypass
+    /// [`emit`]'s foreign-line guard, which cannot tell the block's own
+    /// opening blank line from a foreign one.
+    fn emit_transcript(&mut self, line: Line) {
+        self.emit_inner(line);
+    }
+
+    /// The notify-while-attached / write-between-turns choice (§6.2), with
+    /// no further decisions.
+    fn emit_inner(&mut self, line: Line) {
         if self.events.is_some() {
             self.io.notify(&line);
         } else {
@@ -583,7 +626,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     async fn execute(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::Prompt(text) => self.start_turn(text).await,
+                Action::Prompt(turn) => self.start_turn(turn).await,
                 Action::Approve(approved) => {
                     if let Some(run_id) = self.run_id.clone() {
                         let message = if approved { "y" } else { "n" };
@@ -619,6 +662,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Action::Fork(at) => self.do_fork(at),
                 Action::ListJobs => self.do_list_jobs(),
                 Action::Attach(run_id) => self.do_attach(run_id),
+                Action::Show(n) => self.do_show(n),
                 Action::CancelAllJobs => self.do_cancel_all_jobs(),
                 Action::Quit(code) => self.exit_code = Some(code),
             }
@@ -638,7 +682,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// cancel a run it does not know exists yet — silently, since a fallible
     /// cancel here is intentionally best-effort — and the turn would run to
     /// completion uncancelled.
-    async fn start_turn(&mut self, prompt: String) {
+    async fn start_turn(&mut self, turn: TurnRequest) {
         // A loop, not a recursive call, because a turn that fails to start
         // must still hand on to whatever was queued behind it — and a
         // `async fn` cannot call itself without boxing. Every other
@@ -647,15 +691,16 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         // used to drop it, leaving `/quit`-less batch input waiting on a
         // turn that would never start. That was a spin before the EOF fix
         // and is a silent hang after it, so it is fixed here.
-        let mut pending = Some(prompt);
-        while let Some(prompt) = pending.take() {
+        let mut pending = Some(turn);
+        while let Some(turn) = pending.take() {
             let run_id = forge_session::new_run_id();
             let events = self.host.service().subscribe(&run_id);
             let started = self.host.service().start_run_with_options(
-                prompt,
+                turn.prompt,
                 RunOptions {
                     run_id: Some(run_id.clone()),
                     session_id: Some(self.session_id.clone()),
+                    activate_skills: turn.activate_skills,
                     ..RunOptions::default()
                 },
             );
@@ -854,7 +899,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 let mut transcript = TranscriptState::new();
                 for event in &attachment.backlog {
                     for line in transcript.on_event(event) {
-                        self.emit(line);
+                        self.emit_transcript(line);
                     }
                 }
                 if attachment.is_live() {
@@ -914,6 +959,35 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         }
         for skill in self.host.skills() {
             self.emit(Line::meta(format!("/{} {}", skill.name, skill.description)));
+        }
+    }
+
+    /// `/show [n]` (design §14): re-render the nth most recent recorded
+    /// tool result of the current session from its log — the one place the
+    /// payloads live, since `TranscriptState` retains none (§5). The same
+    /// synchronous store read `/session` and resume already make; mid-turn
+    /// the lines go through `notify` like every other print (`emit`).
+    fn do_show(&mut self, n: Option<usize>) {
+        let ordinal = n.unwrap_or(1);
+        match self.host.service().sessions().events_for(&self.session_id) {
+            Ok(events) => match crate::show::select(&events, ordinal) {
+                Some(selected) => {
+                    for line in crate::show::lines(&selected) {
+                        self.emit(line);
+                    }
+                }
+                None => {
+                    let total = crate::show::count(&events);
+                    self.emit(Line::meta(if total == 0 {
+                        "no tool results in this session yet".to_string()
+                    } else {
+                        format!(
+                            "no tool result {ordinal} in this session - {total} recorded (1 is the most recent)"
+                        )
+                    }));
+                }
+            },
+            Err(e) => self.emit(Line::bad(format!("error: {e}"))),
         }
     }
 
@@ -1016,11 +1090,11 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             )));
             let tail = lines.split_off(lines.len() - BOUND);
             for line in tail {
-                self.emit(line);
+                self.emit_transcript(line);
             }
         } else {
             for line in lines {
-                self.emit(line);
+                self.emit_transcript(line);
             }
         }
     }
@@ -1103,6 +1177,25 @@ async fn join_handle(
 mod tests {
     use super::*;
     use crate::testing::{FakeHost, ScriptedIo};
+    use forge_core::SessionStore;
+
+    /// The host's file list reaches the editor's prompt: after one
+    /// submitted line (which refreshes the snapshot), the next read is
+    /// handed completions that carry the paths.
+    #[tokio::test]
+    async fn the_hosts_project_files_reach_the_prompt_snapshot() {
+        let (host, _tmp) = FakeHost::with_script(r#"[{"text": "ok"}]"#);
+        let host = host.with_paths(vec!["src/main.rs".to_string()]);
+        let mut io = ScriptedIo::new(["anything", "/quit"]);
+        run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(
+            io.last_completions().paths,
+            vec!["src/main.rs".to_string()],
+            "the prompt the editor saw carries the host's paths"
+        );
+    }
 
     /// One turn: the transcript shows the routing line, the tool call, and
     /// the answer exactly once.
@@ -1135,6 +1228,148 @@ mod tests {
             out.contains("  = 2 turns"),
             "the footer reports the turns:\n{out}"
         );
+    }
+
+    /// The ticket's headline: the answer is on screen *while the turn is still
+    /// running*, and the whole answer still prints exactly once.
+    #[tokio::test]
+    async fn a_streamed_answer_arrives_during_the_turn_and_prints_once() {
+        let (host, _tmp) = FakeHost::with_trickled_script(
+            r#"[{"text": "the answer arrives word by word"}]"#,
+            Duration::from_millis(50),
+        );
+        let mut io = ScriptedIo::batch(["what is the answer"]);
+        let chat = tokio::spawn(run(io.handle(), host, Start::fresh()));
+
+        // Half-way through the trickle the partial answer is visible and the
+        // turn has not closed: no footer yet.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !io.output().contains("the answer arrives") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no partial answer ever appeared:\n{}",
+                io.output()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !io.output().contains("  = "),
+            "the turn is still streaming, so there is no footer yet:\n{}",
+            io.output()
+        );
+
+        let code = tokio::time::timeout(Duration::from_secs(10), chat)
+            .await
+            .expect("the chat exits at EOF")
+            .expect("the chat task did not panic")
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        assert_eq!(
+            out.matches("the answer arrives word by word").count(),
+            1,
+            "assembled in place, printed once:\n{out}"
+        );
+        assert!(out.contains("  = "), "a footer closes the turn:\n{out}");
+    }
+
+    /// A `/show` answer typed mid-stream must not land on the half-written
+    /// line: `emit` closes the open block before any line that did not come
+    /// from the transcript.
+    #[tokio::test]
+    async fn a_command_answered_mid_stream_closes_the_block_first() {
+        let (host, _tmp) = FakeHost::with_trickled_script(
+            r#"[{"text": "the answer arrives word by word"}]"#,
+            Duration::from_millis(60),
+        );
+        let mut io = ScriptedIo::new(["what is the answer"]);
+        let chat = tokio::spawn(run(io.handle(), host, Start::fresh()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !io.output().contains("the answer") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stream never started:\n{}",
+                io.output()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        io.push_line("/show");
+        // `/quit` is typed only once the turn has actually finished (its
+        // footer is on screen): typed mid-turn it would only arm the
+        // "still running - ask again" confirmation and the chat would wait
+        // for a second request forever.
+        while !io.output().contains("  = ") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trickle turn never finished:\n{}",
+                io.output()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        io.push_line("/quit");
+        let code = tokio::time::timeout(Duration::from_secs(10), chat)
+            .await
+            .expect("exits")
+            .expect("no panic")
+            .expect("runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        let show_at = out
+            .find("  - no tool results in this session yet")
+            .expect("the /show answer");
+        // The /show line starts at a line boundary — never mid-answer.
+        assert!(
+            out[..show_at].ends_with('\n'),
+            "the block was closed first:\n{out}"
+        );
+        assert_eq!(
+            out.matches("the answer arrives word by word").count(),
+            1,
+            "{out}"
+        );
+    }
+
+    /// `/name` activates exactly that skill through the explicit path: the
+    /// name `xy` is two characters, so no prompt could ever match it
+    /// lexically — the transcript line, the `skill_activated` event and the
+    /// instructions in the model's request all come from the name
+    /// travelling as data end to end.
+    #[tokio::test]
+    async fn a_slash_skill_activates_explicitly_not_by_matching() {
+        let (host, _tmp) = FakeHost::with_skill_and_script(r#"[{"text": "did the thing"}]"#);
+        let service = host.service();
+        let model = host.scripted_model().expect("scripted model");
+        let mut io = ScriptedIo::new(["/xy do the thing", "/quit"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        assert!(
+            out.contains("  - skill: xy"),
+            "the transcript shows the activation:\n{out}"
+        );
+
+        let events = service.sessions().events().expect("events");
+        let activations: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::SkillActivated { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(activations, ["xy"], "{events:?}");
+
+        let recorded = model.recorded();
+        assert_eq!(recorded.len(), 1, "one model call");
+        let systems: Vec<&str> = recorded[0]
+            .messages
+            .iter()
+            .filter(|m| m.role == forge_core::Role::System)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(systems.len(), 1, "{systems:?}");
+        assert!(systems[0].contains("xy INSTRUCTIONS"), "{}", systems[0]);
     }
 
     /// The fast path has no assistant text, so the outcome is the answer —
@@ -1427,6 +1662,135 @@ mod tests {
             out.contains("the first answer"),
             "history is re-rendered:\n{out}"
         );
+    }
+
+    /// `/show` (design §14): the recorded payload, on demand, through the
+    /// §4.1 grammar — which the live stream deliberately stays silent for.
+    #[tokio::test]
+    async fn show_rerenders_the_most_recent_tool_result_after_a_turn() {
+        let (host, _tmp) = FakeHost::with_script_and_read_content(
+            r#"[
+            {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "alpha.rs"}}]},
+            {"text": "alpha.rs defines parse_config"}
+        ]"#,
+            "fn parse_config() {}",
+        );
+        let mut io = ScriptedIo::new(["explain alpha.rs", "/show", "/quit"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        assert!(
+            out.contains("  - tool result 1 of 1: read_file alpha.rs (run "),
+            "the meta header names the result and its run:\n{out}"
+        );
+        assert!(
+            out.contains("    -> fn parse_config() {}"),
+            "the recorded payload, verbatim, under the result gutter:\n{out}"
+        );
+    }
+
+    /// The ticket's "works on continued sessions (backlog), not just live
+    /// runs": the source is the session log, so a chat resumed onto the
+    /// session shows the payload without any turn having run in it.
+    #[tokio::test]
+    async fn show_works_on_a_continued_session() {
+        let (host, _tmp) = FakeHost::with_script_and_read_content(
+            r#"[
+            {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "alpha.rs"}}]},
+            {"text": "read it"}
+        ]"#,
+            "fn parse_config() {}",
+        );
+        let service = host.service();
+        let mut first = ScriptedIo::new(["read alpha", "/quit"]);
+        run(first.handle(), host.clone(), Start::fresh())
+            .await
+            .expect("first chat");
+        let session = service.sessions().list_sessions().expect("sessions")[0]
+            .session_id
+            .clone();
+
+        let mut second = ScriptedIo::new(["/show", "/quit"]);
+        run(second.handle(), host, Start::named(&session))
+            .await
+            .expect("second chat");
+        let out = second.output();
+        assert!(
+            out.contains("  - tool result 1 of 1: read_file alpha.rs (run "),
+            "backlog header:\n{out}"
+        );
+        assert!(
+            out.contains("    -> fn parse_config() {}"),
+            "backlog payload:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_reports_when_there_is_nothing_to_show() {
+        let (host, _tmp) = FakeHost::with_script(r#"[{"text": "ok"}]"#);
+        let mut io = ScriptedIo::new(["/show", "/quit"]);
+        run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert!(
+            io.output()
+                .contains("  - no tool results in this session yet"),
+            "{}",
+            io.output()
+        );
+    }
+
+    /// An out-of-range (or zero) ordinal is one informational line naming
+    /// the count and the numbering — never an error, never a turn.
+    #[tokio::test]
+    async fn show_reports_an_out_of_range_ordinal() {
+        let (host, _tmp) = FakeHost::with_script_and_read_content(
+            r#"[
+            {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "alpha.rs"}}]},
+            {"text": "read it"}
+        ]"#,
+            "fn parse_config() {}",
+        );
+        let mut io = ScriptedIo::new(["read alpha", "/show 9", "/show 0", "/quit"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        for n in ["9", "0"] {
+            assert!(
+                out.contains(&format!(
+                    "  - no tool result {n} in this session - 1 recorded (1 is the most recent)"
+                )),
+                "/show {n} gets the informational line:\n{out}"
+            );
+        }
+    }
+
+    /// Read-only means mid-turn too: the show line prints while the turn is
+    /// attached, and the turn still runs to its answer and footer.
+    #[tokio::test]
+    async fn show_mid_turn_does_not_disturb_the_turn() {
+        let (host, _tmp) = FakeHost::with_slow_script();
+        let mut io = ScriptedIo::batch(["something slow", "/show"]);
+        let code = run(io.handle(), host, Start::fresh())
+            .await
+            .expect("chat runs");
+        assert_eq!(code, 0);
+        let out = io.output();
+        // The slow script makes no tool calls, so the deterministic half of
+        // the mid-turn answer is the nothing-to-show line.
+        assert!(
+            out.contains("  - no tool results in this session yet"),
+            "the mid-turn /show answered:\n{out}"
+        );
+        assert!(
+            out.contains("slow turn done"),
+            "the turn still completed:\n{out}"
+        );
+        assert!(out.contains("  = "), "and printed its footer:\n{out}");
     }
 
     /// Review Focus 4: `/attach` follows a run that finishes on its own —
