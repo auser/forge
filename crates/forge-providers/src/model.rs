@@ -1306,7 +1306,7 @@ pub fn model_from_config(
                 };
                 return Ok(Arc::new(crate::codex::CodexModel::new(
                     Some(base_url),
-                    wire_name,
+                    name,
                     access_token,
                     account_id,
                     Duration::from_secs(120),
@@ -1332,15 +1332,18 @@ pub fn model_from_config(
                 // global `model_base_url` overrides this family like any
                 // other (e.g. pointing `claude-sonnet` at a local
                 // Anthropic-compatible proxy).
-                return Ok(Arc::new(crate::anthropic::AnthropicModel::new(
-                    Some(base_url),
-                    wire_name,
-                    credential,
-                    capabilities,
-                    entry.and_then(|e| e.max_output_tokens),
-                    Duration::from_secs(120),
-                    egress,
-                )?));
+                return Ok(Arc::new(
+                    crate::anthropic::AnthropicModel::new(
+                        Some(base_url),
+                        name,
+                        credential,
+                        capabilities,
+                        entry.and_then(|e| e.max_output_tokens),
+                        Duration::from_secs(120),
+                        egress,
+                    )?
+                    .with_wire_model(wire_name),
+                ));
             }
 
             let credential =
@@ -1355,7 +1358,7 @@ pub fn model_from_config(
             Ok(Arc::new(
                 OpenAiCompatibleModel::new(
                     base_url,
-                    wire_name,
+                    name,
                     credential,
                     capabilities,
                     Duration::from_secs(120),
