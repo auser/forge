@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 /// two definitions of it would be two places to get piped mode wrong.
 pub use crate::io::Interactivity;
 
-use crate::command::{APPROVAL_MODES, Command, Parsed};
+use crate::command::{APPROVAL_MODES, AUTH_PROVIDERS, Command, Parsed};
 use crate::host::HostChange;
 use crate::io::{CompletionSnapshot, Line};
 
@@ -38,8 +38,8 @@ const INTERRUPT_EXIT_CODE: i32 = 130;
 /// second press is a choice and not a discovery.
 const EXIT_HINT: &str = "(press Ctrl-C again, or Ctrl-D, or /quit, to exit)";
 
-/// §9.1, verbatim: `/model` and `/approval` rebuild the runtime, which would
-/// orphan a live run's input channel and cancellation token.
+/// `/model`, `/approval`, and `/auth` rebuild the runtime, which would orphan
+/// a live run's input channel and cancellation token.
 const REBUILD_REFUSAL: &str =
     "finish or cancel the running turn first (/jobs, /attach <id>, Ctrl-C)";
 
@@ -120,6 +120,8 @@ pub enum Action {
     Write(Line),
     Help,
     ListModels,
+    /// Authenticate a subscription, then rebuild onto the newly available model.
+    Authenticate(String),
     ShowApproval,
     /// `/config` (`None`) or `/config <key>` (`Some`).
     ShowConfig(Option<String>),
@@ -260,6 +262,19 @@ impl Controller {
             Parsed::Quit => self.request_exit(0),
             Parsed::Model(None) => vec![Action::ListModels],
             Parsed::Model(Some(name)) => self.rebuild(HostChange::Model(name)),
+            Parsed::Auth(None) => vec![Action::Write(Line::meta(format!(
+                "auth providers: {} - use /auth <provider>",
+                AUTH_PROVIDERS.join(", ")
+            )))],
+            Parsed::Auth(Some(provider)) => {
+                if !AUTH_PROVIDERS.contains(&provider.as_str()) {
+                    return vec![Action::Write(Line::bad(format!(
+                        "unknown auth provider {provider} - one of {}",
+                        AUTH_PROVIDERS.join(", ")
+                    )))];
+                }
+                self.authenticate(provider)
+            }
             Parsed::Approval(None) => vec![Action::ShowApproval],
             Parsed::Approval(Some(mode)) => {
                 if !APPROVAL_MODES.contains(&mode.as_str()) {
@@ -371,7 +386,7 @@ impl Controller {
         vec![Action::Background]
     }
 
-    /// `/model <name>` and `/approval <mode>`: refused while *any* run is
+    /// `/model <name>`, `/approval <mode>`, and `/auth <provider>`: refused while *any* run is
     /// live in this process, attached or not (§9.1). Rebuilding the runtime
     /// would orphan a detached run's input channel and cancellation token,
     /// and a `/bg` job you can no longer answer or cancel is worse than a
@@ -381,6 +396,13 @@ impl Controller {
             return vec![Action::Write(Line::bad(REBUILD_REFUSAL))];
         }
         vec![Action::Host(change)]
+    }
+
+    fn authenticate(&mut self, provider: String) -> Vec<Action> {
+        if self.live_work() > 0 {
+            return vec![Action::Write(Line::bad(REBUILD_REFUSAL))];
+        }
+        vec![Action::Authenticate(provider)]
     }
 
     /// `/fork`, `/session new` and `/session <id>`: every command that moves
@@ -746,12 +768,14 @@ mod tests {
     // --- refusals and quit with work in flight --------------------------
 
     #[test]
-    fn switching_the_model_is_refused_while_a_run_is_live() {
+    fn authenticating_is_refused_while_a_run_is_live() {
         let mut c = idle();
         c.on_line("something long");
-        let actions = c.on_line("/model deepseek-chat");
+        let actions = c.on_line("/auth codex");
         assert!(
-            !actions.iter().any(|a| matches!(a, Action::Host(_))),
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Host(_) | Action::Authenticate(_))),
             "{actions:?}"
         );
         let msg = actions
@@ -793,6 +817,11 @@ mod tests {
                 "prompt-dangerous".into()
             ))]
         );
+        assert_eq!(
+            c.on_line("/auth codex"),
+            vec![Action::Authenticate("codex".into())]
+        );
+        assert!(matches!(c.on_line("/auth").as_slice(), [Action::Write(_)]));
     }
 
     /// An unknown mode is not passed to the host to fail there: the four
@@ -805,6 +834,10 @@ mod tests {
             !actions.iter().any(|a| matches!(a, Action::Host(_))),
             "{actions:?}"
         );
+        assert!(matches!(
+            c.on_line("/auth other").as_slice(),
+            [Action::Write(_)]
+        ));
     }
 
     /// `/fork` is refused only while a turn is *attached* (§11): the live run

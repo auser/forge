@@ -34,7 +34,9 @@ use forge_execution::ApprovalChannel;
 use forge_needle::EngineEmbedder;
 use forge_runtime::AgentService;
 
+use crate::cli::AuthProvider;
 use crate::commands::Context;
+use crate::commands::auth_cmd;
 use crate::commands::service::{ServiceOptions, build_run_service_with, overrides_for};
 
 /// The runtime chat sessions actually use, plus everything `ChatHost`
@@ -126,6 +128,26 @@ impl ChatHost for CliHost {
         // `self.service`/`self.options` exactly as they were (the trait's
         // own contract), so the chat stays usable on the model it had
         // before a bad `/model`.
+        let service = build_run_service_with(&self.ctx, options.clone()).await?;
+        self.service = Arc::new(service);
+        self.options = options;
+        Ok(())
+    }
+
+    async fn authenticate(&mut self, provider: &str) -> Result<(), ForgeError> {
+        let (provider, model) = match provider {
+            "claude" => (AuthProvider::Claude, "claude-sonnet"),
+            "codex" => (AuthProvider::Codex, "gpt-5.6-sol"),
+            "kimi" => (AuthProvider::Kimi, "k3"),
+            other => {
+                return Err(ForgeError::config(format!(
+                    "unknown auth provider {other:?} (expected claude, codex, or kimi)"
+                )));
+            }
+        };
+        auth_cmd::login(&self.ctx, provider)?;
+        let mut options = self.options.clone();
+        options.model = Some(model.to_string());
         let service = build_run_service_with(&self.ctx, options.clone()).await?;
         self.service = Arc::new(service);
         self.options = options;

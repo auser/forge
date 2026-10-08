@@ -21,6 +21,9 @@ pub trait ChatHost: Send + Sync {
     /// Rebuild the runtime with one setting overridden. On error the old
     /// runtime is kept and the error is returned unchanged.
     async fn switch(&mut self, change: HostChange) -> Result<(), ForgeError>;
+    /// Run a provider-owned subscription login, then rebuild the runtime so
+    /// the new credential is usable without restarting chat.
+    async fn authenticate(&mut self, provider: &str) -> Result<(), ForgeError>;
     fn environment(&self) -> Environment;
     /// User-visible model candidates only: this is where mock entries are
     /// filtered out, in one place (§9.3).
