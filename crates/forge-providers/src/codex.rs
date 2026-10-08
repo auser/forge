@@ -160,6 +160,8 @@ impl CodexModel {
             return self.parse_response(body);
         }
         let mut completed = None;
+        let mut output_items = Vec::new();
+        let mut text_deltas = String::new();
         for line in text.lines() {
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
@@ -172,6 +174,16 @@ impl CodexModel {
                 .map_err(|e| ForgeError::provider(format!("invalid Codex SSE event: {e}")))?;
             match event["type"].as_str() {
                 Some("response.completed") => completed = event.get("response").cloned(),
+                Some("response.output_item.done") => {
+                    if let Some(item) = event.get("item") {
+                        output_items.push(item.clone());
+                    }
+                }
+                Some("response.output_text.delta") => {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                        text_deltas.push_str(delta);
+                    }
+                }
                 Some("response.failed") => {
                     return Err(ForgeError::provider(format!(
                         "Codex response failed: {}",
@@ -181,9 +193,22 @@ impl CodexModel {
                 _ => {}
             }
         }
-        self.parse_response(completed.ok_or_else(|| {
+        let mut response = completed.ok_or_else(|| {
             ForgeError::provider("Codex stream ended without a response.completed event")
-        })?)
+        })?;
+        let terminal_has_output = response
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|output| !output.is_empty());
+        if !terminal_has_output && !output_items.is_empty() {
+            response["output"] = Value::Array(output_items);
+        } else if !terminal_has_output && !text_deltas.is_empty() {
+            response["output"] = json!([{
+                "type": "message",
+                "content": [{"type": "output_text", "text": text_deltas}]
+            }]);
+        }
+        self.parse_response(response)
     }
 }
 
@@ -340,6 +365,63 @@ mod tests {
             .unwrap();
         assert_eq!(response.content, "pong");
         assert_eq!(response.usage.unwrap().total_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn keeps_output_items_when_terminal_event_contains_only_metadata() {
+        let server = MockServer::start().await;
+        let message = json!({
+            "type":"response.output_item.done",
+            "item":{"type":"message","content":[
+                {"type":"output_text","text":"I will read it."}
+            ]}
+        });
+        let call = json!({
+            "type":"response.output_item.done",
+            "item":{"type":"function_call","call_id":"call-1","name":"read_file",
+                    "arguments":"{\"path\":\"src/lib.rs\"}"}
+        });
+        let terminal = json!({
+            "type":"response.completed",
+            "response":{"model":"gpt-test","status":"completed",
+                        "usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}
+        });
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!(
+                        "data: {message}\n\ndata: {call}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let model = CodexModel::new(
+            Some(server.uri()),
+            "gpt-test",
+            "oauth-token",
+            "acct-1",
+            Duration::from_secs(2),
+            EgressPolicy::Unrestricted,
+        )
+        .unwrap();
+        let response = model
+            .complete(CompletionRequest::new(
+                "gpt-test",
+                vec![Message::user("inspect")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.content, "I will read it.");
+        assert_eq!(
+            response.tool_calls,
+            vec![ToolCall::new(
+                "call-1",
+                "read_file",
+                json!({"path":"src/lib.rs"})
+            )]
+        );
     }
 
     #[test]

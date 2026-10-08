@@ -207,8 +207,8 @@ Each sub-project gets its own spec → plan → implementation cycle:
 Shipped on main: **cloud subscription support** — first-class login and
 credential detection for Claude Code OAuth, Codex ChatGPT OAuth, and Kimi
 Code OAuth (`forge auth login`, `forge auth status`), with subscription-backed
-generation candidates. Remaining: macOS Keychain lookup and additional
-subscription providers as they expose usable credentials.
+generation candidates, including Claude Code's macOS Keychain store. Remaining:
+additional subscription providers as they expose usable credentials.
 
 **Documentation requirement**: every sub-project keeps `README.md`
 accurate in the same change that lands behavior — the README describes

@@ -273,19 +273,17 @@ pub fn automatic_model(config: &Config) -> Option<String> {
 }
 
 fn automatic_model_rank(model: &AvailableModel) -> u8 {
-    if model.local {
-        0
-    } else if matches!(
-        model.credential,
-        Some(
-            crate::credentials::CredentialSource::ClaudeCodeCredentials
-                | crate::credentials::CredentialSource::CodexAuthJson
-                | crate::credentials::CredentialSource::KimiCodeCredentials
-        )
-    ) {
-        1
-    } else {
-        2
+    use crate::credentials::CredentialSource;
+
+    match (&model.credential, model.local) {
+        (_, true) => 0,
+        (Some(CredentialSource::CodexAuthJson), false) => 1,
+        (
+            Some(CredentialSource::ClaudeCodeCredentials | CredentialSource::ClaudeCodeKeychain),
+            false,
+        ) => 2,
+        (Some(CredentialSource::KimiCodeCredentials), false) => 3,
+        _ => 4,
     }
 }
 
@@ -314,7 +312,11 @@ fn local_endpoint_usable(config: &Config, name: &str) -> bool {
             return false;
         };
         if url.scheme() != "http" {
-            return true;
+            // The zero-config probe cannot complete a TLS handshake without
+            // becoming async. Do not call a bare TCP accept "working": an
+            // HTTPS endpoint remains available when explicitly configured,
+            // but it cannot outrank a verified subscription automatically.
+            return false;
         }
 
         let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
@@ -1221,6 +1223,10 @@ pub fn model_from_config(
             // remote model would complain about a missing API key instead of
             // about the setting that actually stopped it.
             let entry = config.models.get(name);
+            let wire_name = entry
+                .and_then(|entry| entry.extra.get("wire_model"))
+                .and_then(|value| value.as_str())
+                .unwrap_or(name);
             // Checking the configured URL is only half of it: the policy
             // below travels with the client so a redirect cannot carry the
             // request somewhere this check never saw.
@@ -1300,7 +1306,7 @@ pub fn model_from_config(
                 };
                 return Ok(Arc::new(crate::codex::CodexModel::new(
                     Some(base_url),
-                    name,
+                    wire_name,
                     access_token,
                     account_id,
                     Duration::from_secs(120),
@@ -1328,7 +1334,7 @@ pub fn model_from_config(
                 // Anthropic-compatible proxy).
                 return Ok(Arc::new(crate::anthropic::AnthropicModel::new(
                     Some(base_url),
-                    name,
+                    wire_name,
                     credential,
                     capabilities,
                     entry.and_then(|e| e.max_output_tokens),
@@ -1349,7 +1355,7 @@ pub fn model_from_config(
             Ok(Arc::new(
                 OpenAiCompatibleModel::new(
                     base_url,
-                    name,
+                    wire_name,
                     credential,
                     capabilities,
                     Duration::from_secs(120),
@@ -1469,6 +1475,25 @@ mod tests {
             .get_mut("qwen3-coder")
             .expect("entry")
             .base_url = Some(format!("http://{address}/v1"));
+        assert!(!local_endpoint_usable(&config, "qwen3-coder"));
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn local_probe_does_not_mistake_a_tcp_listener_for_working_https() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept().expect("accept");
+        });
+        let mut config = Config::default();
+        config
+            .models
+            .get_mut("qwen3-coder")
+            .expect("entry")
+            .base_url = Some(format!("https://{address}/v1"));
         assert!(!local_endpoint_usable(&config, "qwen3-coder"));
         server.join().expect("server");
     }

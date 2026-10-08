@@ -1066,6 +1066,7 @@ fn slash_opens_the_command_menu_on_a_real_terminal() {
     writer.write_all(b"/").expect("type slash");
     wait_for(&output, "/help", Duration::from_secs(30));
     wait_for(&output, "/model", Duration::from_secs(30));
+    wait_for(&output, "> /", Duration::from_secs(30));
 
     drop(writer);
     child.kill().ok();

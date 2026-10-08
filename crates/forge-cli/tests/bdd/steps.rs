@@ -1590,7 +1590,7 @@ fn claude_credentials_file(world: &mut BddWorld) {
     // The harness sets HOME to <project>/home for each forge invocation.
     world.write_file(
         "home/.claude/.credentials.json",
-        r#"{"claudeOauth": {"accessToken": "sk-ant-oat01-bdd-dummy-token", "expiresAt": 1}}"#,
+        r#"{"claudeAiOauth": {"accessToken": "sk-ant-oat01-bdd-dummy-token"}}"#,
     );
 }
 

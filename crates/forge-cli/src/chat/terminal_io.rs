@@ -356,6 +356,7 @@ fn editor_thread_main(
             KeyEvent::from('/'),
             EventHandler::Conditional(Box::new(SlashHandler {
                 completions: prompt.completions.clone(),
+                prompt: prompt.text.clone(),
             })),
         );
 
@@ -553,6 +554,7 @@ fn slash_action(line: &str, pos: usize) -> SlashAction {
 /// normally.
 struct SlashHandler {
     completions: CompletionSnapshot,
+    prompt: String,
 }
 
 impl ConditionalEventHandler for SlashHandler {
@@ -571,6 +573,10 @@ impl ConditionalEventHandler for SlashHandler {
             for candidate in candidates {
                 let _ = writeln!(stdout, "{}", candidate.display);
             }
+            // We wrote behind rustyline's back, so restore the visible prompt
+            // at the physical cursor position before SelfInsert writes `/`.
+            // The editor's logical buffer/cursor remain untouched.
+            let _ = write!(stdout, "{}", self.prompt);
             let _ = stdout.flush();
         }
         Some(Cmd::SelfInsert(1, '/'))

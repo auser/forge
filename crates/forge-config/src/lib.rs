@@ -342,6 +342,14 @@ impl Default for Config {
         // test-only and refused unless `FORGE_TEST_MOCKS=1` (see
         // `test_mocks`). Hosted models are only called when a router
         // selects them or the user sets `model` explicitly.
+        let wire_model = |name: &str| {
+            let mut extra = toml::Table::new();
+            extra.insert(
+                "wire_model".to_string(),
+                toml::Value::String(name.to_string()),
+            );
+            extra
+        };
         let models = [
             ModelEntry {
                 description: Some("local coding model via oMLX (Qwen3-Coder)".to_string()),
@@ -390,7 +398,7 @@ impl Default for Config {
                 structured_output: None,
                 vision: None,
                 max_context: Some(200_000),
-                extra: toml::Table::new(),
+                extra: wire_model("claude-sonnet-5-5"),
             },
             ModelEntry {
                 description: Some(

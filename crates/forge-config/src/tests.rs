@@ -99,6 +99,10 @@ fn the_builtin_anthropic_entry_declares_streaming() {
     let config = Config::default();
     let entry = &config.model_entries()["claude-sonnet"];
     assert_eq!(entry.streaming, Some(true));
+    assert_eq!(
+        entry.extra.get("wire_model").and_then(toml::Value::as_str),
+        Some("claude-sonnet-5-5")
+    );
 }
 
 #[test]
