@@ -2427,6 +2427,7 @@ impl AgentService {
                 )?;
                 // Replay record: the result verbatim (capped), as the
                 // model is about to see it.
+                let model_output = forge_core::cap_tool_output(&outcome.result.content);
                 self.emit(
                     &sender,
                     &mut collected,
@@ -2436,15 +2437,12 @@ impl AgentService {
                         EventKind::ToolResult {
                             call_id: call.id.clone(),
                             tool: call.name.clone(),
-                            output: forge_core::cap_tool_output(&outcome.result.content),
+                            output: model_output.clone(),
                             is_error: outcome.result.is_error,
                         },
                     ),
                 )?;
-                messages.push(Message::tool(
-                    call.id.clone(),
-                    outcome.result.content.clone(),
-                ));
+                messages.push(Message::tool(call.id.clone(), model_output));
             }
             self.emit(
                 &sender,
