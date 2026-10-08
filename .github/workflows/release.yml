@@ -70,6 +70,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Verify tag matches the workspace version
+        shell: bash
+        run: |
+          version="$(awk '
+            /^\[workspace.package\]$/ { in_package=1; next }
+            /^\[/ { in_package=0 }
+            in_package && /^version = / {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)"
+          test "v$version" = "$GITHUB_REF_NAME" || {
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          }
+
       # The engine is clang/libc++ on every platform (`nm --undefined-only`
       # shows `_ZNSt3__1…`, never `__cxx11`), so Linux needs libc++ — *not* the
       # libstdc++ a Linux build script would reach for by default. The static
@@ -99,6 +116,9 @@ jobs:
       - name: Build release binary
         env:
           NEEDLE_REQUIRE_ENGINE: ${{ matrix.brain && '1' || '' }}
+          # Make the published artifact's identity explicit even when the
+          # checkout action's git metadata is unavailable to build.rs.
+          FORGE_BUILD_COMMIT: ${{ github.sha }}
         run: cargo build --release --locked -p forge-cli --target ${{ matrix.target }}
 
       # Ask the binary we are about to publish whether it has a brain — this

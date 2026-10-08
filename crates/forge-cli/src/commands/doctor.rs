@@ -491,10 +491,11 @@ pub async fn run(ctx: &Context, live: bool) -> Result<(), ForgeError> {
 
 // --- doctor --live ----------------------------------------------------------
 
-/// The canary prompt `--live` sends. Any working model answers it in one
-/// turn without touching a tool — the point is to exercise the stack
-/// (routing → model → events), not the model's intelligence.
-const LIVE_CANARY_PROMPT: &str = "Reply with exactly: FORGE_LIVE_OK";
+/// The canary prompt `--live` sends. It is deliberately a concrete, cheap
+/// repository task rather than a bare instruction: decision routers can route
+/// it confidently instead of spending their full decline budget on a vague
+/// prompt. The exact reply keeps the resulting session easy to recognize.
+const LIVE_CANARY_PROMPT: &str = "Read Cargo.toml, then reply with exactly: FORGE_LIVE_OK";
 
 /// Bound on the whole canary run, model latency included. Generous on
 /// purpose: `--live` exists to prove a slow stack still works, so only a
@@ -2155,6 +2156,16 @@ mod tests {
     }
 
     // --- doctor --live ---
+
+    #[test]
+    fn live_canary_is_a_cheap_routable_repository_task() {
+        assert!(
+            LIVE_CANARY_PROMPT.starts_with("Read Cargo.toml"),
+            "the live canary must be concrete enough for a decision router: \
+             {LIVE_CANARY_PROMPT}"
+        );
+        assert!(LIVE_CANARY_PROMPT.contains("FORGE_LIVE_OK"));
+    }
 
     /// Config resolution in the live tests must not see the developer's
     /// machine: the user-config layer is redirected into a tempdir, the

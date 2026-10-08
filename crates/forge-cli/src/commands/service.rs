@@ -111,6 +111,12 @@ pub(crate) fn overrides_for(ctx: &Context, options: &ServiceOptions) -> CliOverr
     overrides
 }
 
+fn is_zero_config_model_selection(config: &forge_config::Config) -> bool {
+    !config.explicit.contains("model")
+        && !config.explicit.contains("router")
+        && !config.explicit.iter().any(|key| key.starts_with("models."))
+}
+
 /// Build the transport-neutral agent runtime from the resolved
 /// configuration: model provider, decision router (with fallback),
 /// execution provider, filesystem skill registry, and the JSONL session
@@ -134,6 +140,7 @@ pub fn build_service_with(
     // providers proven usable in this environment so a first run does not
     // assume a particular local server is already running.
     let auto_selected = !resolved.config.explicit.contains("model");
+    let zero_config_selection = is_zero_config_model_selection(&resolved.config);
     if auto_selected {
         config.model = forge_providers::automatic_model(&config)
             .unwrap_or_else(|| forge_providers::AUTH_REQUIRED_MODEL.to_string());
@@ -147,9 +154,17 @@ pub fn build_service_with(
         .map(|model| model.name)
         .collect();
     let selected_model = config.model.clone();
-    config
-        .models
-        .retain(|name, _| available.contains(name) || name == &selected_model);
+    if zero_config_selection {
+        // Zero-config selection is the decision: do not immediately ask the
+        // router to reconsider every other detected subscription. Besides
+        // making first-run behavior deterministic, this leaves one eligible
+        // model for routers to accept without an inference round-trip.
+        config.models.retain(|name, _| name == &selected_model);
+    } else {
+        config
+            .models
+            .retain(|name, _| available.contains(name) || name == &selected_model);
+    }
 
     let model = forge_providers::model_from_config(&config, &root)?;
     // Routing registry: `[models]` entries that declare capabilities are
@@ -159,7 +174,11 @@ pub fn build_service_with(
         .iter()
         .filter_map(|(name, entry)| entry.capabilities_if_known().map(|c| (name.clone(), c)))
         .collect();
-    registry.push((model.name().to_string(), model.capabilities()));
+    if let Some((_, capabilities)) = registry.iter_mut().find(|(name, _)| name == model.name()) {
+        *capabilities = model.capabilities();
+    } else {
+        registry.push((model.name().to_string(), model.capabilities()));
+    }
     let router = forge_providers::router_from_config(&config, &registry)?;
 
     let execution = build_execution_with(&config, &root, options.approvals)?;
@@ -243,5 +262,24 @@ mod tests {
         assert_eq!(chosen.model.as_deref(), Some("from-chat"));
         assert_eq!(chosen.approval.as_deref(), Some("deny"));
         assert_eq!(chosen.router.as_deref(), Some("static"));
+    }
+
+    #[test]
+    fn only_an_unconfigured_model_registry_is_narrowed_after_auto_selection() {
+        assert!(is_zero_config_model_selection(
+            &forge_config::Config::default()
+        ));
+        assert!(!is_zero_config_model_selection(
+            &forge_config::Config::default().with_explicit(["router"])
+        ));
+        assert!(!is_zero_config_model_selection(
+            &forge_config::Config::default().with_explicit(["models.a-expensive"])
+        ));
+        assert!(!is_zero_config_model_selection(
+            &forge_config::Config::default().with_explicit(["model"])
+        ));
+        assert!(is_zero_config_model_selection(
+            &forge_config::Config::default().with_explicit(["approval"])
+        ));
     }
 }

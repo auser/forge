@@ -167,9 +167,7 @@ impl ExecutionProvider for NativeExecution {
         self.check_approval(&format!("spawn `{}`", request.command), request.risk)?;
         let mut command = tokio::process::Command::new(&request.command);
         command.args(&request.args);
-        if let Some(cwd) = &request.cwd {
-            command.current_dir(cwd);
-        }
+        command.current_dir(request.cwd.as_deref().unwrap_or(&self.project_root));
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -261,9 +259,7 @@ impl NativeExecution {
     async fn execute_ungated(&self, request: ExecRequest) -> Result<ExecResult, ForgeError> {
         let mut command = tokio::process::Command::new(&request.command);
         command.args(&request.args);
-        if let Some(cwd) = &request.cwd {
-            command.current_dir(cwd);
-        }
+        command.current_dir(request.cwd.as_deref().unwrap_or(&self.project_root));
         tracing::debug!(command = %request.command, risk = ?request.risk, "executing command");
 
         if request.inherit_stdio {
@@ -400,6 +396,27 @@ mod tests {
             .expect("spawn succeeds");
         assert_eq!(result.exit_code, 3);
         assert_eq!(result.stderr.trim(), "oops");
+    }
+
+    #[tokio::test]
+    async fn commands_without_an_explicit_cwd_run_from_the_project_root() {
+        let project = tempfile::tempdir().expect("project");
+        let exec = NativeExecution::new(ApprovalPolicy::Auto, project.path());
+        let result = exec
+            .execute(ExecRequest {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "pwd".to_string()],
+                cwd: None,
+                risk: RiskLevel::Safe,
+                inherit_stdio: false,
+                log_label: None,
+            })
+            .await
+            .expect("pwd succeeds");
+        assert_eq!(
+            std::fs::canonicalize(result.stdout.trim()).expect("reported cwd"),
+            std::fs::canonicalize(project.path()).expect("project cwd")
+        );
     }
 
     #[tokio::test]

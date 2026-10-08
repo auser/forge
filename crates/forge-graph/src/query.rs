@@ -12,7 +12,6 @@
 //! lexical path.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use forge_core::embed::Embedder;
 use forge_core::{ContextHit, ForgeError, ProjectGraph};
@@ -50,9 +49,15 @@ const SEMANTIC_POOL: usize = 50;
 /// model matching `embedder`. A stored index built with a different
 /// model/dimensionality is not comparable to fresh vectors, so it is
 /// ignored rather than mixed.
-fn matching_index(root: &Path, embedder: &dyn Embedder) -> Option<EmbeddingIndex> {
-    EmbeddingIndex::load(&root.join(EMBEDDINGS_REL_PATH))
-        .filter(|idx| idx.matches_model(&embedder.model_id(), embedder.dimensions()))
+fn matching_index(graph: &LocalGraph, embedder: &dyn Embedder) -> Option<EmbeddingIndex> {
+    let current: Vec<(String, String)> = graph
+        .embedding_candidates()
+        .into_iter()
+        .map(|(key, hash, _)| (key, hash))
+        .collect();
+    EmbeddingIndex::load(&graph.root().join(EMBEDDINGS_REL_PATH)).filter(|idx| {
+        idx.matches_model(&embedder.model_id(), embedder.dimensions()) && idx.is_fresh(&current)
+    })
 }
 
 /// Embed a single piece of text, unwrapping the one-vector-per-text
@@ -95,7 +100,7 @@ pub async fn blended_context(
 ) -> Result<Vec<ScoredHit>, ForgeError> {
     let lexical = graph.context(query, LEXICAL_POOL.max(limit));
     let mut out = match embedder {
-        Some(embedder) => match matching_index(graph.root(), embedder) {
+        Some(embedder) => match matching_index(graph, embedder) {
             Some(index) => blend(&index, embedder, query, steering, &lexical).await?,
             None => lexical_only(&lexical),
         },
@@ -205,8 +210,8 @@ pub async fn semantic_grep(
     let embedder = embedder.ok_or_else(|| {
         ForgeError::graph("semantic search needs needle weights (run forge init)")
     })?;
-    let index = matching_index(graph.root(), embedder).ok_or_else(|| {
-        ForgeError::graph("semantic index not built yet; run `forge graph build`")
+    let index = matching_index(graph, embedder).ok_or_else(|| {
+        ForgeError::graph("semantic index not built or stale; run `forge graph build --semantic`")
     })?;
     let query_vector = embed_one(embedder, query).await?;
     Ok(index.search(&query_vector, limit))
@@ -214,6 +219,8 @@ pub async fn semantic_grep(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use async_trait::async_trait;
 
     use super::*;
@@ -251,6 +258,19 @@ mod tests {
         let mut graph = LocalGraph::open(dir).expect("open");
         graph.build().expect("build");
         graph
+    }
+
+    fn fresh_table_index(graph: &LocalGraph) -> EmbeddingIndex {
+        let mut index = EmbeddingIndex::new("table-test".to_string(), 2);
+        for (key, hash, _) in graph.embedding_candidates() {
+            let vector = if key == "beta.rs::beta_other" {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            };
+            index.upsert(key, hash, vector);
+        }
+        index
     }
 
     #[tokio::test]
@@ -307,10 +327,9 @@ mod tests {
     async fn context_blends_semantic_neighbours_into_the_ranking() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let graph = project_with_graph(tmp.path());
-        let mut index = EmbeddingIndex::new("table-test".to_string(), 2);
+        let index = fresh_table_index(&graph);
         // beta.rs is the semantic match for a "needle" query; lexical
         // search cannot see it (its text has no such token).
-        index.upsert("beta.rs::beta_other".into(), "h".into(), vec![1.0, 0.0]);
         index
             .save(&tmp.path().join(EMBEDDINGS_REL_PATH))
             .expect("save");
@@ -329,10 +348,9 @@ mod tests {
     async fn steering_surfaces_a_match_the_query_alone_cannot_see() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let graph = project_with_graph(tmp.path());
-        let mut index = EmbeddingIndex::new("table-test".to_string(), 2);
+        let index = fresh_table_index(&graph);
         // beta.rs embeds as [1,0] — the "needle" direction. A query that
         // does not contain "needle" embeds as [0,1] and cannot reach it.
-        index.upsert("beta.rs::beta_other".into(), "h".into(), vec![1.0, 0.0]);
         index
             .save(&tmp.path().join(EMBEDDINGS_REL_PATH))
             .expect("save");
@@ -397,15 +415,17 @@ mod tests {
         let err = semantic_grep(&graph, Some(&TableEmbedder), "needle", 5)
             .await
             .expect_err("no index");
-        assert!(err.to_string().contains("forge graph build"), "{err}");
+        assert!(
+            err.to_string().contains("forge graph build --semantic"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn semantic_grep_returns_scored_keys() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let graph = project_with_graph(tmp.path());
-        let mut index = EmbeddingIndex::new("table-test".to_string(), 2);
-        index.upsert("beta.rs::beta_other".into(), "h".into(), vec![1.0, 0.0]);
+        let index = fresh_table_index(&graph);
         index
             .save(&tmp.path().join(EMBEDDINGS_REL_PATH))
             .expect("save");
@@ -413,7 +433,28 @@ mod tests {
         let hits = semantic_grep(&graph, Some(&TableEmbedder), "needle", 5)
             .await
             .expect("grep");
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, "beta.rs::beta_other");
+    }
+
+    #[tokio::test]
+    async fn semantic_grep_refuses_a_stale_index_and_names_the_semantic_rebuild() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut graph = project_with_graph(tmp.path());
+        fresh_table_index(&graph)
+            .save(&tmp.path().join(EMBEDDINGS_REL_PATH))
+            .expect("save");
+
+        std::fs::write(tmp.path().join("beta.rs"), "fn renamed_symbol() {}\n")
+            .expect("change source");
+        graph.build().expect("structural rebuild");
+
+        let err = semantic_grep(&graph, Some(&TableEmbedder), "needle", 5)
+            .await
+            .expect_err("stale vectors must not be served");
+        assert!(
+            err.to_string().contains("forge graph build --semantic"),
+            "{err}"
+        );
     }
 }

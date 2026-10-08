@@ -74,6 +74,38 @@ fn version_prints_name_and_version() {
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
 }
 
+#[test]
+fn version_build_identifies_the_exact_binary_without_changing_plain_version() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = forge(tmp.path())
+        .args(["version", "--build"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(stdout.starts_with("forge "), "unexpected: {stdout}");
+    assert!(stdout.contains("commit "), "unexpected: {stdout}");
+    assert!(stdout.contains("target "), "unexpected: {stdout}");
+
+    let output = forge(tmp.path())
+        .args(["--json", "version", "--build"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        value["commit"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        value["target"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn auth_login_delegates_to_the_official_cli_and_detects_its_store() {
@@ -237,11 +269,28 @@ fn bare_forge_bootstraps_a_fresh_project_before_chat() {
 }
 
 #[test]
-fn dogfood_agent_edits_and_validates_a_project_in_one_run() {
+fn compiled_forge_initializes_then_edits_and_validates_a_project() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = tmp.path().join("proj");
-    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::create_dir_all(&project).expect("mkdir");
     std::fs::write(project.join("main.rs"), "fn value() -> u8 { 1 }\n").expect("source");
+
+    // Start with no Forge state and use the compiled CLI for initialization,
+    // so this covers the same boundary as a newly installed binary.
+    let init = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .arg("init")
+        .output()
+        .expect("init");
+    assert!(
+        init.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(project.join(".forge/config.toml").is_file());
+
     std::fs::write(
         project.join("script.json"),
         r#"[
@@ -252,7 +301,7 @@ fn dogfood_agent_edits_and_validates_a_project_in_one_run() {
           }}]},
           {"tool_calls":[{"id":"check-1","name":"run_command","arguments":{
             "command":"sh",
-            "args":["-c","grep -q 'value() -> u8 { 2 }' main.rs"],
+            "args":["-c","pwd; grep -q 'value() -> u8 { 2 }' main.rs"],
             "risk":"risky"
           }}]},
           {"text":"Implemented and validated the change."}
@@ -284,6 +333,120 @@ fn dogfood_agent_edits_and_validates_a_project_in_one_run() {
         "fn value() -> u8 { 2 }\n"
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Implemented and validated"));
+    let sessions = std::fs::read_dir(project.join(".forge/sessions"))
+        .expect("sessions")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .map(|entry| std::fs::read_to_string(entry.path()).expect("session log"))
+        .collect::<String>();
+    let canonical_project = std::fs::canonicalize(&project).expect("canonical project");
+    assert!(
+        sessions.contains(&format!("stdout:\\n{}\\n", canonical_project.display())),
+        "run_command must execute from --project:\n{sessions}"
+    );
+    assert!(
+        sessions.contains(r#""tool":"run_command","output":"exit 0"#),
+        "the validation command must actually succeed:\n{sessions}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_multi_model_router_keeps_every_available_candidate() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn serve_model(server: &MockServer, reply: &str) {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "completion",
+                "model": "test",
+                "choices": [{
+                    "message": {"role": "assistant", "content": reply},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    let expensive = MockServer::start().await;
+    let cheap = MockServer::start().await;
+    serve_model(&expensive, "expensive answered").await;
+    serve_model(&cheap, "cheap answered").await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(project.join(".forge")).expect("forge dir");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        format!(
+            r#"
+router = "cheapest"
+local_only = true
+approval = "auto"
+
+[models.a-expensive]
+base_url = "{}/v1"
+cost_input_per_mtok = 10.0
+cost_output_per_mtok = 10.0
+tools = true
+streaming = false
+
+[models.z-cheap]
+base_url = "{}/v1"
+cost_input_per_mtok = 1.0
+cost_output_per_mtok = 1.0
+tools = true
+streaming = false
+"#,
+            expensive.uri(),
+            cheap.uri()
+        ),
+    )
+    .expect("config");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "answer once"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("cheap answered"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let expensive_requests = expensive.received_requests().await.expect("requests");
+    let cheap_requests = cheap.received_requests().await.expect("requests");
+    assert_eq!(
+        expensive_requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        0
+    );
+    assert_eq!(
+        cheap_requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        1
+    );
 }
 
 /// `forge init` must never fetch the ~35 MB needle weights artifact in a
@@ -904,14 +1067,36 @@ fn graph_build_embeds_symbols_and_semantic_grep_ranks_by_meaning() {
     )
     .expect("write");
 
-    // First build: FORGE_NEEDLE_BACKEND=hash gives a real, working
-    // (deterministic) engine, so the build must embed every symbol and
-    // write the semantic index.
-    let build = forge(tmp.path())
+    // An ordinary build remains structural even when an embedding backend is
+    // available.
+    let structural = forge(tmp.path())
         .env("FORGE_NEEDLE_BACKEND", "hash")
         .args(["--project"])
         .arg(&project)
         .args(["--json", "graph", "build"])
+        .output()
+        .expect("run");
+    assert!(structural.status.success(), "{structural:?}");
+    let structural_json: serde_json::Value =
+        serde_json::from_slice(&structural.stdout).expect("structural build json");
+    assert!(
+        structural_json.get("embedded").is_none(),
+        "structural build must not report embeddings: {structural_json}"
+    );
+    let index_path = project.join(".forge/graph/embeddings.bin");
+    assert!(
+        !index_path.exists(),
+        "ordinary graph build must not create an embedding index"
+    );
+
+    // With --semantic, FORGE_NEEDLE_BACKEND=hash gives a real, working
+    // (deterministic) engine, so the build must embed every symbol and write
+    // the semantic index.
+    let build = forge(tmp.path())
+        .env("FORGE_NEEDLE_BACKEND", "hash")
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "graph", "build", "--semantic"])
         .output()
         .expect("run");
     assert!(build.status.success(), "{build:?}");
@@ -920,7 +1105,6 @@ fn graph_build_embeds_symbols_and_semantic_grep_ranks_by_meaning() {
     let first_embedded = first["embedded"].as_u64().expect("embedded count");
     assert!(first_embedded >= 2, "expected >=2 embedded, got {first}");
 
-    let index_path = project.join(".forge/graph/embeddings.bin");
     assert!(
         index_path.is_file(),
         "embeddings.bin must exist after build"
@@ -959,7 +1143,7 @@ fn graph_build_embeds_symbols_and_semantic_grep_ranks_by_meaning() {
         .env("FORGE_NEEDLE_BACKEND", "hash")
         .args(["--project"])
         .arg(&project)
-        .args(["--json", "graph", "build"])
+        .args(["--json", "graph", "build", "--semantic"])
         .output()
         .expect("run");
     assert!(rebuild.status.success());

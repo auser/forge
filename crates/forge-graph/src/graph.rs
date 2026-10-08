@@ -354,28 +354,30 @@ impl LocalGraph {
         dirs.into_values().collect()
     }
 
-    /// `(key, content_hash, embedding_text)` for every indexed symbol, in
-    /// exactly the format the semantic index (`embed_index::EmbeddingIndex`)
-    /// expects: key `"<path>::<name>"` (so two symbols named alike in
-    /// different files get distinct, independently searchable keys) and
+    /// `(key, content_hash, embedding_text)` for every unique path/name pair,
+    /// in exactly the format the semantic index
+    /// (`embed_index::EmbeddingIndex`) expects: key `"<path>::<name>"` (so
+    /// two symbols named alike in different files get distinct,
+    /// independently searchable keys) and
     /// `content_hash` over the exact text that would be embedded, so a
     /// symbol whose kind/name/path haven't changed is never needlessly
     /// re-embedded. Pure string/hash work — this crate stays model-free;
     /// `forge-cli`'s `graph build` is the one that calls an `Embedder` on
     /// the returned text.
     pub fn embedding_candidates(&self) -> Vec<(String, String, String)> {
-        self.state
-            .symbols
-            .iter()
-            .map(|s| {
-                let key = format!("{}::{}", s.file, s.name);
-                let text = format!("{} {} in {}", s.kind, s.name, s.file);
-                let mut hasher = Sha256::new();
-                hasher.update(text.as_bytes());
-                let hash = format!("{:x}", hasher.finalize());
-                (key, hash, text)
-            })
-            .collect()
+        let mut candidates = BTreeMap::new();
+        for symbol in &self.state.symbols {
+            let key = format!("{}::{}", symbol.file, symbol.name);
+            let text = format!("{} {} in {}", symbol.kind, symbol.name, symbol.file);
+            let mut hasher = Sha256::new();
+            hasher.update(text.as_bytes());
+            let hash = format!("{:x}", hasher.finalize());
+            // The persisted index has one vector per key. Duplicate method
+            // names in one file therefore become one deterministic candidate
+            // instead of being embedded twice and overwriting each other.
+            candidates.entry(key.clone()).or_insert((key, hash, text));
+        }
+        candidates.into_values().collect()
     }
 
     /// Symbols whose recorded call sites reference `symbol`.

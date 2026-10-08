@@ -60,6 +60,18 @@ impl DecisionRouter for NeedleRouter {
         if eligible.is_empty() {
             return Err(ForgeError::router("needle: no eligible candidates"));
         }
+        if let [only] = eligible.as_slice() {
+            tokio::time::timeout(self.timeout, self.engine.info())
+                .await
+                .map_err(|_| ForgeError::router("needle: decision timed out"))??;
+            return Ok(RoutingDecision {
+                selected_model: only.clone(),
+                confidence: 1.0,
+                router_name: "needle".to_string(),
+                fallback_used: false,
+                reason: "only eligible model".to_string(),
+            });
+        }
         let decision = tokio::time::timeout(
             self.timeout,
             self.engine.decide(task.task.clone(), eligible),
@@ -126,6 +138,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_single_eligible_model_routes_without_running_inference() {
+        let router = NeedleRouter::new(
+            Arc::new(NeedleEngine::spawn(HashBackend::new())),
+            vec![("only-model".to_string(), caps(true))],
+            Duration::from_millis(100),
+        );
+        let decision = router
+            .route(&RoutingRequest::new("anything"))
+            .await
+            .expect("one candidate needs no model decision");
+        assert_eq!(decision.selected_model, "only-model");
+        assert_eq!(decision.confidence, 1.0);
+        assert_eq!(decision.reason, "only eligible model");
+    }
+
+    #[tokio::test]
     async fn slow_decision_times_out_and_says_so() {
         // The `timeout` arm of `route` had no coverage: a backend slower
         // than `router_timeout_ms` must produce an Err naming the timeout
@@ -139,7 +167,10 @@ mod tests {
                 decide_calls: Arc::new(AtomicUsize::new(0)),
                 delay: Duration::from_millis(500),
             })),
-            vec![("qwen3-coder".to_string(), caps(true))],
+            vec![
+                ("qwen3-coder".to_string(), caps(true)),
+                ("claude-sonnet".to_string(), caps(true)),
+            ],
             Duration::from_millis(10),
         );
 

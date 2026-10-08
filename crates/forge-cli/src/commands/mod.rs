@@ -99,14 +99,20 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             .await
         }
         Some(Command::Init { preset }) => init::run(&ctx, preset.as_deref()),
-        Some(Command::Version) => {
+        Some(Command::Version { build }) => {
             let name = "forge";
             let version = env!("CARGO_PKG_VERSION");
+            let commit = env!("FORGE_BUILD_COMMIT");
+            let target = env!("FORGE_BUILD_TARGET");
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "name": name, "version": version })
-                );
+                let mut value = serde_json::json!({ "name": name, "version": version });
+                if build {
+                    value["commit"] = commit.into();
+                    value["target"] = target.into();
+                }
+                println!("{value}");
+            } else if build {
+                println!("{name} {version} (commit {commit}, target {target})");
             } else {
                 println!("{name} {version}");
             }
@@ -156,7 +162,7 @@ fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
         return None;
     }
     let label = match command {
-        None | Some(Command::Chat { .. } | Command::Version) => return None,
+        None | Some(Command::Chat { .. } | Command::Version { .. }) => return None,
         Some(Command::Init { .. }) => "initializing project",
         Some(Command::Doctor { .. }) => "checking environment",
         Some(Command::Auth { .. }) => "checking authentication",
@@ -168,7 +174,7 @@ fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
         Some(Command::Model { .. }) => "checking models",
         Some(Command::Router { .. }) => "starting router",
         Some(Command::Graph {
-            command: GraphCommand::Build,
+            command: GraphCommand::Build { .. },
         }) => "building project graph",
         Some(Command::Graph { .. }) => "querying project graph",
         Some(Command::Skill { .. }) => "loading skills",

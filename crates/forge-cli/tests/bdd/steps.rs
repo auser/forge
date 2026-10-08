@@ -1802,7 +1802,7 @@ async fn initialized_project_hash_backend_and_built_graph(world: &mut BddWorld) 
     // `forge init` builds the graph's structure but never embeds (no
     // model calls from `init`, ever); an explicit `graph build` with the
     // hash backend available produces the semantic index.
-    world.run_forge(&["graph", "build"]).await;
+    world.run_forge(&["graph", "build", "--semantic"]).await;
     assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
 }
 

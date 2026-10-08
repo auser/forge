@@ -204,17 +204,27 @@ fi
 # --- verify -----------------------------------------------------------------------
 
 if [[ -x "$TARGET" ]]; then
-    VERSION="$("$TARGET" version 2>/dev/null || true)"
-    [[ -n "$VERSION" ]] && ok "verified: $VERSION"
+    VERSION="$("$TARGET" version --build 2>/dev/null)" \
+        || die "installed binary failed verification: $TARGET version --build"
+    [[ -n "$VERSION" ]] || die "installed binary returned no version: $TARGET"
+    ok "verified installed binary: $VERSION"
+else
+    die "installed binary is not executable: $TARGET"
 fi
 
-case ":$PATH:" in
-    *":$PREFIX:"*) ;;
-    *)
-        warn "$PREFIX is not on your PATH"
-        # shellcheck disable=SC2016 # the literal $PATH is the hint to print
-        printf '  add it with:  export PATH="%s:$PATH"\n' "$PREFIX"
-        ;;
-esac
+# Bash caches command locations. Clear that cache before asking what a fresh
+# `forge` invocation would execute.
+hash -r 2>/dev/null || true
+RESOLVED="$(command -v "$BIN_NAME" 2>/dev/null || true)"
+if [[ "$RESOLVED" != "$TARGET" ]]; then
+    if [[ -n "$RESOLVED" ]]; then
+        warn "'forge' still resolves to $RESOLVED instead of $TARGET"
+    else
+        warn "'forge' does not resolve from PATH (installed at $TARGET)"
+    fi
+    # One correction handles both a missing prefix and an earlier shadow.
+    # shellcheck disable=SC2016 # the literal $PATH is the hint to print
+    printf '  fix this shell with:  export PATH="%s:$PATH"\n' "$PREFIX" >&2
+fi
 
 ok "done — run 'forge init' inside a project to get started"
