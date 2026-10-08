@@ -16,12 +16,15 @@ pub mod service;
 pub mod session_cmd;
 pub mod skill_cmd;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use forge_config::CliOverrides;
 use forge_core::{ForgeError, find_project_root};
 
-use crate::cli::{Cli, Command, GlobalOpts, SessionCommand};
+use crate::cli::{Cli, Command, GlobalOpts, GraphCommand, SessionCommand};
 
 /// Per-invocation context derived from global flags.
 pub struct Context {
@@ -64,8 +67,9 @@ impl Context {
 pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
     let ctx = Context { global: cli.global };
     let json = ctx.global.json;
+    let activity = command_activity(&cli.command, json);
 
-    match cli.command {
+    let result = match cli.command {
         // No subcommand: the interactive chat. Deliberately the same code
         // path as `forge chat`, so the two can never drift.
         None => {
@@ -139,5 +143,79 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
         Some(Command::Serve { host, port }) => serve_cmd::run(&ctx, host, port).await,
         Some(Command::Mcp) => mcp_cmd::run(&ctx).await,
         Some(Command::Acp) => acp_cmd::run(&ctx).await,
+    };
+
+    if let Some(activity) = activity {
+        activity.finish(result.is_ok());
+    }
+    result
+}
+
+fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
+    if json || !std::io::stderr().is_terminal() {
+        return None;
+    }
+    let label = match command {
+        None | Some(Command::Chat { .. } | Command::Version) => return None,
+        Some(Command::Init { .. }) => "initializing project",
+        Some(Command::Doctor { .. }) => "checking environment",
+        Some(Command::Auth { .. }) => "checking authentication",
+        Some(Command::Config { .. }) => "resolving configuration",
+        Some(Command::Run { .. }) => "running agent",
+        Some(Command::Resume { .. }) => "resuming run",
+        Some(Command::Cancel { .. }) => "cancelling run",
+        Some(Command::Session { .. }) => "reading sessions",
+        Some(Command::Model { .. }) => "checking models",
+        Some(Command::Router { .. }) => "starting router",
+        Some(Command::Graph {
+            command: GraphCommand::Build,
+        }) => "building project graph",
+        Some(Command::Graph { .. }) => "querying project graph",
+        Some(Command::Skill { .. }) => "loading skills",
+        Some(Command::Serve { .. }) => "running server",
+        Some(Command::Mcp) => "running MCP server",
+        Some(Command::Acp) => "running ACP server",
+    };
+    Some(Activity::start(label))
+}
+
+struct Activity {
+    label: &'static str,
+    started: Instant,
+    stop: mpsc::Sender<()>,
+    heartbeat: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Activity {
+    const HEARTBEAT: Duration = Duration::from_secs(10);
+
+    fn start(label: &'static str) -> Self {
+        eprintln!("working: {label}...");
+        let started = Instant::now();
+        let (stop, stopped) = mpsc::channel();
+        let heartbeat = std::thread::spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(Self::HEARTBEAT) {
+                eprintln!("still working: {label} ({}s)", started.elapsed().as_secs());
+            }
+        });
+        Self {
+            label,
+            started,
+            stop,
+            heartbeat: Some(heartbeat),
+        }
+    }
+
+    fn finish(mut self, succeeded: bool) {
+        let _ = self.stop.send(());
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        let status = if succeeded { "done" } else { "failed" };
+        eprintln!(
+            "{status}: {} ({:.1}s)",
+            self.label,
+            self.started.elapsed().as_secs_f32()
+        );
     }
 }

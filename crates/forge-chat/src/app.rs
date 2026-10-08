@@ -504,7 +504,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 self.events = None;
                 self.transcript = None;
                 self.controller.on_run_settled();
-                if let Some(next) = self.controller.take_queued() {
+                if let Some(next) = self.take_queued_with_notice() {
                     self.start_turn(next).await;
                 }
             }
@@ -550,7 +550,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         self.events = None;
         self.handle = None;
         self.controller.on_run_settled();
-        if let Some(next) = self.controller.take_queued() {
+        if let Some(next) = self.take_queued_with_notice() {
             self.start_turn(next).await;
         }
     }
@@ -577,9 +577,19 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         self.run_id = None;
         self.events = None;
         self.controller.on_run_settled();
-        if let Some(next) = self.controller.take_queued() {
+        if let Some(next) = self.take_queued_with_notice() {
             self.start_turn(next).await;
         }
+    }
+
+    fn take_queued_with_notice(&mut self) -> Option<TurnRequest> {
+        let waiting = self.controller.queued_len();
+        let next = self.controller.take_queued()?;
+        self.emit(Line::notice(format!(
+            "starting queued message - {} remaining",
+            waiting.saturating_sub(1)
+        )));
+        Some(next)
     }
 
     /// A line that did *not* come from the transcript renderer: a command
@@ -721,7 +731,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                     // as any other typed error.
                     self.emit(Line::bad(format!("error: {e}")));
                     self.controller.on_run_settled();
-                    pending = self.controller.take_queued();
+                    pending = self.take_queued_with_notice();
                 }
             }
         }
