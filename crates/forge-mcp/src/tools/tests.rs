@@ -121,6 +121,188 @@ impl Diagnostics for FakeDoctor {
 
 // --- registry / schemas -------------------------------------------------
 
+#[tokio::test]
+async fn compact_search_and_schema_are_bounded_deterministic_registry_views() {
+    let (_tmp, tools) = fixture();
+    let search =
+        async |args: &Value| crate::compact::call(&tools, "forge_tools_search", args).await;
+    let all = search(&json!({"limit": 100})).await.unwrap().value;
+    let rows = all["tools"].as_array().unwrap();
+    assert_eq!(all["total"], definitions().len());
+    assert_eq!(rows.len(), definitions().len());
+    assert!(
+        rows.windows(2)
+            .all(|w| w[0]["name"].as_str() < w[1]["name"].as_str())
+    );
+    assert!(rows.iter().all(|row| row.as_object().unwrap().len() == 3));
+    assert_eq!(
+        all,
+        search(&json!({"query": "  ", "limit": 100}))
+            .await
+            .unwrap()
+            .value
+    );
+    let default = search(&json!({})).await.unwrap().value;
+    assert_eq!(
+        default["tools"].as_array().unwrap().len(),
+        rows.len().min(10)
+    );
+    let limited = search(&json!({"limit": 1})).await.unwrap().value;
+    assert_eq!(limited["total"], all["total"]);
+    assert_eq!(limited["tools"], json!([rows[0]]));
+    assert_eq!(
+        search(&json!({"query": "no-such-keyword"}))
+            .await
+            .unwrap()
+            .value["total"],
+        0
+    );
+    for def in definitions() {
+        for query in [def.name, def.title, def.description] {
+            let found = search(&json!({"query": query.to_uppercase(), "limit": 100}))
+                .await
+                .unwrap()
+                .value;
+            assert!(
+                found["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["name"] == def.name)
+            );
+        }
+        let schema = crate::compact::call(&tools, "forge_tools_schema", &json!({"name": def.name}))
+            .await
+            .unwrap();
+        assert_eq!(
+            schema.value,
+            json!({
+                "name": def.name, "title": def.title, "description": def.description,
+                "inputSchema": (def.input_schema)()
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn compact_rejects_malformed_arguments_and_recursive_targets() {
+    let (_tmp, tools) = fixture();
+    for name in [
+        "forge_tools_search",
+        "forge_tools_schema",
+        "forge_tools_invoke",
+    ] {
+        for args in [
+            Value::Null,
+            json!([]),
+            json!(true),
+            json!("bad"),
+            json!({"extra": 1}),
+        ] {
+            let result = crate::compact::call(&tools, name, &args).await.unwrap();
+            assert!(result.is_error);
+            assert_eq!(result.value["code"], "invalid_params");
+        }
+    }
+    for args in [
+        json!({"query": null}),
+        json!({"query": 1}),
+        json!({"limit": null}),
+        json!({"limit": 0}),
+        json!({"limit": 101}),
+        json!({"limit": -1}),
+        json!({"limit": 1.5}),
+        json!({"limit": "1"}),
+        json!({"limit": true}),
+    ] {
+        assert_eq!(
+            crate::compact::call(&tools, "forge_tools_search", &args)
+                .await
+                .unwrap()
+                .value["code"],
+            "invalid_params"
+        );
+    }
+    for name in ["forge_tools_schema", "forge_tools_invoke"] {
+        for args in [
+            json!({}),
+            json!({"name": null}),
+            json!({"name": 1}),
+            json!({"name": ""}),
+            json!({"name": " "}),
+        ] {
+            assert_eq!(
+                crate::compact::call(&tools, name, &args)
+                    .await
+                    .unwrap()
+                    .value["code"],
+                "invalid_params"
+            );
+        }
+    }
+    for args in [
+        json!({"name": "forge_doctor"}),
+        json!({"name": "forge_doctor", "arguments": null}),
+        json!({"name": "forge_doctor", "arguments": []}),
+    ] {
+        assert_eq!(
+            crate::compact::call(&tools, "forge_tools_invoke", &args)
+                .await
+                .unwrap()
+                .value["code"],
+            "invalid_params"
+        );
+    }
+    for inner in [
+        "missing",
+        "forge_tools_search",
+        "forge_tools_schema",
+        "forge_tools_invoke",
+    ] {
+        for name in ["forge_tools_schema", "forge_tools_invoke"] {
+            let args = if name == "forge_tools_schema" {
+                json!({"name": inner})
+            } else {
+                json!({"name": inner, "arguments": {}})
+            };
+            let outcome = crate::compact::call(&tools, name, &args).await.unwrap();
+            assert!(outcome.is_error);
+            assert_eq!(outcome.value["code"], "unknown_tool");
+        }
+    }
+    assert!(matches!(
+        crate::compact::call(&tools, "forge_doctor", &json!({})).await,
+        Err(ToolError::UnknownTool(_))
+    ));
+}
+
+#[tokio::test]
+async fn compact_invoke_preserves_native_success_and_error_outcomes() {
+    let (_tmp, tools) = fixture();
+    for (name, args) in [
+        ("forge_skill_list", json!({})),
+        ("forge_doctor", json!({})),
+        ("forge_skill_show", json!({})),
+        ("forge_run_status", json!({"run_id": "missing"})),
+        (
+            "forge_run_input",
+            json!({"run_id": "missing", "input": "y"}),
+        ),
+        ("forge_run_cancel", json!({"run_id": "missing"})),
+    ] {
+        let direct = tools.call(name, &args).await.unwrap();
+        let wrapped = crate::compact::call(
+            &tools,
+            "forge_tools_invoke",
+            &json!({"name": name, "arguments": args}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrapped.value, direct.value, "{name}");
+        assert_eq!(wrapped.is_error, direct.is_error, "{name}");
+    }
+}
+
 #[test]
 fn every_tool_has_a_valid_object_schema() {
     for def in definitions() {
@@ -753,6 +935,52 @@ fn approval_fixture() -> (tempfile::TempDir, ForgeTools) {
     ));
     let tools = ForgeTools::new(service, tmp.path());
     (tmp, tools)
+}
+
+#[tokio::test]
+async fn compact_wrapper_never_authorizes_a_parked_operation() {
+    for answer in ["y", "n"] {
+        let (tmp, tools) = approval_fixture();
+        let invoke = async |name: &str, args: Value| {
+            crate::compact::call(
+                &tools,
+                "forge_tools_invoke",
+                &json!({"name": name, "arguments": args}),
+            )
+            .await
+            .unwrap()
+        };
+        let run = invoke(
+            "forge_run",
+            json!({"prompt": "write the notes", "timeout_ms": 30_000}),
+        )
+        .await;
+        assert!(!run.is_error);
+        assert_eq!(run.value["status"], "waiting_for_approval");
+        assert!(!tmp.path().join("notes.txt").exists());
+        let run_id = &run.value["run_id"];
+        let status = invoke("forge_run_status", json!({"run_id": run_id})).await;
+        assert_eq!(status.value["status"], "waiting_for_approval");
+        assert!(!tmp.path().join("notes.txt").exists());
+        let delivered = invoke(
+            "forge_run_input",
+            json!({"run_id": run_id, "input": answer}),
+        )
+        .await;
+        assert!(!delivered.is_error);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = invoke("forge_run_status", json!({"run_id": run_id})).await;
+                if status.value["status"] == "completed" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("answered run must finish");
+        assert_eq!(tmp.path().join("notes.txt").exists(), answer == "y");
+    }
 }
 
 /// The regression this exists for: a parked run is blocked *inside* the

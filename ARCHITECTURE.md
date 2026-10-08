@@ -267,6 +267,15 @@ forge-cli         clap command tree, doctor, init, the forge binary
 
 ## Editors and harnesses
 
+The MCP adapter also offers opt-in `forge mcp --compact`: three meta-tools
+search summaries from the existing registry, retrieve one schema, and invoke
+the named tool through the existing `ForgeTools` handler. There is no second
+catalog or execution path. Discovery is not authorization, and the invocation
+wrapper retains the target's approvals, errors, and run session recording.
+Default MCP discovery still advertises the full tool surface; the agent loop's
+built-in tools are unchanged. Compact discovery trades a smaller initial
+schema payload for extra round trips, not guaranteed end-to-end savings.
+
 Five front ends sit over the one `AgentService` now: `forge` (batch
 commands like `run`/`serve`/`session`), the interactive chat (`forge chat`,
 and what bare `forge` runs), `forge serve`, `forge mcp`, and `forge acp`.

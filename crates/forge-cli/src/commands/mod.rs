@@ -141,7 +141,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
         Some(Command::Graph { command }) => graph_cmd::run(&ctx, command).await,
         Some(Command::Skill { command }) => skill_cmd::run(&ctx, command).await,
         Some(Command::Serve { host, port }) => serve_cmd::run(&ctx, host, port).await,
-        Some(Command::Mcp) => mcp_cmd::run(&ctx).await,
+        Some(Command::Mcp { compact }) => mcp_cmd::run(&ctx, compact).await,
         Some(Command::Acp) => acp_cmd::run(&ctx).await,
     };
 
@@ -173,7 +173,7 @@ fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
         Some(Command::Graph { .. }) => "querying project graph",
         Some(Command::Skill { .. }) => "loading skills",
         Some(Command::Serve { .. }) => "running server",
-        Some(Command::Mcp) => "running MCP server",
+        Some(Command::Mcp { .. }) => "running MCP server",
         Some(Command::Acp) => "running ACP server",
     };
     Some(Activity::start(label))

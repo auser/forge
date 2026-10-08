@@ -1328,6 +1328,55 @@ Results come back as one text item of compact JSON, mirrored in
 missing weights) are tool errors with the fix in the message, not protocol
 errors.
 
+### Compact discovery (opt-in)
+
+Use `forge mcp --compact` (or `"args": ["mcp", "--compact"]` in your
+client config) to advertise three discovery tools instead of all ten tool
+schemas. The default `forge mcp` interface is unchanged.
+
+```text
+forge_tools_search {query?, limit?}    tool summaries, without input schemas
+forge_tools_schema {name}             one tool's full inputSchema
+forge_tools_invoke {name, arguments}  invoke that tool through the same handler
+```
+
+Search matches all whitespace-separated keywords case-insensitively against
+tool names, titles and descriptions. An empty query lists the catalog.
+Results are sorted by name, bounded by `limit` (1–100, default 10), and
+include `total`, the number of matches before the limit. Schema lookup and
+invocation use exact tool names.
+The catalog comes from the existing registry, not a separately maintained
+copy or a model-generated description.
+
+For example, these are successive `tools/call` request parameters:
+
+```json
+{"name":"forge_tools_search","arguments":{"query":"graph"}}
+{"name":"forge_tools_schema","arguments":{"name":"forge_graph_context"}}
+{"name":"forge_tools_invoke","arguments":{"name":"forge_graph_context","arguments":{"query":"authentication","limit":5}}}
+```
+
+In compact mode only the three discovery tools are exposed directly;
+use `forge_tools_invoke` for the tools in the list above. Invocation returns
+the underlying tool's result unchanged, including `isError`. Unknown target
+names are tool errors (`unknown_tool`); unknown top-level tool names remain
+JSON-RPC errors. Discovery tools cannot invoke themselves or one another.
+
+**Discovery does not grant permission.** Execution, configured approvals,
+and run session recording are unchanged. When an invoked run reports
+`waiting_for_approval`, obtain the user's decision, then deliver it through
+the wrapper:
+
+```json
+{"name":"forge_tools_invoke","arguments":{"name":"forge_run_input","arguments":{"run_id":"...","input":"y"}}}
+```
+
+This mode reduces the initial schema payload but adds discovery round trips.
+It is useful for clients that benefit from progressive disclosure; it is not
+a claim of lower end-to-end token use or faster tasks. It catalogs Forge's
+existing local tools only: no external MCP servers, API crawling, or new
+authorization system. The coding agent's built-in tools are unaffected.
+
 ### Approvals
 
 `forge mcp` is non-interactive by definition: stdin is the protocol channel, so

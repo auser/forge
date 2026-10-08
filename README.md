@@ -109,6 +109,12 @@ change.
 Run `forge graph build` in the project first so the graph tools have an
 index to search.
 
+For on-demand tool discovery, use `"args": ["mcp", "--compact"]`. This
+advertises search/schema/invoke tools instead of every schema up front,
+with the same execution and approval policy. See
+[compact discovery](docs/reference.md#compact-discovery-opt-in) for the workflow
+and tradeoffs.
+
 ## What you get
 
 - `forge run` / `forge chat` — the multi-turn, tool-using agent loop with
