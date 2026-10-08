@@ -19,6 +19,7 @@ use crate::io::{CompletionCandidate, CompletionSnapshot, Line};
 /// The four approval policies (§9.1). One list, so the `/approval`
 /// completion candidates and the value the controller accepts cannot drift.
 pub const APPROVAL_MODES: &[&str] = &["auto", "prompt", "prompt-dangerous", "deny"];
+pub const AUTH_PROVIDERS: &[&str] = &["claude", "codex", "kimi"];
 
 /// Every command with the one-line description `/help` prints.
 ///
@@ -28,6 +29,7 @@ pub const APPROVAL_MODES: &[&str] = &["auto", "prompt", "prompt-dangerous", "den
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "every command, then the discovered skills"),
     ("/model", "list models, or /model <name> to switch"),
+    ("/auth", "sign in: /auth <claude|codex|kimi>"),
     ("/approval", "show the approval policy, or /approval <mode>"),
     ("/config", "effective settings, or /config <key> for one"),
     ("/skills", "discovered skills, name and description"),
@@ -78,6 +80,8 @@ pub enum Parsed {
     Quit,
     /// `None` lists the candidates; `Some` switches.
     Model(Option<String>),
+    /// `None` shows the providers; `Some` starts subscription sign-in.
+    Auth(Option<String>),
     /// `None` shows the policy; `Some` sets it.
     Approval(Option<String>),
     /// `None` is `forge config show`; `Some` is `forge config explain`.
@@ -129,6 +133,7 @@ impl Command {
             "help" => Parsed::Help,
             "quit" | "exit" => Parsed::Quit,
             "model" => Parsed::Model(argument),
+            "auth" => Parsed::Auth(argument),
             "approval" => Parsed::Approval(argument),
             "config" => Parsed::Config(argument),
             "skills" => Parsed::Skills,
@@ -272,6 +277,10 @@ impl Command {
         }
         let candidates: Vec<String> = match command {
             "/model" => snapshot.models.clone(),
+            "/auth" => AUTH_PROVIDERS
+                .iter()
+                .map(|provider| (*provider).to_string())
+                .collect(),
             "/approval" => APPROVAL_MODES.iter().map(|m| (*m).to_string()).collect(),
             "/attach" => snapshot.jobs.clone(),
             "/session" => std::iter::once("new".to_string())
@@ -478,6 +487,11 @@ mod tests {
             Command::parse("/model deepseek-chat", &s),
             Parsed::Model(Some("deepseek-chat".into()))
         );
+        assert_eq!(Command::parse("/auth", &s), Parsed::Auth(None));
+        assert_eq!(
+            Command::parse("/auth codex", &s),
+            Parsed::Auth(Some("codex".into()))
+        );
         assert_eq!(
             Command::parse("/approval deny", &s),
             Parsed::Approval(Some("deny".into()))
@@ -625,6 +639,10 @@ mod tests {
         );
         assert!(
             replacements(&Command::complete("/approval ", 10, &s).1).contains(&"prompt-dangerous")
+        );
+        assert_eq!(
+            replacements(&Command::complete("/auth ", 6, &s).1),
+            vec!["claude", "codex", "kimi"]
         );
         // Unmarked words complete nothing — path completion is the `@`
         // branch's job, and guessing inside a prompt is still forbidden.

@@ -583,6 +583,10 @@ impl ChatHost for FakeHost {
         Ok(())
     }
 
+    async fn authenticate(&mut self, _provider: &str) -> Result<(), ForgeError> {
+        Ok(())
+    }
+
     fn environment(&self) -> Environment {
         self.environment.clone()
     }

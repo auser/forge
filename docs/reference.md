@@ -895,6 +895,10 @@ Forge uses your existing credentials, in this order:
    forge auth login kimi
    ```
 
+   The interactive chat exposes the same flow as `/auth`,
+   `/auth claude`, `/auth codex`, and `/auth kimi`; a successful login rebuilds
+   the runtime onto that subscription without restarting the conversation.
+
 `forge auth status` shows what was detected — provider, usable models, source,
 and kind (api-key/oauth) — never any values. `forge doctor` summarizes the
 same in one line.

@@ -55,7 +55,9 @@ forge auth login kimi
 
 Each command delegates the browser/device flow to the provider's official CLI;
 Forge never asks for or stores your password. `forge auth status` reports what
-is ready without printing credential values.
+is ready without printing credential values. Inside chat, use `/auth` to list
+the same providers or `/auth codex` (and similarly `claude`/`kimi`) to sign in
+and switch without restarting Forge.
 
 Or the explicit steps:
 

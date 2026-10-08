@@ -652,6 +652,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Action::Write(line) => self.emit(line),
                 Action::Help => self.do_help(),
                 Action::ListModels => self.do_list_models(),
+                Action::Authenticate(provider) => self.do_authenticate(&provider).await,
                 Action::ShowApproval => self.do_show_approval(),
                 Action::ShowConfig(key) => self.do_show_config(key),
                 Action::ListSkills => self.do_list_skills(),
@@ -1050,6 +1051,20 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 self.emit(Line::meta(format!(
                     "model {} approval {}",
                     env.model, env.approval
+                )));
+            }
+            Err(e) => self.emit(Line::bad(format!("error: {e}"))),
+        }
+    }
+
+    async fn do_authenticate(&mut self, provider: &str) {
+        self.emit(Line::meta(format!("auth: opening {provider} sign-in...")));
+        match self.host.authenticate(provider).await {
+            Ok(()) => {
+                let env = self.host.environment();
+                self.emit(Line::ok(format!(
+                    "authenticated with {provider}; model {}",
+                    env.model
                 )));
             }
             Err(e) => self.emit(Line::bad(format!("error: {e}"))),
