@@ -34,6 +34,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/config", "effective settings, or /config <key> for one"),
     ("/skills", "discovered skills, name and description"),
     ("/graph", "rank project files for a query"),
+    ("/queue", "list queued messages, or remove <n>, or clear"),
     ("/session", "this session, or new, or /session <id>"),
     ("/fork", "fork this conversation, optionally --at <pos>"),
     ("/bg", "detach the running turn and keep talking"),
@@ -89,6 +90,8 @@ pub enum Parsed {
     Skills,
     /// `/graph <query>`, optionally `/graph <query> -- <steering>`.
     Graph(String, Option<String>),
+    /// Inspect or change prompts waiting behind the active turn.
+    Queue(QueueCommand),
     /// `/session` with no argument: report the current one.
     Session,
     SessionNew,
@@ -100,6 +103,13 @@ pub enum Parsed {
     Attach(String),
     /// `/show`, optionally `/show <n>`: the nth most recent tool result (1 = latest).
     Show(Option<usize>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueueCommand {
+    List,
+    Remove(usize),
+    Clear,
 }
 
 /// Namespace for the two pure entry points. A unit struct rather than free
@@ -168,6 +178,17 @@ impl Command {
                     }
                 }
                 None => Parsed::Usage("/graph <query>"),
+            },
+            "queue" => match argument.as_deref() {
+                None => Parsed::Queue(QueueCommand::List),
+                Some("clear") => Parsed::Queue(QueueCommand::Clear),
+                Some(text) => match text
+                    .strip_prefix("remove ")
+                    .and_then(|position| position.trim().parse::<usize>().ok())
+                {
+                    Some(position) if position > 0 => Parsed::Queue(QueueCommand::Remove(position)),
+                    _ => Parsed::Usage("/queue [remove <n>|clear]"),
+                },
             },
             "session" => match argument.as_deref() {
                 None => Parsed::Session,
@@ -513,6 +534,22 @@ mod tests {
         assert_eq!(
             Command::parse("/graph -- prefer tests", &s),
             Parsed::Usage("/graph <query>")
+        );
+        assert_eq!(
+            Command::parse("/queue", &s),
+            Parsed::Queue(QueueCommand::List)
+        );
+        assert_eq!(
+            Command::parse("/queue remove 2", &s),
+            Parsed::Queue(QueueCommand::Remove(2))
+        );
+        assert_eq!(
+            Command::parse("/queue clear", &s),
+            Parsed::Queue(QueueCommand::Clear)
+        );
+        assert_eq!(
+            Command::parse("/queue remove 0", &s),
+            Parsed::Usage("/queue [remove <n>|clear]")
         );
         assert_eq!(Command::parse("/session new", &s), Parsed::SessionNew);
         assert_eq!(

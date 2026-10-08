@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 /// two definitions of it would be two places to get piped mode wrong.
 pub use crate::io::Interactivity;
 
-use crate::command::{APPROVAL_MODES, AUTH_PROVIDERS, Command, Parsed};
+use crate::command::{APPROVAL_MODES, AUTH_PROVIDERS, Command, Parsed, QueueCommand};
 use crate::host::HostChange;
 use crate::io::{CompletionSnapshot, Line};
 
@@ -288,6 +288,7 @@ impl Controller {
             Parsed::Config(key) => vec![Action::ShowConfig(key)],
             Parsed::Skills => vec![Action::ListSkills],
             Parsed::Graph(query, steering) => vec![Action::Graph(query, steering)],
+            Parsed::Queue(command) => self.on_queue(command),
             // Read-only, so it answers in every state, mid-turn included.
             Parsed::Session => vec![Action::ShowSession],
             // Read-only, so it answers in every state, mid-turn included.
@@ -365,14 +366,63 @@ impl Controller {
         Some(next)
     }
 
+    pub fn queued_len(&self) -> usize {
+        self.queue.len()
+    }
+
     fn on_prompt(&mut self, turn: TurnRequest) -> Vec<Action> {
         if self.attached.is_some() {
             // §6.5: queued as the next turn, FIFO, never dropped.
+            let preview = prompt_preview(&turn.prompt);
             self.queue.push_back(turn);
-            return Vec::new();
+            return vec![Action::Write(Line::notice(format!(
+                "queued #{} - {preview}",
+                self.queue.len()
+            )))];
         }
         self.attached = Some(Attached::Working);
         vec![Action::Prompt(turn)]
+    }
+
+    fn on_queue(&mut self, command: QueueCommand) -> Vec<Action> {
+        match command {
+            QueueCommand::List if self.queue.is_empty() => {
+                vec![Action::Write(Line::meta("queue is empty"))]
+            }
+            QueueCommand::List => self
+                .queue
+                .iter()
+                .enumerate()
+                .map(|(index, turn)| {
+                    Action::Write(Line::meta(format!(
+                        "#{} {}",
+                        index + 1,
+                        prompt_preview(&turn.prompt)
+                    )))
+                })
+                .collect(),
+            QueueCommand::Remove(position) => {
+                let index = position.saturating_sub(1);
+                match self.queue.remove(index) {
+                    Some(turn) => vec![Action::Write(Line::meta(format!(
+                        "removed queued #{} - {}",
+                        position,
+                        prompt_preview(&turn.prompt)
+                    )))],
+                    None => vec![Action::Write(Line::bad(format!(
+                        "no queued message #{position}"
+                    )))],
+                }
+            }
+            QueueCommand::Clear => {
+                let count = self.queue.len();
+                self.queue.clear();
+                vec![Action::Write(Line::meta(format!(
+                    "cleared {count} queued message{}",
+                    if count == 1 { "" } else { "s" }
+                )))]
+            }
+        }
     }
 
     fn on_background(&mut self) -> Vec<Action> {
@@ -526,6 +576,19 @@ impl Controller {
 /// Denial is the safe default, so an ambiguous answer is never consent.
 fn is_affirmative(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn prompt_preview(prompt: &str) -> String {
+    const MAX_CHARS: usize = 72;
+
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
 }
 
 #[cfg(test)]
@@ -995,8 +1058,14 @@ mod tests {
     fn prompts_submitted_while_running_queue_in_order() {
         let mut c = idle();
         c.on_line("first");
-        assert!(c.on_line("second").is_empty(), "nothing happens yet");
-        assert!(c.on_line("third").is_empty());
+        assert_eq!(
+            c.on_line("second"),
+            vec![Action::Write(Line::notice("queued #1 - second"))]
+        );
+        assert_eq!(
+            c.on_line("third"),
+            vec![Action::Write(Line::notice("queued #2 - third"))]
+        );
         c.on_run_settled();
         assert_eq!(c.take_queued(), Some(TurnRequest::plain("second")));
         assert_eq!(
@@ -1005,6 +1074,32 @@ mod tests {
             "FIFO, nothing dropped"
         );
         assert_eq!(c.take_queued(), None);
+    }
+
+    #[test]
+    fn queue_can_be_inspected_removed_and_cleared_without_touching_the_run() {
+        let mut c = idle();
+        c.on_line("active");
+        c.on_line("second");
+        c.on_line("third");
+
+        assert_eq!(
+            c.on_line("/queue"),
+            vec![
+                Action::Write(Line::meta("#1 second")),
+                Action::Write(Line::meta("#2 third")),
+            ]
+        );
+        assert_eq!(
+            c.on_line("/queue remove 1"),
+            vec![Action::Write(Line::meta("removed queued #1 - second"))]
+        );
+        assert_eq!(
+            c.on_line("/queue clear"),
+            vec![Action::Write(Line::meta("cleared 1 queued message"))]
+        );
+        assert_eq!(c.queued_len(), 0);
+        assert_eq!(c.state(), ChatState::Running);
     }
 
     /// A `/skill` typed during a turn keeps its skill when it runs next —
@@ -1017,7 +1112,12 @@ mod tests {
             ..CompletionSnapshot::default()
         });
         c.on_line("first");
-        assert!(c.on_line("/tdd write the failing test").is_empty());
+        assert_eq!(
+            c.on_line("/tdd write the failing test"),
+            vec![Action::Write(Line::notice(
+                "queued #1 - Use the tdd skill. write the failing test"
+            ))]
+        );
         c.on_run_settled();
         assert_eq!(
             c.take_queued(),

@@ -217,6 +217,11 @@ Then, any time something looks wrong: **`forge doctor`** — it probes the
 model endpoint, the router, the embedded brain, and every credential env
 var your config names, and tells you which line to change.
 
+Interactive terminal commands print `working:` immediately, emit a
+`still working:` heartbeat every ten seconds, and finish with `done:` or
+`failed:`. JSON and non-TTY invocations omit this status so scripts retain
+clean machine-readable output.
+
 ### Pick your model (10 seconds)
 
 Exactly one of these, whichever you already have:
@@ -516,10 +521,12 @@ session 01JCF3...  /help for commands
 ```text
 /help       every command, then the discovered skills
 /model      list models, or /model <name> to switch
+/auth       sign in: /auth <claude|codex|kimi>
 /approval   show the approval policy, or /approval <mode>
 /config     effective settings, or /config <key> for one
 /skills     discovered skills, name and description
 /graph      rank project files for a query, optionally /graph <query> -- <steering>
+/queue      list queued messages, or remove <n>, or clear
 /session    this session, or new, or /session <id>
 /fork       fork this conversation, optionally --at <pos>
 /bg         detach the running turn and keep talking
@@ -540,6 +547,17 @@ adds anything it matches. `/model`,
 entry banner and `/model`/`/config`/`/approval` report the *active* model
 honestly even when it is one — hiding that would be a lie about what is
 running.
+
+Typing `/` on an empty line shows the built-in command menu immediately.
+As the prefix becomes unique, Forge displays the remainder inline — `/gr`
+suggests `/graph` without requiring Tab. Tab still lists every matching
+command or discovered skill.
+
+Submitting an ordinary prompt while a turn is running queues it as a
+separate FIFO turn; it never changes the active model request. Forge prints
+`queued #<n>` immediately and announces when the queued message begins.
+Use `/queue` to inspect pending prompts, `/queue remove <n>` to remove one,
+or `/queue clear` to discard all pending prompts.
 
 The live stream renders a tool call as its one-line summary (`  * read_file
 src/main.rs` / `    -> ok (4 ms)`) and deliberately keeps the payload out of

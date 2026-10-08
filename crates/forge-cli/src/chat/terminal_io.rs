@@ -64,14 +64,14 @@ use std::sync::mpsc as std_mpsc;
 
 use async_trait::async_trait;
 use forge_chat::{
-    ChatIo, Command, CompletionCandidate, CompletionSnapshot, Interactivity, Line, Prompt,
-    ReadOutcome,
+    COMMANDS, ChatIo, Command, CompletionCandidate, CompletionSnapshot, Interactivity, Line,
+    Prompt, ReadOutcome,
 };
 use forge_core::ForgeError;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
+use rustyline::hint::{Hint, Hinter};
 use rustyline::history::DefaultHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{
@@ -428,8 +428,8 @@ impl ExternalPrinter for StdoutPrinter {
 /// The `rustyline::Helper`: Tab completion delegates to
 /// [`forge_chat::Command::complete`] over the snapshot carried in the
 /// current [`Prompt`] (never the filesystem, never the host — the editor
-/// thread only ever sees data); multi-line validation is [`is_complete`];
-/// hinting and highlighting are the crate's defaults (none).
+/// thread only ever sees data); slash-command hints update as the user types;
+/// multi-line validation is [`is_complete`].
 struct ChatHelper {
     completions: CompletionSnapshot,
 }
@@ -468,7 +468,49 @@ impl rustyline::completion::Candidate for DisplayCandidate {
 }
 
 impl Hinter for ChatHelper {
-    type Hint = String;
+    type Hint = SlashHint;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+        slash_hint(line, pos, &self.completions)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SlashHint {
+    display: String,
+    completion: String,
+}
+
+impl Hint for SlashHint {
+    fn display(&self) -> &str {
+        &self.display
+    }
+
+    fn completion(&self) -> Option<&str> {
+        Some(&self.completion)
+    }
+}
+
+fn slash_hint(line: &str, pos: usize, completions: &CompletionSnapshot) -> Option<SlashHint> {
+    if pos != line.len() || !line.starts_with('/') || line.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (_, candidates) = Command::complete(line, pos, completions);
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    let completion = candidate.replacement.strip_prefix(line)?.to_string();
+    if completion.is_empty() {
+        return None;
+    }
+    let description = candidate
+        .display
+        .strip_prefix(&candidate.replacement)
+        .unwrap_or_default();
+    Some(SlashHint {
+        display: format!("{completion}{description}"),
+        completion,
+    })
 }
 
 impl Highlighter for ChatHelper {}
@@ -570,7 +612,11 @@ impl ConditionalEventHandler for SlashHandler {
             let mut stdout = std::io::stdout().lock();
             use std::io::Write as _;
             let _ = write!(stdout, "\r\n");
-            for candidate in candidates {
+            for candidate in candidates.into_iter().filter(|candidate| {
+                COMMANDS
+                    .iter()
+                    .any(|(name, _)| *name == candidate.replacement)
+            }) {
                 let _ = writeln!(stdout, "{}", candidate.display);
             }
             // We wrote behind rustyline's back, so restore the visible prompt
@@ -615,6 +661,21 @@ mod tests {
         assert_eq!(slash_action("explain ", 8), SlashAction::Insert);
         assert_eq!(slash_action("/model ", 7), SlashAction::Insert);
         assert_eq!(slash_action("text", 0), SlashAction::Insert);
+    }
+
+    #[test]
+    fn slash_hint_narrows_graph_as_the_prefix_is_typed() {
+        let hint = slash_hint("/gr", 3, &CompletionSnapshot::default())
+            .expect("/gr uniquely identifies /graph");
+        assert_eq!(hint.completion, "aph");
+        assert!(hint.display.starts_with("aph"));
+        assert!(hint.display.contains("rank project files"));
+    }
+
+    #[test]
+    fn slash_hint_waits_until_a_prefix_is_unique() {
+        assert!(slash_hint("/", 1, &CompletionSnapshot::default()).is_none());
+        assert!(slash_hint("/s", 2, &CompletionSnapshot::default()).is_none());
     }
 
     /// Review Focus 4: a pasted fenced block is one input, not five turns.
