@@ -685,6 +685,51 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
 }
 
 #[tokio::test]
+async fn oversized_tool_output_is_capped_before_the_model_and_replay_log() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let huge = "x".repeat(forge_core::MAX_TOOL_OUTPUT_BYTES + 23_000_000);
+    std::fs::write(tmp.path().join("huge.txt"), &huge).expect("write huge fixture");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        tool_reply("read_file", serde_json::json!({"path": "huge.txt"})),
+        text_reply("handled the partial result"),
+    ]));
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(NativeExecution::new(
+            forge_core::ApprovalPolicy::Auto,
+            tmp.path(),
+        )),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        Config::default(),
+    );
+
+    let outcome = service.run("read the huge file").await.expect("run");
+    let expected = forge_core::cap_tool_output(&huge);
+    let requests = model.recorded();
+    let model_result = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.is_some())
+        .expect("tool result reached model");
+    assert_eq!(model_result.content, expected);
+    assert!(model_result.content.contains("bytes dropped"));
+
+    let logged = outcome
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ToolResult { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("tool result logged");
+    assert_eq!(logged, &expected);
+}
+
+#[tokio::test]
 async fn tool_errors_go_back_to_the_model_without_aborting() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let service = scripted_service(
