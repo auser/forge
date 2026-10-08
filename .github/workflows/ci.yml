@@ -53,6 +53,16 @@ jobs:
       - name: BDD
         run: cargo test -p forge-cli --test bdd
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: MCP comparison harness (offline)
+        run: |
+          python3 -m unittest discover -s tools -p 'test_mcp_comparison.py'
+          cargo build -p forge-cli
+          python3 tools/mcp_comparison.py --forge target/debug/forge
+
   # Links and *runs* the FFI backend, which the `verify` job can only
   # type-check. Not the required status check: it fetches the engine from
   # Hugging Face, so an outage upstream must not be able to block a merge —
