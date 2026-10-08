@@ -204,12 +204,11 @@ Each sub-project gets its own spec → plan → implementation cycle:
      interrupt path is tested with a real `SIGINT` against the real
      binary), and no user-facing mention of mocks anywhere.
 
-Parallel track (in progress on main): **cloud subscription support** —
-credential detection for Claude Code OAuth, Codex, Kimi/Moonshot and
-friends (`forge auth status`), extending the generation-plane candidate
-list. Remaining gaps tracked there: OAuth-only Codex (ChatGPT Responses
-backend), macOS Keychain lookup, and additional subscription providers
-as they expose usable credentials.
+Shipped on main: **cloud subscription support** — first-class login and
+credential detection for Claude Code OAuth, Codex ChatGPT OAuth, and Kimi
+Code OAuth (`forge auth login`, `forge auth status`), with subscription-backed
+generation candidates. Remaining: macOS Keychain lookup and additional
+subscription providers as they expose usable credentials.
 
 **Documentation requirement**: every sub-project keeps `README.md`
 accurate in the same change that lands behavior — the README describes
@@ -427,7 +426,7 @@ adds `router_name: "needle"` and confidence — no schema change.
     nothing in `just verify` needs it) but `needle.h` — the API contract —
     is committed so `cargo check` works on machines that never link it.
   - **Pinned artifacts** (macos-arm64, verified by `shasum -a 256`):
-    `libneedle.a` = `98da47c15e1065b4cdc7ddc55e825be78414d4586832db3becaeded39a373df4`
+    `libneedle.a` = `60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a`
     (1 158 184 bytes); `needle.h` =
     `3aa713942528d944598458cecb4a262f2cc49349bec63355f91df0b159964e55`
     (1 187 bytes, committed at `crates/needle-sys/needle.h`).
@@ -452,7 +451,7 @@ adds `router_name: "needle"` and confidence — no schema change.
 
   | folder | sha256 | bytes | wired up |
   | --- | --- | --- | --- |
-  | `macos-arm64` | `98da47c15e1065b4cdc7ddc55e825be78414d4586832db3becaeded39a373df4` | 1 534 232 | yes (`aarch64-apple-darwin`) |
+  | `macos-arm64` | `60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a` | 1 158 184 | yes (`aarch64-apple-darwin`) |
   | `linux-x86_64` | `2581e7d46acd4f66c5839bcfb06b0af11c157c8775636875beb0af5ca35ded54` | 1 675 104 | yes (`x86_64-unknown-linux-gnu`) |
   | `linux-arm64` | `b36c214437b5230bae89291f684de571dceb0922834a09ceeb09a8e21464a481` | 1 539 978 | yes (`aarch64-unknown-linux-gnu`) |
   | `windows-x86_64` | `6fb0b9bccfa9f54d46e05a279273c15021570a53a8b3945613d80d299ca1f634` | 1 808 664 | no |

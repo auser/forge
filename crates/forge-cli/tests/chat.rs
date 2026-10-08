@@ -460,6 +460,12 @@ fn a_piped_chat_assembles_a_streamed_answer_once() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let working = stdout.find("working...").expect("activity acknowledgement");
+    let answer = stdout.find("the answer").expect("answer");
+    assert!(
+        working < answer,
+        "working status must precede the answer:\n{stdout}"
+    );
     assert_eq!(
         stdout.matches("the answer").count(),
         1,
@@ -1033,6 +1039,34 @@ fn a_tab_on_an_at_word_completes_a_project_path_on_a_real_terminal() {
 
     // Killed, not asked to `/quit` — the Ctrl-C test's doc gives the
     // reason (do not race the unrelated outstanding-read hazard).
+    drop(writer);
+    child.kill().ok();
+    child.wait().ok();
+    reader_thread.join().expect("pty reader thread");
+}
+
+/// Typing `/` at an empty real terminal opens the slash-command menu without
+/// requiring Tab. This is the interaction users expect from coding harnesses;
+/// the unit tests cover candidate contents, while this test proves the key
+/// binding reaches rustyline completion in the compiled binary.
+#[cfg(unix)]
+#[test]
+fn slash_opens_the_command_menu_on_a_real_terminal() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let mut cmd = forge(tmp.path(), &project);
+    cmd.env("TERM", "xterm-256color");
+    let (mut child, master) = pty::spawn(cmd).expect("spawn on pty");
+    let mut writer = master.try_clone().expect("clone master for writing");
+    let (output, reader_thread) = tail_stream(master);
+
+    wait_for(&output, "/help for commands", Duration::from_secs(30));
+    wait_for(&output, "> ", Duration::from_secs(30));
+
+    writer.write_all(b"/").expect("type slash");
+    wait_for(&output, "/help", Duration::from_secs(30));
+    wait_for(&output, "/model", Duration::from_secs(30));
+
     drop(writer);
     child.kill().ok();
     child.wait().ok();

@@ -74,6 +74,50 @@ fn version_prints_name_and_version() {
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
 }
 
+#[cfg(unix)]
+#[test]
+fn auth_login_delegates_to_the_official_cli_and_detects_its_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\nmkdir -p \"$HOME/.claude\"\nprintf '%s' \
+         '{\"claudeAiOauth\":{\"accessToken\":\"test-oauth\"}}' \
+         > \"$HOME/.claude/.credentials.json\"\n",
+    )
+    .expect("script");
+    let mut permissions = std::fs::metadata(&claude).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&claude, permissions).expect("chmod");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["auth", "login", "claude"])
+        .env("PATH", path)
+        .output()
+        .expect("run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("authenticated with Claude"));
+}
+
 #[test]
 fn config_explain_reports_environment_origin() {
     let tmp = tempfile::tempdir().expect("tempdir");

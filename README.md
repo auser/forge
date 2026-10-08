@@ -44,6 +44,19 @@ model wins, followed by an authenticated CLI subscription, then an API-key
 hosted provider. Models without working endpoints or credentials are never
 offered to the router.
 
+No model yet? Sign in with a subscription you already have, then run `forge`
+again:
+
+```bash
+forge auth login claude
+forge auth login codex
+forge auth login kimi
+```
+
+Each command delegates the browser/device flow to the provider's official CLI;
+Forge never asks for or stores your password. `forge auth status` reports what
+is ready without printing credential values.
+
 Or the explicit steps:
 
 ```bash

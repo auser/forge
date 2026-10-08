@@ -1,9 +1,10 @@
-# Plug-and-play with Kimi: Moonshot's Kimi K2.7 Code as the model, the
+# Plug-and-play with Kimi: Kimi K3 as the model, the
 # embedded needle brain deciding underneath (the default router).
 #
-# Credential: MOONSHOT_API_KEY in .env / your shell — see env.example.
+# Credential: `forge auth login kimi` (or `kimi login`) uses your Kimi Code
+# subscription. No API key is needed.
 
-model = "kimi-k2.7-code"
+model = "k3"
 execution = "native"
 approval = "prompt"
 

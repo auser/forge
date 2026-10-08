@@ -67,13 +67,15 @@ fn defaults_when_nothing_set() {
     );
     // Built-in model registry with cost metadata.
     let models = resolved.config.model_entries();
-    assert_eq!(models.len(), 6);
+    assert_eq!(models.len(), 8);
     assert_eq!(models["qwen3-coder"].cost_input_per_mtok, Some(0.0));
     assert_eq!(models["deepseek-chat"].cost_input_per_mtok, Some(0.14));
     assert_eq!(
         models["kimi-k2.7-code"].key_env.as_deref(),
         Some("MOONSHOT_API_KEY")
     );
+    assert_eq!(models["gpt-5.6-sol"].provider.as_deref(), Some("codex"));
+    assert_eq!(models["k3"].provider.as_deref(), Some("kimi-code"));
     // OpenRouter: one key brokering many models, so the built-in entry exists
     // to make OPENROUTER_API_KEY useful without any config. The id is qualified
     // because that is how OpenRouter names models on the wire.
@@ -364,7 +366,7 @@ fn models_table_deep_merges_by_name() {
     let resolved = Config::load(Some(&project), &CliOverrides::default()).expect("load");
     let models = &resolved.config.models;
     // 6 built-in defaults + 3 from the layered files.
-    assert_eq!(models.len(), 9);
+    assert_eq!(models.len(), 11);
     // Project entry replaces the same-named user entry entirely.
     assert_eq!(models["shared"].cost_input_per_mtok, Some(9.0));
     assert_eq!(

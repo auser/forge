@@ -352,6 +352,12 @@ fn editor_thread_main(
         editor.set_helper(Some(ChatHelper {
             completions: prompt.completions.clone(),
         }));
+        editor.bind_sequence(
+            KeyEvent::from('/'),
+            EventHandler::Conditional(Box::new(SlashHandler {
+                completions: prompt.completions.clone(),
+            })),
+        );
 
         let outcome = match editor.readline(prompt.text.as_str()) {
             Ok(line) => {
@@ -525,6 +531,52 @@ fn ctrl_c_command(line: &str) -> CtrlC {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashAction {
+    ShowMenu,
+    Insert,
+}
+
+/// What a typed slash means at the current prompt. Everywhere except a
+/// completely empty prompt it remains an ordinary character (paths, prose,
+/// and command arguments must not lose it).
+fn slash_action(line: &str, pos: usize) -> SlashAction {
+    if line.is_empty() && pos == 0 {
+        SlashAction::ShowMenu
+    } else {
+        SlashAction::Insert
+    }
+}
+
+/// Bound to `/`: an empty prompt gets the command palette immediately,
+/// matching other coding harnesses; a slash typed anywhere else inserts
+/// normally.
+struct SlashHandler {
+    completions: CompletionSnapshot,
+}
+
+impl ConditionalEventHandler for SlashHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if slash_action(ctx.line(), ctx.pos()) == SlashAction::ShowMenu {
+            let (_, candidates) = Command::complete("/", 1, &self.completions);
+            let mut stdout = std::io::stdout().lock();
+            use std::io::Write as _;
+            let _ = write!(stdout, "\r\n");
+            for candidate in candidates {
+                let _ = writeln!(stdout, "{}", candidate.display);
+            }
+            let _ = stdout.flush();
+        }
+        Some(Cmd::SelfInsert(1, '/'))
+    }
+}
+
 /// Bound to Ctrl-C (`custom-bindings`, see the design's §2.3 table): reads
 /// the in-progress buffer from [`EventContext::line`] because
 /// `ReadlineError::Interrupted` itself carries none, which is the only way
@@ -550,6 +602,14 @@ impl ConditionalEventHandler for CtrlCHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_opens_completion_only_at_an_empty_prompt() {
+        assert_eq!(slash_action("", 0), SlashAction::ShowMenu);
+        assert_eq!(slash_action("explain ", 8), SlashAction::Insert);
+        assert_eq!(slash_action("/model ", 7), SlashAction::Insert);
+        assert_eq!(slash_action("text", 0), SlashAction::Insert);
+    }
 
     /// Review Focus 4: a pasted fenced block is one input, not five turns.
     #[test]

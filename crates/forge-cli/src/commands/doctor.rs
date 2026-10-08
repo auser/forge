@@ -158,22 +158,22 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
             .filter(|p| p.detected)
             .filter_map(|p| p.source.as_ref().map(|s| format!("{} ({s})", p.provider)))
             .collect();
-        let codex_note = probes.iter().any(|p| p.note.is_some());
+        let notes: Vec<&str> = probes
+            .iter()
+            .filter_map(|probe| probe.note.as_deref())
+            .collect();
         let (level, detail) = if !detected.is_empty() {
-            let suffix = if codex_note {
-                "; codex subscription OAuth unsupported (set OPENAI_API_KEY)"
+            let suffix = if notes.is_empty() {
+                String::new()
             } else {
-                ""
+                format!("; {}", notes.join("; "))
             };
             (
                 Level::Ok,
-                format!("{} detected{}", detected.join(", "), suffix),
+                format!("{} detected{suffix}", detected.join(", ")),
             )
-        } else if codex_note {
-            (
-                Level::Warn,
-                "codex subscription OAuth detected but unsupported; set OPENAI_API_KEY".to_string(),
-            )
+        } else if !notes.is_empty() {
+            (Level::Warn, notes.join("; "))
         } else {
             (
                 Level::Warn,
@@ -199,7 +199,12 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
     }
 
     if let Ok(resolved) = &resolved {
-        let config = &resolved.config;
+        let mut effective = resolved.config.clone();
+        if !effective.explicit.contains("model") {
+            effective.model = forge_providers::automatic_model(&effective)
+                .unwrap_or_else(|| forge_providers::AUTH_REQUIRED_MODEL.to_string());
+        }
+        let config = &effective;
         if let Some(check) = local_only_check(config) {
             checks.push(check);
         }
@@ -211,7 +216,13 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
         // its endpoint (warn, never fail).
         // One list of mock names, owned by the crate that enforces the gate.
         let mock_model = forge_providers::is_mock_model(&config.model);
-        let model_detail = if mock_model {
+        let model_detail = if config.model == forge_providers::AUTH_REQUIRED_MODEL {
+            Some((
+                Level::Warn,
+                "no usable generation model; run `forge auth login <claude|codex|kimi>`"
+                    .to_string(),
+            ))
+        } else if mock_model {
             Some(if forge_config::test_mocks_allowed() {
                 (
                     Level::Warn,
