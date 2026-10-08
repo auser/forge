@@ -447,8 +447,8 @@ fn serve_serves_health_on_ephemeral_port() {
 /// In a build with no inference backend that hint is a dead end — this
 /// binary's `forge init` skips the weights fetch precisely *because* there is
 /// no backend, so following it changes nothing and the user is back where they
-/// started. The fallback warning must name the real cause and the one command
-/// that fixes it.
+/// started. Verbose fallback diagnostics must name the real cause and the one
+/// command that fixes it without polluting the default chat transcript.
 ///
 /// Driven through the real binary rather than a unit test because the bug was
 /// in the composition: each layer's message was defensible on its own, and
@@ -473,8 +473,9 @@ fn a_failed_needle_route_never_tells_a_backend_less_build_to_run_forge_init() {
     let output = forge(tmp.path())
         .args(["--project"])
         .arg(&project)
-        // -v so the router's fallback warning reaches stderr at all.
-        .args(["-v", "run", "hello"])
+        // Expected fallback is debug-level: visible on demand, silent by
+        // default because the structured routing line already explains it.
+        .args(["-vv", "run", "hello"])
         .output()
         .expect("run");
 
@@ -486,7 +487,7 @@ fn a_failed_needle_route_never_tells_a_backend_less_build_to_run_forge_init() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("primary router failed"),
-        "expected the fallback warning; stderr:\n{stderr}"
+        "expected the fallback diagnostic; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("no embedded inference backend"),
