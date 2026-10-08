@@ -1377,6 +1377,11 @@ a claim of lower end-to-end token use or faster tasks. It catalogs Forge's
 existing local tools only: no external MCP servers, API crawling, or new
 authorization system. The coding agent's built-in tools are unaffected.
 
+Use the [MCP comparison harness](mcp-comparison.md) to compare the two
+surfaces on disposable synthetic projects. It separates offline scripted
+protocol checks from model-driven task evaluation; `just mcp-check` runs
+only the offline checks and requires no credentials.
+
 ### Approvals
 
 `forge mcp` is non-interactive by definition: stdin is the protocol channel, so

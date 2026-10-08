@@ -44,8 +44,15 @@ test:
 bdd:
     cargo test -p forge-cli --test bdd
 
-# fmt --check + check + lint (incl. link-free e2e lint) + test + bdd
-verify: check lint lint-ffi test bdd
+# Offline full-vs-compact MCP comparison: unit tests plus real stdio workflows.
+# Requires Python 3.10+; no model, credentials, or third-party Python packages.
+mcp-check:
+    python3 -m unittest discover -s tools -p 'test_mcp_comparison.py'
+    cargo build -p forge-cli
+    python3 tools/mcp_comparison.py --forge target/debug/forge
+
+# fmt --check + check + lint (incl. link-free e2e lint) + test + bdd + MCP smoke
+verify: check lint lint-ffi test bdd mcp-check
     cargo fmt --all --check
 
 # The libneedle FFI backend, linked for real. The engine is fetched and
