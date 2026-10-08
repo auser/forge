@@ -188,7 +188,11 @@ pub enum Command {
     },
 
     /// Print name and version.
-    Version,
+    Version {
+        /// Include the source commit and compilation target.
+        #[arg(long)]
+        build: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -216,7 +220,11 @@ pub enum SessionCommand {
 #[derive(Subcommand)]
 pub enum GraphCommand {
     /// Build or incrementally refresh the graph.
-    Build,
+    Build {
+        /// Also build the local semantic embedding index.
+        #[arg(long)]
+        semantic: bool,
+    },
     /// Check graph freshness.
     Check,
     /// Print a structural map.

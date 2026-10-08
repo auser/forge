@@ -71,9 +71,19 @@ use crate::backend::{BackendError, Decision, NeedleBackend, NeedleToolCall};
 /// while keeping truncation effectively unreachable.
 const OUT_CAPACITY: usize = 256 * 1024;
 
-/// Matches the Python SDK's default. Decisions and records are short; this is
-/// a ceiling, not a target.
+/// General completion ceiling, matching the Python SDK's default. Extraction
+/// records and arbitrary tool arguments can legitimately need this much room.
 const MAX_NEW_TOKENS: i32 = 512;
+
+/// A routing decision only has to select one no-argument tool. Keeping its
+/// generation budget small is important because vague tasks may otherwise
+/// consume the general ceiling before returning an empty (declined) envelope,
+/// exceeding the router's wall-clock timeout and needlessly forcing fallback.
+const DECISION_MAX_NEW_TOKENS: i32 = 128;
+
+fn decision_max_new_tokens() -> i32 {
+    DECISION_MAX_NEW_TOKENS
+}
 
 /// Fallback name for the record tool in [`FfiBackend::extract`] when the
 /// schema carries no `title`.
@@ -132,7 +142,12 @@ impl FfiBackend {
     /// `needle3.cact` and made a warm route round-trip *30x worse*
     /// (~0.5 s → 16.5 s on the first call after the skip). Do not
     /// reintroduce it without re-measuring.
-    fn run(&mut self, tools_json: &str, input: &str) -> Result<Envelope, BackendError> {
+    fn run(
+        &mut self,
+        tools_json: &str,
+        input: &str,
+        max_new_tokens: i32,
+    ) -> Result<Envelope, BackendError> {
         if !self.ready {
             return Err(BackendError::NotLoaded);
         }
@@ -174,7 +189,7 @@ impl FfiBackend {
             }
             needle_sys::needle_complete(
                 text.as_ptr(),
-                MAX_NEW_TOKENS,
+                max_new_tokens,
                 self.out.as_mut_ptr().cast(),
                 capacity,
             )
@@ -350,7 +365,8 @@ impl NeedleBackend for FfiBackend {
             .collect();
         let tools_json = to_json(&tools)?;
 
-        self.run(&tools_json, task)?.decision(&unique)
+        self.run(&tools_json, task, decision_max_new_tokens())?
+            .decision(&unique)
     }
 
     /// One vector per text, L2-normalised by the engine, `dimensions()` long.
@@ -430,7 +446,7 @@ impl NeedleBackend for FfiBackend {
         })];
         let tools_json = to_json(&tools)?;
 
-        self.run(&tools_json, text)?.record()
+        self.run(&tools_json, text, MAX_NEW_TOKENS)?.record()
     }
 
     /// Native tool calling with the caller's tools JSON verbatim. `None` is
@@ -457,7 +473,8 @@ impl NeedleBackend for FfiBackend {
             }
         }
 
-        self.run(tools_json, prompt)?.needle_tool_call()
+        self.run(tools_json, prompt, MAX_NEW_TOKENS)?
+            .needle_tool_call()
     }
 }
 
@@ -676,6 +693,16 @@ mod tests {
     }
 
     #[test]
+    fn routing_decisions_use_a_small_generation_bound() {
+        let decision_bound = decision_max_new_tokens();
+        assert_eq!(decision_bound, 128);
+        assert!(
+            decision_bound < MAX_NEW_TOKENS,
+            "routing must not inherit the general completion ceiling"
+        );
+    }
+
+    #[test]
     fn real_engine_envelope_parses() {
         // Captured verbatim from `libneedle` (macos-arm64, needle3.cact).
         let e = envelope(
@@ -780,7 +807,7 @@ mod tests {
             Err(BackendError::NotLoaded)
         ));
         assert!(matches!(
-            backend.run("[]", "x"),
+            backend.run("[]", "x", MAX_NEW_TOKENS),
             Err(BackendError::NotLoaded)
         ));
     }

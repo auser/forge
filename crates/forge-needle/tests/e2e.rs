@@ -130,8 +130,8 @@ async fn needle_ffi_backend_end_to_end() {
         "'run the tests' should select the test runner"
     );
     assert!(
-        decision.confidence > 0.5,
-        "a clear-cut decision should be confident, got {}",
+        decision.confidence >= 0.7,
+        "a clear-cut decision must clear Forge's default router threshold, got {}",
         decision.confidence
     );
     assert!(

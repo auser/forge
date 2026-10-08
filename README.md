@@ -80,6 +80,25 @@ Anything looks wrong: **`forge doctor`** — it probes the model, the
 router, the brain, and your credentials, and tells you which line to
 change.
 
+## Release checks
+
+`forge version --build` prints the semver, source commit, and compilation
+target. Release artifacts embed the exact GitHub commit, so two builds with the
+same semver can still be identified.
+
+The offline acceptance check
+`cargo test -p forge-cli --test cli compiled_forge_initializes_then_edits_and_validates_a_project`
+starts with an uninitialized disposable project, runs the compiled Forge
+binary, and proves its deterministic mock provider can edit a file and execute
+a validation command. `bash tests/install-path.sh` separately checks installer
+verification and PATH-shadow handling with a local fake release asset.
+
+Before publishing a release, a **manual canary is still required**: install the
+candidate artifact on a clean machine and complete one real edit/test run with
+each supported subscription provider. The hermetic mock check validates the
+agent and tool loop, but cannot validate provider authentication, subscription
+entitlements, or upstream API behavior.
+
 ## Use from your editor
 
 **Zed** (or any ACP editor) — forge as a native agent, in

@@ -70,7 +70,9 @@ impl EmbeddingIndex {
         let mut out = Vec::with_capacity(MAGIC.len() + body.len());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&body);
-        std::fs::write(path, out).map_err(ForgeError::Io)
+        let temp_path = path.with_extension("bin.tmp");
+        std::fs::write(&temp_path, out).map_err(ForgeError::Io)?;
+        std::fs::rename(temp_path, path).map_err(ForgeError::Io)
     }
 
     /// Whether this index was built with the given model/dimensions — a
@@ -91,6 +93,23 @@ impl EmbeddingIndex {
             .filter(|(key, hash)| self.entries.get(key).map(|e| &e.content_hash) != Some(hash))
             .map(|(key, _)| key.clone())
             .collect()
+    }
+
+    /// Whether this index represents exactly the current graph symbols and
+    /// their embedding text. A structural graph rebuild deliberately keeps
+    /// the old index so a later semantic build can update it incrementally,
+    /// but queries must not serve those stale vectors in the meantime.
+    pub fn is_fresh(&self, current: &[(String, String)]) -> bool {
+        let unique: BTreeMap<&str, &str> = current
+            .iter()
+            .map(|(key, hash)| (key.as_str(), hash.as_str()))
+            .collect();
+        self.entries.len() == unique.len()
+            && unique.iter().all(|(key, hash)| {
+                self.entries
+                    .get(*key)
+                    .is_some_and(|entry| entry.content_hash == *hash)
+            })
     }
 
     pub fn upsert(&mut self, key: String, content_hash: String, vector: Vec<f32>) {
@@ -211,6 +230,17 @@ mod tests {
         let mut stale = index.stale_keys(&current);
         stale.sort();
         assert_eq!(stale, vec!["b::y".to_string(), "c::z".to_string()]);
+    }
+
+    #[test]
+    fn freshness_compares_unique_keys_when_the_graph_reports_duplicates() {
+        let mut index = EmbeddingIndex::new("m".to_string(), 2);
+        index.upsert("a::new".to_string(), "hash".to_string(), vec![1.0, 0.0]);
+        let duplicate_candidates = vec![
+            ("a::new".to_string(), "hash".to_string()),
+            ("a::new".to_string(), "hash".to_string()),
+        ];
+        assert!(index.is_fresh(&duplicate_candidates));
     }
 
     #[test]

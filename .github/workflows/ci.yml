@@ -50,6 +50,9 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      - name: Installer PATH tests (offline)
+        run: bash tests/install-path.sh
+
       - name: BDD
         run: cargo test -p forge-cli --test bdd
 

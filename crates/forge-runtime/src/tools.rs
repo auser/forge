@@ -315,17 +315,20 @@ impl ToolDispatcher {
                     self.exec.execute(request).await
                 };
                 match result {
-                    Ok(r) => Ok(ToolOutcome {
-                        result: ToolResult::ok(
-                            call.id.clone(),
-                            call.name.clone(),
-                            format!(
-                                "exit {}\nstdout:\n{}\nstderr:\n{}",
-                                r.exit_code, r.stdout, r.stderr
-                            ),
-                        ),
-                        file_changed: None,
-                    }),
+                    Ok(r) => {
+                        let output = format!(
+                            "exit {}\nstdout:\n{}\nstderr:\n{}",
+                            r.exit_code, r.stdout, r.stderr
+                        );
+                        Ok(ToolOutcome {
+                            result: if r.exit_code == 0 {
+                                ToolResult::ok(call.id.clone(), call.name.clone(), output)
+                            } else {
+                                ToolResult::error(call.id.clone(), call.name.clone(), output)
+                            },
+                            file_changed: None,
+                        })
+                    }
                     Err(e @ ForgeError::ApprovalRequired { .. }) => Err(e),
                     Err(e) => Ok(ToolOutcome {
                         result: ToolResult::error(

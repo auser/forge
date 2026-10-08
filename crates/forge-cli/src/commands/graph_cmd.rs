@@ -14,7 +14,7 @@ const EMBED_BATCH_SIZE: usize = 32;
 
 pub async fn run(ctx: &Context, command: GraphCommand) -> Result<(), ForgeError> {
     match command {
-        GraphCommand::Build => build(ctx).await,
+        GraphCommand::Build { semantic } => build(ctx, semantic).await,
         GraphCommand::Check => check(ctx),
         GraphCommand::Map => map(ctx),
         GraphCommand::Grep { pattern, semantic } => {
@@ -41,30 +41,37 @@ fn open_built(ctx: &Context) -> Result<LocalGraph, ForgeError> {
     Ok(graph)
 }
 
-async fn build(ctx: &Context) -> Result<(), ForgeError> {
+async fn build(ctx: &Context, semantic: bool) -> Result<(), ForgeError> {
     let mut graph = LocalGraph::open(ctx.project_root()?)?;
     let (stats, report) = graph.build_report()?;
-    let embedded = embed_after_build(ctx, &graph).await?;
+    let embedded = if semantic {
+        Some(embed_after_build(ctx, &graph).await?)
+    } else {
+        None
+    };
     if ctx.global.json {
+        let mut output = serde_json::json!({
+            "files": stats.files,
+            "directories": stats.directories,
+            "symbols": stats.symbols,
+            "imports": stats.imports,
+            "tests": stats.tests,
+            "duration_ms": stats.duration_ms,
+            "parsed": report.parsed,
+            "reused": report.reused,
+            "removed": report.removed,
+        });
+        if let Some(embedded) = embedded {
+            output["embedded"] = embedded.into();
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "files": stats.files,
-                "directories": stats.directories,
-                "symbols": stats.symbols,
-                "imports": stats.imports,
-                "tests": stats.tests,
-                "duration_ms": stats.duration_ms,
-                "parsed": report.parsed,
-                "reused": report.reused,
-                "removed": report.removed,
-                "embedded": embedded,
-            }))
-            .map_err(|e| ForgeError::graph(format!("serializing stats: {e}")))?
+            serde_json::to_string_pretty(&output)
+                .map_err(|e| ForgeError::graph(format!("serializing stats: {e}")))?
         );
     } else {
         println!(
-            "graph built: {} files, {} symbols, {} imports, {} tests ({} ms; {} parsed, {} reused, {} removed, {} embedded)",
+            "graph built: {} files, {} symbols, {} imports, {} tests ({} ms; {} parsed, {} reused, {} removed{})",
             stats.files,
             stats.symbols,
             stats.imports,
@@ -73,23 +80,24 @@ async fn build(ctx: &Context) -> Result<(), ForgeError> {
             report.parsed.len(),
             report.reused.len(),
             report.removed.len(),
-            embedded,
+            embedded
+                .map(|count| format!(", {count} embedded"))
+                .unwrap_or_default(),
         );
     }
     Ok(())
 }
 
 /// After a successful `build_report()`, refresh the local semantic index —
-/// but only when a needle engine is genuinely available (constructible AND
-/// able to answer; see `forge_needle::engine_if_available`). Graph
-/// structure itself stays model-free (its README promises no model calls,
-/// ever); this step is purely additive and, without a working engine,
-/// skips silently rather than failing the build. Returns how many symbols
-/// were (re-)embedded this run (0 when skipped, or when nothing changed).
+/// Graph structure itself stays model-free; this explicit, additive step
+/// requires a working needle engine. The index is saved after every batch so
+/// an interrupted first build resumes from its latest completed checkpoint.
 async fn embed_after_build(ctx: &Context, graph: &LocalGraph) -> Result<usize, ForgeError> {
     let resolved = ctx.resolve_config()?;
     let Some(engine) = forge_needle::engine_if_available(&resolved.config).await else {
-        return Ok(0);
+        return Err(ForgeError::graph(
+            "semantic graph build needs needle weights (run forge init)",
+        ));
     };
     let embedder = EngineEmbedder::new(engine).await?;
 
@@ -117,12 +125,19 @@ async fn embed_after_build(ctx: &Context, graph: &LocalGraph) -> Result<usize, F
     pending.sort(); // deterministic batch order regardless of symbol scan order
 
     let mut embedded = 0usize;
+    if !ctx.global.json {
+        eprintln!("embedding {} graph symbols...", pending.len());
+    }
     for batch in pending.chunks(EMBED_BATCH_SIZE) {
         let texts: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
         let vectors = embedder.embed(&texts).await?;
         for ((key, hash, _), vector) in batch.iter().zip(vectors) {
             index.upsert(key.clone(), hash.clone(), vector);
             embedded += 1;
+        }
+        index.save(&index_path)?;
+        if !ctx.global.json {
+            eprintln!("embedded {embedded}/{} graph symbols", pending.len());
         }
     }
 

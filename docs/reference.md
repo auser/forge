@@ -1175,6 +1175,7 @@ model-free by design — this never changes even when a needle engine is availab
 
 ```bash
 forge graph build              # build / incrementally refresh
+forge graph build --semantic   # additionally build/resume local embeddings
 forge graph check              # fresh (exit 0) or stale (exit 1, lists changes)
 forge graph map                # per-directory structural summary
 forge graph grep <pattern>     # search symbols and imports
@@ -1186,18 +1187,22 @@ forge graph context <query>    # ranked files/symbols for agent context
 
 ### Semantic index
 
-When a needle engine is genuinely available (weights loaded and answering, not
-just constructible — see `forge_needle::engine_if_available`), `forge graph
-build` additionally embeds every symbol locally and stores the vectors at
-`.forge/graph/embeddings.bin`. Embedding text is `"<kind> <name> in <path>"`;
+`forge graph build --semantic` embeds every symbol locally and stores the
+vectors at `.forge/graph/embeddings.bin`. It requires a genuinely available
+Needle engine (weights loaded and answering, not just constructible — see
+`forge_needle::engine_if_available`); ordinary `forge graph build` remains a
+fast, model-free structural operation. Embedding text is
+`"<kind> <name> in <path>"`;
 the index key is `"<path>::<name>"`, so two symbols with the same name in
 different files are both independently searchable. Rebuilds are incremental
 and content-hash keyed: only symbols whose embedded text actually changed are
-re-embedded, in batches of 32; symbols removed from the graph are dropped from
-the index too. An index built with a different model or embedding
+re-embedded, in batches of 32. Each completed batch is checkpointed with a
+temporary-file replacement, so an interrupted first build resumes instead of
+starting over; symbols removed from the graph are dropped from the index too.
+An index built with a different model or embedding
 dimensionality is discarded and rebuilt wholesale rather than mixed with new
-vectors. Without a working needle engine, this step is skipped silently — the
-build still succeeds, and no `embeddings.bin` is touched.
+vectors. Without a working Needle engine, `--semantic` fails with an actionable
+error while the ordinary structural build still succeeds.
 
 `embeddings.bin` is a single `serde_json` blob today (an 8-byte `FRGEMB01`
 magic prefix + one JSON object), parsed in full on every load. That is fine

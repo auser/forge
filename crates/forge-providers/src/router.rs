@@ -1555,11 +1555,20 @@ mod tests {
             .await;
 
         unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let tmp = tempfile::tempdir().expect("tempdir");
         let mut config = Config {
             router: "needle".to_string(),
             jev_url: Some(server.uri()),
             router_fallback: "static".to_string(),
             model: "local-coder".to_string(),
+            needle: forge_config::NeedleConfig {
+                weights_path: tmp
+                    .path()
+                    .join("no-weights.cact")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..forge_config::NeedleConfig::default()
+            },
             ..Config::default()
         };
         config.models.insert(
@@ -1600,12 +1609,21 @@ mod tests {
             .await;
 
         unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        let tmp = tempfile::tempdir().expect("tempdir");
         let mut config = Config {
             router: "needle".to_string(),
             router_url: Some(poisoned.uri()),
             jev_url: Some(real_jev.uri()),
             router_fallback: "static".to_string(),
             model: "local-coder".to_string(),
+            needle: forge_config::NeedleConfig {
+                weights_path: tmp
+                    .path()
+                    .join("no-weights.cact")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..forge_config::NeedleConfig::default()
+            },
             ..Config::default()
         };
         config.models.insert(
