@@ -227,4 +227,4 @@ if [[ "$RESOLVED" != "$TARGET" ]]; then
     printf '  fix this shell with:  export PATH="%s:$PATH"\n' "$PREFIX" >&2
 fi
 
-ok "done — run 'forge init' inside a project to get started"
+ok "done — run 'forge' inside a project to get started"

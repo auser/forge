@@ -113,8 +113,8 @@ pub(crate) fn overrides_for(ctx: &Context, options: &ServiceOptions) -> CliOverr
 
 fn is_zero_config_model_selection(config: &forge_config::Config) -> bool {
     !config.explicit.contains("model")
-        && !config.explicit.contains("router")
         && !config.explicit.iter().any(|key| key.starts_with("models."))
+        && (!config.explicit.contains("router") || config.router == "needle")
 }
 
 /// Build the transport-neutral agent runtime from the resolved
@@ -158,7 +158,9 @@ pub fn build_service_with(
         // Zero-config selection is the decision: do not immediately ask the
         // router to reconsider every other detected subscription. Besides
         // making first-run behavior deterministic, this leaves one eligible
-        // model for routers to accept without an inference round-trip.
+        // model, so model routing itself is unnecessary. Needle remains
+        // attached below for its direct tool-decision fast path; using static
+        // here only avoids asking it to choose between one model.
         config.models.retain(|name, _| name == &selected_model);
     } else {
         config
@@ -179,7 +181,11 @@ pub fn build_service_with(
     } else {
         registry.push((model.name().to_string(), model.capabilities()));
     }
-    let router = forge_providers::router_from_config(&config, &registry)?;
+    let mut router_config = config.clone();
+    if zero_config_selection {
+        router_config.router = "static".to_string();
+    }
+    let router = forge_providers::router_from_config(&router_config, &registry)?;
 
     let execution = build_execution_with(&config, &root, options.approvals)?;
     let skills = Arc::new(FsSkillRegistry::new(&root, Some(execution.clone())));
@@ -269,8 +275,15 @@ mod tests {
         assert!(is_zero_config_model_selection(
             &forge_config::Config::default()
         ));
-        assert!(!is_zero_config_model_selection(
+        assert!(is_zero_config_model_selection(
             &forge_config::Config::default().with_explicit(["router"])
+        ));
+        assert!(!is_zero_config_model_selection(
+            &forge_config::Config {
+                router: "cheapest".to_string(),
+                ..forge_config::Config::default()
+            }
+            .with_explicit(["router"])
         ));
         assert!(!is_zero_config_model_selection(
             &forge_config::Config::default().with_explicit(["models.a-expensive"])
@@ -281,5 +294,23 @@ mod tests {
         assert!(is_zero_config_model_selection(
             &forge_config::Config::default().with_explicit(["approval"])
         ));
+    }
+
+    #[test]
+    fn generated_starter_router_still_uses_zero_config_model_selection() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join(".forge")).expect("forge dir");
+        std::fs::write(
+            project.path().join(".forge/config.toml"),
+            "router = \"needle\"\nexecution = \"native\"\napproval = \"prompt-dangerous\"\n",
+        )
+        .expect("starter config");
+        let resolved = forge_config::Config::load(
+            Some(project.path()),
+            &forge_config::CliOverrides::default(),
+        )
+        .expect("config");
+        assert!(resolved.config.explicit.contains("router"));
+        assert!(is_zero_config_model_selection(&resolved.config));
     }
 }
