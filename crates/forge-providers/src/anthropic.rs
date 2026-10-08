@@ -27,6 +27,7 @@ pub struct AnthropicModel {
     stream_client: reqwest::Client,
     base_url: String,
     model: String,
+    wire_model: String,
     credential: ResolvedCredential,
     capabilities: ModelCapabilities,
     max_output_tokens: u32,
@@ -50,6 +51,7 @@ impl AnthropicModel {
         let stream_client = egress
             .streaming_client(timeout)
             .map_err(|e| ForgeError::provider(format!("building streaming HTTP client: {e}")))?;
+        let model = model.into();
         Ok(Self {
             client,
             stream_client,
@@ -57,11 +59,19 @@ impl AnthropicModel {
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            model: model.into(),
+            wire_model: model.clone(),
+            model,
             credential,
             capabilities,
             max_output_tokens: max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
         })
+    }
+
+    /// Send a provider-specific model id while keeping Forge's stable
+    /// configured alias in events, routing, and model selection.
+    pub fn with_wire_model(mut self, wire_model: impl Into<String>) -> Self {
+        self.wire_model = wire_model.into();
+        self
     }
 
     fn messages_url(&self) -> String {
@@ -123,7 +133,7 @@ impl AnthropicModel {
         }
 
         Ok(MessagesRequest {
-            model: &self.model,
+            model: &self.wire_model,
             max_tokens: request.max_tokens.unwrap_or(self.max_output_tokens),
             system: if system.is_empty() {
                 None

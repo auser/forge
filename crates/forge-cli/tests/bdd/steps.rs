@@ -244,9 +244,11 @@ async fn returns_selected_model_and_confidence(world: &mut BddWorld) {
         .received_requests()
         .await
         .expect("received requests");
-    assert!(!received.is_empty(), "router received no request");
-    let body: serde_json::Value =
-        serde_json::from_slice(&received[0].body).expect("router request json");
+    let route = received
+        .iter()
+        .find(|request| request.url.path() == "/route")
+        .expect("router received no routing request");
+    let body: serde_json::Value = serde_json::from_slice(&route.body).expect("router request json");
     assert_eq!(body["task"], "implement the thing");
 
     // The run outcome carries the routed model + confidence.
@@ -1555,12 +1557,13 @@ fn routing_decision_fell_back(world: &mut BddWorld) {
         .unwrap_or_else(|| panic!("no routing decision in: {log}"));
     assert_eq!(decision["fallback_used"], true);
     assert_eq!(decision["router"], "static");
-    // The low-confidence reason is logged on stderr (the event schema
-    // carries the decision, not the reason text).
+    // Expected fallback is part of the structured decision, not a noisy
+    // default-level diagnostic in an interactive terminal.
     assert!(
-        world.last_stderr.contains("below threshold"),
-        "stderr: {}",
-        world.last_stderr
+        decision["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("below threshold")),
+        "decision: {decision}"
     );
 }
 
@@ -1587,7 +1590,7 @@ fn claude_credentials_file(world: &mut BddWorld) {
     // The harness sets HOME to <project>/home for each forge invocation.
     world.write_file(
         "home/.claude/.credentials.json",
-        r#"{"claudeOauth": {"accessToken": "sk-ant-oat01-bdd-dummy-token", "expiresAt": 1}}"#,
+        r#"{"claudeAiOauth": {"accessToken": "sk-ant-oat01-bdd-dummy-token"}}"#,
     );
 }
 

@@ -90,8 +90,10 @@ impl TranscriptState {
             _ => self.close_stream(),
         };
         lines.extend(match &event.kind {
-            // The user just typed it, and piped mode already echoed it.
-            EventKind::RunStarted { .. } => Vec::new(),
+            // Immediate acknowledgement: routing and the first model token can
+            // both take seconds, so never leave an interactive user staring
+            // at a bare prompt wondering whether Enter worked.
+            EventKind::RunStarted { .. } => vec![Line::meta("working...")],
             EventKind::RoutingDecisionMade {
                 router,
                 selected_model,
@@ -807,11 +809,6 @@ mod tests {
     fn replay_and_bookkeeping_kinds_render_nothing() {
         let mut s = TranscriptState::new();
         for kind in [
-            EventKind::RunStarted {
-                provider: "p".into(),
-                model: "m".into(),
-                prompt: "x".into(),
-            },
             EventKind::ToolResult {
                 call_id: "c1".into(),
                 tool: "read_file".into(),
@@ -828,6 +825,22 @@ mod tests {
         ] {
             assert!(texts(&mut s, kind).is_empty(), "this kind must stay silent");
         }
+    }
+
+    #[test]
+    fn a_run_immediately_acknowledges_that_work_started() {
+        let mut s = TranscriptState::new();
+        assert_eq!(
+            texts(
+                &mut s,
+                EventKind::RunStarted {
+                    provider: "p".into(),
+                    model: "m".into(),
+                    prompt: "x".into(),
+                }
+            ),
+            vec!["  - working..."]
+        );
     }
 
     /// What a writer's captured bytes would be: fragments append, everything

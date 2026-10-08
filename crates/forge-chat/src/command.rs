@@ -243,16 +243,10 @@ impl Command {
             return (word_start, candidates);
         }
 
-        // The first word: every command plus every discovered skill. A
-        // typed word still needs its leading slash — nothing guesses inside
-        // a prompt — but an *empty* first word offers the whole menu: the
-        // terminal binds the `/` key itself to completion, and this branch
-        // is what answers that keystroke. Every replacement starts with the
-        // slash, so the editor inserts it as the candidates' common prefix
-        // — the slash the user typed arrives via the completion, not as
-        // input.
+        // The first word: every command plus every discovered skill. Only
+        // with a leading slash — nothing guesses inside a prompt.
         if word_start == 0 {
-            if !word.is_empty() && !word.starts_with('/') {
+            if !word.starts_with('/') {
                 return (word_start, Vec::new());
             }
             let candidates = COMMANDS
@@ -787,13 +781,7 @@ mod tests {
         let line = "@caf\u{e9}";
         let (start, _) = Command::complete(line, line.len() - 1, &s);
         assert!(line.is_char_boundary(start), "start {start} splits a char");
-        // Empty input is also survivable and deliberately offers the command
-        // menu: the terminal's `/` binding invokes completion before the
-        // slash itself reaches the input buffer.
-        assert!(
-            replacements(&Command::complete("", 0, &s).1).contains(&"/help"),
-            "empty input should offer commands"
-        );
+        assert!(Command::complete("", 0, &s).1.is_empty());
     }
 
     /// A slash command may be typed at an approval prompt, where a bare

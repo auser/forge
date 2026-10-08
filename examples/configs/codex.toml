@@ -1,12 +1,10 @@
-# Plug-and-play with Codex: OpenAI's GPT-5 as the model, the embedded
+# Plug-and-play with Codex: OpenAI's GPT-5.6 Codex as the model, the embedded
 # needle brain deciding underneath (the default router).
 #
-# Credential: OPENAI_API_KEY in .env / your shell. A Codex CLI sign-in
-# (~/.codex/auth.json) is detected and reported, but the ChatGPT
-# subscription's Responses backend is not supported yet — today the key
-# is what works.
+# Credential: `forge auth login codex` (or `codex login`) uses your ChatGPT
+# subscription. No API key is needed.
 
-model = "gpt-5"
+model = "gpt-5.6-sol"
 execution = "native"
 approval = "prompt"
 

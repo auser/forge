@@ -13,6 +13,7 @@ use crate::scripted::ScriptedMockModel;
 
 /// Env var that turns the mock's system-context echo back on.
 const MOCK_VERBOSE_ENV: &str = "FORGE_MOCK_VERBOSE";
+pub const AUTH_REQUIRED_MODEL: &str = "auth-required";
 
 /// Deterministic offline model. Replies `mock response to: <prompt>` and
 /// records every request for assertions. Capabilities are configurable so
@@ -135,6 +136,36 @@ impl ModelProvider for MockModel {
     }
 }
 
+struct AuthRequiredModel;
+
+#[async_trait]
+impl ModelProvider for AuthRequiredModel {
+    fn name(&self) -> &str {
+        AUTH_REQUIRED_MODEL
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: false,
+            tools: true,
+            structured_output: false,
+            vision: false,
+            max_context: 32_768,
+        }
+    }
+
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<CompletionResponse, ForgeError> {
+        Err(ForgeError::provider(
+            "no usable generation model is authenticated; run `forge auth login claude`, \
+             `forge auth login codex`, or `forge auth login kimi` (or start/configure a local \
+             OpenAI-compatible model server)",
+        ))
+    }
+}
+
 /// Whether the mock should append its system-context snippet. Anything but
 /// unset/empty/`0`/`false` counts as on.
 fn mock_verbose() -> bool {
@@ -206,9 +237,16 @@ pub fn available_models(config: &Config) -> Vec<AvailableModel> {
             .and_then(|entry| entry.provider.as_deref())
             .map(str::to_string)
             .or_else(|| infer_provider_hint(&endpoint.url));
-        let credential =
-            crate::credentials::resolve_credential(key_env, hint.as_deref()).map(|c| c.source);
-        if (local && local_endpoint_reachable(config, name)) || credential.is_some() {
+        let credential = if hint.as_deref() == Some("codex") {
+            matches!(
+                crate::credentials::codex_auth(),
+                crate::credentials::CodexAuth::OAuth { .. }
+            )
+            .then_some(crate::credentials::CredentialSource::CodexAuthJson)
+        } else {
+            crate::credentials::resolve_credential(key_env, hint.as_deref()).map(|c| c.source)
+        };
+        if (local && local_endpoint_usable(config, name)) || credential.is_some() {
             out.push(AvailableModel {
                 name: name.clone(),
                 local,
@@ -235,22 +273,22 @@ pub fn automatic_model(config: &Config) -> Option<String> {
 }
 
 fn automatic_model_rank(model: &AvailableModel) -> u8 {
-    if model.local {
-        0
-    } else if matches!(
-        model.credential,
-        Some(
-            crate::credentials::CredentialSource::ClaudeCodeCredentials
-                | crate::credentials::CredentialSource::CodexAuthJson
-        )
-    ) {
-        1
-    } else {
-        2
+    use crate::credentials::CredentialSource;
+
+    match (&model.credential, model.local) {
+        (_, true) => 0,
+        (Some(CredentialSource::CodexAuthJson), false) => 1,
+        (
+            Some(CredentialSource::ClaudeCodeCredentials | CredentialSource::ClaudeCodeKeychain),
+            false,
+        ) => 2,
+        (Some(CredentialSource::KimiCodeCredentials), false) => 3,
+        _ => 4,
     }
 }
 
-fn local_endpoint_reachable(config: &Config, name: &str) -> bool {
+fn local_endpoint_usable(config: &Config, name: &str) -> bool {
+    use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
 
     let Some(endpoint) = resolve_endpoint(config, name) else {
@@ -268,9 +306,40 @@ fn local_endpoint_reachable(config: &Config, name: &str) -> bool {
     let Ok(addresses) = (host.trim_matches(['[', ']']), port).to_socket_addrs() else {
         return false;
     };
-    addresses
-        .into_iter()
-        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok())
+    addresses.into_iter().any(|address| {
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(150))
+        else {
+            return false;
+        };
+        if url.scheme() != "http" {
+            // The zero-config probe cannot complete a TLS handshake without
+            // becoming async. Do not call a bare TCP accept "working": an
+            // HTTPS endpoint remains available when explicitly configured,
+            // but it cannot outrank a verified subscription automatically.
+            return false;
+        }
+
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+        let models_path = format!("{}/models", url.path().trim_end_matches('/'));
+        let request = format!(
+            "GET {models_path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let mut response = [0_u8; 256];
+        let Ok(read) = stream.read(&mut response) else {
+            return false;
+        };
+        let status = String::from_utf8_lossy(&response[..read]);
+        let code = status
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok());
+        code.is_some_and(|code| (200..300).contains(&code) || matches!(code, 404 | 405))
+    })
 }
 
 /// The one-line fix for a credential problem, safe to print anywhere: it
@@ -484,9 +553,8 @@ impl OpenAiCompatibleModel {
         }
     }
 
-    /// POST the body with the resolved credential. No credential resolved:
-    /// send unauthenticated but warn loudly — this is the classic
-    /// silent-401 cause. Sources only, never values, plus the exact fix.
+    /// POST the body with the resolved credential. Unauthenticated requests
+    /// are normal for local servers; an actual 401 reports the exact fix.
     fn authed_chat_post(
         &self,
         client: &reqwest::Client,
@@ -496,7 +564,10 @@ impl OpenAiCompatibleModel {
         let mut http = client.post(url).json(body);
         match &self.credential {
             Some(credential) => http = http.bearer_auth(&credential.secret),
-            None => tracing::warn!(
+            // Unauthenticated loopback servers are a normal configuration.
+            // A real 401 carries the actionable credential hint; do not print
+            // a warning before knowing the endpoint rejected the request.
+            None => tracing::debug!(
                 "no credential resolved for model {}; requests will be sent \
                  without authentication (see `forge auth status`) — {}",
                 self.model,
@@ -1123,6 +1194,7 @@ pub fn model_from_config(
     project_root: &std::path::Path,
 ) -> Result<Arc<dyn ModelProvider>, ForgeError> {
     match config.model.as_str() {
+        AUTH_REQUIRED_MODEL => Ok(Arc::new(AuthRequiredModel)),
         // Mocks are test-only; see `test_mocks`. The gate lives here
         // because this is the single place a *configured* model name
         // becomes a provider.
@@ -1151,6 +1223,10 @@ pub fn model_from_config(
             // remote model would complain about a missing API key instead of
             // about the setting that actually stopped it.
             let entry = config.models.get(name);
+            let wire_name = entry
+                .and_then(|entry| entry.extra.get("wire_model"))
+                .and_then(|value| value.as_str())
+                .unwrap_or(name);
             // Checking the configured URL is only half of it: the policy
             // below travels with the client so a redirect cannot carry the
             // request somewhere this check never saw.
@@ -1218,6 +1294,26 @@ pub fn model_from_config(
                 None => (config.model_key_env.clone(), FIELD_MODEL_KEY_ENV),
             };
 
+            if hint.as_deref() == Some("codex") {
+                let crate::credentials::CodexAuth::OAuth {
+                    access_token,
+                    account_id,
+                } = crate::credentials::codex_auth()
+                else {
+                    return Err(ForgeError::provider(
+                        "Codex subscription is not authenticated; run `forge auth login codex`",
+                    ));
+                };
+                return Ok(Arc::new(crate::codex::CodexModel::new(
+                    Some(base_url),
+                    name,
+                    access_token,
+                    account_id,
+                    Duration::from_secs(120),
+                    egress,
+                )?));
+            }
+
             if hint.as_deref() == Some("anthropic") {
                 let credential =
                     crate::credentials::resolve_credential(key_env.as_deref(), Some("anthropic"))
@@ -1225,7 +1321,7 @@ pub fn model_from_config(
                         ForgeError::provider(format!(
                             "no credential for anthropic model {name:?}; tried {key_env_display}, \
                          CLAUDE_CODE_OAUTH_TOKEN, ~/.claude/.credentials.json \
-                         (see `forge auth status`) — {hint}, or run `claude login`",
+                         (see `forge auth status`) — {hint}, or run `forge auth login claude`",
                             key_env_display = key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY"),
                             hint = credential_hint(key_env.as_deref(), key_env_field)
                         ))
@@ -1236,15 +1332,18 @@ pub fn model_from_config(
                 // global `model_base_url` overrides this family like any
                 // other (e.g. pointing `claude-sonnet` at a local
                 // Anthropic-compatible proxy).
-                return Ok(Arc::new(crate::anthropic::AnthropicModel::new(
-                    Some(base_url),
-                    name,
-                    credential,
-                    capabilities,
-                    entry.and_then(|e| e.max_output_tokens),
-                    Duration::from_secs(120),
-                    egress,
-                )?));
+                return Ok(Arc::new(
+                    crate::anthropic::AnthropicModel::new(
+                        Some(base_url),
+                        name,
+                        credential,
+                        capabilities,
+                        entry.and_then(|e| e.max_output_tokens),
+                        Duration::from_secs(120),
+                        egress,
+                    )?
+                    .with_wire_model(wire_name),
+                ));
             }
 
             let credential =
@@ -1331,6 +1430,95 @@ mod tests {
                 .any(|model| model.name == "anthropic/claude-sonnet-4.5")
         );
         unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+    }
+
+    #[test]
+    #[serial]
+    fn codex_subscription_is_an_automatic_model_candidate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        let dir = tmp.path().join(".codex");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"oauth","account_id":"acct"}}"#,
+        )
+        .expect("auth");
+        let mut config = Config::default();
+        config.models.retain(|name, _| name == "gpt-5.6-sol");
+        assert_eq!(automatic_model(&config).as_deref(), Some("gpt-5.6-sol"));
+        match previous_home {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn local_probe_rejects_an_endpoint_that_requires_an_unknown_key() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("respond");
+        });
+
+        let mut config = Config::default();
+        config
+            .models
+            .get_mut("qwen3-coder")
+            .expect("entry")
+            .base_url = Some(format!("http://{address}/v1"));
+        assert!(!local_endpoint_usable(&config, "qwen3-coder"));
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn local_probe_does_not_mistake_a_tcp_listener_for_working_https() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept().expect("accept");
+        });
+        let mut config = Config::default();
+        config
+            .models
+            .get_mut("qwen3-coder")
+            .expect("entry")
+            .base_url = Some(format!("https://{address}/v1"));
+        assert!(!local_endpoint_usable(&config, "qwen3-coder"));
+        server.join().expect("server");
+    }
+
+    #[tokio::test]
+    async fn auth_required_model_names_the_one_command_to_fix_it() {
+        let config = Config {
+            model: AUTH_REQUIRED_MODEL.to_string(),
+            ..Config::default()
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model = model_from_config(&config, tmp.path()).expect("provider");
+        let error = model
+            .complete(CompletionRequest::new(
+                AUTH_REQUIRED_MODEL,
+                vec![forge_core::Message::user("hello")],
+            ))
+            .await
+            .expect_err("must require auth");
+        assert!(error.to_string().contains("forge auth login claude"));
+        assert!(error.to_string().contains("forge auth login codex"));
+        assert!(error.to_string().contains("forge auth login kimi"));
     }
 
     #[tokio::test]

@@ -31,17 +31,16 @@ struct PinnedEngine {
 
 /// Engines forge will download and link automatically.
 ///
-/// **Verified 2026-09-24** (this table's original provenance): each artifact was
+/// **Verified 2026-09-24** (this table's provenance): each artifact was
 /// downloaded from `DEFAULT_BASE_URL` and hashed locally with `shasum -a 256`;
 /// every hash also matched the `x-linked-etag` Hugging Face serves for the
 /// file, and macos-arm64 matched the value independently recorded in the
 /// design spec's §8 in an earlier session.
 ///
-/// **macos-arm64 republished 2026-10-07:** Hugging Face repo commit
-/// `2ae11323dc000f5e70c49f7403efa6af12ba9e67` serves a new archive whose
-/// downloaded SHA-256, `x-linked-etag`, and byte count all match the updated
-/// entry below. Forge's linked FFI tests revalidated the archive before this
-/// pin was changed.
+/// The URL is pinned to the immutable Hugging Face repo commit that served
+/// these exact archives. Upstream's `main` binaries are ABI-mutable and a
+/// later archive kept the C symbol names while changing the native contract,
+/// which linked successfully but crashed at runtime.
 ///
 /// Artifacts published in the same repo whose checksums were collected but
 /// which are deliberately **not** wired up (see the report / spec §8):
@@ -89,8 +88,8 @@ const PINNED_ENGINES: &[PinnedEngine] = &[
     PinnedEngine {
         target: "aarch64-apple-darwin",
         platform: "macos-arm64",
-        sha256: "98da47c15e1065b4cdc7ddc55e825be78414d4586832db3becaeded39a373df4",
-        bytes: 1_534_232,
+        sha256: "60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a",
+        bytes: 1_158_184,
     },
     PinnedEngine {
         target: "aarch64-unknown-linux-gnu",
@@ -103,7 +102,7 @@ const PINNED_ENGINES: &[PinnedEngine] = &[
 /// Resolve-URL prefix for the pinned Hugging Face repo. Mirrors
 /// `forge-needle`'s `weights.rs` constant of the same shape — the engine and
 /// the weights come from the same Apache-2.0 repo.
-const DEFAULT_BASE_URL: &str = "https://huggingface.co/Cactus-Compute/needle3/resolve/main";
+const DEFAULT_BASE_URL: &str = "https://huggingface.co/Cactus-Compute/needle3/resolve/0f51a1ac2917a03644c4cc7836f19476c6d177dd";
 
 /// Where an operator can point this build at an engine they fetched
 /// themselves. Takes precedence over everything else.

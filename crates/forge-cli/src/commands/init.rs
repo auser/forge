@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use forge_core::{ForgeError, find_project_root};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::commands::Context;
 
@@ -81,11 +81,12 @@ pub fn report_first_run(ctx: &Context) -> Result<(), ForgeError> {
         return Ok(());
     }
     let resolved = ctx.resolve_config()?;
-    let model = forge_providers::automatic_model(&resolved.config)
-        .unwrap_or_else(|| "none detected — run `forge model list`".to_string());
     eprintln!("Forge initialized this project");
     eprintln!("  graph       ready");
-    eprintln!("  generation  {model} (auto-selected)");
+    match forge_providers::automatic_model(&resolved.config) {
+        Some(model) => eprintln!("  generation  {model} (auto-selected)"),
+        None => eprintln!("  generation  run `forge auth login <claude|codex|kimi>`"),
+    }
     eprintln!("  approval    {}", resolved.config.approval);
     Ok(())
 }
@@ -324,7 +325,7 @@ fn catalogue_item(config: &forge_config::Config) -> InitItem {
             note: Some(format!("openrouter catalogue: {count} models")),
         },
         Ok(Err(e)) => {
-            warn!(error = %e, "openrouter catalogue refresh failed");
+            debug!(error = %e, "openrouter catalogue refresh failed");
             InitItem {
                 status: ItemStatus::Detected,
                 path,
@@ -334,7 +335,7 @@ fn catalogue_item(config: &forge_config::Config) -> InitItem {
             }
         }
         Err(e) => {
-            warn!(error = %e, "could not run the catalogue refresh");
+            debug!(error = %e, "could not run the catalogue refresh");
             InitItem {
                 status: ItemStatus::Detected,
                 path,

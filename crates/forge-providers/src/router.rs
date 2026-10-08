@@ -309,7 +309,10 @@ impl DecisionRouter for FallbackRouter {
         match self.primary.route(task).await {
             Ok(decision) => Ok(decision),
             Err(primary_err) => {
-                tracing::warn!(error = %primary_err, "primary router failed; using fallback");
+                // Fallback is the configured success path, not an operational
+                // warning. The routing event already tells interactive users
+                // what happened; keep the raw error for `-vv` diagnostics.
+                tracing::debug!(error = %primary_err, "primary router failed; using fallback");
                 let mut decision = self.fallback.route(task).await.map_err(|fallback_err| {
                     ForgeError::router(format!(
                         "primary router failed ({primary_err}); fallback also failed ({fallback_err})"

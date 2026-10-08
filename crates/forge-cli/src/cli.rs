@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -308,6 +308,18 @@ pub enum RouterCommand {
 pub enum AuthCommand {
     /// Show detected credentials (sources only — never values).
     Status,
+    /// Sign in through an installed provider CLI and use that subscription.
+    Login {
+        #[arg(value_enum)]
+        provider: AuthProvider,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AuthProvider {
+    Claude,
+    Codex,
+    Kimi,
 }
 
 #[derive(Subcommand)]

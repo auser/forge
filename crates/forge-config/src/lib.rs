@@ -342,6 +342,14 @@ impl Default for Config {
         // test-only and refused unless `FORGE_TEST_MOCKS=1` (see
         // `test_mocks`). Hosted models are only called when a router
         // selects them or the user sets `model` explicitly.
+        let wire_model = |name: &str| {
+            let mut extra = toml::Table::new();
+            extra.insert(
+                "wire_model".to_string(),
+                toml::Value::String(name.to_string()),
+            );
+            extra
+        };
         let models = [
             ModelEntry {
                 description: Some("local coding model via oMLX (Qwen3-Coder)".to_string()),
@@ -390,7 +398,7 @@ impl Default for Config {
                 structured_output: None,
                 vision: None,
                 max_context: Some(200_000),
-                extra: toml::Table::new(),
+                extra: wire_model("claude-sonnet-5-5"),
             },
             ModelEntry {
                 description: Some(
@@ -411,6 +419,23 @@ impl Default for Config {
                 extra: toml::Table::new(),
             },
             ModelEntry {
+                description: Some(
+                    "OpenAI GPT-5.6 Codex through an existing ChatGPT subscription".to_string(),
+                ),
+                cost_input_per_mtok: Some(0.0),
+                cost_output_per_mtok: Some(0.0),
+                base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
+                key_env: None,
+                provider: Some("codex".to_string()),
+                max_output_tokens: None,
+                tools: Some(true),
+                streaming: Some(false),
+                structured_output: None,
+                vision: None,
+                max_context: Some(400_000),
+                extra: toml::Table::new(),
+            },
+            ModelEntry {
                 description: Some("Moonshot Kimi K2.7 Code, frontier-quality coding".to_string()),
                 cost_input_per_mtok: Some(0.95),
                 cost_output_per_mtok: Some(4.00),
@@ -423,6 +448,21 @@ impl Default for Config {
                 structured_output: None,
                 vision: None,
                 max_context: Some(256_000),
+                extra: toml::Table::new(),
+            },
+            ModelEntry {
+                description: Some("Kimi K3 through an existing Kimi Code subscription".to_string()),
+                cost_input_per_mtok: Some(0.0),
+                cost_output_per_mtok: Some(0.0),
+                base_url: Some("https://api.kimi.com/coding/v1".to_string()),
+                key_env: None,
+                provider: Some("kimi-code".to_string()),
+                max_output_tokens: None,
+                tools: Some(true),
+                streaming: Some(true),
+                structured_output: None,
+                vision: Some(true),
+                max_context: Some(1_048_576),
                 extra: toml::Table::new(),
             },
             // OpenRouter brokers many models behind one key and one
@@ -481,8 +521,10 @@ impl Default for Config {
                 ("deepseek-chat".to_string(), models[1].clone()),
                 ("claude-sonnet".to_string(), models[2].clone()),
                 ("gpt-5".to_string(), models[3].clone()),
-                ("kimi-k2.7-code".to_string(), models[4].clone()),
-                ("anthropic/claude-sonnet-4.5".to_string(), models[5].clone()),
+                ("gpt-5.6-sol".to_string(), models[4].clone()),
+                ("kimi-k2.7-code".to_string(), models[5].clone()),
+                ("k3".to_string(), models[6].clone()),
+                ("anthropic/claude-sonnet-4.5".to_string(), models[7].clone()),
             ]
             .into_iter()
             .collect(),

@@ -96,10 +96,10 @@ credential for it actually exists.
 Those credentials are taken from where they already live: API-key environment
 variables, including ones loaded from `.env`/`.env.local` (`DEEPSEEK_API_KEY`,
 `MOONSHOT_API_KEY`/`KIMI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`), and
-the CLI credential stores — `~/.claude/.credentials.json` for a Claude
-subscription you logged into with `claude login`, and `~/.codex/auth.json`
-when it holds an API key. See [Authentication](#authentication) for the full
-order and the caveats (OAuth-only Codex subscriptions are not usable yet).
+the official CLI credential stores for Claude, Codex, and Kimi subscriptions.
+Run `forge auth login claude`, `forge auth login codex`, or
+`forge auth login kimi`; see [Authentication](#authentication) for the full
+resolution order.
 
 `--local-only` means what it says: forge refuses to build a model provider
 whose endpoint is off this machine (including one a router picked), prunes the
@@ -237,7 +237,7 @@ most common first-run failure.
 **(b) A subscription you already pay for** — Claude:
 
 ```bash
-claude login      # once; forge picks up the stored token automatically
+forge auth login claude
 forge --model claude-sonnet run "Explain this project"
 ```
 
@@ -252,7 +252,8 @@ forge --model deepseek-chat run "Explain this project"
 ```
 
 `forge init` reports the keys it found by name; built-in `[models]` entries
-exist for `deepseek-chat`, `kimi-k2.7-code`, `gpt-5`, and `claude-sonnet`.
+cover API-key and subscription models, including `deepseek-chat`,
+`kimi-k2.7-code`, `gpt-5`, `claude-sonnet`, `gpt-5.6-sol`, and `k3`.
 
 **Just evaluating?** A lot of forge needs no model at all. With zero setup:
 
@@ -823,8 +824,9 @@ decisions are made:
   refused at construction with a typed config error naming the model, the
   URL and the config line that set it — including a model a *router* picked,
   since routed names resolve through the same code. So the hosted `[models]`
-  entries (`claude-sonnet`, `gpt-5`, `deepseek-chat`, `kimi-k2.7-code`) simply
-  cannot be used while it is on, unless you point one at a local endpoint.
+  entries (`claude-sonnet`, `gpt-5.6-sol`, `k3`, `gpt-5`, `deepseek-chat`,
+  `kimi-k2.7-code`) simply cannot be used while it is on, unless you point one
+  at a local endpoint.
 - **Every redirect hop.** Checking the configured URL alone would not be
   worth much: an approved loopback endpoint that answers `307` with a
   `Location` elsewhere would otherwise make forge re-POST your prompt, body
@@ -884,24 +886,30 @@ Forge uses your existing credentials, in this order:
 2. **Conventional env vars** per provider (`ANTHROPIC_API_KEY`,
    `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `MOONSHOT_API_KEY` /
    `KIMI_API_KEY`) — including ones loaded from `.env`/`.env.local` at startup.
-3. **CLI credential stores**: `~/.claude/.credentials.json` (Claude Code OAuth)
-   and `~/.codex/auth.json` (its `OPENAI_API_KEY` field).
+3. **CLI credential stores**: Claude Code OAuth, Codex ChatGPT OAuth, and Kimi
+   Code OAuth. Use Forge's login wrappers rather than editing these files:
+
+   ```bash
+   forge auth login claude
+   forge auth login codex
+   forge auth login kimi
+   ```
 
 `forge auth status` shows what was detected — provider, usable models, source,
 and kind (api-key/oauth) — never any values. `forge doctor` summarizes the
 same in one line.
 
-**Claude subscription**: run `claude login` (or `claude setup-token`) once;
-Forge picks up the stored OAuth token automatically and uses it for the
-built-in `claude-sonnet` entry (`provider = "anthropic"`). Codex CLI:
-`~/.codex/auth.json` with an API key works out of the box; **OAuth-only Codex
-subscriptions are not usable yet** (they target the ChatGPT Responses backend,
-which is unimplemented — set `OPENAI_API_KEY` for API access). macOS Keychain
-credential lookup is not implemented yet.
+The built-in subscription models are `claude-sonnet` (Anthropic Messages),
+`gpt-5.6-sol` (Codex Responses), and `k3` (Kimi Code). Forge reads token
+values only at provider construction, never prints them, and leaves login,
+refresh, logout, and browser/device authorization to the official CLI.
 
-> **Terms note:** subscription OAuth tokens are intended by providers for
-> their own CLIs; using them elsewhere may violate provider terms. API keys
-> are the supported path.
+> **Compatibility note:** Claude and Kimi expose provider-specific OAuth
+> request contracts. Codex subscription access uses the same ChatGPT backend
+> and request shape as Codex CLI; that endpoint is not a general OpenAI API
+> contract and may require Forge updates when Codex changes it. An
+> `OPENAI_API_KEY` with the built-in `gpt-5` entry remains the stable metered
+> API path.
 
 **Jev escalation** (decision plane, not generation): `TYPESAFE_API_KEY` (or
 `jev_key_env` override) enables the Jev tier (see

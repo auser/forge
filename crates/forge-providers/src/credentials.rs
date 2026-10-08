@@ -18,7 +18,9 @@ pub enum CredentialKind {
 pub enum CredentialSource {
     EnvVar(String),
     ClaudeCodeCredentials,
+    ClaudeCodeKeychain,
     CodexAuthJson,
+    KimiCodeCredentials,
 }
 
 impl std::fmt::Display for CredentialSource {
@@ -26,7 +28,11 @@ impl std::fmt::Display for CredentialSource {
         match self {
             Self::EnvVar(name) => write!(f, "env var {name}"),
             Self::ClaudeCodeCredentials => write!(f, "~/.claude/.credentials.json"),
+            Self::ClaudeCodeKeychain => write!(f, "macOS Keychain (Claude Code)"),
             Self::CodexAuthJson => write!(f, "~/.codex/auth.json"),
+            Self::KimiCodeCredentials => {
+                write!(f, "~/.kimi-code/credentials/kimi-code.json")
+            }
         }
     }
 }
@@ -73,22 +79,77 @@ fn home_file(rel: &str) -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(rel))
 }
 
-/// Claude Code OAuth store: `~/.claude/.credentials.json` →
-/// `claudeOauth.accessToken`. (macOS Keychain is not consulted yet.)
+/// Claude Code OAuth store. Current Claude Code writes
+/// `claudeAiOauth.accessToken`; the older `claudeOauth` spelling remains
+/// readable so an upgrade never logs a user out of Forge.
 fn claude_code_token() -> Option<ResolvedCredential> {
-    let path = home_file(".claude/.credentials.json")?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let token = json
-        .pointer("/claudeOauth/accessToken")
+    if let Some(path) = home_file(".claude/.credentials.json")
+        && let Ok(text) = std::fs::read_to_string(path)
+        && let Some(credential) =
+            claude_credential_from_json(&text, CredentialSource::ClaudeCodeCredentials)
+    {
+        return Some(credential);
+    }
+    claude_keychain_token()
+}
+
+fn claude_credential_from_json(text: &str, source: CredentialSource) -> Option<ResolvedCredential> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let oauth = ["/claudeAiOauth", "/claudeOauth"]
+        .into_iter()
+        .find_map(|pointer| json.pointer(pointer))?;
+    let expires_at = oauth
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    if expires_at > 0.0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64()
+            * 1_000.0;
+        if expires_at <= now_ms {
+            return None;
+        }
+    }
+    let token = oauth
+        .get("accessToken")
         .and_then(serde_json::Value::as_str)?;
     if token.is_empty() {
         return None;
     }
-    Some(ResolvedCredential::oauth_token(
-        token,
-        CredentialSource::ClaudeCodeCredentials,
-    ))
+    Some(ResolvedCredential::oauth_token(token, source))
+}
+
+#[cfg(target_os = "macos")]
+fn claude_keychain_token() -> Option<ResolvedCredential> {
+    // Hermetic integration suites deliberately unlock mock providers; never
+    // let those processes read a developer's real login from Keychain.
+    if forge_config::test_mocks_allowed() {
+        return None;
+    }
+    let account = std::env::var("USER").ok()?;
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-a",
+            &account,
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    claude_credential_from_json(&text, CredentialSource::ClaudeCodeKeychain)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_token() -> Option<ResolvedCredential> {
+    None
 }
 
 /// What lives in `~/.codex/auth.json` (if anything usable).
@@ -96,9 +157,10 @@ fn claude_code_token() -> Option<ResolvedCredential> {
 pub enum CodexAuth {
     Missing,
     ApiKey(String),
-    /// Subscription OAuth only — the ChatGPT Responses backend is not
-    /// supported yet.
-    OAuthOnly,
+    OAuth {
+        access_token: String,
+        account_id: String,
+    },
 }
 
 pub fn codex_auth() -> CodexAuth {
@@ -118,10 +180,47 @@ pub fn codex_auth() -> CodexAuth {
     {
         return CodexAuth::ApiKey(key.to_string());
     }
-    if json.get("access_token").is_some() || json.get("tokens").is_some() {
-        return CodexAuth::OAuthOnly;
+    if let Some(tokens) = json.get("tokens")
+        && let (Some(access_token), Some(account_id)) = (
+            tokens
+                .get("access_token")
+                .and_then(serde_json::Value::as_str),
+            tokens.get("account_id").and_then(serde_json::Value::as_str),
+        )
+        && !access_token.is_empty()
+        && !account_id.is_empty()
+    {
+        return CodexAuth::OAuth {
+            access_token: access_token.to_string(),
+            account_id: account_id.to_string(),
+        };
     }
     CodexAuth::Missing
+}
+
+fn kimi_code_token() -> Option<ResolvedCredential> {
+    let path = home_file(".kimi-code/credentials/kimi-code.json")?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if let Some(expires_at) = json.get("expires_at").and_then(serde_json::Value::as_f64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64();
+        if expires_at <= now {
+            return None;
+        }
+    }
+    let token = json
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(ResolvedCredential::oauth_token(
+        token,
+        CredentialSource::KimiCodeCredentials,
+    ))
 }
 
 /// Resolve a credential for a provider. Order: explicit `key_env` env var,
@@ -153,6 +252,7 @@ pub fn resolve_credential(
         Some("moonshot") => from_env("MOONSHOT_API_KEY", CredentialKind::ApiKey)
             .or_else(|| from_env("KIMI_API_KEY", CredentialKind::ApiKey)),
         Some("deepseek") => from_env("DEEPSEEK_API_KEY", CredentialKind::ApiKey),
+        Some("kimi-code") => kimi_code_token(),
         _ => None,
     }
 }
@@ -188,21 +288,18 @@ pub fn probe_auth() -> Vec<AuthProbe> {
     out.push(probe("anthropic", &["claude-sonnet"]));
     out.push(probe("openai", &["gpt-5"]));
     out.push(probe("moonshot", &["kimi-k2.7-code"]));
+    out.push(probe("kimi-code", &["k3"]));
     out.push(probe("deepseek", &["deepseek-chat"]));
 
-    if matches!(codex_auth(), CodexAuth::OAuthOnly) {
-        out.push(AuthProbe {
-            provider: "codex".to_string(),
-            usable_models: vec!["gpt-5".to_string()],
-            detected: false,
-            source: Some(CredentialSource::CodexAuthJson),
-            kind: Some(CredentialKind::OAuthToken),
-            note: Some(
-                "detected Codex subscription (OAuth); the ChatGPT Responses backend is not yet supported — set OPENAI_API_KEY for API access"
-                    .to_string(),
-            ),
-        });
-    }
+    let codex = codex_auth();
+    out.push(AuthProbe {
+        provider: "codex".to_string(),
+        usable_models: vec!["gpt-5.6-sol".to_string()],
+        detected: matches!(codex, CodexAuth::OAuth { .. }),
+        source: matches!(codex, CodexAuth::OAuth { .. }).then_some(CredentialSource::CodexAuthJson),
+        kind: matches!(codex, CodexAuth::OAuth { .. }).then_some(CredentialKind::OAuthToken),
+        note: None,
+    });
     out
 }
 
@@ -255,7 +352,7 @@ mod tests {
         std::fs::create_dir_all(&claude_dir).expect("mkdir");
         std::fs::write(
             claude_dir.join(".credentials.json"),
-            r#"{"claudeOauth": {"accessToken": "sk-ant-oat01-dummy", "expiresAt": 1}}"#,
+            r#"{"claudeAiOauth": {"accessToken": "sk-ant-oat01-dummy"}}"#,
         )
         .expect("write");
         let cred = resolve_credential(None, Some("anthropic")).expect("resolved");
@@ -279,10 +376,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("auth.json"),
-            r#"{"access_token": "t", "refresh_token": "r"}"#,
+            r#"{"tokens": {"access_token": "t", "account_id": "acct-1"}}"#,
         )
         .expect("write oauth");
-        assert_eq!(codex_auth(), CodexAuth::OAuthOnly);
+        assert_eq!(
+            codex_auth(),
+            CodexAuth::OAuth {
+                access_token: "t".to_string(),
+                account_id: "acct-1".to_string(),
+            }
+        );
 
         std::fs::write(
             dir.join("auth.json"),
@@ -299,12 +402,58 @@ mod tests {
 
     #[test]
     #[serial]
+    fn kimi_code_credentials_file_is_parsed() {
+        clear_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        let dir = tmp.path().join(".kimi-code/credentials");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("kimi-code.json"),
+            r#"{"access_token":"kimi-oauth","refresh_token":"refresh"}"#,
+        )
+        .expect("write");
+        let cred = resolve_credential(None, Some("kimi-code")).expect("resolved");
+        assert_eq!(cred.kind, CredentialKind::OAuthToken);
+        assert_eq!(cred.source, CredentialSource::KimiCodeCredentials);
+        match prev_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn expired_float_kimi_credential_is_not_advertised() {
+        clear_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        let dir = tmp.path().join(".kimi-code/credentials");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("kimi-code.json"),
+            r#"{"access_token":"expired","expires_at":1.5}"#,
+        )
+        .expect("write");
+        assert!(resolve_credential(None, Some("kimi-code")).is_none());
+        match prev_home {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    #[serial]
     fn probe_returns_one_row_per_provider() {
         clear_env();
         let probes = probe_auth();
         assert!(probes.iter().any(|p| p.provider == "anthropic"));
         assert!(probes.iter().any(|p| p.provider == "openai"));
         assert!(probes.iter().any(|p| p.provider == "moonshot"));
+        assert!(probes.iter().any(|p| p.provider == "kimi-code"));
+        assert!(probes.iter().any(|p| p.provider == "codex"));
         assert!(probes.iter().any(|p| p.provider == "deepseek"));
     }
 }

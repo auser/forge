@@ -134,8 +134,9 @@ pub fn build_service_with(
     // providers proven usable in this environment so a first run does not
     // assume a particular local server is already running.
     let auto_selected = !resolved.config.explicit.contains("model");
-    if auto_selected && let Some(model) = forge_providers::automatic_model(&config) {
-        config.model = model;
+    if auto_selected {
+        config.model = forge_providers::automatic_model(&config)
+            .unwrap_or_else(|| forge_providers::AUTH_REQUIRED_MODEL.to_string());
     }
 
     // One availability resolution feeds both routing and provider creation.

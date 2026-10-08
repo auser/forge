@@ -72,6 +72,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             if init::ensure(&ctx)? {
                 init::report_first_run(&ctx)?;
             }
+            auth_cmd::ensure_for_chat(&ctx)?;
             chat_cmd::run(&ctx, chat_cmd::ChatArgs::default()).await
         }
         Some(Command::Chat {
@@ -82,6 +83,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             if init::ensure(&ctx)? {
                 init::report_first_run(&ctx)?;
             }
+            auth_cmd::ensure_for_chat(&ctx)?;
             chat_cmd::run(
                 &ctx,
                 chat_cmd::ChatArgs {
@@ -109,6 +111,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
         Some(Command::Doctor { live }) => doctor::run(&ctx, live).await,
         Some(Command::Auth { command }) => match command {
             crate::cli::AuthCommand::Status => auth_cmd::status(&ctx),
+            crate::cli::AuthCommand::Login { provider } => auth_cmd::login(&ctx, provider),
         },
         Some(Command::Config { command }) => config_cmd::run(&ctx, command),
 

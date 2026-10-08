@@ -22,14 +22,14 @@ pub async fn run(ctx: &Context, command: ModelCommand) -> Result<(), ForgeError>
 fn provider_for(ctx: &Context, name: Option<&str>) -> Result<Arc<dyn ModelProvider>, ForgeError> {
     let resolved = ctx.resolve_config()?;
     let root = ctx.project_root()?;
-    let model = name.unwrap_or(&resolved.config.model).to_string();
-    forge_providers::model_from_config(
-        &Config {
-            model,
-            ..resolved.config.clone()
-        },
-        &root,
-    )
+    let mut config = resolved.config.clone();
+    config.model = match name {
+        Some(name) => name.to_string(),
+        None if !config.explicit.contains("model") => forge_providers::automatic_model(&config)
+            .unwrap_or_else(|| forge_providers::AUTH_REQUIRED_MODEL.to_string()),
+        None => config.model.clone(),
+    };
+    forge_providers::model_from_config(&config, &root)
 }
 
 fn list(ctx: &Context) -> Result<(), ForgeError> {

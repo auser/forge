@@ -12,6 +12,7 @@
 //! connection — there is no separate abort path to keep in step.
 
 mod anthropic;
+mod codex;
 mod credentials;
 mod jev;
 mod local_only;
@@ -22,6 +23,7 @@ mod scripted;
 mod sse;
 
 pub use anthropic::AnthropicModel;
+pub use codex::CodexModel;
 pub use credentials::{
     AuthProbe, CredentialKind, CredentialSource, ResolvedCredential, codex_auth, probe_auth,
     resolve_credential,
@@ -29,8 +31,8 @@ pub use credentials::{
 pub use jev::JevRouter;
 pub use local_only::{EgressPolicy, endpoint_is_local};
 pub use model::{
-    AvailableModel, MockModel, OpenAiCompatibleModel, automatic_model, available_models,
-    is_mock_model, model_endpoint, model_from_config,
+    AUTH_REQUIRED_MODEL, AvailableModel, MockModel, OpenAiCompatibleModel, automatic_model,
+    available_models, is_mock_model, model_endpoint, model_from_config,
 };
 pub use router::{
     CheapestRouter, FallbackRouter, HttpRouter, LayaRouter, MockRouter, StaticRouter,

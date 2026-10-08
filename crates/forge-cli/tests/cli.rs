@@ -74,6 +74,50 @@ fn version_prints_name_and_version() {
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
 }
 
+#[cfg(unix)]
+#[test]
+fn auth_login_delegates_to_the_official_cli_and_detects_its_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\nmkdir -p \"$HOME/.claude\"\nprintf '%s' \
+         '{\"claudeAiOauth\":{\"accessToken\":\"test-oauth\"}}' \
+         > \"$HOME/.claude/.credentials.json\"\n",
+    )
+    .expect("script");
+    let mut permissions = std::fs::metadata(&claude).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&claude, permissions).expect("chmod");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["auth", "login", "claude"])
+        .env("PATH", path)
+        .output()
+        .expect("run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("authenticated with Claude"));
+}
+
 #[test]
 fn config_explain_reports_environment_origin() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -403,8 +447,8 @@ fn serve_serves_health_on_ephemeral_port() {
 /// In a build with no inference backend that hint is a dead end — this
 /// binary's `forge init` skips the weights fetch precisely *because* there is
 /// no backend, so following it changes nothing and the user is back where they
-/// started. The fallback warning must name the real cause and the one command
-/// that fixes it.
+/// started. Verbose fallback diagnostics must name the real cause and the one
+/// command that fixes it without polluting the default chat transcript.
 ///
 /// Driven through the real binary rather than a unit test because the bug was
 /// in the composition: each layer's message was defensible on its own, and
@@ -429,8 +473,9 @@ fn a_failed_needle_route_never_tells_a_backend_less_build_to_run_forge_init() {
     let output = forge(tmp.path())
         .args(["--project"])
         .arg(&project)
-        // -v so the router's fallback warning reaches stderr at all.
-        .args(["-v", "run", "hello"])
+        // Expected fallback is debug-level: visible on demand, silent by
+        // default because the structured routing line already explains it.
+        .args(["-vv", "run", "hello"])
         .output()
         .expect("run");
 
@@ -442,7 +487,7 @@ fn a_failed_needle_route_never_tells_a_backend_less_build_to_run_forge_init() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("primary router failed"),
-        "expected the fallback warning; stderr:\n{stderr}"
+        "expected the fallback diagnostic; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("no embedded inference backend"),

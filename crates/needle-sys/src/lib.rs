@@ -39,8 +39,9 @@
 //! header ever stops agreeing with the code, which is the safety net a
 //! generator would otherwise provide.
 //!
-//! # Contract (reverified 2026-10-07 against `macos-arm64/libneedle.a`,
-//! sha256 `98da47c15e1065b4cdc7ddc55e825be78414d4586832db3becaeded39a373df4`)
+//! # Contract (verified against immutable Hugging Face revision
+//! `0f51a1ac2917a03644c4cc7836f19476c6d177dd`, `macos-arm64/libneedle.a`,
+//! sha256 `60cc14f1a2eda8da72b75f8f228fb72cadc2850b38702370f43e9660b74e951a`)
 //!
 //! Everything here operates on **one process-global, non-thread-safe model**.
 //! Callers must serialise every call — `forge-needle`'s engine does this by
