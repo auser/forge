@@ -30,11 +30,40 @@ a risky operation: answer it with forge_run_input (\"y\" approves).";
 /// MCP server over forge's tool registry.
 pub struct ForgeMcpServer {
     tools: Arc<ForgeTools>,
+    compact: bool,
 }
 
 impl ForgeMcpServer {
     pub fn new(tools: Arc<ForgeTools>) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            compact: false,
+        }
+    }
+
+    /// Advertise only discovery wrappers; native calls retain their approval requirements.
+    pub fn compact(tools: Arc<ForgeTools>) -> Self {
+        Self {
+            tools,
+            compact: true,
+        }
+    }
+
+    fn catalog(&self) -> Vec<Tool> {
+        let defs = if self.compact {
+            crate::compact::definitions_compact()
+        } else {
+            definitions()
+        };
+        defs.iter().map(tool_of).collect()
+    }
+
+    async fn dispatch(&self, name: &str, args: &Value) -> Result<ToolOutcome, ToolError> {
+        if self.compact {
+            crate::compact::call(&self.tools, name, args).await
+        } else {
+            self.tools.call(name, args).await
+        }
     }
 }
 
@@ -81,7 +110,14 @@ impl ServerHandler for ForgeMcpServer {
         let mut config = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         config.server_info =
             Implementation::new("forge", env!("CARGO_PKG_VERSION")).with_title("Forge");
-        config.instructions = Some(INSTRUCTIONS.to_string());
+        config.instructions = Some(
+            if self.compact {
+                crate::compact::INSTRUCTIONS
+            } else {
+                INSTRUCTIONS
+            }
+            .to_string(),
+        );
         config
     }
 
@@ -92,7 +128,7 @@ impl ServerHandler for ForgeMcpServer {
     ) -> Result<ListToolsResult, McpError> {
         // The whole surface fits in one page, so no cursor is issued.
         Ok(ListToolsResult {
-            tools: definitions().iter().map(tool_of).collect(),
+            tools: self.catalog(),
             ..ListToolsResult::default()
         })
     }
@@ -105,8 +141,10 @@ impl ServerHandler for ForgeMcpServer {
         let args = request
             .arguments
             .map(Value::Object)
+            // rmcp maps both missing arguments and explicit null to None.
+            // Preserve optional protocol arguments, including empty searches.
             .unwrap_or(Value::Object(Map::new()));
-        match self.tools.call(&request.name, &args).await {
+        match self.dispatch(&request.name, &args).await {
             Ok(outcome) => Ok(CallToolResponse::Complete(result_of(outcome))),
             // Per the tools spec, an unknown tool is a protocol error.
             Err(ToolError::UnknownTool(name)) => Err(McpError::invalid_params(
@@ -123,7 +161,15 @@ impl ServerHandler for ForgeMcpServer {
 /// Nothing in this process may write to stdout afterwards: stdout is the
 /// protocol channel.
 pub async fn serve_stdio(tools: ForgeTools) -> Result<(), ForgeError> {
-    let server = ForgeMcpServer::new(Arc::new(tools));
+    serve(ForgeMcpServer::new(Arc::new(tools))).await
+}
+
+/// Serve the opt-in compact discovery surface on stdin/stdout.
+pub async fn serve_stdio_compact(tools: ForgeTools) -> Result<(), ForgeError> {
+    serve(ForgeMcpServer::compact(Arc::new(tools))).await
+}
+
+async fn serve(server: ForgeMcpServer) -> Result<(), ForgeError> {
     let running = server
         .serve(rmcp::transport::stdio())
         .await
@@ -178,8 +224,8 @@ mod tests {
         assert!(text.text.contains("unknown run: r1"));
     }
 
-    #[test]
-    fn the_server_advertises_tools_and_names_itself_forge() {
+    #[tokio::test]
+    async fn the_server_advertises_tools_and_names_itself_forge() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let service = std::sync::Arc::new(forge_runtime::AgentService::new(
             Arc::new(forge_providers::MockModel::new()),
@@ -191,12 +237,55 @@ mod tests {
             )),
             forge_config::Config::default(),
         ));
-        let server = ForgeMcpServer::new(Arc::new(ForgeTools::new(service, tmp.path())));
+        let tools = Arc::new(ForgeTools::new(service, tmp.path()));
+        let server = ForgeMcpServer::new(tools.clone());
 
         let info = server.get_info();
         assert_eq!(info.server_info.name, "forge");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert!(info.capabilities.tools.is_some());
         assert!(info.instructions.is_some());
+        assert_eq!(server.catalog().len(), definitions().len());
+        assert_eq!(info.instructions.as_deref(), Some(INSTRUCTIONS));
+
+        let compact = ForgeMcpServer::compact(tools);
+        assert_eq!(
+            compact
+                .catalog()
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            [
+                "forge_tools_search",
+                "forge_tools_schema",
+                "forge_tools_invoke"
+            ]
+        );
+        assert!(
+            compact
+                .get_info()
+                .instructions
+                .unwrap()
+                .contains("never authorizes")
+        );
+        for name in ["forge_doctor", "missing"] {
+            assert_eq!(
+                compact
+                    .dispatch(name, &serde_json::json!({}))
+                    .await
+                    .unwrap_err(),
+                ToolError::UnknownTool(name.to_owned())
+            );
+        }
+        let wrapped = compact
+            .dispatch(
+                "forge_tools_invoke",
+                &serde_json::json!({"name": "missing", "arguments": {}}),
+            )
+            .await
+            .unwrap();
+        let result = result_of(wrapped);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.structured_content.unwrap()["code"], "unknown_tool");
     }
 }

@@ -55,9 +55,10 @@
 //!   protocol errors instead. rmcp adds/strips the `resultType`
 //!   discriminator per negotiated version.
 
+mod compact;
 mod runs;
 pub mod server;
 pub mod tools;
 
-pub use server::{ForgeMcpServer, serve_stdio};
+pub use server::{ForgeMcpServer, serve_stdio, serve_stdio_compact};
 pub use tools::{Diagnostics, ForgeTools, ToolDef, ToolError, ToolOutcome, definitions};

@@ -31,7 +31,7 @@ use crate::commands::{Context, doctor};
 /// Unlike `forge serve`, this does not autostart the Laya router adapter:
 /// a client expects the server to be answering requests immediately, and
 /// `FallbackRouter` already covers an unreachable router.
-pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
+pub async fn run(ctx: &Context, compact: bool) -> Result<(), ForgeError> {
     let service = Arc::new(crate::commands::service::build_run_service(ctx).await?);
     let root = ctx.project_root()?;
 
@@ -45,7 +45,11 @@ pub async fn run(ctx: &Context) -> Result<(), ForgeError> {
             global: ctx.global.clone(),
         },
     }));
-    forge_mcp::serve_stdio(tools).await
+    if compact {
+        forge_mcp::serve_stdio_compact(tools).await
+    } else {
+        forge_mcp::serve_stdio(tools).await
+    }
 }
 
 /// Bridges the MCP `forge_doctor` tool to the CLI's own checks.

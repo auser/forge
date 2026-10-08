@@ -108,7 +108,12 @@ pub enum Command {
 
     /// Serve the Model Context Protocol over stdio (for editors and agent
     /// harnesses). stdout carries the protocol; logs go to stderr.
-    Mcp,
+    Mcp {
+        /// Advertise search/schema/invoke tools instead of every tool schema.
+        /// Execution and approval policy are unchanged.
+        #[arg(long)]
+        compact: bool,
+    },
 
     /// Serve the Agent Client Protocol over stdio, making forge an
     /// in-editor agent (Zed and other ACP clients). stdout carries the

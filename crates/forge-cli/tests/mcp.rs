@@ -120,8 +120,17 @@ struct McpClient {
 
 impl McpClient {
     fn spawn(tmp: &Path, project: &Path) -> Self {
+        Self::spawn_with_args(tmp, project, &[])
+    }
+
+    fn spawn_compact(tmp: &Path, project: &Path) -> Self {
+        Self::spawn_with_args(tmp, project, &["--compact"])
+    }
+
+    fn spawn_with_args(tmp: &Path, project: &Path, args: &[&str]) -> Self {
         let mut child = forge(tmp, project)
             .arg("mcp")
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -193,6 +202,13 @@ impl McpClient {
         )
     }
 
+    fn invoke(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        self.call_tool(
+            "forge_tools_invoke",
+            serde_json::json!({ "name": name, "arguments": arguments }),
+        )
+    }
+
     /// The JSON payload a tool returned, read out of the content array
     /// (the text item) — and cross-checked against `structuredContent`.
     fn tool_json(result: &serde_json::Value) -> serde_json::Value {
@@ -243,6 +259,283 @@ impl McpClient {
             "method": "notifications/initialized",
         }));
         response
+    }
+}
+
+fn assert_compact_tools(listed: &serde_json::Value) {
+    let mut names: Vec<_> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "forge_tools_invoke",
+            "forge_tools_schema",
+            "forge_tools_search"
+        ]
+    );
+}
+
+#[test]
+fn compact_legacy_discovers_schemas_and_invokes_the_native_graph_tools() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let mut full = McpClient::spawn(tmp.path(), &project);
+    full.initialize();
+    let full_list = full.request("tools/list", serde_json::json!({}));
+    let native_tools = full_list["result"]["tools"].as_array().expect("tools");
+
+    let mut compact = McpClient::spawn_compact(tmp.path(), &project);
+    compact.initialize();
+    let compact_list = compact.request("tools/list", serde_json::json!({}));
+    assert_compact_tools(&compact_list);
+    let full_bytes = serde_json::to_vec(&full_list["result"]).unwrap().len();
+    let compact_bytes = serde_json::to_vec(&compact_list["result"]).unwrap().len();
+    eprintln!("tools/list result bytes: full={full_bytes}, compact={compact_bytes}");
+    assert!(compact_bytes < full_bytes);
+
+    let search = compact.call_tool("forge_tools_search", serde_json::json!({}));
+    let found = McpClient::tool_json(&search);
+    let omitted = compact.request(
+        "tools/call",
+        serde_json::json!({ "name": "forge_tools_search" }),
+    );
+    assert_eq!(McpClient::tool_json(&omitted), found);
+    assert_eq!(found["total"], native_tools.len());
+    assert_eq!(
+        found["tools"].as_array().expect("summaries").len(),
+        native_tools.len().min(10)
+    );
+    for summary in found["tools"].as_array().unwrap() {
+        let original = native_tools
+            .iter()
+            .find(|tool| tool["name"] == summary["name"])
+            .expect("native tool");
+        assert_eq!(
+            summary,
+            &serde_json::json!({
+                "name": original["name"],
+                "title": original["title"],
+                "description": original["description"],
+            }),
+            "search must return summaries, not schemas"
+        );
+    }
+    // Every fetched schema is the original schema, not a hand-maintained copy.
+    for original in native_tools {
+        let schema = compact.call_tool(
+            "forge_tools_schema",
+            serde_json::json!({ "name": original["name"] }),
+        );
+        assert_eq!(
+            McpClient::tool_json(&schema),
+            serde_json::json!({
+                "name": original["name"],
+                "title": original["title"],
+                "description": original["description"],
+                "inputSchema": original["inputSchema"],
+            })
+        );
+    }
+    let search = compact.call_tool(
+        "forge_tools_search",
+        serde_json::json!({ "query": "GRAPH CONTEXT", "limit": 1 }),
+    );
+    assert_eq!(
+        McpClient::tool_json(&search)["tools"][0]["name"],
+        "forge_graph_context"
+    );
+    for (name, args) in [
+        ("forge_graph_map", serde_json::json!({})),
+        (
+            "forge_graph_context",
+            serde_json::json!({ "query": "parse_config" }),
+        ),
+        (
+            "forge_graph_grep",
+            serde_json::json!({ "pattern": "serve_http" }),
+        ),
+        // The native tool's error is preserved, not wrapped as a successful invoke.
+        (
+            "forge_graph_grep",
+            serde_json::json!({ "pattern": "http", "semantic": true }),
+        ),
+    ] {
+        let direct = full.call_tool(name, args.clone());
+        let invoked = compact.invoke(name, args);
+        assert_eq!(invoked["result"], direct["result"], "{name}");
+    }
+    full.shutdown();
+    compact.shutdown();
+}
+
+#[test]
+fn compact_modern_discover_list_and_call_need_no_handshake() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let mut client = McpClient::spawn_compact(tmp.path(), &project);
+    let discovered = client.modern_request("server/discover", serde_json::json!({}));
+    assert!(
+        discovered["result"]["supportedVersions"]
+            .as_array()
+            .expect("versions")
+            .iter()
+            .any(|v| v == MODERN_VERSION)
+    );
+    assert!(discovered["result"]["capabilities"]["tools"].is_object());
+    assert_compact_tools(&client.modern_request("tools/list", serde_json::json!({})));
+    let called = client.modern_request(
+        "tools/call",
+        serde_json::json!({
+            "name": "forge_tools_invoke",
+            "arguments": {
+                "name": "forge_graph_context",
+                "arguments": { "query": "parse_config" }
+            }
+        }),
+    );
+    assert_eq!(McpClient::tool_json(&called)["hits"][0]["path"], "alpha.rs");
+    client.shutdown();
+}
+
+#[test]
+fn compact_distinguishes_protocol_errors_from_inner_tool_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let mut client = McpClient::spawn_compact(tmp.path(), &project);
+    client.initialize();
+    for name in ["forge_graph_map", "forge_not_a_tool"] {
+        let response = client.call_tool(name, serde_json::json!({}));
+        assert!(response["error"].is_object(), "{response}");
+        assert!(response.get("result").is_none(), "{response}");
+    }
+    for name in [
+        "forge_not_a_tool",
+        "forge_tools_search",
+        "forge_tools_schema",
+        "forge_tools_invoke",
+    ] {
+        for meta in ["forge_tools_schema", "forge_tools_invoke"] {
+            let mut args = serde_json::json!({ "name": name });
+            if meta == "forge_tools_invoke" {
+                args["arguments"] = serde_json::json!({});
+            }
+            let response = client.call_tool(meta, args);
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            assert_eq!(McpClient::tool_json(&response)["code"], "unknown_tool");
+        }
+    }
+    for (name, args) in [
+        ("forge_tools_search", serde_json::json!({ "limit": 0 })),
+        ("forge_tools_search", serde_json::json!({ "limit": 101 })),
+        ("forge_tools_schema", serde_json::json!({})),
+        (
+            "forge_tools_invoke",
+            serde_json::json!({ "name": "forge_graph_map", "arguments": [] }),
+        ),
+        // Correct wrapper, malformed native arguments.
+        (
+            "forge_tools_invoke",
+            serde_json::json!({ "name": "forge_graph_context", "arguments": {} }),
+        ),
+    ] {
+        let response = client.call_tool(name, args);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert_eq!(McpClient::tool_json(&response)["code"], "invalid_params");
+    }
+    // Bad requests must not poison the connection.
+    let map = client.invoke("forge_graph_map", serde_json::json!({}));
+    assert!(McpClient::tool_json(&map)["directories"].is_array());
+    client.shutdown();
+}
+
+#[test]
+fn compact_invoke_preserves_approval_and_session_history() {
+    // Exercise both answers through the same wrapper: discovery is not permission.
+    for (answer, approved) in [("y", true), ("n", false)] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = scaffold(tmp.path(), "prompt");
+        let mut client = McpClient::spawn_compact(tmp.path(), &project);
+        client.initialize();
+        let run = client.invoke(
+            "forge_run",
+            serde_json::json!({ "prompt": "write the notes", "timeout_ms": 30000 }),
+        );
+        let started = McpClient::tool_json(&run);
+        assert_eq!(started["status"], "waiting_for_approval", "{started}");
+        assert!(!project.join("notes.txt").exists());
+        let run_id = &started["run_id"];
+        let status = client.invoke("forge_run_status", serde_json::json!({ "run_id": run_id }));
+        assert_eq!(
+            McpClient::tool_json(&status)["status"],
+            "waiting_for_approval"
+        );
+        assert!(!project.join("notes.txt").exists());
+        let delivered = client.invoke(
+            "forge_run_input",
+            serde_json::json!({ "run_id": run_id, "input": answer }),
+        );
+        assert_eq!(McpClient::tool_json(&delivered)["delivered"], true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let status = client.invoke("forge_run_status", serde_json::json!({ "run_id": run_id }));
+            let status = McpClient::tool_json(&status);
+            if status["status"] == "completed" {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(project.join("notes.txt").exists(), approved);
+        if approved {
+            assert_eq!(
+                std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+                "scripted content"
+            );
+        }
+        client.shutdown();
+        let session_id = started["session_id"].as_str().expect("session id");
+        let log = std::fs::read_to_string(
+            project
+                .join(".forge/sessions")
+                .join(format!("{session_id}.jsonl")),
+        )
+        .expect("session log");
+        let events: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("session event JSON"))
+            .collect();
+        assert!(
+            events
+                .iter()
+                .all(|event| { event["run_id"] == *run_id && event["session_id"] == session_id })
+        );
+        assert!(
+            events.windows(2).all(|pair| {
+                pair[0]["seq"].as_u64().unwrap() < pair[1]["seq"].as_u64().unwrap()
+            })
+        );
+        assert!(
+            events.iter().any(|event| {
+                event["type"] == "tool_completed"
+                    && event["name"] == "write_file"
+                    && event["success"] == approved
+            }),
+            "{log}"
+        );
+        assert!(
+            events.iter().any(|event| event["type"] == "tool_result"),
+            "{log}"
+        );
+        if !approved {
+            assert!(log.contains("approval denied"), "{log}");
+        }
     }
 }
 
