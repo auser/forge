@@ -23,6 +23,20 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 use super::{ContextPlan, ContextPlanDraft, PathBuf, plan_from_draft};
 
+// Preserve the original error and never print paths, identifiers, or contents.
+// Unit-test subprocesses otherwise lose the failing OS stage at the public API.
+fn stage<T>(_name: &'static str, result: io::Result<T>) -> io::Result<T> {
+    #[cfg(test)]
+    if let Err(error) = &result {
+        eprintln!(
+            "Windows context stage={_name} kind={:?} os_code={:?}",
+            error.kind(),
+            error.raw_os_error()
+        );
+    }
+    result
+}
+
 fn bool_result(ok: i32) -> io::Result<()> {
     if ok == 0 {
         Err(io::Error::last_os_error())
@@ -56,7 +70,6 @@ impl Drop for Local {
 struct PrivateSecurity {
     descriptor: Local,
     owner: PSID,
-    dacl: *mut ACL,
     default_owner: Vec<usize>,
 }
 
@@ -149,7 +162,6 @@ impl PrivateSecurity {
             Ok(Self {
                 descriptor,
                 owner,
-                dacl,
                 default_owner,
             })
         }
@@ -181,20 +193,16 @@ impl PrivateSecurity {
             if EqualSid(owner, self.owner) == 0 && EqualSid(owner, default_owner.Owner) == 0 {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            let error = SetSecurityInfo(
+            // SetSecurityInfo propagates ACL changes to children, including
+            // hardlinks we have not validated. The native operation changes
+            // only this handle's object; each child is checked before sealing.
+            status_result(NtSetSecurityObject(
                 file.as_raw_handle(),
-                SE_FILE_OBJECT,
                 OWNER_SECURITY_INFORMATION
                     | DACL_SECURITY_INFORMATION
                     | PROTECTED_DACL_SECURITY_INFORMATION,
-                self.owner,
-                null_mut(),
-                self.dacl,
-                null_mut(),
-            );
-            if error != 0 {
-                return Err(io::Error::from_raw_os_error(error as i32));
-            }
+                self.descriptor.0,
+            ))?;
         }
         Ok(())
     }
@@ -246,25 +254,28 @@ fn open(
     // synchronous call. RootDirectory is a live owned handle. The final component
     // is opened as a reparse object, never followed, then checked by handle.
     unsafe {
-        status_result(NtCreateFile(
-            &mut handle,
-            access,
-            &attributes,
-            &mut iosb,
-            null(),
-            FILE_ATTRIBUTE_NORMAL,
-            sharing,
-            disposition,
-            FILE_SYNCHRONOUS_IO_NONALERT
-                | FILE_OPEN_REPARSE_POINT
-                | if directory {
-                    FILE_DIRECTORY_FILE
-                } else {
-                    FILE_NON_DIRECTORY_FILE
-                },
-            null(),
-            0,
-        ))?;
+        stage(
+            "open",
+            status_result(NtCreateFile(
+                &mut handle,
+                access,
+                &attributes,
+                &mut iosb,
+                null(),
+                FILE_ATTRIBUTE_NORMAL,
+                sharing,
+                disposition,
+                FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_DIRECTORY_FILE
+                    } else {
+                        FILE_NON_DIRECTORY_FILE
+                    },
+                null(),
+                0,
+            )),
+        )?;
         let file = File::from_raw_handle(handle);
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         bool_result(GetFileInformationByHandle(file.as_raw_handle(), &mut info))?;
@@ -273,7 +284,7 @@ fn open(
         {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        security.protect(&file)?;
+        stage("protect", security.protect(&file))?;
         Ok(file)
     }
 }
@@ -420,7 +431,7 @@ fn write<T: serde::Serialize>(
 }
 
 pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<ContextPlan> {
-    let root = Tree::root(path, true)?;
+    let root = stage("root", Tree::root(path, true))?;
     let locks = root.directory("locks", true)?;
     let lock = open(
         &locks,
@@ -437,12 +448,18 @@ pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<Context
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5))
             }
-            Err(_) => return Err(io::ErrorKind::WouldBlock.into()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return stage("lock-timeout", Err(io::ErrorKind::WouldBlock.into()));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return stage("lock", Err(error));
+            }
         }
     }
     let latest = root.directory("latest", true)?;
     let latest_name = format!("{}.json", draft.session_id);
-    let previous: Option<String> = read(&latest, &latest_name, &root.security)?;
+    let previous: Option<String> =
+        stage("read-latest", read(&latest, &latest_name, &root.security))?;
     let changed = previous.is_some_and(|hash| hash != draft.stable_prefix.combined_hash);
     let plan = plan_from_draft(draft, changed);
     let plans = root.directory("plans", true)?;
@@ -453,17 +470,23 @@ pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<Context
         FILE_OPEN_IF,
         &root.security,
     )?;
-    write(
-        &run,
-        &format!("{}.json", plan.request_ordinal),
-        &plan,
-        &root.security,
+    stage(
+        "write-plan",
+        write(
+            &run,
+            &format!("{}.json", plan.request_ordinal),
+            &plan,
+            &root.security,
+        ),
     )?;
-    write(
-        &latest,
-        &latest_name,
-        &plan.stable_prefix.combined_hash,
-        &root.security,
+    stage(
+        "write-latest",
+        write(
+            &latest,
+            &latest_name,
+            &plan.stable_prefix.combined_hash,
+            &root.security,
+        ),
     )?;
     Ok(plan)
 }
@@ -486,6 +509,47 @@ mod tests {
     use super::*;
     use crate::store::{ContextStore, FsContextStore, tests::draft};
     use std::fs;
+
+    fn security_snapshot(path: &Path) -> Vec<u16> {
+        let file = OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        // Compare owner, group and DACL without repairing any permissions.
+        // SAFETY: the API allocations stay alive while the SDDL is copied.
+        unsafe {
+            let information =
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+            let mut descriptor = null_mut();
+            assert_eq!(
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    information,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    &mut descriptor,
+                ),
+                0
+            );
+            let _descriptor = Local(descriptor);
+            let mut text = null_mut();
+            let mut length = 0;
+            bool_result(ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                information,
+                &mut text,
+                &mut length,
+            ))
+            .unwrap();
+            let _text = Local(text.cast());
+            std::slice::from_raw_parts(text, length as usize).to_vec()
+        }
+    }
 
     fn symlink_available(result: io::Result<()>) -> bool {
         match result {
@@ -518,7 +582,10 @@ mod tests {
             ] {
                 let project = tempfile::tempdir().unwrap();
                 let victim = tempfile::tempdir().unwrap();
-                let link = project.path().join(component);
+                let victim_file = victim.path().join("sentinel");
+                fs::write(&victim_file, "secret victim").unwrap();
+                // cmd's mklink treats forward slashes as switch delimiters.
+                let link = project.path().join(component.replace('/', "\\"));
                 fs::create_dir_all(link.parent().unwrap()).unwrap();
                 if junction {
                     // Junction creation does not require symlink privilege. It
@@ -536,12 +603,23 @@ mod tests {
                 )) {
                     return;
                 }
+                let original_security = security_snapshot(victim.path());
+                let original_file_security = security_snapshot(&victim_file);
                 let store = FsContextStore::new(project.path().join(".forge/context"));
                 assert!(
                     store.record(draft("run", "s", 1, "private")).is_err(),
                     "{component}"
                 );
-                assert_eq!(fs::read_dir(victim.path()).unwrap().count(), 0);
+                assert_eq!(fs::read_dir(victim.path()).unwrap().count(), 1);
+                assert_eq!(fs::read_to_string(&victim_file).unwrap(), "secret victim");
+                assert!(
+                    security_snapshot(victim.path()) == original_security,
+                    "victim directory security changed: {component}"
+                );
+                assert!(
+                    security_snapshot(&victim_file) == original_file_security,
+                    "victim descendant security changed: {component}"
+                );
                 // Remove only the reparse point, never recurse through the target.
                 fs::remove_dir(&link).unwrap();
             }
@@ -563,6 +641,7 @@ mod tests {
                 } else if !symlink_available(std::os::windows::fs::symlink_file(&victim, &link)) {
                     return;
                 }
+                let original_security = security_snapshot(&victim);
                 let store = FsContextStore::new(&root);
                 if component.starts_with("plans") {
                     assert!(store.plan("run", 1).is_err());
@@ -573,8 +652,30 @@ mod tests {
                     assert!(store.record(draft("run", "s", 1, "a")).is_err());
                 }
                 assert_eq!(fs::read_to_string(&victim).unwrap(), "secret victim");
+                assert!(
+                    security_snapshot(&victim) == original_security,
+                    "victim file security changed: hardlink={hardlink} component={component}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn sealing_directory_does_not_touch_unopened_descendants() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().join("context");
+        let nested = root.join("unopened");
+        fs::create_dir_all(&nested).unwrap();
+        let victim = project.path().join("victim");
+        fs::write(&victim, "secret victim").unwrap();
+        fs::hard_link(&victim, nested.join("link")).unwrap();
+        let original_security = security_snapshot(&victim);
+        let nested_security = security_snapshot(&nested);
+        let tree = Tree::root(&root, false).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "secret victim");
+        assert!(security_snapshot(&victim) == original_security);
+        assert!(security_snapshot(&nested) == nested_security);
+        drop(tree);
     }
 
     #[test]
