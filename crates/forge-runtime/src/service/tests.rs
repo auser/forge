@@ -759,7 +759,10 @@ async fn oversized_tool_output_is_capped_before_the_model_and_replay_log() {
     );
 
     let outcome = service.run("read the huge file").await.expect("run");
-    let expected = forge_core::cap_tool_output(&huge);
+    let expected = format!(
+        "{}\n[Complete sanitized output unavailable]\n",
+        forge_core::cap_tool_output(&huge)
+    );
     let requests = model.recorded();
     let model_result = requests[1]
         .messages
@@ -4067,4 +4070,5 @@ async fn context_store_failure_is_visible_and_fail_open() {
     )));
 }
 
+mod artifacts;
 mod context_privacy;

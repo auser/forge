@@ -664,6 +664,7 @@ name = "forge-context"
 version = "0.2.6"
 dependencies = [
  "forge-core",
+ "forge-session",
  "rustix",
  "serde",
  "serde_json",

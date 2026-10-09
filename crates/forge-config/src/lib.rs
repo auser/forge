@@ -110,6 +110,25 @@ pub struct BudgetConfig {
     pub on_exceeded: String,
 }
 
+/// `[context_artifacts]`: bounds on sanitized, retrievable tool outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextArtifactsConfig {
+    pub max_project_bytes: u64,
+    pub max_age_secs: u64,
+    pub max_artifact_bytes: u64,
+}
+
+impl Default for ContextArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            max_project_bytes: 128 * 1024 * 1024,
+            max_age_secs: 7 * 24 * 60 * 60,
+            max_artifact_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
 /// Limit for one tool, reset for every agent run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ToolLimitConfig {
@@ -296,6 +315,8 @@ pub struct Config {
     /// Per-tool call ceilings, keyed by the exact tool name. Entries are
     /// deep-merged across configuration files.
     pub tool_limits: BTreeMap<String, ToolLimitConfig>,
+    /// Retention bounds for sanitized tool outputs (`[context_artifacts]`).
+    pub context_artifacts: ContextArtifactsConfig,
     /// Days a cached OpenRouter model catalogue counts as fresh (see
     /// [`crate::catalogue`]). A stale cache is still used — with a warning
     /// naming its age — because stale prices beat no prices; must be >= 1.
@@ -579,6 +600,7 @@ impl Default for Config {
             needle: NeedleConfig::default(),
             budget: BudgetConfig::default(),
             tool_limits: BTreeMap::new(),
+            context_artifacts: ContextArtifactsConfig::default(),
             catalogue_ttl_days: 7,
             // Nothing here was explicitly configured — this *is* the
             // defaults layer.
@@ -737,6 +759,16 @@ impl Config {
         if self.tool_limits.contains_key("") {
             return Err(ForgeError::config(
                 "tool_limits keys must be non-empty tool names".to_string(),
+            ));
+        }
+        if self.context_artifacts.max_project_bytes == 0
+            || self.context_artifacts.max_age_secs == 0
+            || self.context_artifacts.max_artifact_bytes == 0
+            || self.context_artifacts.max_artifact_bytes > self.context_artifacts.max_project_bytes
+        {
+            return Err(ForgeError::config(
+                "context_artifacts limits must be positive, with max_artifact_bytes <= max_project_bytes"
+                    .to_string(),
             ));
         }
         let sha = &self.needle.weights_sha256;

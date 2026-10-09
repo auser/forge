@@ -194,6 +194,14 @@ pub fn build_service_with(
     let context_store = Arc::new(forge_context::FsContextStore::new(
         root.join(".forge").join("context"),
     ));
+    let artifact_store = Arc::new(forge_context::FsArtifactStore::new(
+        root.join(".forge").join("context"),
+        forge_context::ArtifactLimits {
+            max_project_bytes: config.context_artifacts.max_project_bytes,
+            max_age_secs: config.context_artifacts.max_age_secs,
+            max_artifact_bytes: config.context_artifacts.max_artifact_bytes,
+        },
+    ));
 
     // Wire the project graph when one has been built; absence never
     // blocks a run.
@@ -217,6 +225,7 @@ pub fn build_service_with(
         AgentService::new(model, router, execution, skills, sessions, config)
             .with_graph(graph)
             .with_context_store(Some(context_store))
+            .with_artifact_store(Some(artifact_store))
             .with_system_context(crate::commands::guidance::system_context(&root))
             .with_model_factory(Arc::new(factory)),
     )
@@ -226,6 +235,15 @@ pub fn build_service_with(
 mod tests {
     use super::*;
     use crate::cli::GlobalOpts;
+
+    #[test]
+    fn configured_artifact_defaults_match_storage_defaults() {
+        let config = forge_config::Config::default().context_artifacts;
+        let storage = forge_context::ArtifactLimits::default();
+        assert_eq!(config.max_project_bytes, storage.max_project_bytes);
+        assert_eq!(config.max_age_secs, storage.max_age_secs);
+        assert_eq!(config.max_artifact_bytes, storage.max_artifact_bytes);
+    }
 
     /// The default must *be* today's runtime, because every existing call
     /// site reaches `build_service_with` through it.

@@ -206,6 +206,7 @@ fn run_messages(events: &[&Event]) -> RunReplay {
             | EventKind::SessionForked { .. }
             | EventKind::ContextPlanRecorded { .. }
             | EventKind::ContextPlanUnavailable { .. }
+            | EventKind::ToolOutputArtifact { .. }
             | EventKind::Error { .. }
             | EventKind::Cancelled { .. } => {}
         }

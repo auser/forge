@@ -88,6 +88,28 @@ impl Redactor {
         Some(prefix.len())
     }
 
+    /// Retrieval results are a JSON envelope, not free text: redact its text
+    /// field without letting a pattern consume quotes or continuation metadata.
+    /// Unknown/malformed envelopes retain the ordinary free-text policy.
+    pub fn redact_tool_output(&self, tool: &str, output: &str) -> String {
+        if tool == "retrieve_tool_output"
+            && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(output)
+            && let Some(object) = value.as_object_mut()
+            && object.len() == 5
+            && object.get("text").is_some_and(|v| v.is_string())
+            && ["start", "end", "total_bytes"]
+                .iter()
+                .all(|key| object.get(*key).is_some_and(|v| v.is_u64()))
+            && object
+                .get("next_start")
+                .is_some_and(|v| v.is_null() || v.is_u64())
+        {
+            self.redact_value(&mut value);
+            return value.to_string();
+        }
+        self.redact(output)
+    }
+
     /// Deep-redact every string inside a JSON value.
     pub fn redact_value(&self, value: &mut serde_json::Value) {
         match value {
@@ -110,6 +132,21 @@ impl Redactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_redaction_is_limited_to_retrieval_envelopes() {
+        let redactor = Redactor::new();
+        for (tool, output) in [
+            ("retrieve_tool_output", "sk-abcdefghijk {broken"),
+            ("retrieve_tool_output", r#"{"text":"sk-abcdefghijk"}"#),
+            ("read_file", "Bearer token"),
+        ] {
+            assert_eq!(
+                redactor.redact_tool_output(tool, output),
+                redactor.redact(output)
+            );
+        }
+    }
 
     #[test]
     fn redacts_common_token_patterns() {

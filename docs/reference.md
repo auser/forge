@@ -857,6 +857,29 @@ fails through normal dispatch. Negative, non-integer, missing, or extra fields
 in a limit fail configuration parsing instead of being ignored. Limits from
 later config files override the same tool while preserving other tools.
 
+Sanitized tool-artifact retention has independent project-level bounds:
+
+```toml
+[context_artifacts]
+max_project_bytes = 134217728 # 128 MiB of deduplicated payloads
+max_age_secs = 604800        # seven days
+max_artifact_bytes = 8388608 # 8 MiB per complete sanitized output
+```
+
+These keys merge individually across user and project configuration. All must
+be positive, and the artifact limit cannot exceed the project limit. Unknown
+keys in this section are rejected. Outputs exceeding the artifact limit are
+not silently stored as partial originals: their capped view reports that full
+output is unavailable. Eviction also makes omitted detail unavailable; the
+session log retains the capped view, not a backup of the complete artifact.
+
+Retention is enforced on writes and authorized retrievals, not by a background
+sweeper. The age limit is absolute: reads refresh least-recently-used ordering,
+but do not extend expiry. Metadata is separately bounded to 4096 source manifests,
+4096 objects and an 8 MiB index. Atomic writes may temporarily require space for
+one additional artifact and index staging. If cleanup cannot enforce the bounds,
+storage fails closed rather than silently exceeding them.
+
 Inspect the resolved configuration:
 
 ```bash
@@ -1560,6 +1583,42 @@ change it. Accounting is fail-open: an unwritable or malformed context store
 records `context_plan_unavailable`, while the original provider request
 continues unchanged. Context accounting does not yet compress content, inject
 memory, reorder messages, or otherwise change model behavior.
+
+### Retrievable tool outputs
+
+Tool results are sanitized using the session redactor before they enter provider
+requests, not only before logging. Oversized results keep their capped view.
+When complete sanitized output fits the artifact limits and storage succeeds,
+the view includes an opaque handle for `retrieve_tool_output`. The tool is
+offered to tool-capable models when artifact storage is available.
+
+Examples of tool arguments:
+
+```json
+{"handle":"<handle from tool output>","start":65536,"end":66560}
+{"handle":"<handle from tool output>","query":"failed assertion"}
+{"handle":"<handle from tool output>","start":65536,"limit":4096}
+```
+
+`start` and exclusive `end` are byte offsets, adjusted to avoid splitting UTF-8
+characters. `limit` is a positive byte limit, at most 16384; literal queries
+default to that limit. Responses are bounded to 16 KiB including JSON metadata
+and include continuation information. Retrieval never silently expands history
+and never recursively stores its own output.
+
+Authorization comes from typed artifact grants in the current session's event
+history. A fork inherits only grants present before its cut, including nested
+forks; a guessed content hash or a handle pasted into a prompt grants no access.
+Manifests identify the source session, run, call and the persisted tool-request
+event sequence. Project-wide deduplication does not grant cross-session access.
+Retrieval participates in ordinary tool quotas and policy audit, but not the
+Needle direct-execution shortcut.
+
+Only sanitized complete bytes are stored. Missing, evicted or unauthorized
+artifacts return unavailable; failed writes do not advertise a retrieval handle.
+Retention can intentionally lose detail absent from the capped session log.
+Redaction remains a heuristic for known secret patterns and captured environment
+secrets, not a guarantee to recognize every sensitive value.
 
 ```bash
 forge session list        # sessions with event counts

@@ -474,6 +474,7 @@ impl TurnState {
             | EventKind::SessionForked { .. }
             | EventKind::ContextPlanRecorded { .. }
             | EventKind::ContextPlanUnavailable { .. }
+            | EventKind::ToolOutputArtifact { .. }
             | EventKind::RunStarted { .. }
             | EventKind::ApprovalDecided { .. }
             | EventKind::TurnCompleted { .. }

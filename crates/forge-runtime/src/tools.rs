@@ -94,6 +94,89 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Offered only to the normal model loop when local artifact storage is injected.
+pub(crate) fn artifact_tool_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "retrieve_tool_output",
+        "Retrieve a bounded part of a complete sanitized tool output. Use a handle from visible history. Supply start/end byte offsets, a positive byte limit, or a nonempty literal query. Query defaults to a 16384-byte limit. Responses include continuation.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string"},
+                "start": {"type": "integer", "minimum": 0},
+                "end": {"type": "integer", "minimum": 1},
+                "query": {"type": "string", "minLength": 1, "maxLength": 16384},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 16384}
+            },
+            "required": ["handle"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+pub(crate) fn artifact_query(
+    args: &serde_json::Value,
+) -> Result<(&str, forge_context::ArtifactQuery), &'static str> {
+    const INVALID: &str = "invalid retrieval: supply a bounded byte range, positive byte limit (at most 16384), or nonempty literal query";
+    let object = args.as_object().ok_or(INVALID)?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "handle" | "start" | "end" | "query" | "limit"))
+    {
+        return Err(INVALID);
+    }
+    let handle = args
+        .get("handle")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or(INVALID)?;
+    let number = |key| {
+        args.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or(INVALID)
+    };
+    let start = if args.get("start").is_some() {
+        number("start")?
+    } else {
+        0
+    };
+    let query = if args.get("query").is_some() {
+        let literal = args["query"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 16384)
+            .ok_or(INVALID)?;
+        let limit = if args.get("limit").is_some() {
+            number("limit")?
+        } else {
+            16384
+        };
+        if limit == 0 || limit > 16384 || args.get("end").is_some() {
+            return Err(INVALID);
+        }
+        forge_context::ArtifactQuery::Search {
+            literal: literal.to_owned(),
+            start,
+            limit,
+        }
+    } else {
+        let end = if args.get("limit").is_some() {
+            let limit = number("limit")?;
+            if limit == 0 || limit > 16384 || args.get("end").is_some() {
+                return Err(INVALID);
+            }
+            start.checked_add(limit).ok_or(INVALID)?
+        } else {
+            number("end")?
+        };
+        if end <= start || end - start > 16384 {
+            return Err(INVALID);
+        }
+        forge_context::ArtifactQuery::Range { start, end }
+    };
+    Ok((handle, query))
+}
+
 /// The outcome of dispatching one tool call.
 pub struct ToolOutcome {
     pub result: ToolResult,
@@ -265,6 +348,9 @@ impl ToolDispatcher {
                     RiskLevel::Safe,
                     arg_str(&call.arguments, "pattern").is_err(),
                 ),
+                "retrieve_tool_output" => {
+                    (RiskLevel::Safe, artifact_query(&call.arguments).is_err())
+                }
                 _ => return None,
             }
         };
