@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use forge_config::Config;
+use forge_context::{ContextStore, MemoryContextStore};
 use forge_core::ToolCall;
 use forge_core::{DecisionRouter, EventKind, ForgeError, RiskLevel, RoutingRequest};
 use forge_execution::{ApprovalChannel, MockExecution, NativeExecution};
@@ -9,6 +10,10 @@ use forge_session::JsonlSessionStore;
 use serial_test::serial;
 
 use super::*;
+
+fn with_context(service: AgentService, store: Arc<MemoryContextStore>) -> AgentService {
+    service.with_context_store(Some(store))
+}
 
 fn test_service(root: &std::path::Path) -> AgentService {
     AgentService::new(
@@ -3630,3 +3635,90 @@ async fn the_session_ceiling_counts_spend_from_prior_runs() {
     assert!(err.to_string().contains("session_tokens"), "got: {err}");
     assert!(err.to_string().contains("10 tokens spent"), "got: {err}");
 }
+
+#[tokio::test]
+async fn context_accounting_records_each_exact_provider_request() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(MemoryContextStore::default());
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        tool_reply("read_file", serde_json::json!({"path": "missing"})),
+        text_reply("done"),
+    ]));
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(NativeExecution::new(
+            forge_core::ApprovalPolicy::Auto,
+            tmp.path(),
+        )),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(tmp.path().join("sessions"))),
+        Config::default(),
+    )
+    .with_context_store(Some(store.clone()));
+
+    let outcome = service.run("inspect").await.expect("run");
+    let recorded: Vec<_> = outcome
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ContextPlanRecorded {
+                request_ordinal, ..
+            } => Some(*request_ordinal),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recorded, vec![1, 2]);
+    let first = store.plan(&outcome.run_id, 1).unwrap().unwrap();
+    let second = store.plan(&outcome.run_id, 2).unwrap().unwrap();
+    let requests = model.recorded();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(first.components.system_guidance, ContextSize::default());
+    assert_eq!(first.components.skill_instructions, ContextSize::default());
+    assert_eq!(first.components.graph_context, ContextSize::default());
+    assert_eq!(first.components.replay_history, ContextSize::default());
+    for (plan, request) in [&first, &second].into_iter().zip(&requests) {
+        assert_eq!(
+            plan.components.tool_schemas,
+            ContextSize::of_items(&request.tools)
+        );
+        assert_eq!(
+            plan.components.total,
+            ContextSize::of_items(&request.messages)
+                .saturating_add(ContextSize::of_items(&request.tools))
+        );
+    }
+    assert_eq!(first.components.memory, ContextSize::default());
+    assert!(
+        second.components.replay_history.chars > first.components.replay_history.chars,
+        "assistant/tool messages are active history"
+    );
+    assert_eq!(
+        first.stable_prefix.combined_hash, second.stable_prefix.combined_hash,
+        "dynamic history does not drift the stable prefix"
+    );
+}
+
+#[tokio::test]
+async fn context_store_failure_is_visible_and_fail_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(MemoryContextStore::failing("secret path must not escape"));
+    let service = with_context(
+        scripted_service(
+            tmp.path(),
+            vec![text_reply("still completed")],
+            forge_core::ApprovalPolicy::Auto,
+        ),
+        store,
+    );
+
+    let outcome = service.run("private prompt").await.expect("run");
+    assert_eq!(outcome.text, "still completed");
+    assert!(outcome.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ContextPlanUnavailable { message, .. }
+            if message == "context accounting unavailable"
+    )));
+}
+
+mod context_privacy;

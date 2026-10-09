@@ -19,6 +19,7 @@ harness = false
 forge-acp.workspace = true
 forge-chat.workspace = true
 forge-config.workspace = true
+forge-context.workspace = true
 forge-core.workspace = true
 forge-execution.workspace = true
 forge-graph.workspace = true

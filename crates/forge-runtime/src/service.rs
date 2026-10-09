@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use forge_config::Config;
+use forge_context::{
+    CONTEXT_PLAN_VERSION, ContextComponents, ContextPlanDraft, ContextPlanSummary, ContextSize,
+    ContextStore, stable_prefix,
+};
 use forge_core::{
     CompletionRequest, DecisionRouter, Event, EventKind, ExecutionProvider, ForgeError, Message,
     ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, RunState, SessionStore, Skill,
@@ -87,6 +91,14 @@ struct RunGate<'a> {
     session_id: &'a str,
     input_rx: &'a mut mpsc::Receiver<String>,
     token: &'a CancellationToken,
+}
+
+#[derive(Clone, Copy)]
+struct ContextBoundaries {
+    system_end: usize,
+    skills_end: usize,
+    graph_end: usize,
+    prompt_index: usize,
 }
 
 /// Result of a completed run.
@@ -381,6 +393,7 @@ pub struct AgentService {
     sessions: Arc<JsonlSessionStore>,
     config: Config,
     graph: Option<Arc<dyn ProjectGraph>>,
+    context_store: Option<Arc<dyn ContextStore>>,
     /// Stable coding contract and project guidance supplied by the host.
     /// Kept separate from replay: it is current run context, not conversation.
     system_context: Vec<Message>,
@@ -435,6 +448,7 @@ impl AgentService {
             sessions,
             config,
             graph: None,
+            context_store: None,
             system_context: Vec::new(),
             model_factory: None,
             needle: None,
@@ -452,6 +466,12 @@ impl AgentService {
     /// Attach a project graph for context seeding and graph tools.
     pub fn with_graph(mut self, graph: Option<Arc<dyn ProjectGraph>>) -> Self {
         self.graph = graph;
+        self
+    }
+
+    /// Attach best-effort context accounting. Its failure never blocks a model call.
+    pub fn with_context_store(mut self, store: Option<Arc<dyn ContextStore>>) -> Self {
+        self.context_store = store;
         self
     }
 
@@ -1098,6 +1118,78 @@ impl AgentService {
         let cost_usd = completion_cost(response.usage, costs.price(model_name));
         spend.record(response.usage, cost_usd);
         decisions.record_usage(turn, model_name, response.usage, cost_usd, elapsed_ms);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_context_plan(
+        &self,
+        sender: &broadcast::Sender<Event>,
+        collected: &mut Vec<Event>,
+        run_id: &str,
+        session_id: &str,
+        ordinal: u32,
+        request: &CompletionRequest,
+        boundaries: ContextBoundaries,
+        max_context: usize,
+    ) -> Result<(), ForgeError> {
+        let Some(store) = &self.context_store else {
+            return Ok(());
+        };
+        let size = |messages: &[Message]| ContextSize::of_items(messages);
+        let mut components = ContextComponents {
+            system_guidance: size(&request.messages[..boundaries.system_end]),
+            skill_instructions: size(
+                &request.messages[boundaries.system_end..boundaries.skills_end],
+            ),
+            graph_context: size(&request.messages[boundaries.skills_end..boundaries.graph_end]),
+            replay_history: size(&request.messages[boundaries.graph_end..boundaries.prompt_index])
+                .saturating_add(size(&request.messages[boundaries.prompt_index + 1..])),
+            memory: ContextSize::default(),
+            current_prompt: size(
+                &request.messages[boundaries.prompt_index..=boundaries.prompt_index],
+            ),
+            tool_schemas: ContextSize::of_items(&request.tools),
+            total: ContextSize::default(),
+        };
+        components.calculate_total();
+        let draft = ContextPlanDraft {
+            version: CONTEXT_PLAN_VERSION,
+            run_id: run_id.to_string(),
+            session_id: session_id.to_string(),
+            request_ordinal: ordinal,
+            remaining_context_tokens: max_context.saturating_sub(components.total.estimated_tokens),
+            components,
+            stable_prefix: stable_prefix(&self.system_context, &request.tools),
+            reserved_output_tokens: request.max_tokens,
+        };
+        let kind = match store.record(draft) {
+            Ok(plan) => {
+                let summary = ContextPlanSummary::from(&plan);
+                EventKind::ContextPlanRecorded {
+                    plan_id: summary.plan_id,
+                    request_ordinal: summary.request_ordinal,
+                    stable_prefix_hash: summary.stable_prefix_hash,
+                    prefix_changed: summary.prefix_changed,
+                    total_estimated_input_tokens: summary.total_estimated_input_tokens,
+                    reserved_output_tokens: summary.reserved_output_tokens,
+                    plan_path: summary.plan_path,
+                }
+            }
+            Err(error) => {
+                let category = match error {
+                    ForgeError::Io(_) => "io",
+                    ForgeError::Session(_) => "store",
+                    _ => "unknown",
+                };
+                tracing::warn!(error_category = category, "context accounting unavailable");
+                EventKind::ContextPlanUnavailable {
+                    request_ordinal: ordinal,
+                    error_category: category.to_string(),
+                    message: "context accounting unavailable".to_string(),
+                }
+            }
+        };
+        self.emit(sender, collected, Event::new(run_id, session_id, kind))
     }
 
     /// Enforce `[budget]` before a model call: when a configured ceiling
@@ -2057,6 +2149,7 @@ impl AgentService {
         // System first is what providers expect, and the history is a real
         // user/assistant/tool transcript that must arrive in its own order.
         let mut messages = self.system_context.clone();
+        let system_end = messages.len();
         // Explicitly requested skills activate first, in caller order with
         // duplicates collapsed — ahead of, never instead of, lexical
         // discovery. The caller asked for these by name, so a failed
@@ -2093,6 +2186,7 @@ impl AgentService {
                 }
             }
         }
+        let skills_end = messages.len();
         if let Some(graph) = &self.graph {
             let hits = graph.context(task, 5);
             if !hits.is_empty() {
@@ -2106,8 +2200,16 @@ impl AgentService {
                 )));
             }
         }
+        let graph_end = messages.len();
         messages.extend(history);
+        let prompt_index = messages.len();
         messages.push(Message::user(prompt));
+        let context_boundaries = ContextBoundaries {
+            system_end,
+            skills_end,
+            graph_end,
+            prompt_index,
+        };
 
         // Resolve the provider for the routed model (defaults to the
         // configured one).
@@ -2152,6 +2254,16 @@ impl AgentService {
                 Err(e) => return Err(fail(&mut collected, e)),
             }
             let request = CompletionRequest::new(decision.selected_model.clone(), messages);
+            self.record_context_plan(
+                &sender,
+                &mut collected,
+                &run_id,
+                &session_id,
+                1,
+                &request,
+                context_boundaries,
+                model.capabilities().max_context,
+            )?;
             let complete_started = std::time::Instant::now();
             let response = match self
                 .complete_streaming(
@@ -2238,6 +2350,16 @@ impl AgentService {
 
             let request = CompletionRequest::new(selected.clone(), messages.clone())
                 .with_tools(tools.clone());
+            self.record_context_plan(
+                &sender,
+                &mut collected,
+                &run_id,
+                &session_id,
+                turn,
+                &request,
+                context_boundaries,
+                model.capabilities().max_context,
+            )?;
             let complete_started = std::time::Instant::now();
             let response = match self
                 .complete_streaming(

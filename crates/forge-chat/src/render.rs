@@ -239,7 +239,9 @@ impl TranscriptState {
             EventKind::Cancelled { .. } => vec![Line::bad("cancelled")],
             // Its `summary` is an 80-character digest written by the store;
             // the answer comes from `AssistantMessage` or the run outcome.
-            EventKind::Completed { .. } => Vec::new(),
+            EventKind::Completed { .. }
+            | EventKind::ContextPlanRecorded { .. }
+            | EventKind::ContextPlanUnavailable { .. } => Vec::new(),
         });
         lines
     }

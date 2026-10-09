@@ -71,6 +71,29 @@ fn format_event(event: &Event) -> String {
             from_session,
             at_position,
         } => format!("session_forked from={from_session} at_position={at_position}"),
+        EventKind::ContextPlanRecorded {
+            plan_id,
+            request_ordinal,
+            stable_prefix_hash,
+            prefix_changed,
+            total_estimated_input_tokens,
+            reserved_output_tokens,
+            plan_path,
+        } => format!(
+            "context_plan_recorded id={plan_id} request={request_ordinal} prefix={} changed={} input_tokens={} output_tokens={} path={plan_path}",
+            &stable_prefix_hash[..stable_prefix_hash.len().min(12)],
+            prefix_changed,
+            total_estimated_input_tokens,
+            reserved_output_tokens
+                .map_or_else(|| "provider-default".to_string(), |value| value.to_string()),
+        ),
+        EventKind::ContextPlanUnavailable {
+            request_ordinal,
+            error_category,
+            message,
+        } => format!(
+            "context_plan_unavailable request={request_ordinal} category={error_category} message={message}"
+        ),
         EventKind::InputReceived { message } => format!("input_received message={message}"),
         EventKind::Note { message } => format!("note message={message}"),
         EventKind::Error { message } => format!("error message={message}"),
