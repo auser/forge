@@ -242,7 +242,8 @@ impl TranscriptState {
             // the answer comes from `AssistantMessage` or the run outcome.
             EventKind::Completed { .. }
             | EventKind::ContextPlanRecorded { .. }
-            | EventKind::ContextPlanUnavailable { .. } => Vec::new(),
+            | EventKind::ContextPlanUnavailable { .. }
+            | EventKind::ToolOutputArtifact { .. } => Vec::new(),
         });
         lines
     }

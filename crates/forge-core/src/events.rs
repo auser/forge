@@ -18,6 +18,7 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 ///   its delta-free equivalent. Purely additive, like v3.
 /// * v5 adds the redaction-safe `tool_policy_decision` audit event.
 /// * v6 adds compact context accounting plan pointers and failure events.
+/// * v7 adds typed tool artifact retrieval grants, anchored to tool requests.
 ///
 /// The change is purely additive: no existing kind or field changed
 /// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
@@ -25,7 +26,7 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 /// event kinds an older reader does not know; runs recorded before v3
 /// replay as well as their data allows (see
 /// `forge_runtime::replay::conversation_from_events`).
-pub const EVENT_SCHEMA_VERSION: u32 = 6;
+pub const EVENT_SCHEMA_VERSION: u32 = 7;
 
 /// Version of the tool-policy rules represented by `ToolPolicyDecision`.
 pub const TOOL_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -238,6 +239,15 @@ pub enum EventKind {
         request_ordinal: u32,
         error_category: String,
         message: String,
+    },
+    /// Trusted retrieval grant (v7). `event_seq` anchors the already persisted
+    /// ToolCallRequested event in `source_run_id`, not this grant event.
+    ToolOutputArtifact {
+        handle: String,
+        source_session_id: String,
+        source_run_id: String,
+        call_id: String,
+        event_seq: u64,
     },
 }
 

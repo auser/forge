@@ -440,6 +440,7 @@ pub struct AgentService {
     config: Config,
     graph: Option<Arc<dyn ProjectGraph>>,
     context_store: Option<Arc<dyn ContextStore>>,
+    artifact_store: Option<Arc<dyn forge_context::ArtifactStore>>,
     /// Stable coding contract and project guidance supplied by the host.
     /// Kept separate from replay: it is current run context, not conversation.
     system_context: Vec<Message>,
@@ -495,6 +496,7 @@ impl AgentService {
             config,
             graph: None,
             context_store: None,
+            artifact_store: None,
             system_context: Vec::new(),
             model_factory: None,
             needle: None,
@@ -518,6 +520,15 @@ impl AgentService {
     /// Attach best-effort context accounting. Its failure never blocks a model call.
     pub fn with_context_store(mut self, store: Option<Arc<dyn ContextStore>>) -> Self {
         self.context_store = store;
+        self
+    }
+
+    /// Attach local sanitized tool artifacts. Absent storage still redacts outputs.
+    pub fn with_artifact_store(
+        mut self,
+        store: Option<Arc<dyn forge_context::ArtifactStore>>,
+    ) -> Self {
+        self.artifact_store = store;
         self
     }
 
@@ -1060,6 +1071,99 @@ impl AgentService {
             .get(run_id)
             .is_some_and(CancellationToken::is_cancelled);
         token_fired || self.cancel_marker(run_id).exists()
+    }
+
+    /// The single post-dispatch boundary, shared by ordinary and Needle tools.
+    /// Sanitize the complete result before truncation, storage or publication.
+    fn prepare_tool_output(
+        &self,
+        call: &ToolCall,
+        raw: &str,
+        source: forge_context::ArtifactSource,
+    ) -> (String, Option<EventKind>) {
+        let sanitized = forge_context::SanitizedOutput::new(self.sessions.redactor(), raw);
+        let text = sanitized.as_str();
+        if text.len() <= forge_core::MAX_TOOL_OUTPUT_BYTES || call.name == "retrieve_tool_output" {
+            return (forge_core::cap_tool_output(text), None);
+        }
+        let capped = forge_core::cap_tool_output(text);
+        let reference = self
+            .artifact_store
+            .as_ref()
+            .and_then(|store| store.put(source, &sanitized).ok());
+        match reference {
+            Some(reference) => {
+                let output = format!(
+                    "{capped}\n[Complete sanitized output: retrieve_tool_output handle={}]\n",
+                    reference.handle
+                );
+                let event = EventKind::ToolOutputArtifact {
+                    handle: reference.handle,
+                    source_session_id: reference.source.session_id,
+                    source_run_id: reference.source.run_id,
+                    call_id: reference.source.call_id,
+                    event_seq: reference.source.event_seq,
+                };
+                (output, Some(event))
+            }
+            None => (
+                format!("{capped}\n[Complete sanitized output unavailable]\n"),
+                None,
+            ),
+        }
+    }
+
+    /// Grants come only from the exact persisted session prefix. Forks physically
+    /// copy that prefix, including inherited source identities; no ancestor's
+    /// current log or model-supplied text is consulted.
+    fn retrieve_tool_output(&self, session_id: &str, call: &ToolCall) -> ToolOutcome {
+        let result = (|| {
+            let store = self.artifact_store.as_ref().ok_or("artifact unavailable")?;
+            let (handle, query) = crate::tools::artifact_query(&call.arguments)?;
+            let events = self
+                .sessions
+                .events_for(session_id)
+                .map_err(|_| "artifact unavailable")?;
+            let allowed = events
+                .into_iter()
+                .filter_map(|event| match event.kind {
+                    EventKind::ToolOutputArtifact {
+                        handle,
+                        source_session_id,
+                        source_run_id,
+                        call_id,
+                        event_seq,
+                    } => Some(forge_context::ArtifactRef {
+                        handle,
+                        source: forge_context::ArtifactSource {
+                            session_id: source_session_id,
+                            run_id: source_run_id,
+                            call_id,
+                            event_seq,
+                        },
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let read = store
+                .retrieve(handle, &allowed, query)
+                .map_err(|_| "artifact unavailable")?
+                .ok_or("artifact unavailable")?;
+            let output = serde_json::to_string(&read).map_err(|_| "artifact unavailable")?;
+            if output.len() > 16 * 1024 {
+                return Err("artifact unavailable");
+            }
+            Ok(output)
+        })();
+        ToolOutcome {
+            result: match result {
+                Ok(text) => ToolResult::ok(call.id.clone(), call.name.clone(), text),
+                Err(error) => {
+                    ToolResult::error(call.id.clone(), call.name.clone(), error.to_owned())
+                }
+            },
+            file_changed: None,
+        }
     }
 
     /// Append an event to the store (which assigns its sequence number),
@@ -2032,6 +2136,12 @@ impl AgentService {
                     },
                 ),
             )?;
+            let source = forge_context::ArtifactSource {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                call_id: fast.call.id.clone(),
+                event_seq: collected.last().expect("persisted tool request").seq,
+            };
             let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
             let reservation = tool_quotas.reserve(&fast.call.name);
             let mut policy = dispatcher
@@ -2097,7 +2207,15 @@ impl AgentService {
                     },
                 ),
             )?;
-            let text = outcome.result.content;
+            let (text, artifact) =
+                self.prepare_tool_output(&fast.call, &outcome.result.content, source);
+            if let Some(kind) = artifact {
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(&run_id, &session_id, kind),
+                )?;
+            }
             self.emit(
                 &sender,
                 &mut collected,
@@ -2107,7 +2225,7 @@ impl AgentService {
                     EventKind::ToolResult {
                         call_id: fast.call.id.clone(),
                         tool: fast.call.name.clone(),
-                        output: forge_core::cap_tool_output(&text),
+                        output: text.clone(),
                         is_error: outcome.result.is_error,
                     },
                 ),
@@ -2278,7 +2396,7 @@ impl AgentService {
         };
         if let Some((call, output)) = failed_fast {
             messages.push(Message::assistant_tool_calls(vec![call.clone()]));
-            messages.push(Message::tool(call.id, forge_core::cap_tool_output(&output)));
+            messages.push(Message::tool(call.id, output));
         }
 
         // Resolve the provider for the routed model (defaults to the
@@ -2295,11 +2413,14 @@ impl AgentService {
         // The capability gate: what the *model* is offered. Needle was
         // offered the full surface above regardless of this — a chat-only
         // model receives zero tools, exactly as before the reorder.
-        let tools = if model.capabilities().tools {
+        let mut tools = if model.capabilities().tools {
             decide_tools
         } else {
             Vec::new()
         };
+        if model.capabilities().tools && self.artifact_store.is_some() {
+            tools.push(crate::tools::artifact_tool_definition());
+        }
 
         if tools.is_empty() {
             // Single-turn path: providers without tool support behave
@@ -2498,6 +2619,12 @@ impl AgentService {
                         },
                     ),
                 )?;
+                let source = forge_context::ArtifactSource {
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    call_id: call.id.clone(),
+                    event_seq: collected.last().expect("persisted tool request").seq,
+                };
                 let reservation = tool_quotas.reserve(&call.name);
                 if let Some(mut policy) = dispatcher.evaluate_policy(call) {
                     if reservation.is_err() {
@@ -2534,7 +2661,12 @@ impl AgentService {
                     ),
                 )?;
 
-                let outcome = match ToolRunQuotas::dispatch(&dispatcher, call, reservation).await {
+                let dispatched = if call.name == "retrieve_tool_output" && reservation.is_ok() {
+                    Ok(self.retrieve_tool_output(&session_id, call))
+                } else {
+                    ToolRunQuotas::dispatch(&dispatcher, call, reservation).await
+                };
+                let outcome = match dispatched {
                     Ok(outcome) => outcome,
                     Err(ForgeError::ApprovalRequired { description, risk }) => {
                         self.emit(
@@ -2643,7 +2775,15 @@ impl AgentService {
                 )?;
                 // Replay record: the result verbatim (capped), as the
                 // model is about to see it.
-                let model_output = forge_core::cap_tool_output(&outcome.result.content);
+                let (model_output, artifact) =
+                    self.prepare_tool_output(call, &outcome.result.content, source);
+                if let Some(kind) = artifact {
+                    self.emit(
+                        &sender,
+                        &mut collected,
+                        Event::new(&run_id, &session_id, kind),
+                    )?;
+                }
                 self.emit(
                     &sender,
                     &mut collected,

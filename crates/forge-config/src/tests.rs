@@ -40,6 +40,53 @@ fn write_project_config(root: &Path, contents: &str) {
 }
 
 #[test]
+fn context_artifact_limits_default_and_validate() {
+    let defaults = Config::default();
+    assert_eq!(
+        defaults.context_artifacts.max_project_bytes,
+        128 * 1024 * 1024
+    );
+    assert_eq!(defaults.context_artifacts.max_age_secs, 7 * 24 * 60 * 60);
+    assert_eq!(
+        defaults.context_artifacts.max_artifact_bytes,
+        8 * 1024 * 1024
+    );
+    defaults.validate().unwrap();
+    for entry in [
+        "max_project_bytes = 0",
+        "max_age_secs = 0",
+        "max_artifact_bytes = 0",
+        "max_project_bytes = 1",
+    ] {
+        let config: Config = toml::from_str(&format!("[context_artifacts]\n{entry}")).unwrap();
+        assert!(config.validate().is_err(), "{entry}");
+    }
+    for entry in ["max_age_secs = -1", "max_artifacts_bytes = 1"] {
+        assert!(toml::from_str::<Config>(&format!("[context_artifacts]\n{entry}")).is_err());
+    }
+}
+
+#[test]
+#[serial]
+fn context_artifact_limits_merge_by_field() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::isolated(user.path());
+    write_user_config(user.path(), "[context_artifacts]\nmax_age_secs = 3600");
+    write_project_config(
+        project.path(),
+        "[context_artifacts]\nmax_artifact_bytes = 1048576",
+    );
+    let loaded = Config::load(Some(project.path()), &CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.context_artifacts.max_age_secs, 3600);
+    assert_eq!(loaded.config.context_artifacts.max_artifact_bytes, 1048576);
+    assert_eq!(
+        loaded.config.context_artifacts.max_project_bytes,
+        128 * 1024 * 1024
+    );
+}
+
+#[test]
 fn tool_limits_parse_and_reject_malformed_entries() {
     let config: Config =
         toml::from_str("[tool_limits]\nread_file = { per_run = 2 }").expect("valid limits");

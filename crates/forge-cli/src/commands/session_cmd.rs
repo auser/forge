@@ -108,6 +108,11 @@ fn format_event(event: &Event) -> String {
             "context_plan_unavailable request={request_ordinal} category={error_category} message={message}"
         ),
         EventKind::InputReceived { message } => format!("input_received message={message}"),
+        EventKind::ToolOutputArtifact {
+            handle, event_seq, ..
+        } => {
+            format!("tool_output_artifact handle={handle} source_seq={event_seq}")
+        }
         EventKind::Note { message } => format!("note message={message}"),
         EventKind::Error { message } => format!("error message={message}"),
         EventKind::Cancelled { reason } => format!("cancelled reason={reason}"),

@@ -6,6 +6,13 @@ use forge_core::ForgeError;
 
 use crate::{ContextPlan, ContextPlanDraft};
 
+pub(crate) fn artifact_transaction<T>(
+    path: &std::path::Path,
+    operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    filesystem::artifact_transaction(path, operation)
+}
+
 pub trait ContextStore: Send + Sync {
     fn record(&self, draft: ContextPlanDraft) -> Result<ContextPlan, ForgeError>;
     fn plan(&self, run_id: &str, ordinal: u32) -> Result<Option<ContextPlan>, ForgeError>;
@@ -212,6 +219,92 @@ mod filesystem {
         result
     }
 
+    struct ArtifactDirectory {
+        root: File,
+        objects: File,
+    }
+
+    impl ArtifactDirectory {
+        fn parent(&self, name: &str) -> io::Result<&File> {
+            if !crate::artifact::valid_artifact_filename(name) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            Ok(if name == "index.json" {
+                &self.root
+            } else {
+                &self.objects
+            })
+        }
+    }
+
+    impl crate::artifact::ArtifactFiles for ArtifactDirectory {
+        fn read(&self, name: &str, bound: usize) -> io::Result<Option<Vec<u8>>> {
+            let input = match file(self.parent(name)?, name, OFlags::RDONLY) {
+                Ok(input) => input,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            fs::fchmod(&input, Mode::from_raw_mode(0o600))?;
+            super::read_bounded(input, bound).map(Some)
+        }
+
+        fn write(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+            let parent = self.parent(name)?;
+            match file(parent, name, OFlags::RDONLY) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            // Fixed crash-recoverable staging name, exclusively protected by
+            // the permanent project lock. Validate before truncating/chmod.
+            let mut output = file(parent, ".pending", OFlags::WRONLY | OFlags::CREATE)?;
+            fs::fchmod(&output, Mode::from_raw_mode(0o600))?;
+            output.set_len(0)?;
+            output.write_all(bytes)?;
+            output.sync_all()?;
+            fs::renameat(parent, ".pending", parent, name)?;
+            parent.sync_all()
+        }
+
+        fn remove(&mut self, name: &str) -> io::Result<()> {
+            let parent = self.parent(name)?;
+            // Reject hardlinks/symlinks even for deletion. unlinkat never
+            // follows a replacement between this check and the unlink.
+            match file(parent, name, OFlags::RDONLY) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            fs::unlinkat(parent, name, AtFlags::empty())?;
+            parent.sync_all()
+        }
+    }
+
+    pub(super) fn artifact_transaction<T>(
+        path: &Path,
+        operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let context = root(path, true)?;
+        let root = directory(&context, "artifacts".as_ref(), true)?;
+        let lock = file(&root, "lock", OFlags::RDWR | OFlags::CREATE)?;
+        fs::fchmod(&lock, Mode::from_raw_mode(0o600))?;
+        super::lock_artifacts(&lock)?;
+        let objects = directory(&root, "objects".as_ref(), true)?;
+        // Recover the only possible staging entries from an interrupted
+        // transaction, including when limits have since been lowered.
+        for parent in [&root, &objects] {
+            match file(parent, ".pending", OFlags::RDONLY) {
+                Ok(_) => {
+                    fs::unlinkat(parent, ".pending", AtFlags::empty())?;
+                    parent.sync_all()?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        operation(&mut ArtifactDirectory { root, objects })
+    }
+
     pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<ContextPlan> {
         let root = root(path, true)?;
         let locks = directory(&root, "locks".as_ref(), true)?;
@@ -279,12 +372,50 @@ mod filesystem {
     use super::*;
     use std::{io, path::Path};
 
+    pub(super) fn artifact_transaction<T>(
+        _: &Path,
+        _: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> io::Result<T>,
+    ) -> io::Result<T> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     pub(super) fn record(_: &Path, _: ContextPlanDraft) -> io::Result<ContextPlan> {
         Err(io::ErrorKind::Unsupported.into())
     }
 
     pub(super) fn plan(_: &Path, _: &str, _: u32) -> io::Result<Option<ContextPlan>> {
         Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn read_bounded(input: std::fs::File, bound: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    if input.metadata()?.len() > bound as u64 {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let mut bytes = Vec::new();
+    input
+        .take((bound as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > bound {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(unix, windows))]
+fn lock_artifacts(lock: &std::fs::File) -> std::io::Result<()> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return Err(std::io::ErrorKind::WouldBlock.into()),
+        }
     }
 }
 

@@ -54,6 +54,12 @@ impl JsonlSessionStore {
         &self.root
     }
 
+    /// Share the exact policy and environment-secret snapshot used by event
+    /// persistence when sanitizing complete tool outputs before truncation.
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
+    }
+
     /// Where a trailing fragment of `text` could still grow into a
     /// redactable secret (see [`Redactor::secret_prefix_start`]). The
     /// streaming runtime holds deltas back from that point, so a

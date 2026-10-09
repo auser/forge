@@ -430,6 +430,129 @@ fn write<T: serde::Serialize>(
     result
 }
 
+struct ArtifactDirectory {
+    tree: Tree,
+    objects: File,
+}
+
+impl ArtifactDirectory {
+    fn parent(&self, name: &str) -> io::Result<&File> {
+        if !crate::artifact::valid_artifact_filename(name) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(if name == "index.json" {
+            self.tree.current()
+        } else {
+            &self.objects
+        })
+    }
+}
+
+impl crate::artifact::ArtifactFiles for ArtifactDirectory {
+    fn read(&self, name: &str, bound: usize) -> io::Result<Option<Vec<u8>>> {
+        let input = match open(
+            self.parent(name)?,
+            name.as_ref(),
+            false,
+            FILE_OPEN,
+            &self.tree.security,
+        ) {
+            Ok(input) => input,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        super::read_bounded(input, bound).map(Some)
+    }
+
+    fn write(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let parent = self.parent(name)?;
+        match open(parent, name.as_ref(), false, FILE_OPEN, &self.tree.security) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // Stable staging name under the permanent project lock. open rejects
+        // reparse points/hardlinks and seals private ACLs before any mutation.
+        let mut output = open(
+            parent,
+            ".pending".as_ref(),
+            false,
+            FILE_OPEN_IF,
+            &self.tree.security,
+        )?;
+        output.set_len(0)?;
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        replace(&output, parent, name)
+    }
+
+    fn remove(&mut self, name: &str) -> io::Result<()> {
+        let input = match open(
+            self.parent(name)?,
+            name.as_ref(),
+            false,
+            FILE_OPEN,
+            &self.tree.security,
+        ) {
+            Ok(input) => input,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: deletion addresses only the validated pinned file handle;
+        // no pathname resolution or target-following fallback is permitted.
+        unsafe {
+            bool_result(SetFileInformationByHandle(
+                input.as_raw_handle(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            ))
+        }
+    }
+}
+
+pub(super) fn artifact_transaction<T>(
+    path: &Path,
+    operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut tree = Tree::root(path, true)?;
+    tree.descend("artifacts".as_ref(), true)?;
+    let lock = open(
+        tree.current(),
+        "lock".as_ref(),
+        false,
+        FILE_OPEN_IF,
+        &tree.security,
+    )?;
+    super::lock_artifacts(&lock)?;
+    let objects = tree.directory("objects", true)?;
+    for parent in [tree.current(), &objects] {
+        let input = match open(
+            parent,
+            ".pending".as_ref(),
+            false,
+            FILE_OPEN,
+            &tree.security,
+        ) {
+            Ok(input) => input,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: delete only this validated staging inode, never its path.
+        unsafe {
+            bool_result(SetFileInformationByHandle(
+                input.as_raw_handle(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            ))?;
+        }
+    }
+    operation(&mut ArtifactDirectory { tree, objects })
+}
+
 pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<ContextPlan> {
     let root = stage("root", Tree::root(path, true))?;
     let locks = root.directory("locks", true)?;
@@ -710,12 +833,116 @@ mod tests {
     }
 
     #[test]
+    fn artifact_links_never_change_victim_acls() {
+        use crate::{
+            ArtifactLimits, ArtifactSource, ArtifactStore, FsArtifactStore, SanitizedOutput,
+        };
+        let output = SanitizedOutput::new(&forge_session::Redactor::new(), "safe");
+        for hardlink in [true, false] {
+            for component in [
+                "artifacts/lock",
+                "artifacts/index.json",
+                "artifacts/.pending",
+                "artifacts/objects/.pending",
+            ] {
+                let project = tempfile::tempdir().unwrap();
+                let root = project.path().join("context");
+                let victim = project.path().join("victim");
+                fs::write(&victim, "secret victim").unwrap();
+                let link = root.join(component);
+                fs::create_dir_all(link.parent().unwrap()).unwrap();
+                if hardlink {
+                    fs::hard_link(&victim, &link).unwrap();
+                } else if !symlink_available(std::os::windows::fs::symlink_file(&victim, &link)) {
+                    return;
+                }
+                let original = security_snapshot(&victim);
+                let store = FsArtifactStore::new(&root, ArtifactLimits::default());
+                assert!(
+                    store
+                        .put(
+                            ArtifactSource {
+                                session_id: "session".into(),
+                                run_id: "run".into(),
+                                call_id: "call".into(),
+                                event_seq: 1,
+                            },
+                            &output
+                        )
+                        .is_err()
+                );
+                assert_eq!(fs::read_to_string(&victim).unwrap(), "secret victim");
+                assert_eq!(security_snapshot(&victim), original);
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_directory_reparse_points_fail_closed() {
+        use crate::{
+            ArtifactLimits, ArtifactSource, ArtifactStore, FsArtifactStore, SanitizedOutput,
+        };
+        for component in ["artifacts", "artifacts/objects"] {
+            let project = tempfile::tempdir().unwrap();
+            let root = project.path().join("context");
+            let victim = project.path().join("victim");
+            fs::create_dir(&victim).unwrap();
+            fs::write(victim.join("sentinel"), "unchanged").unwrap();
+            let link = root.join(component);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            if !symlink_available(std::os::windows::fs::symlink_dir(&victim, &link)) {
+                return;
+            }
+            let original = security_snapshot(&victim);
+            let store = FsArtifactStore::new(&root, ArtifactLimits::default());
+            assert!(
+                store
+                    .put(
+                        ArtifactSource {
+                            session_id: "session".into(),
+                            run_id: "run".into(),
+                            call_id: "call".into(),
+                            event_seq: 1,
+                        },
+                        &SanitizedOutput::new(&forge_session::Redactor::new(), "safe")
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read_to_string(victim.join("sentinel")).unwrap(),
+                "unchanged"
+            );
+            assert_eq!(security_snapshot(&victim), original);
+        }
+    }
+
+    #[test]
     fn private_acls_and_exclusive_temporaries() {
+        use crate::{
+            ArtifactLimits, ArtifactSource, ArtifactStore, FsArtifactStore, SanitizedOutput,
+        };
         let project = tempfile::tempdir().unwrap();
         let root = project.path().join(".forge/context");
         FsContextStore::new(&root)
             .record(draft("run", "s", 1, "private"))
             .unwrap();
+        FsArtifactStore::new(&root, ArtifactLimits::default())
+            .put(
+                ArtifactSource {
+                    session_id: "session".into(),
+                    run_id: "run".into(),
+                    call_id: "call".into(),
+                    event_seq: 1,
+                },
+                &SanitizedOutput::new(&forge_session::Redactor::new(), "private"),
+            )
+            .unwrap();
+        let object = fs::read_dir(root.join("artifacts/objects"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let object_relative = format!("artifacts/objects/{}", object.file_name().to_str().unwrap());
         let security = PrivateSecurity::new().unwrap();
         for relative in [
             "",
@@ -726,6 +953,11 @@ mod tests {
             "plans/run/1.json",
             "latest/s.json",
             "locks/s",
+            "artifacts",
+            "artifacts/objects",
+            "artifacts/index.json",
+            "artifacts/lock",
+            &object_relative,
         ] {
             let path = root.join(relative);
             let file = OpenOptions::new()
