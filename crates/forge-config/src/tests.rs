@@ -40,6 +40,55 @@ fn write_project_config(root: &Path, contents: &str) {
 }
 
 #[test]
+fn observer_requires_explicit_model_and_valid_dedicated_budgets() {
+    let config = Config::default();
+    assert!(!config.observer.enabled);
+    assert!(!config.observer.allow_remote);
+    assert!(config.observer.model.is_none());
+    assert_eq!(config.observer.session_usd, 0.05);
+    assert_eq!(config.observer.daily_usd, 0.25);
+    for entry in [
+        "enabled = true",
+        "model = ''",
+        "session_usd = -0.01",
+        "session_usd = nan",
+        "daily_usd = inf",
+    ] {
+        let config: Config = toml::from_str(&format!("[observer]\n{entry}")).unwrap();
+        assert!(config.validate().is_err(), "{entry}");
+    }
+    assert!(toml::from_str::<Config>("[observer]\nallow_remtoe = true").is_err());
+    let config: Config = toml::from_str(
+        "[observer]\nenabled=true\nmodel='local-observer'\nsession_usd=0.0\ndaily_usd=0.0",
+    )
+    .unwrap();
+    config.validate().unwrap();
+    assert!(!config.observer.allow_remote);
+}
+
+#[test]
+#[serial]
+fn observer_settings_merge_without_overriding_remote_consent() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::isolated(user.path());
+    write_user_config(
+        user.path(),
+        "[observer]\nmodel='local-observer'\nsession_usd=0.03",
+    );
+    write_project_config(project.path(), "[observer]\nenabled=true");
+    let resolved = Config::load(Some(project.path()), &CliOverrides::default()).unwrap();
+    assert!(resolved.config.observer.enabled);
+    assert_eq!(
+        resolved.config.observer.model.as_deref(),
+        Some("local-observer")
+    );
+    assert_eq!(resolved.config.observer.session_usd, 0.03);
+    assert_eq!(resolved.config.observer.daily_usd, 0.25);
+    assert!(!resolved.config.observer.allow_remote);
+}
+
+#[test]
 fn context_compression_defaults_and_rejects_unknown_settings() {
     assert!(Config::default().context_compression.enabled);
     let disabled: Config = toml::from_str("[context_compression]\nenabled = false").unwrap();

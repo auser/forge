@@ -512,6 +512,25 @@ impl crate::artifact::ArtifactFiles for ArtifactDirectory {
     }
 }
 
+pub(super) fn observer_read(path: &Path, bound: usize) -> io::Result<Option<Vec<u8>>> {
+    let result = (|| {
+        let mut tree = Tree::root(path, false)?;
+        tree.descend("observer-jobs".as_ref(), false)?;
+        let input = open(
+            tree.current(),
+            "index.json".as_ref(),
+            false,
+            FILE_OPEN,
+            &tree.security,
+        )?;
+        super::read_bounded(input, bound).map(Some)
+    })();
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        result => result,
+    }
+}
+
 pub(super) fn artifact_transaction<T>(
     path: &Path,
     namespace: &str,

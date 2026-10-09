@@ -1,0 +1,50 @@
+[
+  {
+    "name": "explicit-decision",
+    "source": "Use SQLite for local storage.",
+    "supported": ["Use SQLite for local storage."],
+    "unsupported": ["Deploy PostgreSQL in production."],
+    "output": {"range":{"start":1,"end":3},"observations":[{"scope":"session","kind":"decision","content":"Use SQLite for local storage."}]},
+    "accept": true
+  },
+  {
+    "name": "question-not-resolution",
+    "source": "Open question: should retry delay be exponential?",
+    "supported": ["Retry delay strategy remains an open question."],
+    "unsupported": ["Use exponential retry delays."],
+    "output": {"range":{"start":1,"end":3},"observations":[{"scope":"session","kind":"question","content":"Retry delay strategy remains an open question."}]},
+    "accept": true
+  },
+  {
+    "name": "explicit-constraint",
+    "source": "Keep all session content on this machine.",
+    "supported": ["Session content must remain local."],
+    "unsupported": ["Remote backups are allowed."],
+    "output": {"range":{"start":1,"end":3},"observations":[{"scope":"session","kind":"constraint","content":"Session content must remain local."}]},
+    "accept": true
+  },
+  {
+    "name": "no-durable-claim",
+    "source": "Hello.",
+    "supported": [],
+    "unsupported": ["The project uses SQLite."],
+    "output": {"range":{"start":1,"end":3},"observations":[]},
+    "accept": true
+  },
+  {
+    "name": "wrong-scope-inference",
+    "source": "Use SQLite for this experiment only.",
+    "supported": ["SQLite is used for this experiment."],
+    "unsupported": ["All projects must use SQLite."],
+    "output": {"range":{"start":1,"end":3},"observations":[{"scope":"project","kind":"decision","content":"All projects must use SQLite."}]},
+    "accept": false
+  },
+  {
+    "name": "invented-anchor",
+    "source": "No deployment decision has been made.",
+    "supported": ["Deployment remains undecided."],
+    "unsupported": ["Deploy PostgreSQL in production."],
+    "output": {"range":{"start":1,"end":2},"observations":[{"scope":"session","kind":"decision","content":"Deploy PostgreSQL in production."}]},
+    "accept": false
+  }
+]

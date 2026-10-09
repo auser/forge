@@ -5,6 +5,7 @@
 //! the server's SSE transport consumes.
 
 pub mod budget;
+pub mod observer;
 pub mod replay;
 mod service;
 mod tools;

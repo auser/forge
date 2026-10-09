@@ -441,6 +441,7 @@ pub struct AgentService {
     graph: Option<Arc<dyn ProjectGraph>>,
     context_store: Option<Arc<dyn ContextStore>>,
     artifact_store: Option<Arc<dyn forge_context::ArtifactStore>>,
+    observer: Option<Arc<crate::observer::ObserverSupervisor>>,
     compression_enabled: bool,
     /// Stable coding contract and project guidance supplied by the host.
     /// Kept separate from replay: it is current run context, not conversation.
@@ -499,6 +500,7 @@ impl AgentService {
             graph: None,
             context_store: None,
             artifact_store: None,
+            observer: None,
             compression_enabled,
             system_context: Vec::new(),
             model_factory: None,
@@ -523,6 +525,22 @@ impl AgentService {
     /// Attach best-effort context accounting. Its failure never blocks a model call.
     pub fn with_context_store(mut self, store: Option<Arc<dyn ContextStore>>) -> Self {
         self.context_store = store;
+        self
+    }
+
+    /// Attach an explicitly started, independently owned observer. Notifications
+    /// never wait for provider work; no observer output enters active context.
+    pub fn with_observer(
+        mut self,
+        observer: Option<Arc<crate::observer::ObserverSupervisor>>,
+    ) -> Self {
+        self.observer = observer.filter(|worker| {
+            let matches = worker.uses_sessions(&self.sessions);
+            if !matches {
+                tracing::warn!("observer unavailable: session store mismatch");
+            }
+            matches
+        });
         self
     }
 
@@ -1741,6 +1759,9 @@ impl AgentService {
     ) -> Result<RunOutcome, ForgeError> {
         let result = self.run_inner(plan, run_id, session_id, max_turns).await;
         self.finish_run(run_id, RunState::of_result(&result));
+        if let Some(observer) = &self.observer {
+            observer.notify();
+        }
         result
     }
 
@@ -3234,6 +3255,13 @@ impl AgentService {
                 at_position,
             },
         ))?;
+
+        // Freeze derived memory now, never during startup discovery. Failure
+        // leaves this child permanently uninitialized for observation, while
+        // the ordinary conversation fork still succeeds.
+        if let Some(observer) = &self.observer {
+            observer.freeze_fork(source_session_id, &events, &session_id, at_position);
+        }
 
         tracing::info!(
             source = source_session_id,

@@ -368,6 +368,7 @@ pub(crate) fn credential_hint(key_env: Option<&str>, config_field: &str) -> Stri
 /// none was found, requests go out unauthenticated with a one-time warn.
 pub struct OpenAiCompatibleModel {
     client: reqwest::Client,
+    response_max_bytes: Option<usize>,
     /// The streaming twin of `client`: no total deadline (D7 — see
     /// [`EgressPolicy::streaming_client`]).
     stream_client: reqwest::Client,
@@ -403,6 +404,7 @@ impl OpenAiCompatibleModel {
             .map_err(|e| ForgeError::provider(format!("building streaming HTTP client: {e}")))?;
         Ok(Self {
             client,
+            response_max_bytes: None,
             stream_client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
@@ -419,6 +421,11 @@ impl OpenAiCompatibleModel {
     pub fn with_key_env(mut self, key_env: Option<String>, config_field: &'static str) -> Self {
         self.key_env = key_env;
         self.key_env_field = config_field;
+        self
+    }
+
+    pub(crate) fn with_response_max_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.response_max_bytes = max_bytes;
         self
     }
 }
@@ -828,6 +835,19 @@ impl ModelProvider for OpenAiCompatibleModel {
             .map_err(|e| send_error(&url, e))?;
 
         let status = response.status();
+        // Background calls bound the entire wire envelope before any parsing,
+        // including error bodies. Interactive clients retain their old path.
+        if let Some(max_bytes) = self.response_max_bytes {
+            let bytes = crate::response::bounded_bytes(response, max_bytes).await?;
+            if !status.is_success() {
+                return Err(ForgeError::provider(format!(
+                    "model endpoint returned {status}"
+                )));
+            }
+            let body = serde_json::from_slice(&bytes)
+                .map_err(|_| ForgeError::provider("invalid bounded model response JSON"))?;
+            return parse_chat_completion(&self.model, &url, &body);
+        }
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             // 401/403 from the model endpoint is the one failure whose fix
@@ -857,6 +877,9 @@ impl ModelProvider for OpenAiCompatibleModel {
         request: CompletionRequest,
         on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<CompletionResponse, ForgeError> {
+        if self.response_max_bytes.is_some() {
+            return Err(crate::response::streaming_unsupported());
+        }
         reject_tools_without_capability(&request, self.capabilities)?;
         let url = self.chat_url();
         // Scoped so the body's borrow of `request` ends here: the fallback
@@ -1304,14 +1327,17 @@ pub fn model_from_config(
                         "Codex subscription is not authenticated; run `forge auth login codex`",
                     ));
                 };
-                return Ok(Arc::new(crate::codex::CodexModel::new(
-                    Some(base_url),
-                    name,
-                    access_token,
-                    account_id,
-                    Duration::from_secs(120),
-                    egress,
-                )?));
+                return Ok(Arc::new(
+                    crate::codex::CodexModel::new(
+                        Some(base_url),
+                        name,
+                        access_token,
+                        account_id,
+                        Duration::from_secs(120),
+                        egress,
+                    )?
+                    .with_response_max_bytes(config.model_response_max_bytes),
+                ));
             }
 
             if hint.as_deref() == Some("anthropic") {
@@ -1342,7 +1368,8 @@ pub fn model_from_config(
                         Duration::from_secs(120),
                         egress,
                     )?
-                    .with_wire_model(wire_name),
+                    .with_wire_model(wire_name)
+                    .with_response_max_bytes(config.model_response_max_bytes),
                 ));
             }
 
@@ -1364,7 +1391,8 @@ pub fn model_from_config(
                     Duration::from_secs(120),
                     egress,
                 )?
-                .with_key_env(key_env, key_env_field),
+                .with_key_env(key_env, key_env_field)
+                .with_response_max_bytes(config.model_response_max_bytes),
             ))
         }
     }

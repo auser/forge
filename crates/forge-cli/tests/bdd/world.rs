@@ -305,10 +305,32 @@ impl BddWorld {
             buf
         });
 
+        let completed_turns = || {
+            stdout_buf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lines()
+                .filter(|line| line.starts_with("  = "))
+                .count()
+        };
+        let mut completed_before_previous_input = 0;
         for (i, line) in lines.iter().enumerate() {
             if i > 0 {
                 wait_for_quiescence(&stdout_buf, Duration::from_millis(200)).await;
             }
+            if i > 0 && *line == "/fork" && !lines[i - 1].starts_with('/') {
+                // Silence during startup/provider work is not turn completion.
+                // The idle-only /fork scenario must wait for the rendered
+                // footer, not race the controller with a fixed quiet interval.
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while completed_turns() <= completed_before_previous_input {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("chat turn did not finish before /fork");
+            }
+            completed_before_previous_input = completed_turns();
             stdin
                 .write_all(format!("{line}\n").as_bytes())
                 .await
