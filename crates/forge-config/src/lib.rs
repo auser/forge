@@ -110,6 +110,14 @@ pub struct BudgetConfig {
     pub on_exceeded: String,
 }
 
+/// Limit for one tool, reset for every agent run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolLimitConfig {
+    /// Maximum attempted calls to this tool in one run.
+    pub per_run: u64,
+}
+
 impl BudgetConfig {
     /// Whether any ceiling is set — when none is, the loop skips the whole
     /// accounting scan.
@@ -248,6 +256,9 @@ pub struct Config {
     /// Spend ceilings enforced by the agent loop (`[budget]`); all ceilings
     /// absent means no budget.
     pub budget: BudgetConfig,
+    /// Per-tool call ceilings, keyed by the exact tool name. Entries are
+    /// deep-merged across configuration files.
+    pub tool_limits: BTreeMap<String, ToolLimitConfig>,
     /// Days a cached OpenRouter model catalogue counts as fresh (see
     /// [`crate::catalogue`]). A stale cache is still used — with a warning
     /// naming its age — because stale prices beat no prices; must be >= 1.
@@ -530,6 +541,7 @@ impl Default for Config {
             .collect(),
             needle: NeedleConfig::default(),
             budget: BudgetConfig::default(),
+            tool_limits: BTreeMap::new(),
             catalogue_ttl_days: 7,
             // Nothing here was explicitly configured — this *is* the
             // defaults layer.
@@ -684,6 +696,11 @@ impl Config {
                 BUDGET_ON_EXCEEDED_VALUES.join(", "),
                 self.budget.on_exceeded
             )));
+        }
+        if self.tool_limits.contains_key("") {
+            return Err(ForgeError::config(
+                "tool_limits keys must be non-empty tool names".to_string(),
+            ));
         }
         let sha = &self.needle.weights_sha256;
         if !sha.is_empty() && !(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())) {

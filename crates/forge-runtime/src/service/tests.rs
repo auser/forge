@@ -750,6 +750,93 @@ async fn tool_errors_go_back_to_the_model_without_aborting() {
 }
 
 #[tokio::test]
+async fn per_run_tool_quota_blocks_the_next_call_without_aborting() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("input.txt"), "contents").expect("fixture");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        tool_reply("read_file", serde_json::json!({"path": "input.txt"})),
+        tool_reply("read_file", serde_json::json!({"path": "input.txt"})),
+        text_reply("stopped after quota"),
+    ]));
+    let mut config = Config::default();
+    config.tool_limits.insert(
+        "read_file".to_string(),
+        forge_config::ToolLimitConfig { per_run: 1 },
+    );
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(NativeExecution::new(
+            forge_core::ApprovalPolicy::Auto,
+            tmp.path(),
+        )),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        config,
+    );
+
+    let outcome = service.run("read twice").await.expect("run recovers");
+    assert_eq!(outcome.text, "stopped after quota");
+    assert_eq!(outcome.tool_calls, 2, "denied calls are still attempts");
+    let requests = model.recorded();
+    let quota_result = requests[2]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.is_some())
+        .expect("quota result reaches model");
+    assert!(quota_result.content.contains("per-run quota exceeded"));
+}
+
+#[tokio::test]
+async fn zero_tool_quota_denies_execution_and_counters_reset_between_runs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("never-created.txt");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        tool_reply(
+            "write_file",
+            serde_json::json!({"path": "never-created.txt", "content": "x"}),
+        ),
+        text_reply("first denied"),
+        tool_reply(
+            "write_file",
+            serde_json::json!({"path": "never-created.txt", "content": "x"}),
+        ),
+        text_reply("second denied"),
+    ]));
+    let mut config = Config::default();
+    config.tool_limits.insert(
+        "write_file".to_string(),
+        forge_config::ToolLimitConfig { per_run: 0 },
+    );
+    let service = AgentService::new(
+        model,
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(NativeExecution::new(
+            forge_core::ApprovalPolicy::Auto,
+            tmp.path(),
+        )),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        config,
+    );
+
+    assert_eq!(
+        service.run("first").await.expect("first run").text,
+        "first denied"
+    );
+    assert_eq!(
+        service.run("second").await.expect("second run").text,
+        "second denied"
+    );
+    assert!(!path.exists(), "zero quota must prevent execution");
+}
+
+#[tokio::test]
 async fn approval_pause_without_input_fails_cleanly() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let service = scripted_service(

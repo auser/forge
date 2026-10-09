@@ -76,6 +76,53 @@ struct FastPathDispatch {
     confidence: f64,
 }
 
+/// Run-local quota state. It is deliberately created inside `run_inner`, so
+/// concurrent runs on the same service never share counters.
+struct ToolRunQuotas<'a> {
+    limits: &'a std::collections::BTreeMap<String, forge_config::ToolLimitConfig>,
+    attempts: HashMap<String, u64>,
+}
+
+impl<'a> ToolRunQuotas<'a> {
+    fn new(config: &'a Config) -> Self {
+        Self {
+            limits: &config.tool_limits,
+            attempts: HashMap::new(),
+        }
+    }
+
+    /// Reserve an attempt before dispatch. Invalid calls consume quota because
+    /// validation happens in the dispatcher; calls rejected here do not.
+    fn reserve(&mut self, tool: &str) -> Result<(), String> {
+        let Some(limit) = self.limits.get(tool) else {
+            return Ok(());
+        };
+        let used = self.attempts.entry(tool.to_string()).or_default();
+        if *used >= limit.per_run {
+            return Err(format!(
+                "per-run quota exceeded for tool `{tool}`: limit is {}; choose another action or finish the run",
+                limit.per_run
+            ));
+        }
+        *used += 1;
+        Ok(())
+    }
+
+    async fn dispatch(
+        &mut self,
+        dispatcher: &ToolDispatcher,
+        call: &ToolCall,
+    ) -> Result<ToolOutcome, ForgeError> {
+        if let Err(message) = self.reserve(&call.name) {
+            return Ok(ToolOutcome {
+                result: ToolResult::error(call.id.clone(), call.name.clone(), message),
+                file_changed: None,
+            });
+        }
+        dispatcher.dispatch(call).await
+    }
+}
+
 /// The plumbing a pause-for-approval inside the agent loop needs: how to
 /// emit events for this run, and how to wait for the answer. Bundled so
 /// the gates that use it (the budget gate today) don't each grow a
@@ -1559,6 +1606,7 @@ impl AgentService {
         prompt: &str,
         run_id: &str,
         tools: &[forge_core::ToolDefinition],
+        quotas: &mut ToolRunQuotas<'_>,
     ) -> Option<FastPathDispatch> {
         let engine = self.needle.as_ref()?;
         if self.cancel_requested(run_id) {
@@ -1664,7 +1712,7 @@ impl AgentService {
         }
 
         let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
-        match dispatcher.dispatch(&tool_call).await {
+        match quotas.dispatch(&dispatcher, &tool_call).await {
             Ok(outcome) if !outcome.result.is_error => Some(FastPathDispatch {
                 call: tool_call,
                 outcome,
@@ -1737,6 +1785,7 @@ impl AgentService {
         let mut input_rx = self.take_input_receiver(&run_id);
         let mut collected = Vec::new();
         let mut tool_call_count = 0usize;
+        let mut tool_quotas = ToolRunQuotas::new(&self.config);
         let decisions = DecisionLog::handle(&self.decision_log, &session_id);
         let turn_no = self.next_turn(&session_id);
         // Spend so far, scanned from the decision logs this session (and
@@ -1825,7 +1874,9 @@ impl AgentService {
         // non-empty and does not gate the fast path.
         let fast = if resumed_from.is_none() && activate_skills.is_empty() {
             let started = std::time::Instant::now();
-            let outcome = self.needle_fast_path(prompt, &run_id, &decide_tools).await;
+            let outcome = self
+                .needle_fast_path(prompt, &run_id, &decide_tools, &mut tool_quotas)
+                .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             decisions.record(
                 turn_no,
@@ -2318,7 +2369,7 @@ impl AgentService {
                     ),
                 )?;
 
-                let outcome = match dispatcher.dispatch(call).await {
+                let outcome = match tool_quotas.dispatch(&dispatcher, call).await {
                     Ok(outcome) => outcome,
                     Err(ForgeError::ApprovalRequired { description, risk }) => {
                         self.emit(
