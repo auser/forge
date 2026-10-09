@@ -516,10 +516,11 @@ mod tests {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .unwrap();
-        // Compare the object's stored owner, group and DACL. The file-aware
-        // GetSecurityInfo API can reconstruct inheritance flags from the
-        // parent's current ACL; that is not a snapshot of this object's
-        // security descriptor. Do not normalize away any stored ACE flags.
+        // Compare copies of the object's owner, group and DACL using the same
+        // kernel-object query before and after sealing. Preserve all returned
+        // ACE flags; the root positive control verifies detection of changes.
+        // GetSecurityInfo produced different descendant snapshots in Windows
+        // CI; the reason for that API difference has not been established.
         // SAFETY: the aligned descriptor buffer stays alive while SDDL is copied.
         unsafe {
             let information =
