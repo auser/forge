@@ -674,7 +674,11 @@ mod tests {
         let tree = Tree::root(&root, false).unwrap();
         assert_eq!(fs::read_to_string(&victim).unwrap(), "secret victim");
         assert!(security_snapshot(&victim) == original_security);
-        assert!(security_snapshot(&nested) == nested_security);
+        assert_eq!(
+            String::from_utf16_lossy(&security_snapshot(&nested)),
+            String::from_utf16_lossy(&nested_security),
+            "sealing the root changed an unopened descendant's security"
+        );
         drop(tree);
     }
 
