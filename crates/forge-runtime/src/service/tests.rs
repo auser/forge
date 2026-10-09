@@ -49,13 +49,22 @@ fn needle_service(
     model: Arc<dyn forge_core::ModelProvider>,
     execution: Arc<dyn forge_core::ExecutionProvider>,
 ) -> AgentService {
+    needle_service_with_config(root, model, execution, Config::default())
+}
+
+fn needle_service_with_config(
+    root: &std::path::Path,
+    model: Arc<dyn forge_core::ModelProvider>,
+    execution: Arc<dyn forge_core::ExecutionProvider>,
+    config: Config,
+) -> AgentService {
     AgentService::new(
         model,
         Arc::new(MockRouter::selecting("scripted-mock")),
         execution,
         Arc::new(NullSkillRegistry),
         Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions"))),
-        Config::default(),
+        config,
     )
     .with_needle(Some(Arc::new(forge_needle::NeedleEngine::spawn(
         forge_needle::HashBackend::new(),
@@ -2885,6 +2894,102 @@ async fn needle_fast_path_dispatches_exact_tool_prompt_without_the_model() {
     assert!(
         !event_kinds(&outcome).contains(&"turn_completed"),
         "the model loop must not run"
+    );
+}
+
+#[tokio::test]
+async fn needle_fast_path_zero_quota_is_visible_to_events_and_model() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply(
+        "stopped after visible denial",
+    )]));
+    let exec = Arc::new(MockExecution::new(tmp.path()).with_read_content("must not be read"));
+    let mut config = Config::default();
+    config.tool_limits.insert(
+        "read_file".to_string(),
+        forge_config::ToolLimitConfig { per_run: 0 },
+    );
+    let service = needle_service_with_config(tmp.path(), model.clone(), exec.clone(), config);
+
+    let outcome = service
+        .run("read_file: {\"path\": \"Cargo.toml\"}")
+        .await
+        .expect("model recovers from quota denial");
+
+    assert_eq!(outcome.tool_calls, 1);
+    assert!(
+        exec.recorded_file_ops().is_empty(),
+        "denied call never executes"
+    );
+    assert!(
+        outcome
+            .events
+            .iter()
+            .any(|event| matches!(&event.kind, EventKind::ToolCompleted { success: false, .. }))
+    );
+    assert!(outcome.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ToolResult { output, is_error: true, .. }
+            if output.contains("per-run quota exceeded")
+    )));
+    let requests = model.recorded();
+    assert!(requests[0].messages.iter().any(|message| {
+        message.tool_call_id.is_some() && message.content.contains("per-run quota exceeded")
+    }));
+}
+
+#[tokio::test]
+async fn failed_needle_attempt_is_visible_before_its_consumed_quota_denies_model_retry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = Arc::new(ScriptedMockModel::new(vec![
+        tool_reply("read_file", serde_json::json!({"path": "missing.txt"})),
+        text_reply("finished after both visible errors"),
+    ]));
+    let mut config = Config::default();
+    config.tool_limits.insert(
+        "read_file".to_string(),
+        forge_config::ToolLimitConfig { per_run: 1 },
+    );
+    let service = needle_service_with_config(
+        tmp.path(),
+        model.clone(),
+        Arc::new(NativeExecution::new(
+            forge_core::ApprovalPolicy::Auto,
+            tmp.path(),
+        )),
+        config,
+    );
+
+    let outcome = service
+        .run("read_file: {\"path\": \"missing.txt\"}")
+        .await
+        .expect("model sees both failures");
+
+    assert_eq!(outcome.tool_calls, 2);
+    let errors: Vec<&str> = outcome
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolResult {
+                output,
+                is_error: true,
+                ..
+            } => Some(output.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors.len(),
+        2,
+        "both consumed attempt and denial are logged"
+    );
+    assert!(errors[0].contains("io error"), "{errors:?}");
+    assert!(errors[1].contains("per-run quota exceeded"), "{errors:?}");
+    let requests = model.recorded();
+    assert!(
+        requests[0].messages.iter().any(|message| {
+            message.tool_call_id.is_some() && message.content.contains("io error")
+        })
     );
 }
 

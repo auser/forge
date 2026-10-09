@@ -1713,16 +1713,15 @@ impl AgentService {
 
         let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
         match quotas.dispatch(&dispatcher, &tool_call).await {
-            Ok(outcome) if !outcome.result.is_error => Some(FastPathDispatch {
+            Ok(outcome) => Some(FastPathDispatch {
                 call: tool_call,
                 outcome,
                 confidence: call.confidence,
             }),
-            // A tool error means the operation did not complete, so the loop
-            // is where it belongs: a model may recover from it. (An
-            // `ApprovalRequired` cannot reach here — gate 5 admits only
-            // `Safe` operations — but it is handled the same way for free.)
-            _ => {
+            // An `ApprovalRequired` cannot reach here — gate 5 admits only
+            // `Safe` operations — but any dispatcher-level failure still
+            // declines without claiming a visible tool attempt.
+            Err(_) => {
                 tracing::debug!(
                     run_id,
                     tool = %tool_call.name,
@@ -1908,6 +1907,7 @@ impl AgentService {
         } else {
             None
         };
+        let mut failed_fast = None;
         if let Some(fast) = fast {
             tracing::info!(
                 run_id,
@@ -1991,7 +1991,7 @@ impl AgentService {
                     &session_id,
                     EventKind::ToolCompleted {
                         name: fast.call.name.clone(),
-                        success: true,
+                        success: !fast.outcome.result.is_error,
                     },
                 ),
             )?;
@@ -2006,25 +2006,30 @@ impl AgentService {
                         call_id: fast.call.id.clone(),
                         tool: fast.call.name.clone(),
                         output: forge_core::cap_tool_output(&text),
-                        is_error: false,
+                        is_error: fast.outcome.result.is_error,
                     },
                 ),
             )?;
-            let summary: String = text.chars().take(80).collect();
-            self.emit(
-                &sender,
-                &mut collected,
-                Event::new(&run_id, &session_id, EventKind::Completed { summary }),
-            )?;
-            return Ok(RunOutcome {
-                run_id,
-                session_id,
-                text,
-                // No model turn ran; the one tool call is the whole run.
-                turns: 0,
-                tool_calls: tool_call_count + 1,
-                events: collected,
-            });
+            tool_call_count += 1;
+            if fast.outcome.result.is_error {
+                failed_fast = Some((fast.call, text));
+            } else {
+                let summary: String = text.chars().take(80).collect();
+                self.emit(
+                    &sender,
+                    &mut collected,
+                    Event::new(&run_id, &session_id, EventKind::Completed { summary }),
+                )?;
+                return Ok(RunOutcome {
+                    run_id,
+                    session_id,
+                    text,
+                    // No model turn ran; the one tool call is the whole run.
+                    turns: 0,
+                    tool_calls: tool_call_count,
+                    events: collected,
+                });
+            }
         }
 
         // ROUTE: only reached when needle declined (or is unavailable) and
@@ -2159,6 +2164,10 @@ impl AgentService {
         }
         messages.extend(history);
         messages.push(Message::user(prompt));
+        if let Some((call, output)) = failed_fast {
+            messages.push(Message::assistant_tool_calls(vec![call.clone()]));
+            messages.push(Message::tool(call.id, forge_core::cap_tool_output(&output)));
+        }
 
         // Resolve the provider for the routed model (defaults to the
         // configured one).

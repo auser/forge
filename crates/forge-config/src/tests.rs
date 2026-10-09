@@ -54,6 +54,10 @@ fn tool_limits_parse_and_reject_malformed_entries() {
         toml::from_str::<Config>("[tool_limits]\nread_file = { per_run = -1 }").is_err(),
         "negative limits must fail"
     );
+    assert!(
+        toml::from_str::<Config>("[tool_limits]\nread_file = [2]").is_err(),
+        "array shorthand must fail instead of masquerading as a limit table"
+    );
 }
 
 #[test]

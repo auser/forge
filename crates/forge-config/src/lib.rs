@@ -111,11 +111,48 @@ pub struct BudgetConfig {
 }
 
 /// Limit for one tool, reset for every agent run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ToolLimitConfig {
     /// Maximum attempted calls to this tool in one run.
     pub per_run: u64,
+}
+
+impl<'de> Deserialize<'de> for ToolLimitConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ToolLimitVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ToolLimitVisitor {
+            type Value = ToolLimitConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a table with exactly one `per_run` integer")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut per_run = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "per_run" {
+                        return Err(serde::de::Error::unknown_field(&key, &["per_run"]));
+                    }
+                    if per_run.is_some() {
+                        return Err(serde::de::Error::duplicate_field("per_run"));
+                    }
+                    per_run = Some(map.next_value()?);
+                }
+                Ok(ToolLimitConfig {
+                    per_run: per_run.ok_or_else(|| serde::de::Error::missing_field("per_run"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ToolLimitVisitor)
+    }
 }
 
 impl BudgetConfig {
