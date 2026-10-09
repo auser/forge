@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::execution::RiskLevel;
+use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 
 /// Current event schema version.
 ///
@@ -16,6 +16,7 @@ use crate::execution::RiskLevel;
 ///   model's in-flight answer. Rendering-only: replay ignores them and
 ///   reads the final `assistant_message`, so a v4 log replays exactly as
 ///   its delta-free equivalent. Purely additive, like v3.
+/// * v5 adds the redaction-safe `tool_policy_decision` audit event.
 ///
 /// The change is purely additive: no existing kind or field changed
 /// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
@@ -23,7 +24,10 @@ use crate::execution::RiskLevel;
 /// event kinds an older reader does not know; runs recorded before v3
 /// replay as well as their data allows (see
 /// `forge_runtime::replay::conversation_from_events`).
-pub const EVENT_SCHEMA_VERSION: u32 = 4;
+pub const EVENT_SCHEMA_VERSION: u32 = 5;
+
+/// Version of the tool-policy rules represented by `ToolPolicyDecision`.
+pub const TOOL_POLICY_SCHEMA_VERSION: u32 = 1;
 
 /// Cap on the tool output stored in an [`EventKind::ToolResult`].
 ///
@@ -131,6 +135,17 @@ pub enum EventKind {
     ToolCallRequested {
         tool: String,
         args_summary: String,
+    },
+    /// The redaction-safe policy decision made before a recognized tool call
+    /// can execute. Exactly one is emitted per policy evaluation.
+    ToolPolicyDecision {
+        tool: String,
+        risk: RiskLevel,
+        approval_policy: ApprovalPolicy,
+        disposition: ToolPolicyDisposition,
+        reason: String,
+        policy_schema: u32,
+        forge_version: String,
     },
     FileChanged {
         path: PathBuf,

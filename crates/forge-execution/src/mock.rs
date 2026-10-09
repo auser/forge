@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use forge_core::{
-    ExecRequest, ExecResult, ExecutionProvider, FileOp, FileOpResult, ForgeError, RunningProcess,
+    ExecRequest, ExecResult, ExecutionProvider, FileOp, FileOpResult, ForgeError, RiskLevel,
+    RunningProcess,
 };
 
 /// Records every command and file op, returning canned results. Used by
@@ -68,6 +69,14 @@ impl MockExecution {
 impl ExecutionProvider for MockExecution {
     fn name(&self) -> &str {
         "mock"
+    }
+
+    fn approval_policy(&self) -> forge_core::ApprovalPolicy {
+        forge_core::ApprovalPolicy::Auto
+    }
+
+    fn file_op_risk(&self, op: &FileOp) -> RiskLevel {
+        op.risk(&self.project_root)
     }
 
     async fn execute(&self, request: ExecRequest) -> Result<ExecResult, ForgeError> {

@@ -39,6 +39,19 @@ fn format_event(event: &Event) -> String {
         EventKind::ToolCallRequested { tool, args_summary } => {
             format!("tool_call_requested tool={tool} args={args_summary}")
         }
+        EventKind::ToolPolicyDecision {
+            tool,
+            risk,
+            approval_policy,
+            disposition,
+            reason,
+            policy_schema,
+            forge_version,
+        } => format!(
+            "tool_policy_decision tool={tool} risk={risk:?} approval={approval_policy:?} \
+             disposition={disposition:?} reason={reason:?} policy_schema={policy_schema} \
+             forge_version={forge_version}"
+        ),
         EventKind::ApprovalRequested { command, risk } => {
             format!("approval_requested command={command} risk={risk:?}")
         }

@@ -94,6 +94,7 @@ fn event_kinds(outcome: &RunOutcome) -> Vec<&str> {
             EventKind::RoutingDecisionMade { .. } => "routing_decision_made",
             EventKind::SkillActivated { .. } => "skill_activated",
             EventKind::ToolCallRequested { .. } => "tool_call_requested",
+            EventKind::ToolPolicyDecision { .. } => "tool_policy_decision",
             EventKind::ToolStarted { .. } => "tool_started",
             EventKind::ToolCompleted { .. } => "tool_completed",
             EventKind::FileChanged { .. } => "file_changed",
@@ -673,6 +674,7 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
             // v3 replay record of the model's tool-call turn
             "assistant_message",
             "tool_call_requested",
+            "tool_policy_decision",
             "tool_started",
             "file_changed",
             "tool_completed",
@@ -688,9 +690,44 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
             "completed"
         ]
     );
+    let policy_events: Vec<_> = outcome
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolPolicyDecision {
+                tool,
+                risk,
+                approval_policy,
+                disposition,
+                reason,
+                policy_schema,
+                forge_version,
+            } => Some((
+                tool,
+                risk,
+                approval_policy,
+                disposition,
+                reason,
+                policy_schema,
+                forge_version,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(policy_events.len(), 1);
+    assert_eq!(policy_events[0].0, "write_file");
+    assert_eq!(*policy_events[0].1, RiskLevel::Risky);
+    assert_eq!(*policy_events[0].2, forge_core::ApprovalPolicy::Auto);
+    assert_eq!(
+        *policy_events[0].3,
+        forge_core::ToolPolicyDisposition::Execute
+    );
+    assert_eq!(policy_events[0].4, "policy permits this risk level");
+    assert_eq!(*policy_events[0].5, forge_core::TOOL_POLICY_SCHEMA_VERSION);
+    assert!(!policy_events[0].6.is_empty());
     // Sequence numbers are monotonic.
     let seqs: Vec<u64> = outcome.events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=14).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=15).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -2885,6 +2922,7 @@ async fn needle_fast_path_dispatches_exact_tool_prompt_without_the_model() {
             // model
             "assistant_message", // v3: the call the brain made
             "tool_call_requested",
+            "tool_policy_decision",
             "tool_started",
             "tool_completed",
             "tool_result", // v3: its output, for replay
@@ -2991,6 +3029,122 @@ async fn failed_needle_attempt_is_visible_before_its_consumed_quota_denies_model
             message.tool_call_id.is_some() && message.content.contains("io error")
         })
     );
+}
+
+#[tokio::test]
+async fn fast_path_failures_preserve_policy_and_recover_through_model() {
+    use forge_core::ToolPolicyDisposition::{Block, Execute};
+
+    for (prompt, disposition) in [
+        ("read_file: {\"path\":\"missing.txt\"}", Execute),
+        ("graph_context: {\"query\":\"anything\"}", Execute),
+        ("graph_context: {}", Block),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model = Arc::new(ScriptedMockModel::new(vec![text_reply("recovered")]));
+        let service = needle_service(
+            tmp.path(),
+            model.clone(),
+            Arc::new(NativeExecution::new(
+                forge_core::ApprovalPolicy::Auto,
+                tmp.path(),
+            )),
+        );
+        let outcome = service.run(prompt).await.expect("recovery");
+        assert_eq!(outcome.text, "recovered", "{prompt}");
+        assert_eq!(outcome.tool_calls, 1, "{prompt}");
+        let policies: Vec<_> = outcome
+            .events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::ToolPolicyDecision { disposition, .. } => Some(disposition),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(policies, vec![disposition], "{prompt}");
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolCompleted { success: false, .. }))
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolResult { is_error: true, .. }))
+        );
+        let requests = model.recorded();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .any(|m| m.tool_call_id.is_some())
+        );
+        let policy = outcome
+            .events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::ToolPolicyDecision { .. }))
+            .unwrap();
+        let started = outcome
+            .events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::ToolStarted { .. }))
+            .unwrap();
+        assert!(policy < started);
+    }
+}
+
+#[tokio::test]
+async fn quota_blocks_are_audited_once_on_both_dispatch_paths() {
+    for needle in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut replies = vec![];
+        if !needle {
+            replies.push(tool_reply(
+                "read_file",
+                serde_json::json!({"path":"file.txt"}),
+            ));
+        }
+        replies.push(text_reply("stopped"));
+        let model = Arc::new(ScriptedMockModel::new(replies));
+        let exec = Arc::new(MockExecution::new(tmp.path()));
+        let mut config = Config::default();
+        config.tool_limits.insert(
+            "read_file".into(),
+            forge_config::ToolLimitConfig { per_run: 0 },
+        );
+        let service = needle_service_with_config(tmp.path(), model, exec.clone(), config);
+        let outcome = service
+            .run(if needle {
+                "read_file: {\"path\":\"file.txt\"}"
+            } else {
+                "Please help"
+            })
+            .await
+            .expect("run");
+        assert!(exec.recorded_file_ops().is_empty());
+        let policies: Vec<_> = outcome
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ToolPolicyDecision {
+                    disposition,
+                    reason,
+                    ..
+                } => Some((*disposition, reason.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            policies,
+            vec![(
+                forge_core::ToolPolicyDisposition::Block,
+                "per-run tool quota exhausted"
+            )]
+        );
+    }
 }
 
 #[tokio::test]
