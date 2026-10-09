@@ -197,6 +197,7 @@ fn run_messages(events: &[&Event]) -> RunReplay {
             | EventKind::ToolStarted { .. }
             | EventKind::ToolCompleted { .. }
             | EventKind::ToolCallRequested { .. }
+            | EventKind::ToolPolicyDecision { .. }
             | EventKind::FileChanged { .. }
             | EventKind::ApprovalRequested { .. }
             | EventKind::ApprovalDecided { .. }

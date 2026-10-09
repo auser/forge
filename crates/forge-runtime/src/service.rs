@@ -9,7 +9,7 @@ use forge_config::Config;
 use forge_core::{
     CompletionRequest, DecisionRouter, Event, EventKind, ExecutionProvider, ForgeError, Message,
     ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, RunState, SessionStore, Skill,
-    SkillMeta, SkillRegistry, ToolCall, ToolResult,
+    SkillMeta, SkillRegistry, TOOL_POLICY_SCHEMA_VERSION, ToolCall, ToolResult,
 };
 use forge_needle::NeedleEngine;
 use forge_session::{
@@ -69,10 +69,9 @@ const GUARD_SAFE: &str = "safe operation";
 const GUARD_RISKY: &str =
     "destructive operation: delete, remove, rm, rmdir, overwrite, truncate, drop, format, kill";
 
-/// A tool call the brain picked, already executed, ready to be reported.
+/// A tool call the brain picked and vetted, ready for policy evaluation.
 struct FastPathDispatch {
     call: ToolCall,
-    outcome: ToolOutcome,
     confidence: f64,
 }
 
@@ -109,11 +108,11 @@ impl<'a> ToolRunQuotas<'a> {
     }
 
     async fn dispatch(
-        &mut self,
         dispatcher: &ToolDispatcher,
         call: &ToolCall,
+        reservation: Result<(), String>,
     ) -> Result<ToolOutcome, ForgeError> {
-        if let Err(message) = self.reserve(&call.name) {
+        if let Err(message) = reservation {
             return Ok(ToolOutcome {
                 result: ToolResult::error(call.id.clone(), call.name.clone(), message),
                 file_changed: None,
@@ -1578,8 +1577,7 @@ impl AgentService {
     ///     `RiskLevel::Safe`, the one classification no approval policy can
     ///     gate;
     ///  6. the guardrail `decide` answers `GUARD_SAFE`, confidently and in
-    ///     time;
-    ///  7. the dispatch itself succeeded.
+    ///     time.
     ///
     /// Both brain calls are bounded by `router_timeout_ms`: a slow or hung
     /// engine costs a run that budget once and then behaves as if no brain
@@ -1596,17 +1594,15 @@ impl AgentService {
     /// even consulted. Anything else — writes, edits, deletes, commands —
     /// falls through *before* the execution provider is touched at all.
     ///
-    /// Nothing is emitted from here, so a decline leaves no trace and no
-    /// side effect for the loop to contradict. The cost is that a
-    /// dispatched call's `tool_*` events are written just after the work
-    /// rather than just before it, for the few milliseconds one local
-    /// read takes.
+    /// This only selects a candidate; it neither emits events nor executes.
+    /// The caller reserves quota and records the policy before dispatch.
+    /// Failed dispatches are logged and supplied to the model for recovery;
+    /// only successful dispatches complete the run without a model turn.
     async fn needle_fast_path(
         &self,
         prompt: &str,
         run_id: &str,
         tools: &[forge_core::ToolDefinition],
-        quotas: &mut ToolRunQuotas<'_>,
     ) -> Option<FastPathDispatch> {
         let engine = self.needle.as_ref()?;
         if self.cancel_requested(run_id) {
@@ -1711,25 +1707,10 @@ impl AgentService {
             return None;
         }
 
-        let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
-        match quotas.dispatch(&dispatcher, &tool_call).await {
-            Ok(outcome) => Some(FastPathDispatch {
-                call: tool_call,
-                outcome,
-                confidence: call.confidence,
-            }),
-            // An `ApprovalRequired` cannot reach here — gate 5 admits only
-            // `Safe` operations — but any dispatcher-level failure still
-            // declines without claiming a visible tool attempt.
-            Err(_) => {
-                tracing::debug!(
-                    run_id,
-                    tool = %tool_call.name,
-                    "needle fast path handed the call back to the agent loop"
-                );
-                None
-            }
-        }
+        Some(FastPathDispatch {
+            call: tool_call,
+            confidence: call.confidence,
+        })
     }
 
     /// The turn number this run is in its session, for the decision log:
@@ -1873,9 +1854,7 @@ impl AgentService {
         // non-empty and does not gate the fast path.
         let fast = if resumed_from.is_none() && activate_skills.is_empty() {
             let started = std::time::Instant::now();
-            let outcome = self
-                .needle_fast_path(prompt, &run_id, &decide_tools, &mut tool_quotas)
-                .await;
+            let outcome = self.needle_fast_path(prompt, &run_id, &decide_tools).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             decisions.record(
                 turn_no,
@@ -1961,6 +1940,32 @@ impl AgentService {
                     },
                 ),
             )?;
+            let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
+            let reservation = tool_quotas.reserve(&fast.call.name);
+            let mut policy = dispatcher
+                .evaluate_policy(&fast.call)
+                .expect("needle only selects recognized tools");
+            if reservation.is_err() {
+                policy.disposition = forge_core::ToolPolicyDisposition::Block;
+                policy.reason = "per-run tool quota exhausted".to_string();
+            }
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::ToolPolicyDecision {
+                        tool: fast.call.name.clone(),
+                        risk: policy.risk,
+                        approval_policy: policy.approval_policy,
+                        disposition: policy.disposition,
+                        reason: policy.reason,
+                        policy_schema: TOOL_POLICY_SCHEMA_VERSION,
+                        forge_version: env!("CARGO_PKG_VERSION").to_string(),
+                    },
+                ),
+            )?;
             self.emit(
                 &sender,
                 &mut collected,
@@ -1972,7 +1977,12 @@ impl AgentService {
                     },
                 ),
             )?;
-            if let Some(path) = &fast.outcome.file_changed {
+            let outcome = match ToolRunQuotas::dispatch(&dispatcher, &fast.call, reservation).await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => return Err(fail(&mut collected, e)),
+            };
+            if let Some(path) = &outcome.file_changed {
                 self.emit(
                     &sender,
                     &mut collected,
@@ -1991,11 +2001,11 @@ impl AgentService {
                     &session_id,
                     EventKind::ToolCompleted {
                         name: fast.call.name.clone(),
-                        success: !fast.outcome.result.is_error,
+                        success: !outcome.result.is_error,
                     },
                 ),
             )?;
-            let text = fast.outcome.result.content;
+            let text = outcome.result.content;
             self.emit(
                 &sender,
                 &mut collected,
@@ -2006,12 +2016,12 @@ impl AgentService {
                         call_id: fast.call.id.clone(),
                         tool: fast.call.name.clone(),
                         output: forge_core::cap_tool_output(&text),
-                        is_error: fast.outcome.result.is_error,
+                        is_error: outcome.result.is_error,
                     },
                 ),
             )?;
             tool_call_count += 1;
-            if fast.outcome.result.is_error {
+            if outcome.result.is_error {
                 failed_fast = Some((fast.call, text));
             } else {
                 let summary: String = text.chars().take(80).collect();
@@ -2366,6 +2376,30 @@ impl AgentService {
                         },
                     ),
                 )?;
+                let reservation = tool_quotas.reserve(&call.name);
+                if let Some(mut policy) = dispatcher.evaluate_policy(call) {
+                    if reservation.is_err() {
+                        policy.disposition = forge_core::ToolPolicyDisposition::Block;
+                        policy.reason = "per-run tool quota exhausted".to_string();
+                    }
+                    self.emit(
+                        &sender,
+                        &mut collected,
+                        Event::new(
+                            &run_id,
+                            &session_id,
+                            EventKind::ToolPolicyDecision {
+                                tool: call.name.clone(),
+                                risk: policy.risk,
+                                approval_policy: policy.approval_policy,
+                                disposition: policy.disposition,
+                                reason: policy.reason,
+                                policy_schema: TOOL_POLICY_SCHEMA_VERSION,
+                                forge_version: env!("CARGO_PKG_VERSION").to_string(),
+                            },
+                        ),
+                    )?;
+                }
                 self.emit(
                     &sender,
                     &mut collected,
@@ -2378,7 +2412,7 @@ impl AgentService {
                     ),
                 )?;
 
-                let outcome = match tool_quotas.dispatch(&dispatcher, call).await {
+                let outcome = match ToolRunQuotas::dispatch(&dispatcher, call, reservation).await {
                     Ok(outcome) => outcome,
                     Err(ForgeError::ApprovalRequired { description, risk }) => {
                         self.emit(

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use forge_core::{
     ApprovalPolicy, ExecRequest, ExecResult, ExecutionProvider, FileOp, FileOpResult, ForgeError,
-    RiskLevel,
+    RiskLevel, ToolPolicyDisposition, tool_policy_disposition,
 };
 
 /// Where a gated operation puts its question.
@@ -76,19 +76,13 @@ impl NativeExecution {
     /// Gate an operation by risk level and approval policy. Shared by
     /// command execution and file operations.
     fn check_approval(&self, description: &str, risk: RiskLevel) -> Result<(), ForgeError> {
-        if risk == RiskLevel::Safe {
-            return Ok(());
-        }
-        match self.approval {
-            ApprovalPolicy::Auto => Ok(()),
-            ApprovalPolicy::Deny => Err(ForgeError::execution(format!(
+        match tool_policy_disposition(risk, self.approval) {
+            ToolPolicyDisposition::Execute => Ok(()),
+            ToolPolicyDisposition::Deny => Err(ForgeError::execution(format!(
                 "approval denied: {description} is {risk:?} and policy is 'deny'"
             ))),
-            ApprovalPolicy::Prompt => self.ask_approval(description, risk),
-            ApprovalPolicy::PromptDestructive => match risk {
-                RiskLevel::Destructive => self.ask_approval(description, risk),
-                _ => Ok(()),
-            },
+            ToolPolicyDisposition::RequireApproval => self.ask_approval(description, risk),
+            ToolPolicyDisposition::Block => unreachable!("validated execution cannot be blocked"),
         }
     }
 
@@ -147,6 +141,14 @@ fn resolve(root: &std::path::Path, path: &std::path::Path) -> PathBuf {
 impl ExecutionProvider for NativeExecution {
     fn name(&self) -> &str {
         "native"
+    }
+
+    fn approval_policy(&self) -> ApprovalPolicy {
+        self.approval
+    }
+
+    fn file_op_risk(&self, op: &FileOp) -> RiskLevel {
+        op.risk(&self.project_root)
     }
 
     async fn execute(&self, request: ExecRequest) -> Result<ExecResult, ForgeError> {

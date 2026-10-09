@@ -120,6 +120,7 @@ impl TranscriptState {
                     vec![Line::tool(format!("{tool} {summary}"))]
                 }
             }
+            EventKind::ToolPolicyDecision { .. } => Vec::new(),
             // Always follows `ToolCallRequested` for the same call, so a
             // second line per call buys nothing. The timer restarts here,
             // which is the point at which work actually begins.
