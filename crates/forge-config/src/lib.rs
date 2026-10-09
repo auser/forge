@@ -110,6 +110,51 @@ pub struct BudgetConfig {
     pub on_exceeded: String,
 }
 
+/// Limit for one tool, reset for every agent run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ToolLimitConfig {
+    /// Maximum attempted calls to this tool in one run.
+    pub per_run: u64,
+}
+
+impl<'de> Deserialize<'de> for ToolLimitConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ToolLimitVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ToolLimitVisitor {
+            type Value = ToolLimitConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a table with exactly one `per_run` integer")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut per_run = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "per_run" {
+                        return Err(serde::de::Error::unknown_field(&key, &["per_run"]));
+                    }
+                    if per_run.is_some() {
+                        return Err(serde::de::Error::duplicate_field("per_run"));
+                    }
+                    per_run = Some(map.next_value()?);
+                }
+                Ok(ToolLimitConfig {
+                    per_run: per_run.ok_or_else(|| serde::de::Error::missing_field("per_run"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ToolLimitVisitor)
+    }
+}
+
 impl BudgetConfig {
     /// Whether any ceiling is set — when none is, the loop skips the whole
     /// accounting scan.
@@ -248,6 +293,9 @@ pub struct Config {
     /// Spend ceilings enforced by the agent loop (`[budget]`); all ceilings
     /// absent means no budget.
     pub budget: BudgetConfig,
+    /// Per-tool call ceilings, keyed by the exact tool name. Entries are
+    /// deep-merged across configuration files.
+    pub tool_limits: BTreeMap<String, ToolLimitConfig>,
     /// Days a cached OpenRouter model catalogue counts as fresh (see
     /// [`crate::catalogue`]). A stale cache is still used — with a warning
     /// naming its age — because stale prices beat no prices; must be >= 1.
@@ -530,6 +578,7 @@ impl Default for Config {
             .collect(),
             needle: NeedleConfig::default(),
             budget: BudgetConfig::default(),
+            tool_limits: BTreeMap::new(),
             catalogue_ttl_days: 7,
             // Nothing here was explicitly configured — this *is* the
             // defaults layer.
@@ -684,6 +733,11 @@ impl Config {
                 BUDGET_ON_EXCEEDED_VALUES.join(", "),
                 self.budget.on_exceeded
             )));
+        }
+        if self.tool_limits.contains_key("") {
+            return Err(ForgeError::config(
+                "tool_limits keys must be non-empty tool names".to_string(),
+            ));
         }
         let sha = &self.needle.weights_sha256;
         if !sha.is_empty() && !(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())) {

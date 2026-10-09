@@ -40,6 +40,45 @@ fn write_project_config(root: &Path, contents: &str) {
 }
 
 #[test]
+fn tool_limits_parse_and_reject_malformed_entries() {
+    let config: Config =
+        toml::from_str("[tool_limits]\nread_file = { per_run = 2 }").expect("valid limits");
+    assert_eq!(config.tool_limits["read_file"].per_run, 2);
+
+    let error =
+        toml::from_str::<Config>("[tool_limits]\nread_file = { per_run = 2, per_session = 3 }")
+            .expect_err("unknown fields must fail");
+    assert!(error.to_string().contains("per_session"));
+
+    assert!(
+        toml::from_str::<Config>("[tool_limits]\nread_file = { per_run = -1 }").is_err(),
+        "negative limits must fail"
+    );
+    assert!(
+        toml::from_str::<Config>("[tool_limits]\nread_file = [2]").is_err(),
+        "array shorthand must fail instead of masquerading as a limit table"
+    );
+}
+
+#[test]
+#[serial]
+fn project_tool_limits_deep_merge_over_user_limits() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tempfile::tempdir().expect("project");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_user_config(
+        tmp.path(),
+        "[tool_limits]\nread_file = { per_run = 1 }\nwrite_file = { per_run = 2 }",
+    );
+    write_project_config(project.path(), "[tool_limits]\nread_file = { per_run = 3 }");
+
+    let resolved =
+        Config::load(Some(project.path()), &CliOverrides::default()).expect("merged config");
+    assert_eq!(resolved.config.tool_limits["read_file"].per_run, 3);
+    assert_eq!(resolved.config.tool_limits["write_file"].per_run, 2);
+}
+
+#[test]
 #[serial]
 fn defaults_when_nothing_set() {
     let tmp = tempfile::tempdir().expect("tempdir");
