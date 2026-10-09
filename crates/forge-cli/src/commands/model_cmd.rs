@@ -36,17 +36,32 @@ fn list(ctx: &Context) -> Result<(), ForgeError> {
     let resolved = ctx.resolve_config()?;
     let active = provider_for(ctx, None)?;
     let caps = active.capabilities();
+    let eligibility: std::collections::BTreeMap<String, forge_providers::ModelEligibility> =
+        forge_providers::model_eligibility(&resolved.config)
+            .into_iter()
+            .map(|status| (status.name.clone(), status))
+            .collect();
+    let active_status = eligibility.get(active.name());
+    let active_eligible = active_status.is_none_or(|status| status.eligible);
+    let active_reason = active_status
+        .map(|status| status.reason.as_str())
+        .unwrap_or("explicitly selected");
 
     if ctx.global.json {
         let mut models = vec![serde_json::json!({
             "name": active.name(),
             "active": true,
+            "eligible": active_eligible,
+            "availability": active_reason,
             "capabilities": caps,
         })];
         for (name, entry) in resolved.config.model_entries() {
+            let status = eligibility.get(name);
             models.push(serde_json::json!({
                 "name": name,
                 "active": false,
+                "eligible": status.is_some_and(|status| status.eligible),
+                "availability": status.map(|status| status.reason.as_str()).unwrap_or("not evaluated"),
                 "description": entry.description,
                 "cost_input_per_mtok": entry.cost_input_per_mtok,
                 "cost_output_per_mtok": entry.cost_output_per_mtok,
@@ -61,8 +76,14 @@ fn list(ctx: &Context) -> Result<(), ForgeError> {
         );
     } else {
         println!(
-            "{} (active) — streaming={} tools={} structured_output={} vision={} max_context={}",
+            "{} (active, {}: {}) — streaming={} tools={} structured_output={} vision={} max_context={}",
             active.name(),
+            if active_eligible {
+                "eligible"
+            } else {
+                "ineligible"
+            },
+            active_reason,
             caps.streaming,
             caps.tools,
             caps.structured_output,
@@ -81,13 +102,22 @@ fn list(ctx: &Context) -> Result<(), ForgeError> {
             println!("mock-local (test-only mock, available offline)");
         }
         for (name, entry) in resolved.config.model_entries() {
+            let status = eligibility.get(name);
             let desc = entry.description.as_deref().unwrap_or("");
             let costs = match entry.costs() {
                 Some((input, output)) => format!("cost_in=${input}/1M cost_out=${output}/1M"),
                 None => "unpriced".to_string(),
             };
             println!(
-                "{name} — {costs} {} {}",
+                "{name} — {}: {}; {costs} {} {}",
+                if status.is_some_and(|status| status.eligible) {
+                    "eligible"
+                } else {
+                    "ineligible"
+                },
+                status
+                    .map(|status| status.reason.as_str())
+                    .unwrap_or("not evaluated"),
                 entry
                     .base_url
                     .as_deref()

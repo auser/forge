@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use forge_config::Config;
 use forge_context::{ContextStore, MemoryContextStore};
-use forge_core::ToolCall;
-use forge_core::{DecisionRouter, EventKind, ForgeError, RiskLevel, RoutingRequest};
+use forge_core::{
+    CompletionRequest, CompletionResponse, DecisionRouter, EventKind, ForgeError,
+    ModelCapabilities, ModelProvider, RiskLevel, RoutingRequest, ToolCall,
+};
 use forge_execution::{ApprovalChannel, MockExecution, NativeExecution};
 use forge_providers::{MockModel, MockRouter, ScriptedMockModel, ScriptedReply};
 use forge_session::JsonlSessionStore;
@@ -81,6 +83,137 @@ fn text_reply(text: &str) -> ScriptedReply {
         text: Some(text.to_string()),
         tool_calls: Vec::new(),
     }
+}
+
+struct RateLimitedModel;
+
+#[async_trait::async_trait]
+impl ModelProvider for RateLimitedModel {
+    fn name(&self) -> &str {
+        "limited"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<CompletionResponse, ForgeError> {
+        Err(ForgeError::provider_rate_limited("limited", Some(60)))
+    }
+}
+
+struct BackupModel;
+
+#[async_trait::async_trait]
+impl ModelProvider for BackupModel {
+    fn name(&self) -> &str {
+        "backup"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<CompletionResponse, ForgeError> {
+        Ok(CompletionResponse {
+            model: "backup".to_string(),
+            content: "backup answered".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_unpinned_followup_excludes_an_observed_provider_cooldown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let limited: Arc<dyn ModelProvider> = Arc::new(RateLimitedModel);
+    let backup: Arc<dyn ModelProvider> = Arc::new(BackupModel);
+    let mut config = Config {
+        model: "limited".to_string(),
+        model_pinned: false,
+        ..Config::default()
+    };
+    config.models.clear();
+    config
+        .models
+        .insert("limited".to_string(), forge_config::ModelEntry::default());
+    config
+        .models
+        .insert("backup".to_string(), forge_config::ModelEntry::default());
+
+    let limited_for_factory = limited.clone();
+    let backup_for_factory = backup.clone();
+    let service = AgentService::new(
+        limited,
+        Arc::new(forge_providers::StaticRouter::new("limited")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        config,
+    )
+    .with_model_factory(Arc::new(move |name| match name {
+        "limited" => Ok(limited_for_factory.clone()),
+        "backup" => Ok(backup_for_factory.clone()),
+        other => Err(ForgeError::provider(format!("unknown test model {other}"))),
+    }));
+
+    let first = service.run("first").await.expect_err("rate limited");
+    assert!(matches!(first, ForgeError::ProviderRateLimited { .. }));
+    assert!(!service.provider_availability().is_eligible("limited"));
+
+    let second = service.run("second").await.expect("backup succeeds");
+    assert_eq!(second.text, "backup answered");
+    assert!(second.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::RoutingDecisionMade {
+            selected_model,
+            reason,
+            ..
+        } if selected_model == "backup" && reason.contains("limited (rate limited")
+    )));
+}
+
+#[tokio::test]
+async fn an_explicit_pin_remains_binding_during_an_observed_cooldown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let availability = ProviderAvailability::default();
+    availability.observe_failure(
+        "limited",
+        &ForgeError::provider_rate_limited("limited", Some(60)),
+    );
+    let mut config = Config {
+        model: "limited".to_string(),
+        model_pinned: true,
+        ..Config::default()
+    };
+    config.models.clear();
+    config
+        .models
+        .insert("limited".to_string(), forge_config::ModelEntry::default());
+    let service = AgentService::new(
+        Arc::new(RateLimitedModel),
+        Arc::new(forge_providers::StaticRouter::new("limited")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(
+            tmp.path().join(".forge").join("sessions"),
+        )),
+        config,
+    )
+    .with_provider_availability(availability);
+
+    let error = service.run("pinned").await.expect_err("pin fails visibly");
+    assert!(matches!(error, ForgeError::ProviderRateLimited { .. }));
 }
 
 fn tool_reply(name: &str, arguments: serde_json::Value) -> ScriptedReply {

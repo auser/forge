@@ -4,7 +4,7 @@
 //! chunks are authoritative, including errors and SSE envelopes. Never reserve
 //! from an untrusted length or include response contents in read errors.
 
-use forge_core::ForgeError;
+use forge_core::{ForgeError, ProviderFailureKind};
 
 /// Turn an observed HTTP 429 into a typed error before its body is consumed
 /// or a streaming caller decides to retry. Only the delta-seconds form is
@@ -23,6 +23,23 @@ pub(crate) fn rate_limit_error(provider: &str, response: &reqwest::Response) -> 
         provider,
         retry_after_seconds,
     ))
+}
+
+/// Classify a provider's non-429 HTTP refusal without relying on its body
+/// wording. The caller may retain a bounded, redaction-safe detail string for
+/// diagnosis; routing policy sees only the closed failure kind.
+pub(crate) fn http_status_error(
+    provider: &str,
+    status: reqwest::StatusCode,
+    message: impl Into<String>,
+) -> ForgeError {
+    let kind = match status.as_u16() {
+        401 => ProviderFailureKind::Authentication,
+        403 => ProviderFailureKind::Entitlement,
+        408 | 425 | 500..=599 => ProviderFailureKind::Transient,
+        _ => ProviderFailureKind::InvalidRequest,
+    };
+    ForgeError::provider_failure(provider, kind, Some(status.as_u16()), message)
 }
 
 pub(crate) async fn bounded_bytes(

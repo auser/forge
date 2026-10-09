@@ -1,4 +1,29 @@
+use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
+
+/// Closed failure classes that may affect whether a model is eligible for a
+/// later routing decision. The message remains diagnostic; policy keys off
+/// this enum rather than provider-specific prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureKind {
+    Authentication,
+    Transient,
+    InvalidRequest,
+    Entitlement,
+}
+
+impl fmt::Display for ProviderFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Authentication => "authentication",
+            Self::Transient => "transient",
+            Self::InvalidRequest => "invalid_request",
+            Self::Entitlement => "entitlement",
+        })
+    }
+}
 
 /// Typed error shared by every Forge crate and adapter.
 #[derive(Debug, Error)]
@@ -23,6 +48,16 @@ pub enum ForgeError {
     ProviderRateLimited {
         provider: String,
         retry_after_seconds: Option<u64>,
+    },
+
+    #[error("model provider {provider} failed ({kind}){status_suffix}: {message}",
+        status_suffix = http_status_suffix(*status)
+    )]
+    ProviderFailure {
+        provider: String,
+        kind: ProviderFailureKind,
+        status: Option<u16>,
+        message: String,
     },
 
     #[error("router error: {0}")]
@@ -97,6 +132,29 @@ impl ForgeError {
         }
     }
 
+    pub fn provider_failure(
+        provider: impl Into<String>,
+        kind: ProviderFailureKind,
+        status: Option<u16>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::ProviderFailure {
+            provider: provider.into(),
+            kind,
+            status,
+            message: message.into(),
+        }
+    }
+
+    /// Classification available to routing health without parsing a display
+    /// string. Generic provider errors deliberately remain unclassified.
+    pub fn provider_failure_kind(&self) -> Option<ProviderFailureKind> {
+        match self {
+            Self::ProviderFailure { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
     pub fn router(message: impl Into<String>) -> Self {
         Self::Router(message.into())
     }
@@ -140,5 +198,11 @@ impl ForgeError {
 fn retry_after_suffix(seconds: Option<u64>) -> String {
     seconds
         .map(|seconds| format!("; retry after {seconds} seconds"))
+        .unwrap_or_default()
+}
+
+fn http_status_suffix(status: Option<u16>) -> String {
+    status
+        .map(|status| format!("; HTTP {status}"))
         .unwrap_or_default()
 }

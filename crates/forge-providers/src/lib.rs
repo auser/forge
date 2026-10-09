@@ -33,8 +33,9 @@ pub use credentials::{
 pub use jev::JevRouter;
 pub use local_only::{EgressPolicy, endpoint_is_local};
 pub use model::{
-    AUTH_REQUIRED_MODEL, AvailableModel, MockModel, OpenAiCompatibleModel, automatic_model,
-    available_models, is_mock_model, model_endpoint, model_from_config,
+    AUTH_REQUIRED_MODEL, AvailableModel, MockModel, ModelEligibility, OpenAiCompatibleModel,
+    automatic_model, available_models, is_mock_model, model_eligibility, model_endpoint,
+    model_from_config,
 };
 pub use observer::{observer_model_from_config, observer_prices_from_config};
 pub use router::{

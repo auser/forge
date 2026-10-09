@@ -4,6 +4,7 @@
 //! store and onto a per-run broadcast channel — `subscribe` is the seam
 //! the server's SSE transport consumes.
 
+pub mod availability;
 pub mod budget;
 pub mod inspection;
 pub mod observer;
@@ -11,6 +12,7 @@ pub mod replay;
 mod service;
 mod tools;
 
+pub use availability::{AvailabilitySnapshot, AvailabilityState, ProviderAvailability};
 pub use budget::{BudgetTrip, SpendTracker, completion_cost};
 
 pub use replay::{Replay, conversation_from_events, fit_to_budget, history_budget_chars};

@@ -212,6 +212,21 @@ pub struct AvailableModel {
     pub credential: Option<crate::credentials::CredentialSource>,
 }
 
+/// Why a configured model is or is not eligible before any generation call.
+/// This contains no endpoint credentials and is safe for CLI/JSON diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelEligibility {
+    pub name: String,
+    pub eligible: bool,
+    pub local: bool,
+    pub reason: String,
+}
+
+struct ModelProbe {
+    eligibility: ModelEligibility,
+    credential: Option<crate::credentials::CredentialSource>,
+}
+
 /// Resolve the models that are usable in the current environment.
 ///
 /// Local endpoints need no credential but must accept a short TCP probe.
@@ -220,13 +235,52 @@ pub struct AvailableModel {
 /// routing must never advertise a model that provider construction already
 /// knows it cannot reach or authenticate.
 pub fn available_models(config: &Config) -> Vec<AvailableModel> {
+    probe_models(config)
+        .into_iter()
+        .filter(|probe| probe.eligibility.eligible)
+        .map(|probe| AvailableModel {
+            name: probe.eligibility.name,
+            local: probe.eligibility.local,
+            credential: probe.credential,
+        })
+        .collect()
+}
+
+/// Report every configured model, including the ones deliberately withheld
+/// from routing. Unlike `model test`, this performs no generation request.
+pub fn model_eligibility(config: &Config) -> Vec<ModelEligibility> {
+    probe_models(config)
+        .into_iter()
+        .map(|probe| probe.eligibility)
+        .collect()
+}
+
+fn probe_models(config: &Config) -> Vec<ModelProbe> {
     let mut out = Vec::new();
     for name in config.model_entries().keys() {
         let Some(endpoint) = resolve_endpoint(config, name) else {
+            out.push(ModelProbe {
+                eligibility: ModelEligibility {
+                    name: name.clone(),
+                    eligible: false,
+                    local: false,
+                    reason: "no endpoint configured".to_string(),
+                },
+                credential: None,
+            });
             continue;
         };
         let local = crate::local_only::endpoint_is_local(&endpoint.url);
         if config.local_only && !local {
+            out.push(ModelProbe {
+                eligibility: ModelEligibility {
+                    name: name.clone(),
+                    eligible: false,
+                    local,
+                    reason: "blocked by local_only".to_string(),
+                },
+                credential: None,
+            });
             continue;
         }
         let entry = config.models.get(name);
@@ -246,13 +300,23 @@ pub fn available_models(config: &Config) -> Vec<AvailableModel> {
         } else {
             crate::credentials::resolve_credential(key_env, hint.as_deref()).map(|c| c.source)
         };
-        if (local && local_endpoint_usable(config, name)) || credential.is_some() {
-            out.push(AvailableModel {
+        let local_reachable = local && local_endpoint_usable(config, name);
+        let eligible = local_reachable || credential.is_some();
+        let reason = match (local, local_reachable, credential.is_some()) {
+            (true, true, _) => "local endpoint reachable",
+            (true, false, _) => "local endpoint unreachable",
+            (false, _, true) => "credential available",
+            (false, _, false) => "credential unavailable",
+        };
+        out.push(ModelProbe {
+            eligibility: ModelEligibility {
                 name: name.clone(),
                 local,
-                credential,
-            });
-        }
+                eligible,
+                reason: reason.to_string(),
+            },
+            credential,
+        });
     }
     out
 }
@@ -590,24 +654,39 @@ impl OpenAiCompatibleModel {
 /// (and the host declined) is in the source chain, not in reqwest's own
 /// Display — without it this reads as an unexplained failure against the
 /// endpoint the user configured.
-fn send_error(url: &str, e: reqwest::Error) -> ForgeError {
+fn send_error(model: &str, url: &str, e: reqwest::Error) -> ForgeError {
     if e.is_timeout() {
-        ForgeError::provider(format!("model request to {url} timed out"))
+        ForgeError::provider_failure(
+            model,
+            forge_core::ProviderFailureKind::Transient,
+            None,
+            format!("model request to {url} timed out"),
+        )
     } else if e.is_redirect() {
         ForgeError::provider(format!(
             "model request to {url} was not completed: {}",
             crate::local_only::error_detail(&e)
         ))
     } else if e.is_connect() {
-        ForgeError::provider(format!(
-            "cannot reach OpenAI-compatible server at {url} (connection refused); \
-             start your model server (e.g. oMLX) or set model = \"mock-local\" for offline use"
-        ))
+        ForgeError::provider_failure(
+            model,
+            forge_core::ProviderFailureKind::Transient,
+            None,
+            format!(
+                "cannot reach OpenAI-compatible server at {url} (connection refused); \
+                 start your model server (e.g. oMLX) or set model = \"mock-local\" for offline use"
+            ),
+        )
     } else {
-        ForgeError::provider(format!(
-            "model request to {url} failed: {}",
-            crate::local_only::error_detail(&e)
-        ))
+        ForgeError::provider_failure(
+            model,
+            forge_core::ProviderFailureKind::Transient,
+            None,
+            format!(
+                "model request to {url} failed: {}",
+                crate::local_only::error_detail(&e)
+            ),
+        )
     }
 }
 
@@ -832,7 +911,7 @@ impl ModelProvider for OpenAiCompatibleModel {
             .authed_chat_post(&self.client, &url, &self.chat_body(&request, false))
             .send()
             .await
-            .map_err(|e| send_error(&url, e))?;
+            .map_err(|e| send_error(&self.model, &url, e))?;
 
         let status = response.status();
         if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
@@ -843,9 +922,11 @@ impl ModelProvider for OpenAiCompatibleModel {
         if let Some(max_bytes) = self.response_max_bytes {
             let bytes = crate::response::bounded_bytes(response, max_bytes).await?;
             if !status.is_success() {
-                return Err(ForgeError::provider(format!(
-                    "model endpoint returned {status}"
-                )));
+                return Err(crate::response::http_status_error(
+                    &self.model,
+                    status,
+                    format!("model endpoint returned {status}"),
+                ));
             }
             let body = serde_json::from_slice(&bytes)
                 .map_err(|_| ForgeError::provider("invalid bounded model response JSON"))?;
@@ -864,9 +945,11 @@ impl ModelProvider for OpenAiCompatibleModel {
             } else {
                 String::new()
             };
-            return Err(ForgeError::provider(format!(
-                "model endpoint {url} returned {status}: {text}{suffix}"
-            )));
+            return Err(crate::response::http_status_error(
+                &self.model,
+                status,
+                format!("model endpoint {url} returned {status}: {text}{suffix}"),
+            ));
         }
         let body: serde_json::Value = response
             .json()
@@ -892,12 +975,19 @@ impl ModelProvider for OpenAiCompatibleModel {
             self.authed_chat_post(&self.stream_client, &url, &body)
                 .send()
                 .await
-                .map_err(|e| send_error(&url, e))?
+                .map_err(|e| send_error(&self.model, &url, e))?
         };
 
         let status = response.status();
         if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
             return Err(error);
+        }
+        if !status.is_success() && status != reqwest::StatusCode::BAD_REQUEST {
+            return Err(crate::response::http_status_error(
+                &self.model,
+                status,
+                format!("model streaming endpoint {url} returned {status}"),
+            ));
         }
         if !status.is_success() {
             // Nothing was shown yet, so exactly one non-streaming retry is
@@ -1450,6 +1540,12 @@ mod tests {
                 .iter()
                 .any(|model| model.name == "anthropic/claude-sonnet-4.5")
         );
+        let eligibility = model_eligibility(&config);
+        assert!(eligibility.iter().any(|model| {
+            model.name == "anthropic/claude-sonnet-4.5"
+                && !model.eligible
+                && model.reason == "credential unavailable"
+        }));
     }
 
     #[test]
@@ -1744,13 +1840,13 @@ mod tests {
             .complete(CompletionRequest::new("m", vec![Message::user("x")]))
             .await
             .expect_err("must fail");
-        match err {
-            ForgeError::Provider(msg) => {
-                assert!(msg.contains("500"), "got: {msg}");
-                assert!(!msg.contains("test-key"), "must never leak keys: {msg}");
-            }
-            other => panic!("expected provider error, got {other:?}"),
-        }
+        assert_eq!(
+            err.provider_failure_kind(),
+            Some(forge_core::ProviderFailureKind::Transient)
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "got: {msg}");
+        assert!(!msg.contains("test-key"), "must never leak keys: {msg}");
     }
 
     /// The real-world failure: a config naming `OMLX_API_KEY`, the var
@@ -1782,9 +1878,11 @@ mod tests {
             .complete(CompletionRequest::new("m", vec![Message::user("x")]))
             .await
             .expect_err("401 must fail");
-        let ForgeError::Provider(msg) = err else {
-            panic!("expected a provider error");
-        };
+        assert_eq!(
+            err.provider_failure_kind(),
+            Some(forge_core::ProviderFailureKind::Authentication)
+        );
+        let msg = err.to_string();
         assert!(msg.contains("401"), "msg: {msg}");
         assert!(msg.contains("OMLX_API_KEY"), "msg: {msg}");
         assert!(msg.contains("remove model_key_env"), "msg: {msg}");
@@ -1813,9 +1911,11 @@ mod tests {
             .complete(CompletionRequest::new("m", vec![Message::user("x")]))
             .await
             .expect_err("401 must fail");
-        let ForgeError::Provider(msg) = err else {
-            panic!("expected a provider error");
-        };
+        assert_eq!(
+            err.provider_failure_kind(),
+            Some(forge_core::ProviderFailureKind::Authentication)
+        );
+        let msg = err.to_string();
         assert!(msg.contains("model_key_env"), "msg: {msg}");
     }
 
@@ -1843,9 +1943,11 @@ mod tests {
             .complete(CompletionRequest::new("m", vec![Message::user("x")]))
             .await
             .expect_err("500 must fail");
-        let ForgeError::Provider(msg) = err else {
-            panic!("expected a provider error");
-        };
+        assert_eq!(
+            err.provider_failure_kind(),
+            Some(forge_core::ProviderFailureKind::Transient)
+        );
+        let msg = err.to_string();
         assert!(!msg.contains("hint:"), "msg: {msg}");
     }
 
@@ -1891,9 +1993,11 @@ mod tests {
             ))
             .await
             .expect_err("401 must fail");
-        let ForgeError::Provider(msg) = err else {
-            panic!("expected a provider error");
-        };
+        assert_eq!(
+            err.provider_failure_kind(),
+            Some(forge_core::ProviderFailureKind::Authentication)
+        );
+        let msg = err.to_string();
         assert!(msg.contains("OMLX_API_KEY"), "msg: {msg}");
         assert!(msg.contains("remove model_key_env"), "msg: {msg}");
     }
@@ -1928,9 +2032,11 @@ mod tests {
             ))
             .await
             .expect_err("401 must fail");
-        let ForgeError::Provider(msg) = err else {
-            panic!("expected a provider error");
-        };
+        assert_eq!(
+            err.provider_failure_kind(),
+            Some(forge_core::ProviderFailureKind::Authentication)
+        );
+        let msg = err.to_string();
         assert!(msg.contains("ENTRY_ONLY_KEY"), "msg: {msg}");
         assert!(msg.contains("the model entry's key_env"), "msg: {msg}");
         assert!(!msg.contains("remove model_key_env"), "msg: {msg}");
@@ -2807,7 +2913,7 @@ mod tests {
             ))
             .await
             .expect_err("unroutable endpoint must fail");
-        assert!(matches!(err, ForgeError::Provider(_)));
+        assert!(matches!(err, ForgeError::ProviderFailure { .. }));
     }
 
     // --- SSE streaming (TICKET-2) ------------------------------------------

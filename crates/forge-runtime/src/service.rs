@@ -24,6 +24,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::availability::{AvailabilitySnapshot, AvailabilityState, ProviderAvailability};
 use crate::budget::{SpendTracker, completion_cost};
 use crate::tools::{ToolDispatcher, ToolOutcome, minimum_dispatch_risk, tool_definitions};
 
@@ -57,6 +58,21 @@ const NEEDLE_DISPATCH: &str = "needle-dispatch";
 /// in microseconds, far inside this. Not configurable: it is a property of the
 /// engine's one-time setup cost, not a preference.
 const FIRST_TOOL_CALL_PROBE: Duration = Duration::from_millis(250);
+
+fn availability_summary(snapshot: &AvailabilitySnapshot) -> String {
+    let state = match snapshot.state {
+        AvailabilityState::Available => "available",
+        AvailabilityState::RateLimited => "rate limited",
+        AvailabilityState::AuthenticationFailed => "authentication failed",
+        AvailabilityState::TransientFailure => "transient failure observed",
+        AvailabilityState::InvalidRequest => "invalid request observed",
+        AvailabilityState::EntitlementFailed => "entitlement failed",
+    };
+    match snapshot.retry_after_seconds {
+        Some(seconds) => format!("{} ({state}, retry after {seconds}s)", snapshot.model),
+        None => format!("{} ({state})", snapshot.model),
+    }
+}
 
 /// The two `decide` options of the fast-path guardrail. Order matters:
 /// only `GUARD_SAFE` (index 0) lets a call through, and `HashBackend`
@@ -449,6 +465,9 @@ pub struct AgentService {
     /// Resolves a provider for the routed model name; defaults to the
     /// single configured model for every selection.
     model_factory: Option<ModelFactory>,
+    /// Process-local provider evidence. It may narrow an unpinned candidate
+    /// set, but an explicit model choice remains binding and fails visibly.
+    provider_availability: ProviderAvailability,
     /// On-device brain for the direct-dispatch fast path. `None` (the
     /// default) means every run goes through the model loop.
     needle: Option<Arc<NeedleEngine>>,
@@ -515,6 +534,7 @@ impl AgentService {
             compression_enabled,
             system_context: Vec::new(),
             model_factory: None,
+            provider_availability: ProviderAvailability::default(),
             needle: None,
             needle_warmed: AtomicBool::new(false),
             broadcasters: Mutex::new(HashMap::new()),
@@ -582,6 +602,15 @@ impl AgentService {
     pub fn with_model_factory(mut self, factory: ModelFactory) -> Self {
         self.model_factory = Some(factory);
         self
+    }
+
+    pub fn with_provider_availability(mut self, availability: ProviderAvailability) -> Self {
+        self.provider_availability = availability;
+        self
+    }
+
+    pub fn provider_availability(&self) -> ProviderAvailability {
+        self.provider_availability.clone()
     }
 
     /// Attach the on-device Needle brain, enabling the direct-dispatch
@@ -2397,26 +2426,62 @@ impl AgentService {
         // more suggestion the router may improve on — a user who said
         // `--model gpt-5` must never be "rerouted" onto a different
         // provider (least of all one that then errors).
-        let candidates: Vec<String> = if self.config.model_pinned {
-            vec![self.config.model.clone()]
-        } else {
-            let mut candidates: Vec<String> = self.config.model_entries().keys().cloned().collect();
-            if !candidates.contains(&self.config.model) {
-                candidates.push(self.config.model.clone());
-            }
-            candidates.sort();
-            candidates
-        };
+        let (candidates, excluded): (Vec<String>, Vec<AvailabilitySnapshot>) =
+            if self.config.model_pinned {
+                (vec![self.config.model.clone()], Vec::new())
+            } else {
+                let mut candidates: Vec<String> =
+                    self.config.model_entries().keys().cloned().collect();
+                if !candidates.contains(&self.config.model) {
+                    candidates.push(self.config.model.clone());
+                }
+                candidates.sort();
+                let mut excluded = Vec::new();
+                candidates.retain(|model| {
+                    let snapshot = self.provider_availability.snapshot(model);
+                    if snapshot.eligible {
+                        true
+                    } else {
+                        excluded.push(snapshot);
+                        false
+                    }
+                });
+                (candidates, excluded)
+            };
+        if candidates.is_empty() {
+            let reasons = excluded
+                .iter()
+                .map(availability_summary)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(fail(
+                &mut collected,
+                ForgeError::router(format!(
+                    "no model is currently eligible; observed provider state: {reasons}"
+                )),
+            ));
+        }
         let routing_request = RoutingRequest {
             task: task.to_string(),
             required_capabilities: Vec::new(),
             candidates,
         };
         let route_started = std::time::Instant::now();
-        let decision = match self.router.route(&routing_request).await {
+        let mut decision = match self.router.route(&routing_request).await {
             Ok(decision) => decision,
             Err(e) => return Err(fail(&mut collected, e)),
         };
+        if !excluded.is_empty() {
+            let exclusions = excluded
+                .iter()
+                .map(availability_summary)
+                .collect::<Vec<_>>()
+                .join(", ");
+            decision.reason = format!(
+                "{}; excluded by observed provider state: {exclusions}",
+                decision.reason
+            );
+        }
         tracing::info!(
             run_id,
             model = %decision.selected_model,
@@ -2602,8 +2667,14 @@ impl AgentService {
                 )
                 .await
             {
-                Ok(response) => response,
-                Err(e) => return Err(fail(&mut collected, e)),
+                Ok(response) => {
+                    self.provider_availability.observe_success(model.name());
+                    response
+                }
+                Err(e) => {
+                    self.provider_availability.observe_failure(model.name(), &e);
+                    return Err(fail(&mut collected, e));
+                }
             };
             self.account_completion(
                 &decisions,
@@ -2698,8 +2769,14 @@ impl AgentService {
                 )
                 .await
             {
-                Ok(response) => response,
-                Err(e) => return Err(fail(&mut collected, e)),
+                Ok(response) => {
+                    self.provider_availability.observe_success(model.name());
+                    response
+                }
+                Err(e) => {
+                    self.provider_availability.observe_failure(model.name(), &e);
+                    return Err(fail(&mut collected, e));
+                }
             };
             self.account_completion(
                 &decisions,
