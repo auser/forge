@@ -478,6 +478,17 @@ pub struct AgentService {
 }
 
 impl AgentService {
+    pub fn session_store(&self) -> Arc<JsonlSessionStore> {
+        Arc::clone(&self.sessions)
+    }
+
+    /// Wake policy-aware observer cancellation without starting a worker.
+    pub fn notify_observer(&self) {
+        if let Some(observer) = &self.observer {
+            observer.notify();
+        }
+    }
+
     pub fn new(
         model: Arc<dyn ModelProvider>,
         router: Arc<dyn DecisionRouter>,
@@ -962,10 +973,13 @@ impl AgentService {
             for run_id in runs {
                 let own: Vec<&Event> = events.iter().filter(|e| e.run_id == run_id).collect();
                 // A fork marker is provenance, not a run.
-                if own
-                    .iter()
-                    .all(|e| matches!(e.kind, EventKind::SessionForked { .. }))
-                {
+                if own.iter().all(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::SessionForked { .. }
+                            | EventKind::MemoryObservationChanged { .. }
+                    )
+                }) {
                     continue;
                 }
                 let state = self
@@ -3080,7 +3094,13 @@ impl AgentService {
             events
                 .iter()
                 .rev()
-                .find(|e| !matches!(e.kind, EventKind::SessionForked { .. }))
+                .find(|e| {
+                    !matches!(
+                        e.kind,
+                        EventKind::SessionForked { .. }
+                            | EventKind::MemoryObservationChanged { .. }
+                    )
+                })
                 .map(|e| e.run_id.clone())
                 .ok_or_else(|| ForgeError::session("session has no runs"))?
         };

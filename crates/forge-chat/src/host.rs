@@ -14,6 +14,8 @@ use async_trait::async_trait;
 use forge_core::ForgeError;
 use forge_runtime::AgentService;
 
+use crate::io::Line;
+
 /// Everything the chat needs from forge that is not the runtime itself.
 #[async_trait]
 pub trait ChatHost: Send + Sync {
@@ -24,6 +26,49 @@ pub trait ChatHost: Send + Sync {
     /// Run a provider-owned subscription login, then rebuild the runtime so
     /// the new credential is usable without restarting chat.
     async fn authenticate(&mut self, provider: &str) -> Result<(), ForgeError>;
+    /// Inspect the App's current session without starting workers or model calls.
+    async fn context_status(&mut self, _session_id: &str) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "context inspection is unavailable in this host",
+        ))
+    }
+    async fn memory_status(&mut self, _session_id: &str) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "memory inspection is unavailable in this host",
+        ))
+    }
+    /// Session consent for extraction only, never live prompt injection. The
+    /// host enforces project readiness and requests active observer cancellation
+    /// on off; neither control alters the conversation or its active model turn.
+    async fn set_memory_observation(
+        &mut self,
+        _session_id: &str,
+        _enabled: bool,
+    ) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "memory controls are unavailable in this host",
+        ))
+    }
+    /// Bounded backend page (at most 20 items / 16 KiB), with continuation.
+    async fn memory_show(
+        &mut self,
+        _session_id: &str,
+        _offset: usize,
+    ) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "memory inspection is unavailable in this host",
+        ))
+    }
+    /// Source metadata only; never implicitly dump raw source text.
+    async fn memory_sources(
+        &mut self,
+        _session_id: &str,
+        _offset: usize,
+    ) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "memory inspection is unavailable in this host",
+        ))
+    }
     fn environment(&self) -> Environment;
     /// User-visible model candidates only: this is where mock entries are
     /// filtered out, in one place (§9.3).

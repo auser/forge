@@ -41,6 +41,7 @@
 
 use std::time::Duration;
 
+use crate::command::{ContextCommand, MemoryCommand};
 use forge_core::{Event, EventKind, ForgeError};
 use forge_runtime::{Attachment, RunOptions, RunOutcome};
 use tokio::sync::{broadcast, mpsc};
@@ -674,9 +675,46 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Action::ListJobs => self.do_list_jobs(),
                 Action::Attach(run_id) => self.do_attach(run_id),
                 Action::Show(n) => self.do_show(n),
+                Action::Context(ContextCommand::Status) => {
+                    let result = self.host.context_status(&self.session_id).await;
+                    self.emit_inspection(result);
+                }
+                Action::Memory(command) => {
+                    let result = match command {
+                        MemoryCommand::Status => self.host.memory_status(&self.session_id).await,
+                        MemoryCommand::On => {
+                            self.host
+                                .set_memory_observation(&self.session_id, true)
+                                .await
+                        }
+                        MemoryCommand::Off => {
+                            self.host
+                                .set_memory_observation(&self.session_id, false)
+                                .await
+                        }
+                        MemoryCommand::Show { offset } => {
+                            self.host.memory_show(&self.session_id, offset).await
+                        }
+                        MemoryCommand::Sources { offset } => {
+                            self.host.memory_sources(&self.session_id, offset).await
+                        }
+                    };
+                    self.emit_inspection(result);
+                }
                 Action::CancelAllJobs => self.do_cancel_all_jobs(),
                 Action::Quit(code) => self.exit_code = Some(code),
             }
+        }
+    }
+
+    fn emit_inspection(&mut self, result: Result<Vec<Line>, ForgeError>) {
+        match result {
+            Ok(lines) => {
+                for line in lines {
+                    self.emit(line);
+                }
+            }
+            Err(error) => self.emit(Line::bad(format!("error: {error}"))),
         }
     }
 
@@ -1203,6 +1241,155 @@ mod tests {
     use super::*;
     use crate::testing::{FakeHost, ScriptedIo};
     use forge_core::SessionStore;
+
+    #[tokio::test]
+    async fn inspections_and_completion_do_not_start_model_turns() {
+        let (mut host, _tmp) = FakeHost::with_script(r#"[{"text":"unused"}]"#);
+        let service = host.service();
+        let model = host.scripted_model().unwrap();
+        let calls = host.script_inspections((0..6).map(|_| Ok(vec![Line::meta("inspection")])));
+        let mut io = ScriptedIo::batch([
+            "/context status",
+            "/memory status",
+            "/memory on",
+            "/memory off",
+            "/memory show --offset 20",
+            "/memory sources --offset 40",
+        ]);
+        assert_eq!(run(io.handle(), host, Start::fresh()).await.unwrap(), 0);
+        let snapshot = io.last_completions();
+        for text in ["/context ", "/memory ", "/memory s"] {
+            crate::command::Command::complete(text, text.len(), &snapshot);
+        }
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[4].offset, 20);
+        assert_eq!(calls[5].offset, 40);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.session_id == calls[0].session_id)
+        );
+        assert!(service.sessions().list_sessions().unwrap().is_empty());
+        assert!(model.recorded().is_empty());
+        assert!(!io.output().contains("working..."));
+    }
+
+    #[tokio::test]
+    async fn inspection_failure_keeps_chat_and_user_prompt_alive() {
+        let (mut host, _tmp) = FakeHost::with_script(r#"[{"text":"answer after failure"}]"#);
+        let model = host.scripted_model().unwrap();
+        let calls = host.script_inspections([Err(ForgeError::config(
+            "observer prerequisites unavailable",
+        ))]);
+        let mut io = ScriptedIo::batch(["/memory on", "unchanged user prompt"]);
+        assert_eq!(run(io.handle(), host, Start::fresh()).await.unwrap(), 0);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(io.output().contains("observer prerequisites unavailable"));
+        assert!(io.output().contains("answer after failure"));
+        let recorded = model.recorded();
+        assert_eq!(recorded.len(), 1);
+        let user_messages: Vec<_> = recorded[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == forge_core::Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(user_messages, vec!["unchanged user prompt"]);
+    }
+
+    #[tokio::test]
+    async fn inspection_targets_follow_fork_switch_and_new_session() {
+        let (mut host, _tmp) = FakeHost::with_script(r#"[{"text":"seed"}]"#);
+        let service = host.service();
+        let mut seed = ScriptedIo::batch(["seed prompt"]);
+        run(seed.handle(), host.clone(), Start::fresh())
+            .await
+            .unwrap();
+        let original = service.sessions().list_sessions().unwrap()[0]
+            .session_id
+            .clone();
+        let calls = host.script_inspections((0..4).map(|_| Ok(vec![Line::meta("inspection")])));
+        let mut io = ScriptedIo::batch([
+            "/context status".to_string(),
+            "/fork".to_string(),
+            "/memory off".to_string(),
+            format!("/session {original}"),
+            "/memory show".to_string(),
+            "/session new".to_string(),
+            "/memory sources".to_string(),
+        ]);
+        run(io.handle(), host, Start::named(&original))
+            .await
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].session_id, original);
+        assert_ne!(calls[1].session_id, original);
+        assert_eq!(calls[2].session_id, original);
+        assert_ne!(calls[3].session_id, original);
+        assert_ne!(calls[3].session_id, calls[1].session_id);
+    }
+
+    #[tokio::test]
+    async fn inspections_and_off_notify_mid_stream_without_stopping_the_turn() {
+        let (mut host, _tmp) = FakeHost::with_trickled_script(
+            r#"[{"text":"the answer arrives word by word"}]"#,
+            Duration::from_millis(60),
+        );
+        let responses = [
+            "context status result",
+            "memory status result",
+            "memory show result",
+            "memory sources result",
+            "memory off result",
+        ];
+        let calls = host.script_inspections(responses.map(|text| Ok(vec![Line::meta(text)])));
+        let mut io = ScriptedIo::new(["original prompt"]);
+        let chat = tokio::spawn(run(io.handle(), host, Start::fresh()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !io.output().contains("the answer") {
+            assert!(std::time::Instant::now() < deadline, "stream never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for command in [
+            "/context status",
+            "/memory status",
+            "/memory show",
+            "/memory sources",
+            "/memory off",
+        ] {
+            io.push_line(command);
+        }
+        while !io.output().contains("  = ") {
+            assert!(std::time::Instant::now() < deadline, "turn never finished");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        io.push_line("/quit");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), chat)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let notifications = io.notifications();
+        for response in responses {
+            assert!(
+                notifications
+                    .iter()
+                    .any(|line| line.text.contains(response)),
+                "{response}"
+            );
+            let output = io.output();
+            let position = output.find(&format!("  - {response}")).unwrap();
+            assert!(output[..position].ends_with('\n'), "{output}");
+        }
+        assert_eq!(calls.lock().unwrap().len(), 5);
+        assert!(io.output().contains("the answer arrives word by word"));
+        assert!(!io.output().contains("cancelled"));
+    }
 
     /// The host's file list reaches the editor's prompt: after one
     /// submitted line (which refreshes the snapshot), the next read is

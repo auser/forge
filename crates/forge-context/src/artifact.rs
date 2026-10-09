@@ -280,6 +280,29 @@ impl FsArtifactStore {
     ) -> io::Result<T> {
         crate::store::artifact_transaction(&self.root, operation)
     }
+
+    /// Ledger metadata only: no payload verification, eviction or LRU refresh.
+    pub fn inspect(&self) -> io::Result<Option<ArtifactMetadata>> {
+        let Some(bytes) = crate::store::namespace_read(&self.root, "artifacts", MAX_INDEX_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let files = BTreeMap::from([(INDEX.to_string(), bytes)]);
+        let index = load(&files)?;
+        let now = self.clock.now_secs();
+        Ok(Some(ArtifactMetadata {
+            ledgered_objects: index.objects.len(),
+            ledgered_manifests: index.manifests.len(),
+            ledgered_bytes: payload(&index),
+            expired_manifests: index
+                .manifests
+                .values()
+                .filter(|m| now.saturating_sub(m.created) >= self.limits.max_age_secs)
+                .count(),
+            max_project_bytes: self.limits.max_project_bytes,
+            payload_integrity_verified: false,
+        }))
+    }
 }
 impl MemoryArtifactStore {
     fn transaction<T>(
@@ -291,6 +314,16 @@ impl MemoryArtifactStore {
 }
 implement_store!(FsArtifactStore, FsArtifactStore::transaction);
 implement_store!(MemoryArtifactStore, MemoryArtifactStore::transaction);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactMetadata {
+    pub ledgered_objects: usize,
+    pub ledgered_manifests: usize,
+    pub ledgered_bytes: u64,
+    pub expired_manifests: usize,
+    pub max_project_bytes: u64,
+    pub payload_integrity_verified: bool,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

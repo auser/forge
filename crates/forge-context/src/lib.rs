@@ -14,8 +14,8 @@ mod plan;
 mod store;
 
 pub use artifact::{
-    ArtifactClock, ArtifactLimits, ArtifactQuery, ArtifactRead, ArtifactRef, ArtifactSource,
-    ArtifactStore, FsArtifactStore, MAX_ARTIFACT_MANIFESTS, MAX_ARTIFACT_OBJECTS,
+    ArtifactClock, ArtifactLimits, ArtifactMetadata, ArtifactQuery, ArtifactRead, ArtifactRef,
+    ArtifactSource, ArtifactStore, FsArtifactStore, MAX_ARTIFACT_MANIFESTS, MAX_ARTIFACT_OBJECTS,
     MAX_ARTIFACT_RESPONSE_BYTES, MemoryArtifactStore, REDACTION_POLICY_VERSION,
     SanitizedArtifactSource, SanitizedOutput,
 };

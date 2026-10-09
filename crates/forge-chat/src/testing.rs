@@ -56,6 +56,7 @@ enum Trigger {
 struct Shared {
     lines: Mutex<VecDeque<String>>,
     output: Mutex<String>,
+    notifications: Mutex<Vec<Line>>,
     interactivity: Interactivity,
     reads_done: AtomicUsize,
     /// Reads that resolved [`ReadOutcome::Eof`] — the count that makes a
@@ -85,6 +86,10 @@ pub struct ScriptedIo {
 }
 
 impl ScriptedIo {
+    pub fn notifications(&self) -> Vec<Line> {
+        self.shared.notifications.lock().unwrap().clone()
+    }
+
     pub fn new<I, S>(lines: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -112,6 +117,7 @@ impl ScriptedIo {
             shared: Arc::new(Shared {
                 lines: Mutex::new(lines.into_iter().map(Into::into).collect()),
                 output: Mutex::new(String::new()),
+                notifications: Mutex::new(Vec::new()),
                 interactivity,
                 reads_done: AtomicUsize::new(0),
                 eof_reads: AtomicUsize::new(0),
@@ -313,6 +319,7 @@ impl ChatIo for ScriptedIoHandle {
     }
 
     fn notify(&mut self, line: &Line) {
+        self.0.notifications.lock().unwrap().push(line.clone());
         self.record(&line.text, !line.fragment);
     }
 
@@ -358,6 +365,18 @@ pub struct FakeHost {
     /// What `project_files` returns — the `@`-completion source, empty by
     /// default (an unbuilt graph degrades to silence).
     paths: Vec<String>,
+    inspection_results: Arc<Mutex<InspectionResults>>,
+    inspection_calls: Arc<Mutex<Vec<InspectionCall>>>,
+}
+
+type InspectionResults = VecDeque<Result<Vec<Line>, ForgeError>>;
+
+/// What the App actually sent to the host; no implicit fake policy success.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectionCall {
+    pub session_id: String,
+    pub command: &'static str,
+    pub offset: usize,
 }
 
 /// The one-skill registry behind [`FakeHost::with_skill_and_script`]: the
@@ -388,6 +407,32 @@ impl SkillRegistry for StubSkills {
 }
 
 impl FakeHost {
+    pub fn script_inspections(
+        &mut self,
+        results: impl IntoIterator<Item = Result<Vec<Line>, ForgeError>>,
+    ) -> Arc<Mutex<Vec<InspectionCall>>> {
+        *self.inspection_results.lock().unwrap() = results.into_iter().collect();
+        Arc::clone(&self.inspection_calls)
+    }
+
+    fn inspect(
+        &mut self,
+        session_id: &str,
+        command: &'static str,
+        offset: usize,
+    ) -> Result<Vec<Line>, ForgeError> {
+        self.inspection_calls.lock().unwrap().push(InspectionCall {
+            session_id: session_id.to_string(),
+            command,
+            offset,
+        });
+        self.inspection_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err(ForgeError::config("inspection response was not scripted")))
+    }
+
     /// A service whose model is a [`ScriptedMockModel`] parsed from `json`
     /// (see [`ScriptedMockModel::from_json`] for the shape) and whose
     /// execution never asks for approval.
@@ -568,6 +613,8 @@ impl FakeHost {
             skills,
             scripted_model: None,
             paths: Vec::new(),
+            inspection_results: Arc::default(),
+            inspection_calls: Arc::default(),
         };
         (host, tmp)
     }
@@ -575,6 +622,42 @@ impl FakeHost {
 
 #[async_trait]
 impl ChatHost for FakeHost {
+    async fn context_status(&mut self, session_id: &str) -> Result<Vec<Line>, ForgeError> {
+        self.inspect(session_id, "context status", 0)
+    }
+
+    async fn memory_status(&mut self, session_id: &str) -> Result<Vec<Line>, ForgeError> {
+        self.inspect(session_id, "memory status", 0)
+    }
+
+    async fn set_memory_observation(
+        &mut self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<Vec<Line>, ForgeError> {
+        self.inspect(
+            session_id,
+            if enabled { "memory on" } else { "memory off" },
+            0,
+        )
+    }
+
+    async fn memory_show(
+        &mut self,
+        session_id: &str,
+        offset: usize,
+    ) -> Result<Vec<Line>, ForgeError> {
+        self.inspect(session_id, "memory show", offset)
+    }
+
+    async fn memory_sources(
+        &mut self,
+        session_id: &str,
+        offset: usize,
+    ) -> Result<Vec<Line>, ForgeError> {
+        self.inspect(session_id, "memory sources", offset)
+    }
+
     fn service(&self) -> Arc<AgentService> {
         Arc::clone(&self.service)
     }

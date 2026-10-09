@@ -126,6 +126,9 @@ fn format_event(event: &Event) -> String {
             "tool_output_compression source_seq={event_seq} version={version} kind={kind:?} reason={reason:?} baseline_tokens={} view_tokens={} omitted={omitted}",
             baseline.estimated_tokens, view.estimated_tokens,
         ),
+        EventKind::MemoryObservationChanged { enabled } => {
+            format!("memory_observation_changed enabled={enabled}")
+        }
         EventKind::Note { message } => format!("note message={message}"),
         EventKind::Error { message } => format!("error message={message}"),
         EventKind::Cancelled { reason } => format!("cancelled reason={reason}"),

@@ -99,6 +99,12 @@ pub trait ObserverQueue: Send + Sync {
         actual_micro_usd: Option<u64>,
     ) -> ObserverResult<()>;
     fn fail(&self, lease: &ObserverLease, retryable: bool) -> ObserverResult<()>;
+    /// Cancel a local attempt without discarding incurred or ambiguous spend.
+    /// Existing retry bounds still apply; consent cannot reset charge history.
+    fn discard(&self, lease: &ObserverLease, actual_micro_usd: Option<u64>) -> ObserverResult<()> {
+        let _ = actual_micro_usd;
+        self.fail(lease, true)
+    }
     fn reconcile(
         &self,
         job_id: &str,
@@ -157,10 +163,6 @@ fn validate(index: &Index) -> ObserverResult<()> {
             || (r.state == ObserverJobState::Pending && r.attempts != 0)
             || (r.state == ObserverJobState::Retryable && !(1..3).contains(&r.attempts))
             || (r.state == ObserverJobState::Failed && r.attempts == 0)
-            || r.charges.iter().enumerate().any(|(i, c)| {
-                c.actual.is_some()
-                    && (r.state != ObserverJobState::Committed || i + 1 != r.charges.len())
-            })
         {
             return Err(ObserverError::Corrupt);
         }
@@ -289,6 +291,39 @@ pub struct FsObserverQueue {
     clock: Arc<dyn ObserverClock>,
 }
 impl FsObserverQueue {
+    /// Project-wide charged spend today, explicitly separate from session counts.
+    pub fn inspect_daily_charged(&self) -> ObserverResult<Option<u64>> {
+        let Some(bytes) = crate::store::observer_read(&self.root, MAX_INDEX_BYTES)
+            .map_err(|_| ObserverError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        let index = decode(Some(bytes))?;
+        let day = self.clock.now_unix_seconds() / 86400;
+        index
+            .jobs
+            .values()
+            .flat_map(|r| &r.charges)
+            .filter(|c| c.day == day)
+            .try_fold(0, |sum, c| add(sum, c.actual.unwrap_or(c.reserved)))
+            .map(Some)
+    }
+
+    /// Session-filtered persisted queue metadata; never claims or expires leases.
+    pub fn inspect_session(&self, session: &str) -> ObserverResult<Option<ObserverStatus>> {
+        let Some(bytes) = crate::store::observer_read(&self.root, MAX_INDEX_BYTES)
+            .map_err(|_| ObserverError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        let mut index = decode(Some(bytes))?;
+        expire(&mut index, self.clock.now_unix_seconds());
+        index
+            .jobs
+            .retain(|_, record| record.job.session_id == session);
+        status(&index).map(Some)
+    }
+
     fn read_index(&self) -> ObserverResult<Index> {
         decode(
             crate::store::observer_read(&self.root, MAX_INDEX_BYTES)
@@ -505,6 +540,28 @@ macro_rules! impl_queue {
                     };
                     r.lease = None;
                     r.next_attempt_at = add(now, 5)?;
+                    save(files, &index)
+                })
+            }
+            fn discard(
+                &self,
+                lease: &ObserverLease,
+                actual_micro_usd: Option<u64>,
+            ) -> ObserverResult<()> {
+                self.transaction(&mut |files| {
+                    let mut index = load(files)?;
+                    let now = self.clock.now_unix_seconds();
+                    let r = fenced(&mut index, lease, now)?;
+                    r.state = if r.attempts < 3 {
+                        ObserverJobState::Retryable
+                    } else {
+                        ObserverJobState::Failed
+                    };
+                    r.lease = None;
+                    r.next_attempt_at = add(now, 5)?;
+                    if let Some(last) = r.charges.last_mut() {
+                        last.actual = actual_micro_usd;
+                    }
                     save(files, &index)
                 })
             }

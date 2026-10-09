@@ -207,6 +207,12 @@ pub fn observer_chunks(
     let mut start = snap.local_start;
     let mut active = std::collections::BTreeSet::new();
     for (i, event) in events.iter().enumerate().skip((start - 1) as usize) {
+        if matches!(
+            event.kind,
+            EventKind::MemoryObservationChanged { .. } | EventKind::SessionForked { .. }
+        ) {
+            continue;
+        }
         active.insert(event.run_id.as_str());
         if !event.kind.is_terminal() {
             continue;

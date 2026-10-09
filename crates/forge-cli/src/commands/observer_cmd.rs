@@ -10,18 +10,7 @@ use forge_session::JsonlSessionStore;
 use super::Context;
 
 fn micro_usd(value: f64, round_up: bool) -> Result<u64, ForgeError> {
-    let scaled = value * 1_000_000.0;
-    if !scaled.is_finite() || scaled < 0.0 || scaled >= u64::MAX as f64 {
-        return Err(ForgeError::config("observer amount is out of range"));
-    }
-    // Round reservations/rates up; ceilings down. Never create extra spending
-    // permission by rounding or silently price a tiny positive rate as free.
-    let rounded = if round_up {
-        scaled.ceil()
-    } else {
-        scaled.floor()
-    };
-    Ok(rounded as u64)
+    ObserverPrices::micro_usd(value, round_up)
 }
 
 fn budget(config: &forge_config::Config) -> Result<BudgetLimits, ForgeError> {

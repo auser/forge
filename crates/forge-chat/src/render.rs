@@ -86,7 +86,9 @@ impl TranscriptState {
         // block was waiting for). The prefix close is the defensive half:
         // it covers a cancelled or failed run whose message never comes.
         let mut lines = match &event.kind {
-            EventKind::AssistantDelta { .. } | EventKind::AssistantMessage { .. } => Vec::new(),
+            EventKind::AssistantDelta { .. }
+            | EventKind::AssistantMessage { .. }
+            | EventKind::MemoryObservationChanged { .. } => Vec::new(),
             _ => self.close_stream(),
         };
         lines.extend(match &event.kind {
@@ -241,6 +243,7 @@ impl TranscriptState {
             // Its `summary` is an 80-character digest written by the store;
             // the answer comes from `AssistantMessage` or the run outcome.
             EventKind::Completed { .. }
+            | EventKind::MemoryObservationChanged { .. }
             | EventKind::ContextPlanRecorded { .. }
             | EventKind::ContextPlanUnavailable { .. }
             | EventKind::ToolOutputArtifact { .. }
@@ -434,6 +437,37 @@ fn risk_word(risk: RiskLevel) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_policy_event_is_silent_and_does_not_close_a_stream() {
+        let mut transcript = TranscriptState::new();
+        transcript.on_event(&Event::new(
+            "run",
+            "session",
+            EventKind::AssistantDelta {
+                text: "partial ".into(),
+            },
+        ));
+        for enabled in [true, false] {
+            assert!(
+                transcript
+                    .on_event(&Event::new(
+                        "control",
+                        "session",
+                        EventKind::MemoryObservationChanged { enabled }
+                    ))
+                    .is_empty()
+            );
+        }
+        let lines = transcript.on_event(&Event::new(
+            "run",
+            "session",
+            EventKind::AssistantDelta {
+                text: "answer".into(),
+            },
+        ));
+        assert_eq!(lines, vec![Line::fragment("answer")]);
+    }
+
     use super::*;
     use forge_core::{Event, EventKind, RiskLevel, ToolCall};
 

@@ -3,7 +3,7 @@
 //! systems or security/rename operations fail closed at this boundary.
 use std::ffi::{OsStr, c_void};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
@@ -167,7 +167,7 @@ impl PrivateSecurity {
         }
     }
 
-    fn protect(&self, file: &File) -> io::Result<()> {
+    fn check_owner(&self, file: &File) -> io::Result<()> {
         // Refuse foreign-owned objects. Elevated Windows tokens can create
         // objects owned by their default owner group rather than TokenUser;
         // accept that owner too, then seal ownership to the individual user.
@@ -193,6 +193,14 @@ impl PrivateSecurity {
             if EqualSid(owner, self.owner) == 0 && EqualSid(owner, default_owner.Owner) == 0 {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
+        }
+        Ok(())
+    }
+
+    fn protect(&self, file: &File) -> io::Result<()> {
+        self.check_owner(file)?;
+        // SAFETY: the descriptor and validated object handle remain live.
+        unsafe {
             // SetSecurityInfo propagates ACL changes to children, including
             // hardlinks we have not validated. The native operation changes
             // only this handle's object; each child is checked before sealing.
@@ -215,6 +223,30 @@ fn open(
     disposition: u32,
     security: &PrivateSecurity,
 ) -> io::Result<File> {
+    open_with_access(
+        parent,
+        name,
+        directory,
+        Access::Mutable(disposition),
+        security,
+    )
+}
+
+// Inspection is an explicit capability, not a synonym for "do not create":
+// mutable FILE_OPEN operations still seal ACLs and require mutation rights.
+#[derive(Clone, Copy)]
+enum Access {
+    Inspect,
+    Mutable(u32),
+}
+
+fn open_with_access(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+    access: Access,
+    security: &PrivateSecurity,
+) -> io::Result<File> {
     let mut name: Vec<u16> = name.encode_wide().collect();
     // Single components only, including exclusion of NT alternate data streams.
     if name.is_empty()
@@ -235,17 +267,36 @@ fn open(
         RootDirectory: parent.as_raw_handle(),
         ObjectName: &mut unicode,
         Attributes: 0, // case sensitive: distinct validated IDs stay distinct
-        SecurityDescriptor: security.descriptor.0.cast(),
+        SecurityDescriptor: match access {
+            Access::Inspect => null_mut(),
+            Access::Mutable(_) => security.descriptor.0.cast(),
+        },
         SecurityQualityOfService: null_mut(),
     };
     let mut handle = null_mut();
     let mut iosb = IO_STATUS_BLOCK::default();
-    let access = FILE_GENERIC_READ
-        | FILE_GENERIC_WRITE
-        | READ_CONTROL
-        | WRITE_DAC
-        | WRITE_OWNER
-        | if directory { 0 } else { DELETE };
+    let (rights, disposition) = match access {
+        Access::Inspect => (
+            READ_CONTROL
+                | SYNCHRONIZE
+                | FILE_READ_ATTRIBUTES
+                | if directory {
+                    FILE_TRAVERSE
+                } else {
+                    FILE_READ_DATA
+                },
+            FILE_OPEN,
+        ),
+        Access::Mutable(disposition) => (
+            FILE_GENERIC_READ
+                | FILE_GENERIC_WRITE
+                | READ_CONTROL
+                | WRITE_DAC
+                | WRITE_OWNER
+                | if directory { 0 } else { DELETE },
+            disposition,
+        ),
+    };
     // Directory handles deny delete sharing, pinning every traversed component.
     // File readers share delete so replacement never waits for them to close.
     let sharing =
@@ -258,7 +309,7 @@ fn open(
             "open",
             status_result(NtCreateFile(
                 &mut handle,
-                access,
+                rights,
                 &attributes,
                 &mut iosb,
                 null(),
@@ -284,7 +335,10 @@ fn open(
         {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        stage("protect", security.protect(&file))?;
+        match access {
+            Access::Inspect => stage("check-owner", security.check_owner(&file))?,
+            Access::Mutable(_) => stage("protect", security.protect(&file))?,
+        }
         Ok(file)
     }
 }
@@ -293,9 +347,16 @@ fn open(
 struct Tree {
     handles: Vec<File>,
     security: PrivateSecurity,
+    inspect: bool,
 }
 impl Tree {
     fn root(path: &Path, create: bool) -> io::Result<Self> {
+        Self::root_with_access(path, create, false)
+    }
+    fn inspect(path: &Path) -> io::Result<Self> {
+        Self::root_with_access(path, false, true)
+    }
+    fn root_with_access(path: &Path, create: bool, inspect: bool) -> io::Result<Self> {
         let security = PrivateSecurity::new()?;
         let parts: Vec<_> = path.components().collect();
         let boundary = parts
@@ -310,13 +371,14 @@ impl Tree {
         };
         // Only the trusted project ancestry may resolve symlinks.
         let anchor = OpenOptions::new()
-            .read(true)
+            .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(anchor)?;
         let mut tree = Self {
             handles: vec![anchor],
             security,
+            inspect,
         };
         for part in &parts[boundary..] {
             match part {
@@ -333,24 +395,35 @@ impl Tree {
         self.handles.last().unwrap()
     }
     fn descend(&mut self, name: &OsStr, create: bool) -> io::Result<()> {
-        let file = open(
+        let file = open_with_access(
             self.current(),
             name,
             true,
-            if create { FILE_OPEN_IF } else { FILE_OPEN },
+            self.access(create)?,
             &self.security,
         )?;
         self.handles.push(file);
         Ok(())
     }
     fn directory(&self, name: &str, create: bool) -> io::Result<File> {
-        open(
+        open_with_access(
             self.current(),
             name.as_ref(),
             true,
-            if create { FILE_OPEN_IF } else { FILE_OPEN },
+            self.access(create)?,
             &self.security,
         )
+    }
+    fn access(&self, create: bool) -> io::Result<Access> {
+        match (self.inspect, create) {
+            (true, true) => Err(io::ErrorKind::PermissionDenied.into()),
+            (true, false) => Ok(Access::Inspect),
+            (false, _) => Ok(Access::Mutable(if create {
+                FILE_OPEN_IF
+            } else {
+                FILE_OPEN
+            })),
+        }
     }
 }
 
@@ -358,14 +431,14 @@ fn read<T: serde::de::DeserializeOwned>(
     parent: &File,
     name: &str,
     security: &PrivateSecurity,
+    access: Access,
 ) -> io::Result<Option<T>> {
-    let mut file = match open(parent, name.as_ref(), false, FILE_OPEN, security) {
+    let file = match open_with_access(parent, name.as_ref(), false, access, security) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let bytes = super::read_bounded(file, 64 * 1024)?;
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|_| io::ErrorKind::InvalidData.into())
@@ -512,15 +585,19 @@ impl crate::artifact::ArtifactFiles for ArtifactDirectory {
     }
 }
 
-pub(super) fn observer_read(path: &Path, bound: usize) -> io::Result<Option<Vec<u8>>> {
+pub(super) fn namespace_read(
+    path: &Path,
+    namespace: &str,
+    bound: usize,
+) -> io::Result<Option<Vec<u8>>> {
     let result = (|| {
-        let mut tree = Tree::root(path, false)?;
-        tree.descend("observer-jobs".as_ref(), false)?;
-        let input = open(
+        let mut tree = Tree::inspect(path)?;
+        tree.descend(namespace.as_ref(), false)?;
+        let input = open_with_access(
             tree.current(),
             "index.json".as_ref(),
             false,
-            FILE_OPEN,
+            Access::Inspect,
             &tree.security,
         )?;
         super::read_bounded(input, bound).map(Some)
@@ -601,8 +678,15 @@ pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<Context
     }
     let latest = root.directory("latest", true)?;
     let latest_name = format!("{}.json", draft.session_id);
-    let previous: Option<String> =
-        stage("read-latest", read(&latest, &latest_name, &root.security))?;
+    let previous: Option<String> = stage(
+        "read-latest",
+        read(
+            &latest,
+            &latest_name,
+            &root.security,
+            Access::Mutable(FILE_OPEN),
+        ),
+    )?;
     let changed = previous.is_some_and(|hash| hash != draft.stable_prefix.combined_hash);
     let plan = plan_from_draft(draft, changed);
     let plans = root.directory("plans", true)?;
@@ -636,10 +720,15 @@ pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<Context
 
 pub(super) fn plan(path: &Path, run_id: &str, ordinal: u32) -> io::Result<Option<ContextPlan>> {
     let result = (|| {
-        let mut tree = Tree::root(path, false)?;
+        let mut tree = Tree::inspect(path)?;
         tree.descend("plans".as_ref(), false)?;
         tree.descend(run_id.as_ref(), false)?;
-        read(tree.current(), &format!("{ordinal}.json"), &tree.security)
+        read(
+            tree.current(),
+            &format!("{ordinal}.json"),
+            &tree.security,
+            Access::Inspect,
+        )
     })();
     match result {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -701,6 +790,147 @@ mod tests {
             .unwrap();
             let _text = Local(text.cast());
             std::slice::from_raw_parts(text, length as usize).to_vec()
+        }
+    }
+
+    // Retain WRITE_DAC handles before restricting access. Restore the fixture on
+    // unwind too, so read-only directories cannot interfere with TempDir cleanup.
+    struct FixtureDacls {
+        handles: Vec<File>,
+        security: PrivateSecurity,
+    }
+
+    impl FixtureDacls {
+        fn new(paths: &[PathBuf], read_only: bool) -> Self {
+            let security = PrivateSecurity::new().unwrap();
+            let handles: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    OpenOptions::new()
+                        .access_mode(WRITE_DAC)
+                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect();
+            let fixture = Self { handles, security };
+            // SAFETY: SID and descriptors remain live for each synchronous call.
+            unsafe {
+                let mut text = null_mut();
+                bool_result(ConvertSidToStringSidW(fixture.security.owner, &mut text)).unwrap();
+                let _text = Local(text.cast());
+                let mut length = 0;
+                while *text.add(length) != 0 {
+                    length += 1;
+                }
+                let sid = String::from_utf16(std::slice::from_raw_parts(text, length)).unwrap();
+                let dacl = if read_only {
+                    // No group ACE can accidentally grant write access under an
+                    // elevated token. Owner's implicit WRITE_DAC is not data write.
+                    format!("D:P(A;;0x{:x};;;{sid})", FILE_GENERIC_READ | FILE_TRAVERSE)
+                } else {
+                    // Intentionally broader than the backend's private ACL.
+                    format!("D:P(A;;FA;;;{sid})(A;;FR;;;WD)")
+                };
+                let dacl: Vec<u16> = dacl.encode_utf16().chain(Some(0)).collect();
+                let mut descriptor = null_mut();
+                bool_result(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    dacl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                ))
+                .unwrap();
+                let descriptor = Local(descriptor);
+                for handle in &fixture.handles {
+                    status_result(NtSetSecurityObject(
+                        handle.as_raw_handle(),
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        descriptor.0,
+                    ))
+                    .unwrap();
+                }
+            }
+            fixture
+        }
+    }
+
+    impl Drop for FixtureDacls {
+        fn drop(&mut self) {
+            for handle in &self.handles {
+                // SAFETY: retained handles have WRITE_DAC even after ACL changes.
+                let result = unsafe {
+                    NtSetSecurityObject(
+                        handle.as_raw_handle(),
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        self.security.descriptor.0,
+                    )
+                };
+                assert!(result >= 0, "restore fixture DACL: {result}");
+            }
+        }
+    }
+
+    #[test]
+    fn inspection_preserves_broad_and_read_only_security() {
+        use crate::observer::{FsObserverQueue, ObserverQueue};
+
+        for read_only in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let root = project.path().join(".forge/context");
+            let store = FsContextStore::new(&root);
+            let expected = store.record(draft("run", "s", 1, "private")).unwrap();
+            let mut paths = vec![
+                project.path().join(".forge"),
+                root.clone(),
+                root.join("plans"),
+                root.join("plans/run"),
+                root.join("plans/run/1.json"),
+            ];
+            for namespace in ["artifacts", "observations", "observer-jobs"] {
+                fs::create_dir(root.join(namespace)).unwrap();
+                fs::write(root.join(namespace).join("index.json"), br#"{"jobs":{}}"#).unwrap();
+                paths.push(root.join(namespace));
+                paths.push(root.join(namespace).join("index.json"));
+            }
+            let _fixture = FixtureDacls::new(&paths, read_only);
+            let before: Vec<_> = paths.iter().map(|path| security_snapshot(path)).collect();
+            if read_only {
+                for path in &paths {
+                    assert_eq!(
+                        OpenOptions::new()
+                            .access_mode(FILE_WRITE_DATA)
+                            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                            .open(path)
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::PermissionDenied,
+                    );
+                }
+                // FILE_OPEN still means mutable unless explicitly inspecting.
+                assert!(Tree::root(&root, false).is_err());
+            }
+            assert_eq!(store.plan("run", 1).unwrap().unwrap(), expected);
+            assert!(store.plan("run", 2).unwrap().is_none());
+            for namespace in ["artifacts", "observations", "observer-jobs"] {
+                assert_eq!(
+                    namespace_read(&root, namespace, 1024).unwrap().unwrap(),
+                    br#"{"jobs":{}}"#,
+                );
+            }
+            let queue = FsObserverQueue::new(&root);
+            queue.status().unwrap();
+            assert!(queue.jobs().unwrap().is_empty());
+            assert!(queue.inspect_session("s").unwrap().is_some());
+            assert_eq!(queue.inspect_daily_charged().unwrap(), Some(0));
+            assert!(namespace_read(&root, "absent", 1024).unwrap().is_none());
+            assert!(!root.join("absent").exists());
+            for (path, original) in paths.iter().zip(before) {
+                assert_eq!(security_snapshot(path), original, "{path:?}");
+            }
+            assert!(!root.join("observer-jobs/lock").exists());
+            assert!(!root.join("observer-jobs/objects").exists());
         }
     }
 

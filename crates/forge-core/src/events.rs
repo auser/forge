@@ -20,6 +20,7 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 /// * v6 adds compact context accounting plan pointers and failure events.
 /// * v7 adds typed tool artifact retrieval grants, anchored to tool requests.
 /// * v8 adds bounded tool-output compression decisions (not retrieval grants).
+/// * v9 adds session consent for derived observations (never replay content).
 ///
 /// The change is purely additive: no existing kind or field changed
 /// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
@@ -27,7 +28,7 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 /// event kinds an older reader does not know; runs recorded before v3
 /// replay as well as their data allows (see
 /// `forge_runtime::replay::conversation_from_events`).
-pub const EVENT_SCHEMA_VERSION: u32 = 8;
+pub const EVENT_SCHEMA_VERSION: u32 = 9;
 
 /// Version of the tool-policy rules represented by `ToolPolicyDecision`.
 pub const TOOL_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -134,6 +135,10 @@ impl Event {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
+    /// Session policy, inherited through copied fork prefixes. Not a model turn.
+    MemoryObservationChanged {
+        enabled: bool,
+    },
     RunStarted {
         provider: String,
         model: String,
@@ -428,7 +433,7 @@ mod tests {
             },
         );
         let value = serde_json::to_value(&event).unwrap();
-        assert_eq!(value["v"], 8);
+        assert_eq!(value["v"], EVENT_SCHEMA_VERSION);
         assert_eq!(value["type"], "tool_output_compression");
         assert_eq!(value["kind"], "search");
         assert_eq!(value["reason"], "compressed");

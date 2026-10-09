@@ -1667,6 +1667,67 @@ forge resume <id>         # continue a completed run: a new run in the same
                           # replayed as the model's history
 ```
 
+### Context and session memory controls
+
+Inspection is explicit; ordinary chat does not gain extra status chatter:
+
+```text
+/context status
+/memory status
+/memory on
+/memory off
+/memory show
+/memory sources
+/memory show --offset 20
+/memory sources --offset 20
+```
+
+Chat targets its current session, including after a switch or fork. CLI
+equivalents always require an explicit session:
+
+```bash
+forge context status --session <id> --json
+forge memory status --session <id> --json
+forge memory on --session <id>
+forge memory off --session <id>
+forge memory show --session <id> --offset 0 --json
+forge memory sources --session <id> --offset 0 --json
+```
+
+`memory on` grants observation-extraction consent only. It does not inject
+observations into prompts, select another model, grant hosted egress, or bypass
+pricing and spending controls. Project observer configuration must be enabled
+and usable first. Sessions without an explicit consent event are off by default,
+even when the project observer is enabled; previously stored observations remain.
+Resume retains the latest policy in session history. Forks inherit only policy
+through their cut and can change independently afterward.
+
+`memory off` prevents new discovery/dispatch and requests cancellation of active
+observation where possible. It does not cancel the chat turn, delete existing
+observations, or refund incurred/ambiguous provider charges. Remote work or a
+commit already completing cannot necessarily be undone.
+Toggling consent does not reset the observer's three-attempt safety limit;
+cancelled attempts can exhaust a job, which remains visible as failed.
+
+Context status separates latest request budgets and prefix drift, cumulative
+compression/retrieval metrics, and project-level artifact metadata health.
+Memory status distinguishes raw events, session observations, jobs and desired
+consent versus effective eligibility. Live prompt injection and consolidated
+memory are explicitly reported unavailable; neither is implied by `on`.
+Missing or unreadable derived stores are not presented as empty healthy stores.
+
+Observation and source pages are bounded, ordered and report continuation.
+Inspection uses immutable ledger commit order so later commits for earlier
+source ranges do not shift existing page offsets. Rendering for model context
+retains its separate source-order rule.
+Source inspection provides observation provenance, not an automatic raw-event
+dump. Inspection does not create an absent context store or refresh artifact
+retention. JSON mode produces one machine-readable document without TTY activity
+on stdout. Read-only chat commands remain usable during a streaming turn.
+Effective eligibility reports policy and estimated budget affordability, not
+an immediate dispatch promise; worker leases, retry limits and atomic cost
+reservations still apply.
+
 ### Observation ledger groundwork
 
 The context crate provides a fixture-fed observation ledger and deterministic
@@ -1711,7 +1772,7 @@ as child-local history.
 
 Background observation is disabled by default and never silently reuses the
 active conversation model. Enabling it requires an explicit model and known
-input/output prices:
+input/output prices, plus session consent through `/memory on`:
 
 ```toml
 [observer]
