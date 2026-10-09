@@ -41,6 +41,316 @@ fn run(f: &ContextMemoryService, session: &str, id: &str) {
 }
 
 #[test]
+fn facade_session_errors_never_expose_private_variants_or_paths() {
+    let (dir, f) = fixture();
+    run(&f, "s", "r");
+    let path = dir.path().join(".forge/sessions/s.jsonl");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let private = "private_unknown_event_distinctive_82374";
+    let corrupt = original.replace("run_started", private);
+    assert_ne!(original, corrupt);
+    std::fs::write(&path, &corrupt).unwrap();
+    let errors = [
+        f.context_status("s").unwrap_err(),
+        f.memory_status("s").unwrap_err(),
+        f.memory_show("s", 0).unwrap_err(),
+        f.memory_sources("s", 0).unwrap_err(),
+        f.set_memory_enabled("s", true).unwrap_err(),
+        f.set_memory_enabled("s", false).unwrap_err(),
+    ];
+    for error in errors {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains(private));
+            assert!(!rendered.contains(dir.path().to_str().unwrap()));
+            assert!(!rendered.contains("s.jsonl"));
+            assert!(rendered.contains("session events unavailable"));
+        }
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), corrupt);
+}
+
+fn commit_records(f: &ContextMemoryService, session: &str, start: u64, count: usize) {
+    let events = f.events(session).unwrap();
+    let drafts = (0..count)
+        .map(|i| ObservationDraft {
+            scope: ObservationScope::Session,
+            kind: ObservationKind::State,
+            content: format!("record-{start}-{i}"),
+        })
+        .collect();
+    FsObservationStore::new(&f.root)
+        .commit(
+            ValidatedObservationBatch::new(
+                session,
+                &events,
+                SourceRange {
+                    start,
+                    end: start + 1,
+                },
+                forge_context::OBSERVER_VERSION,
+                drafts,
+                f.sessions.redactor(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn record_offsets_survive_late_commit_of_earlier_source() {
+    let (_dir, f) = fixture();
+    run(&f, "s", "early");
+    run(&f, "s", "late");
+    commit_records(&f, "s", 3, 21);
+    let first = f.memory_show("s", 0).unwrap();
+    assert_eq!(first.items.len(), 20);
+    assert_eq!(first.next_offset, Some(20));
+    commit_records(&f, "s", 1, 1);
+    let rest = f.memory_show("s", first.next_offset.unwrap()).unwrap();
+    assert_eq!(
+        rest.items
+            .iter()
+            .map(|i| i.content.as_str())
+            .collect::<Vec<_>>(),
+        ["record-3-20", "record-1-0"]
+    );
+    assert_eq!(rest.next_offset, None);
+    let ids = first
+        .items
+        .iter()
+        .chain(&rest.items)
+        .map(|i| &i.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 22);
+}
+
+#[test]
+fn source_offsets_survive_late_commit_of_earlier_source() {
+    let (_dir, f) = fixture();
+    for i in 0..22 {
+        run(&f, "s", &format!("r{i}"));
+    }
+    for i in 1..22 {
+        commit_records(&f, "s", i * 2 + 1, 1);
+    }
+    let first = f.memory_sources("s", 0).unwrap();
+    assert_eq!(first.items.len(), 20);
+    assert_eq!(first.next_offset, Some(20));
+    commit_records(&f, "s", 1, 1);
+    let rest = f.memory_sources("s", 20).unwrap();
+    assert_eq!(
+        rest.items.iter().map(|i| i.range.start).collect::<Vec<_>>(),
+        [43, 1]
+    );
+    assert_eq!(rest.next_offset, None);
+    let ids = first
+        .items
+        .iter()
+        .chain(&rest.items)
+        .map(|i| &i.batch_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 22);
+}
+
+#[test]
+fn frozen_fork_order_and_live_append_keep_existing_offsets() {
+    let (_dir, f) = fixture();
+    for i in 0..3 {
+        run(&f, "parent", &format!("r{i}"));
+    }
+    // Freeze a prefix whose commit order intentionally differs from source order.
+    commit_records(&f, "parent", 5, 20);
+    commit_records(&f, "parent", 3, 1);
+    f.sessions.copy_prefix("parent", "child", 6).unwrap();
+    f.sessions
+        .append(Event::new(
+            "fork",
+            "child",
+            EventKind::SessionForked {
+                from_session: "parent".into(),
+                at_position: 6,
+            },
+        ))
+        .unwrap();
+    FsObservationStore::new(&f.root)
+        .fork(
+            "parent",
+            &f.events("parent").unwrap(),
+            "child",
+            &f.events("child").unwrap(),
+            6,
+            f.sessions.redactor(),
+        )
+        .unwrap();
+    let first = f.memory_show("child", 0).unwrap();
+    assert_eq!(first.items.len(), 20);
+    assert_eq!(first.items[0].content, "record-5-0");
+    assert_eq!(first.next_offset, Some(20));
+    // Parent commits after the cut are not injected into the frozen projection.
+    commit_records(&f, "parent", 1, 1);
+    run(&f, "child", "local");
+    commit_records(&f, "child", 8, 1);
+    let rest = f.memory_show("child", 20).unwrap();
+    assert_eq!(
+        rest.items
+            .iter()
+            .map(|i| i.content.as_str())
+            .collect::<Vec<_>>(),
+        ["record-3-0", "record-8-0"]
+    );
+    assert_eq!(rest.next_offset, None);
+    let sources = f.memory_sources("child", 0).unwrap();
+    assert_eq!(
+        sources
+            .items
+            .iter()
+            .map(|i| i.range.start)
+            .collect::<Vec<_>>(),
+        [5, 3, 8]
+    );
+}
+
+fn prices_and_budget(f: &mut ContextMemoryService, price: f64, session: f64, daily: f64) {
+    let config = Arc::make_mut(&mut f.config);
+    config.observer.session_usd = session;
+    config.observer.daily_usd = daily;
+    let entry = config.models.get_mut("test-observer").unwrap();
+    entry.cost_input_per_mtok = Some(price);
+    entry.cost_output_per_mtok = Some(price);
+}
+
+#[test]
+fn missing_queue_zero_ceilings_preserve_consent_but_require_affordability() {
+    let (_dir, mut f) = fixture();
+    // A tiny positive price is rounded up, never silently made free.
+    prices_and_budget(&mut f, 0.0000000001, 0.0, 0.0);
+    let status = f.set_memory_enabled("s", true).unwrap();
+    assert!(status.desired_enabled);
+    assert!(!status.effective_eligible);
+    assert!(matches!(status.session_jobs, StoreInspection::Missing));
+    assert!(
+        status
+            .unavailable_reasons
+            .iter()
+            .any(|r| r.starts_with("session observer budget"))
+    );
+    assert!(
+        status
+            .unavailable_reasons
+            .iter()
+            .any(|r| r.starts_with("project daily observer budget"))
+    );
+    prices_and_budget(&mut f, 0.0, 0.0, 0.0);
+    assert!(f.memory_status("s").unwrap().effective_eligible);
+}
+
+#[test]
+fn known_chunk_reservation_must_fit_both_ceilings() {
+    let (_dir, mut f) = fixture();
+    run(&f, "s", "r");
+    prices_and_budget(&mut f, 1.0, 1.0, 1.0);
+    f.set_memory_enabled("s", true).unwrap();
+    let events = f.events("s").unwrap();
+    let reserve = f
+        .inspection_reservation("s", &events, &StoreInspection::Missing)
+        .unwrap();
+    assert!(reserve > 1);
+    let exact = reserve as f64 / 1_000_000.0;
+    let short = (reserve - 1) as f64 / 1_000_000.0;
+    prices_and_budget(&mut f, 1.0, short, 1.0);
+    assert!(!f.memory_status("s").unwrap().effective_eligible);
+    prices_and_budget(&mut f, 1.0, 1.0, short);
+    assert!(!f.memory_status("s").unwrap().effective_eligible);
+    prices_and_budget(&mut f, 1.0, exact, exact);
+    assert!(f.memory_status("s").unwrap().effective_eligible);
+}
+
+#[test]
+fn smaller_affordable_chunk_remains_eligible_when_larger_chunk_is_blocked() {
+    let (_dir, mut f) = fixture();
+    run(&f, "s", "small");
+    for kind in [
+        EventKind::RunStarted {
+            provider: "local".into(),
+            model: "local".into(),
+            prompt: "large".repeat(1000),
+        },
+        EventKind::Completed {
+            summary: "done".into(),
+        },
+    ] {
+        f.sessions.append(Event::new("large", "s", kind)).unwrap();
+    }
+    prices_and_budget(&mut f, 1.0, 1.0, 1.0);
+    f.set_memory_enabled("s", true).unwrap();
+    let events = f.events("s").unwrap();
+    let policy = forge_context::ObserverPolicy {
+        observer_version: forge_context::OBSERVER_VERSION.into(),
+        model: "test-observer".into(),
+        prompt_version: forge_context::OBSERVER_PROMPT_VERSION.into(),
+        limits: forge_context::ObserverLimits::default(),
+    };
+    let chunks =
+        forge_context::observer_chunks("s", &events, f.sessions.redactor(), &policy).unwrap();
+    let costs = chunks
+        .iter()
+        .map(|chunk| {
+            f.prices()
+                .unwrap()
+                .cost(
+                    chunk.input_tokens,
+                    u64::from(policy.limits.max_output_tokens),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(costs.len(), 2);
+    assert!(costs[0] < costs[1]);
+    let limit = (costs[0] + 1) as f64 / 1_000_000.0;
+    prices_and_budget(&mut f, 1.0, limit, limit);
+    assert!(f.memory_status("s").unwrap().effective_eligible);
+}
+
+#[test]
+fn charged_equality_allows_free_work_but_never_spend_above_either_limit() {
+    use forge_context::{BudgetLimits, ObserverQueue};
+    let (_dir, mut f) = fixture();
+    run(&f, "s", "r");
+    let policy = forge_context::ObserverPolicy {
+        observer_version: forge_context::OBSERVER_VERSION.into(),
+        model: "test-observer".into(),
+        prompt_version: forge_context::OBSERVER_PROMPT_VERSION.into(),
+        limits: forge_context::ObserverLimits::default(),
+    };
+    let job = forge_context::observer_chunks(
+        "s",
+        &f.events("s").unwrap(),
+        f.sessions.redactor(),
+        &policy,
+    )
+    .unwrap()
+    .remove(0)
+    .job;
+    let queue = FsObserverQueue::new(&f.root);
+    queue.enqueue(job.clone()).unwrap();
+    queue
+        .claim(&job.id, 10, BudgetLimits::default())
+        .unwrap()
+        .unwrap();
+    for (price, session, daily, eligible) in [
+        (0.0, 0.000010, 0.000010, true),
+        (1.0, 0.000010, 0.000010, false),
+        (0.0, 0.000009, 0.000010, false),
+        (0.0, 0.000010, 0.000009, false),
+    ] {
+        prices_and_budget(&mut f, price, session, daily);
+        let status = f.set_memory_enabled("s", true).unwrap();
+        assert!(status.desired_enabled);
+        assert_eq!(status.effective_eligible, eligible);
+    }
+}
+
+#[test]
 fn absent_queries_are_default_off_and_create_nothing() {
     let (dir, f) = fixture();
     let status = f.memory_status("fresh").unwrap();

@@ -27,7 +27,21 @@ pub struct ObserverPrices {
 }
 
 impl ObserverPrices {
-    fn cost(self, input: u64, output: u64) -> Option<u64> {
+    /// Convert dollar amounts without granting spending permission through
+    /// rounding: rates round up, budget ceilings round down.
+    pub fn micro_usd(value: f64, round_up: bool) -> Result<u64, ForgeError> {
+        let scaled = value * 1_000_000.0;
+        if !scaled.is_finite() || scaled < 0.0 || scaled >= u64::MAX as f64 {
+            return Err(ForgeError::config("observer amount is out of range"));
+        }
+        Ok(if round_up {
+            scaled.ceil()
+        } else {
+            scaled.floor()
+        } as u64)
+    }
+
+    pub(crate) fn cost(self, input: u64, output: u64) -> Option<u64> {
         let numerator = u128::from(input)
             .checked_mul(u128::from(self.input_micro_usd_per_million))?
             .checked_add(

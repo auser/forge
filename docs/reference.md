@@ -1717,10 +1717,16 @@ memory are explicitly reported unavailable; neither is implied by `on`.
 Missing or unreadable derived stores are not presented as empty healthy stores.
 
 Observation and source pages are bounded, ordered and report continuation.
+Inspection uses immutable ledger commit order so later commits for earlier
+source ranges do not shift existing page offsets. Rendering for model context
+retains its separate source-order rule.
 Source inspection provides observation provenance, not an automatic raw-event
 dump. Inspection does not create an absent context store or refresh artifact
 retention. JSON mode produces one machine-readable document without TTY activity
 on stdout. Read-only chat commands remain usable during a streaming turn.
+Effective eligibility reports policy and estimated budget affordability, not
+an immediate dispatch promise; worker leases, retry limits and atomic cost
+reservations still apply.
 
 ### Observation ledger groundwork
 

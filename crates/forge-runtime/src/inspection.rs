@@ -12,6 +12,8 @@ use forge_core::{Event, EventKind, ForgeError, SessionStore};
 use forge_session::JsonlSessionStore;
 use serde::Serialize;
 
+use crate::observer::ObserverPrices;
+
 // Serializes local policy publication with the final commitment check. Remote
 // processes are detected by polling; a commit already in progress cannot undo.
 pub(crate) static MEMORY_POLICY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -59,6 +61,10 @@ pub struct ContextStatus {
 pub struct MemoryStatus {
     pub session_id: String,
     pub desired_enabled: bool,
+    /// Policy eligibility, not dispatch readiness: at least one estimated
+    /// unobserved chunk must fit the budget. With none, check minimum priced
+    /// token allowance. Leases, retries and future source chunks still require
+    /// the worker's atomic reservation check.
     pub effective_eligible: bool,
     pub unavailable_reasons: Vec<String>,
     pub raw_event_count: usize,
@@ -142,7 +148,9 @@ impl ContextMemoryService {
         {
             return Err(ForgeError::session("invalid session identifier"));
         }
-        self.sessions.events_for(session)
+        self.sessions
+            .events_for(session)
+            .map_err(|_| ForgeError::session("session events unavailable"))
     }
 
     fn prerequisites(&self) -> Vec<String> {
@@ -159,6 +167,26 @@ impl ContextMemoryService {
         if model.is_none() {
             reasons.push("observer requires an explicit model".into());
         }
+        if self.prices().is_none() {
+            reasons.push("observer requires complete known input and output prices".into());
+        }
+        if [
+            self.config.observer.session_usd,
+            self.config.observer.daily_usd,
+        ]
+        .into_iter()
+        .any(|v| ObserverPrices::micro_usd(v, false).is_err())
+        {
+            reasons.push("observer budget is invalid".into());
+        }
+        if let ObserverReadiness::Unavailable { reason } = &self.readiness {
+            reasons.push(reason.clone());
+        }
+        reasons
+    }
+
+    fn prices(&self) -> Option<ObserverPrices> {
+        let model = self.config.observer.model.as_deref();
         let entries = self.config.model_entries();
         let catalogue = forge_config::catalogue::load_for_routing(&self.config);
         let book = forge_config::CostBook::new(
@@ -173,27 +201,11 @@ impl ContextMemoryService {
             }
             book.price(name)
         });
-        let priced = prices.is_some_and(|(input, output)| {
-            [input, output]
-                .into_iter()
-                .all(|v| v.is_finite() && v >= 0.0)
-        });
-        if !priced {
-            reasons.push("observer requires complete known input and output prices".into());
-        }
-        if [
-            self.config.observer.session_usd,
-            self.config.observer.daily_usd,
-        ]
-        .into_iter()
-        .any(|v| !v.is_finite() || v < 0.0)
-        {
-            reasons.push("observer budget is invalid".into());
-        }
-        if let ObserverReadiness::Unavailable { reason } = &self.readiness {
-            reasons.push(reason.clone());
-        }
-        reasons
+        let (input, output) = prices?;
+        Some(ObserverPrices {
+            input_micro_usd_per_million: ObserverPrices::micro_usd(input, true).ok()?,
+            output_micro_usd_per_million: ObserverPrices::micro_usd(output, true).ok()?,
+        })
     }
 
     fn batches(&self, session: &str, events: &[Event]) -> StoreInspection<Vec<ObservationBatch>> {
@@ -217,7 +229,8 @@ impl ContextMemoryService {
         if !desired_enabled {
             reasons.push("session consent is off".into());
         }
-        let observations = match self.batches(session, &events) {
+        let batches = self.batches(session, &events);
+        let observations = match &batches {
             StoreInspection::Available(batches) => {
                 StoreInspection::Available(batches.iter().map(|b| b.observations.len()).sum())
             }
@@ -226,17 +239,7 @@ impl ContextMemoryService {
             StoreInspection::Unavailable => StoreInspection::Unavailable,
         };
         let jobs = match FsObserverQueue::new(&self.root).inspect_session(session) {
-            Ok(Some(status)) => {
-                let charged = status
-                    .known_micro_usd
-                    .saturating_add(status.unknown_micro_usd)
-                    .saturating_add(status.reserved_micro_usd);
-                if charged > 0 && charged >= (self.config.observer.session_usd * 1_000_000.0) as u64
-                {
-                    reasons.push("session observer budget exhausted".into());
-                }
-                StoreInspection::Available(status)
-            }
+            Ok(Some(status)) => StoreInspection::Available(status),
             Ok(None) => StoreInspection::Missing,
             Err(ObserverError::Corrupt) => StoreInspection::Corrupt,
             Err(_) => StoreInspection::Unavailable,
@@ -261,16 +264,46 @@ impl ContextMemoryService {
             reasons.push("fork observation snapshot is unavailable".into());
         }
         let daily = match FsObserverQueue::new(&self.root).inspect_daily_charged() {
-            Ok(Some(charged)) => {
-                if charged > 0 && charged >= (self.config.observer.daily_usd * 1_000_000.0) as u64 {
-                    reasons.push("project daily observer budget exhausted".into());
-                }
-                StoreInspection::Available(charged)
-            }
+            Ok(Some(charged)) => StoreInspection::Available(charged),
             Ok(None) => StoreInspection::Missing,
             Err(ObserverError::Corrupt) => StoreInspection::Corrupt,
             Err(_) => StoreInspection::Unavailable,
         };
+        let reservation = self.inspection_reservation(session, &events, &batches);
+        let charged = match &jobs {
+            StoreInspection::Missing => Some(0),
+            StoreInspection::Available(status) => status
+                .known_micro_usd
+                .checked_add(status.unknown_micro_usd)
+                .and_then(|value| value.checked_add(status.reserved_micro_usd)),
+            _ => None,
+        };
+        let daily_charged = match &daily {
+            StoreInspection::Missing => Some(0),
+            StoreInspection::Available(charged) => Some(*charged),
+            _ => None,
+        };
+        for (charged, ceiling, reason) in [
+            (
+                charged,
+                self.config.observer.session_usd,
+                "session observer budget cannot reserve",
+            ),
+            (
+                daily_charged,
+                self.config.observer.daily_usd,
+                "project daily observer budget cannot reserve",
+            ),
+        ] {
+            let affordable = charged
+                .zip(reservation)
+                .and_then(|(charged, reserve)| charged.checked_add(reserve))
+                .zip(ObserverPrices::micro_usd(ceiling, false).ok())
+                .is_some_and(|(needed, limit)| needed <= limit);
+            if !affordable {
+                reasons.push(reason.into());
+            }
+        }
         Ok(MemoryStatus {
             session_id: session.into(),
             desired_enabled,
@@ -287,6 +320,46 @@ impl ContextMemoryService {
             session_budget_usd: self.config.observer.session_usd,
             project_daily_budget_usd: self.config.observer.daily_usd,
         })
+    }
+
+    fn inspection_reservation(
+        &self,
+        session: &str,
+        events: &[Event],
+        batches: &StoreInspection<Vec<ObservationBatch>>,
+    ) -> Option<u64> {
+        let prices = self.prices()?;
+        let policy = forge_context::ObserverPolicy {
+            observer_version: forge_context::OBSERVER_VERSION.into(),
+            model: self.config.observer.model.clone()?,
+            prompt_version: forge_context::OBSERVER_PROMPT_VERSION.into(),
+            limits: forge_context::ObserverLimits::default(),
+        };
+        let chunks =
+            forge_context::observer_chunks(session, events, self.sessions.redactor(), &policy)
+                .ok()?;
+        let mut reservation: Option<u64> = None;
+        for chunk in chunks {
+            if let StoreInspection::Available(batches) = batches
+                && batches.iter().any(|batch| {
+                    batch.source_session_id == session
+                        && batch.observer_version == policy.observer_version
+                        && batch.range == chunk.job.range
+                        && batch.source_fingerprint == chunk.job.source_fingerprint
+                })
+            {
+                continue;
+            }
+            let cost = prices.cost(
+                chunk.input_tokens,
+                u64::from(policy.limits.max_output_tokens),
+            )?;
+            reservation = Some(reservation.map_or(cost, |minimum| minimum.min(cost)));
+        }
+        // A large blocked chunk must not hide an affordable smaller chunk.
+        // With no pending source, require room for at least one priced token.
+        // Zero-price work remains affordable exactly at the ceiling.
+        reservation.or_else(|| prices.cost(1, 1))
     }
 
     /// Allows an absent safe current-chat ID; CLI hosts must check existence.
@@ -406,14 +479,10 @@ impl ContextMemoryService {
 
     pub fn memory_show(&self, session: &str, offset: usize) -> Result<MemoryPage, ForgeError> {
         let events = self.events(session)?;
-        let (store, mut batches) = split(self.batches(session, &events));
-        batches.sort_by(|a, b| {
-            (&a.source_session_id, a.range.start, &a.id).cmp(&(
-                &b.source_session_id,
-                b.range.start,
-                &b.id,
-            ))
-        });
+        // Inspection follows immutable ledger commit order (including the frozen
+        // fork prefix), then record order within each batch. Unlike the canonical
+        // renderer's source order, appending an earlier source cannot move offsets.
+        let (store, batches) = split(self.batches(session, &events));
         let items = batches
             .into_iter()
             .flat_map(|b| {
@@ -451,14 +520,8 @@ impl ContextMemoryService {
         offset: usize,
     ) -> Result<MemorySourcePage, ForgeError> {
         let events = self.events(session)?;
-        let (store, mut batches) = split(self.batches(session, &events));
-        batches.sort_by(|a, b| {
-            (&a.source_session_id, a.range.start, &a.id).cmp(&(
-                &b.source_session_id,
-                b.range.start,
-                &b.id,
-            ))
-        });
+        // Same append-stable ledger order as memory_show, not renderer order.
+        let (store, batches) = split(self.batches(session, &events));
         let items = batches
             .into_iter()
             .map(|b| MemorySource {
