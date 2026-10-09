@@ -549,6 +549,9 @@ impl ModelProvider for AnthropicModel {
             .map_err(|e| send_error(&url, e))?;
 
         let status = response.status();
+        if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
+            return Err(error);
+        }
         if let Some(max_bytes) = self.response_max_bytes {
             let bytes = crate::response::bounded_bytes(response, max_bytes).await?;
             if !status.is_success() {
@@ -590,6 +593,9 @@ impl ModelProvider for AnthropicModel {
         };
 
         let status = response.status();
+        if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
+            return Err(error);
+        }
         if !status.is_success() {
             // Nothing was shown yet, so exactly one non-streaming retry is
             // safe and cheap.
@@ -1181,6 +1187,32 @@ mod tests {
             second.get("stream").is_none(),
             "the fallback must not retry the stream: {second}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_rate_limit_is_typed_and_never_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "19")
+                    .set_body_string("rate limited"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = model(&server.uri(), CredentialKind::ApiKey);
+        let (deltas, response) = stream_with(&model).await;
+        assert!(deltas.is_empty());
+        assert!(matches!(
+            response,
+            Err(ForgeError::ProviderRateLimited {
+                provider,
+                retry_after_seconds: Some(19),
+            }) if provider == "claude-sonnet"
+        ));
+        assert_eq!(server.received_requests().await.expect("requests").len(), 1);
     }
 
     /// The OAuth arm on the streaming path: bearer token plus the beta

@@ -101,6 +101,12 @@ Run `forge auth login claude`, `forge auth login codex`, or
 `forge auth login kimi`; see [Authentication](#authentication) for the full
 resolution order.
 
+Generation adapters treat an observed HTTP `429` as a typed rate-limit
+interruption. When the provider supplies a numeric `Retry-After`, Forge reports
+the number of seconds; it does not guess a reset time, infer remaining quota,
+or immediately retry a rejected streaming request as a second whole-response
+request. The recorded session remains resumable with `forge resume <id>`.
+
 `--local-only` means what it says: forge refuses to build a model provider
 whose endpoint is off this machine (including one a router picked), prunes the
 Jev tier in both roles, degrades an off-device `http`/`laya` router to static,

@@ -6,6 +6,25 @@
 
 use forge_core::ForgeError;
 
+/// Turn an observed HTTP 429 into a typed error before its body is consumed
+/// or a streaming caller decides to retry. Only the delta-seconds form is
+/// retained: it is actionable without clock assumptions, and malformed or
+/// date-form values remain an honest unknown rather than a guessed reset.
+pub(crate) fn rate_limit_error(provider: &str, response: &reqwest::Response) -> Option<ForgeError> {
+    if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let retry_after_seconds = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    Some(ForgeError::provider_rate_limited(
+        provider,
+        retry_after_seconds,
+    ))
+}
+
 pub(crate) async fn bounded_bytes(
     mut response: reqwest::Response,
     max_bytes: usize,

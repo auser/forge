@@ -12,6 +12,19 @@ pub enum ForgeError {
     #[error("model provider error: {0}")]
     Provider(String),
 
+    /// The provider explicitly refused a generation request because its
+    /// current rate limit was exhausted. `retry_after_seconds` is present
+    /// only when the provider supplied a valid `Retry-After` delta; Forge
+    /// never invents provider capacity or a reset time.
+    #[error(
+        "model provider {provider} rate limited (HTTP 429){retry_after}",
+        retry_after = retry_after_suffix(*retry_after_seconds)
+    )]
+    ProviderRateLimited {
+        provider: String,
+        retry_after_seconds: Option<u64>,
+    },
+
     #[error("router error: {0}")]
     Router(String),
 
@@ -74,6 +87,16 @@ impl ForgeError {
         Self::Provider(message.into())
     }
 
+    pub fn provider_rate_limited(
+        provider: impl Into<String>,
+        retry_after_seconds: Option<u64>,
+    ) -> Self {
+        Self::ProviderRateLimited {
+            provider: provider.into(),
+            retry_after_seconds,
+        }
+    }
+
     pub fn router(message: impl Into<String>) -> Self {
         Self::Router(message.into())
     }
@@ -112,4 +135,10 @@ impl ForgeError {
     pub fn cancelled(message: impl Into<String>) -> Self {
         Self::Cancelled(message.into())
     }
+}
+
+fn retry_after_suffix(seconds: Option<u64>) -> String {
+    seconds
+        .map(|seconds| format!("; retry after {seconds} seconds"))
+        .unwrap_or_default()
 }

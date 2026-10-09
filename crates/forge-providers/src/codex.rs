@@ -250,6 +250,9 @@ impl ModelProvider for CodexModel {
                 ForgeError::provider(format!("Codex request failed: {}", error_detail(&e)))
             })?;
         let status = response.status();
+        if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
+            return Err(error);
+        }
         if let Some(max_bytes) = self.response_max_bytes {
             // Codex complete is SSE on the wire: bound the whole event
             // envelope, not just the final extracted answer.
@@ -286,6 +289,45 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, header, method, path},
     };
+
+    #[tokio::test]
+    async fn rate_limit_preserves_retry_after_without_reading_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "23")
+                    .set_body_string("private account detail"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = CodexModel::new(
+            Some(server.uri()),
+            "gpt-test",
+            "oauth-token",
+            "acct-1",
+            Duration::from_secs(5),
+            EgressPolicy::default(),
+        )
+        .expect("model");
+
+        let error = model
+            .complete(CompletionRequest::new(
+                "gpt-test",
+                vec![Message::user("hello")],
+            ))
+            .await
+            .expect_err("rate limited");
+        assert!(matches!(
+            error,
+            ForgeError::ProviderRateLimited {
+                provider,
+                retry_after_seconds: Some(23),
+            } if provider == "gpt-test"
+        ));
+    }
 
     #[tokio::test]
     async fn serializes_auth_conversation_and_tools_and_parses_response() {
