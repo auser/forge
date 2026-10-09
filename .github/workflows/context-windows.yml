@@ -1,0 +1,40 @@
+name: Context storage (Windows)
+
+on:
+  push:
+    paths:
+      - "crates/forge-context/**"
+      - "crates/forge-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/context-windows.yml"
+  pull_request:
+    paths:
+      - "crates/forge-context/**"
+      - "crates/forge-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/context-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  context-storage:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      # A security test may explicitly skip locally without symlink privilege,
+      # but the Windows CI gate must actually execute those tests.
+      FORGE_CONTEXT_REQUIRE_SYMLINK_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (context only, no inference backend)
+        run: cargo clippy --locked -p forge-context --all-targets -- -D warnings
+      - name: Test private cross-process context storage
+        run: cargo test --locked -p forge-context -- --nocapture

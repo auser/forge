@@ -619,6 +619,7 @@ dependencies = [
  "forge-acp",
  "forge-chat",
  "forge-config",
+ "forge-context",
  "forge-core",
  "forge-execution",
  "forge-graph",
@@ -656,6 +657,20 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "forge-context"
+version = "0.2.6"
+dependencies = [
+ "forge-core",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "ulid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -765,6 +780,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "forge-config",
+ "forge-context",
  "forge-core",
  "forge-execution",
  "forge-graph",
@@ -778,6 +794,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "wiremock",
 ]
 

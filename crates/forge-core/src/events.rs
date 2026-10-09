@@ -17,6 +17,7 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 ///   reads the final `assistant_message`, so a v4 log replays exactly as
 ///   its delta-free equivalent. Purely additive, like v3.
 /// * v5 adds the redaction-safe `tool_policy_decision` audit event.
+/// * v6 adds compact context accounting plan pointers and failure events.
 ///
 /// The change is purely additive: no existing kind or field changed
 /// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
@@ -24,7 +25,7 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 /// event kinds an older reader does not know; runs recorded before v3
 /// replay as well as their data allows (see
 /// `forge_runtime::replay::conversation_from_events`).
-pub const EVENT_SCHEMA_VERSION: u32 = 5;
+pub const EVENT_SCHEMA_VERSION: u32 = 6;
 
 /// Version of the tool-policy rules represented by `ToolPolicyDecision`.
 pub const TOOL_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -220,6 +221,23 @@ pub enum EventKind {
     SessionForked {
         from_session: String,
         at_position: u64,
+    },
+    /// Compact pointer to a sanitized context accounting plan (v6).
+    ContextPlanRecorded {
+        plan_id: String,
+        request_ordinal: u32,
+        stable_prefix_hash: String,
+        prefix_changed: bool,
+        total_estimated_input_tokens: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reserved_output_tokens: Option<u32>,
+        plan_path: String,
+    },
+    /// Best-effort context accounting failed; generation continued (v6).
+    ContextPlanUnavailable {
+        request_ordinal: u32,
+        error_category: String,
+        message: String,
     },
 }
 

@@ -472,6 +472,8 @@ impl TurnState {
             // replay records as well would duplicate the transcript.
             EventKind::ToolResult { .. }
             | EventKind::SessionForked { .. }
+            | EventKind::ContextPlanRecorded { .. }
+            | EventKind::ContextPlanUnavailable { .. }
             | EventKind::RunStarted { .. }
             | EventKind::ApprovalDecided { .. }
             | EventKind::TurnCompleted { .. }

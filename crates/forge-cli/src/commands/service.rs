@@ -191,6 +191,9 @@ pub fn build_service_with(
     let skills = Arc::new(FsSkillRegistry::new(&root, Some(execution.clone())));
 
     let sessions = Arc::new(JsonlSessionStore::new(root.join(".forge").join("sessions")));
+    let context_store = Arc::new(forge_context::FsContextStore::new(
+        root.join(".forge").join("context"),
+    ));
 
     // Wire the project graph when one has been built; absence never
     // blocks a run.
@@ -213,6 +216,7 @@ pub fn build_service_with(
     Ok(
         AgentService::new(model, router, execution, skills, sessions, config)
             .with_graph(graph)
+            .with_context_store(Some(context_store))
             .with_system_context(crate::commands::guidance::system_context(&root))
             .with_model_factory(Arc::new(factory)),
     )

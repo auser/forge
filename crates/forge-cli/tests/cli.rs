@@ -854,9 +854,20 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     assert!(list.status.success());
     let stdout = String::from_utf8(list.stdout).expect("utf8");
     assert!(stdout.contains(session_id), "list output: {stdout}");
-    // run_started, routing_decision_made, assistant_message (the v3 replay
-    // record of the model's answer), turn_completed, completed.
-    assert!(stdout.contains("5 events"), "list output: {stdout}");
+    // run_started, routing_decision_made, context_plan_recorded,
+    // assistant_message (the v3 replay record of the model's answer),
+    // turn_completed, completed.
+    assert!(stdout.contains("6 events"), "list output: {stdout}");
+    let plan_path = project
+        .join(".forge/context/plans")
+        .join(run_id)
+        .join("1.json");
+    let plan = std::fs::read_to_string(plan_path).expect("context plan");
+    assert!(!plan.contains("\"hi\""), "plan leaked prompt: {plan}");
+    assert!(
+        !plan.contains("mock response"),
+        "plan leaked response: {plan}"
+    );
 
     // resume continues the completed run: a NEW run in the same session,
     // replaying the session's conversation, printing the new run's output.
@@ -891,6 +902,10 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     assert!(
         show_out.contains("input_received"),
         "resume marker missing: {show_out}"
+    );
+    assert!(
+        show_out.contains("context_plan_recorded"),
+        "context plan event missing: {show_out}"
     );
 
     let cancel = forge(tmp.path())

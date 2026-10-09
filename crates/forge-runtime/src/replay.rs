@@ -204,6 +204,8 @@ fn run_messages(events: &[&Event]) -> RunReplay {
             | EventKind::TurnCompleted { .. }
             | EventKind::AssistantDelta { .. }
             | EventKind::SessionForked { .. }
+            | EventKind::ContextPlanRecorded { .. }
+            | EventKind::ContextPlanUnavailable { .. }
             | EventKind::Error { .. }
             | EventKind::Cancelled { .. } => {}
         }

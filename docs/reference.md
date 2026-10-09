@@ -1517,7 +1517,7 @@ growing set of other editors, speak natively.
 
 ## Sessions and events
 
-Every run appends versioned events (`"v": 4`, with a monotonic per-run `seq`
+Every run appends versioned events (`"v": 5`, with a monotonic per-run `seq`
 assigned by the session store on append) to
 `.forge/sessions/<session_id>.jsonl` — one JSON object per line, append-only.
 v1 logs (no `seq`, f32 confidence) and v2 logs remain readable.
@@ -1528,7 +1528,8 @@ The log carries two streams, deliberately separated:
   `run_started`, `routing_decision_made`, `skill_activated`,
   `tool_call_requested`, `tool_started`, `tool_completed`, `file_changed`,
   `approval_requested`, `approval_decided`, `turn_completed`,
-  `input_received`, `note` (v1 compat), `error`, `cancelled`, `completed`;
+  `input_received`, `note` (v1 compat), `error`, `cancelled`, `completed`,
+  and the compact `context_plan_recorded`/`context_plan_unavailable` events;
   plus (v4) `assistant_delta` — ordered text fragments of a streaming
   model's in-flight answer. Rendering-only: replay ignores them and reads
   the final `assistant_message`.
@@ -1542,6 +1543,23 @@ Events carry run/session IDs, provider, model, routing confidence, and
 fallback flags. Secret-looking values (API-key patterns, `Bearer` tokens,
 values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env vars) are redacted to
 `[REDACTED]` before anything is written — replay payloads included.
+
+### Context accounting
+
+Production frontends account for every model request. Sanitized, rebuildable
+plans live at `.forge/context/plans/<run-id>/<request-ordinal>.json`; they
+contain component character/token estimates and hashes, never prompts, tool
+results, or tool-schema text. The measured tool component is the exact ordered
+surface offered to the selected model (including a compact discovery surface
+when that is what the frontend offers), not an internal registry.
+
+The stable prefix has separate hashes for the exact static system messages and
+the exact ordered offered tools, plus a combined hash. Skills, graph context,
+history, memory, and the current prompt are intentionally dynamic and do not
+change it. Accounting is fail-open: an unwritable or malformed context store
+records `context_plan_unavailable`, while the original provider request
+continues unchanged. Context accounting does not yet compress content, inject
+memory, reorder messages, or otherwise change model behavior.
 
 ```bash
 forge session list        # sessions with event counts
