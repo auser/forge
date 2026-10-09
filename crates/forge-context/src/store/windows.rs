@@ -514,10 +514,11 @@ impl crate::artifact::ArtifactFiles for ArtifactDirectory {
 
 pub(super) fn artifact_transaction<T>(
     path: &Path,
+    namespace: &str,
     operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> io::Result<T>,
 ) -> io::Result<T> {
     let mut tree = Tree::root(path, true)?;
-    tree.descend("artifacts".as_ref(), true)?;
+    tree.descend(namespace.as_ref(), true)?;
     let lock = open(
         tree.current(),
         "lock".as_ref(),
@@ -700,6 +701,70 @@ mod tests {
             }
             Err(error) => panic!("symlink setup failed: {error}"),
         }
+    }
+
+    #[test]
+    fn observation_native_links_preserve_victim_bytes_and_security() {
+        use crate::{FsObservationStore, ObservationStore, SourceRange, ValidatedObservationBatch};
+        let event = forge_core::Event::new(
+            "r",
+            "s",
+            forge_core::EventKind::InputReceived {
+                message: "fixture".into(),
+            },
+        );
+        let source = [event];
+        let redactor = forge_session::Redactor::new();
+        for hardlink in [true, false] {
+            for name in ["index.json", "lock", ".pending"] {
+                let project = tempfile::tempdir().unwrap();
+                let root = project.path().join("context");
+                fs::create_dir_all(root.join("observations")).unwrap();
+                let victim = project.path().join("victim");
+                fs::write(&victim, "private victim").unwrap();
+                let link = root.join("observations").join(name);
+                if hardlink {
+                    fs::hard_link(&victim, &link).unwrap();
+                } else if !symlink_available(std::os::windows::fs::symlink_file(&victim, &link)) {
+                    // Junction coverage below does not require symlink privilege.
+                    continue;
+                }
+                let security = security_snapshot(&victim);
+                let batch = ValidatedObservationBatch::new(
+                    "s",
+                    &source,
+                    SourceRange { start: 1, end: 1 },
+                    "v1",
+                    vec![],
+                    &redactor,
+                )
+                .unwrap();
+                assert!(FsObservationStore::new(&root).commit(batch).is_err());
+                assert_eq!(fs::read_to_string(&victim).unwrap(), "private victim");
+                assert_eq!(security_snapshot(&victim), security);
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let root = project.path().join("context");
+        fs::create_dir_all(&root).unwrap();
+        let link = root.join("observations");
+        let output = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(victim.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "junction setup: {output:?}");
+        let security = security_snapshot(victim.path());
+        assert!(
+            FsObservationStore::new(&root)
+                .projection("s", &source, &redactor)
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(victim.path()).unwrap().count(), 0);
+        assert_eq!(security_snapshot(victim.path()), security);
+        fs::remove_dir(link).unwrap();
     }
 
     #[test]

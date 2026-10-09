@@ -1667,6 +1667,46 @@ forge resume <id>         # continue a completed run: a new run in the same
                           # replayed as the model's history
 ```
 
+### Observation ledger groundwork
+
+The context crate provides a fixture-fed observation ledger and deterministic
+renderer. This is a library contract, not an enabled memory feature: it does
+not call an observer model, schedule background work, inject observations into
+live requests, or change the current zero observation-memory accounting.
+
+An observation batch refers to an inclusive, one-based range of positions in
+an explicitly identified session log. Positions are not per-run event sequence
+numbers. A range can produce multiple atomic observations; commits reject
+duplicate or overlapping ranges even when the observer version differs.
+Disjoint ranges may arrive out of order. Coverage records retain gaps rather
+than reporting the largest observed position as a complete watermark.
+
+Fork projection is a frozen snapshot: only whole batches ending at or before
+the cut are inherited, with original source identities retained. Later parent
+observations do not appear automatically in a child. The renderer excludes a
+whole batch that intersects the recent raw tail, including inherited batches
+whose original session ID differs from the child. Tail messages are supplied
+through existing replay normalization and remain unchanged.
+
+Rendered observations are explicitly labeled derived, untrusted data—not
+project or system instructions. Source existence and scope validation do not
+prove that an observation's content is true. Project-scope records do not imply
+automatic promotion or cross-session selection; those remain later work.
+
+The filesystem ledger uses a private bounded atomic index under
+`.forge/context/observations/`. Commits preserve immutable logical batch prefixes;
+the physical index is atomically replaced, not an append-only JSONL file.
+Limits are 1024 sessions, 4096 batches and a 16 MiB index. A supplied source
+snapshot is limited to 65,536 events, 1 MiB per serialized event and 16 MiB
+total; a batch contains at most 128 observations, each at most 16 KiB.
+Corrupt or over-limit inputs are rejected rather than partially committed.
+
+Callers must supply authoritative source snapshots and a matching normalized
+raw-tail boundary. Fingerprints detect changes to those snapshots; they do not
+prove their origin on disk. After a fork, local observation ranges start after
+the copied prefix and provenance marker; inherited gaps cannot be re-observed
+as child-local history.
+
 ### Forking a session
 
 ```bash

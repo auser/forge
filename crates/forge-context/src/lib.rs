@@ -7,6 +7,8 @@
 
 mod artifact;
 mod compression;
+mod observation;
+mod observation_render;
 mod plan;
 mod store;
 
@@ -19,6 +21,16 @@ pub use artifact::{
 pub use compression::{
     COMPRESSION_VERSION, CompressionDecision, CompressionKind, CompressionReason,
     CompressionResult, compress_tool_output,
+};
+pub use observation::{
+    FsObservationStore, LedgerProjection, MAX_OBSERVATION_BATCHES, MAX_OBSERVATION_CONTENT_BYTES,
+    MAX_OBSERVATION_LEDGER_BYTES, MAX_OBSERVATION_SOURCE_EVENTS, MAX_OBSERVATIONS_PER_BATCH,
+    MemoryObservationStore, Observation, ObservationBatch, ObservationDraft, ObservationError,
+    ObservationKind, ObservationScope, ObservationStore, SourceRange, ValidatedObservationBatch,
+};
+pub use observation_render::{
+    OBSERVATION_HEADER, ObservationRender, ObservationSelection, ObservationSelectionReason,
+    render_observations,
 };
 pub use plan::{
     CONTEXT_PLAN_VERSION, ContextComponents, ContextPlan, ContextPlanDraft, ContextPlanSummary,
