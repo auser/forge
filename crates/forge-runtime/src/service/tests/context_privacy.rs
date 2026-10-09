@@ -147,6 +147,28 @@ impl Write for LogBuffer {
 
 #[tokio::test]
 async fn context_store_warning_logs_category_not_private_error_and_run_succeeds() {
+    // Tracing callsite interest is process-global. Isolate this capture assertion
+    // from parallel tests installing/dropping subscribers or exercising the same
+    // warning callsite without a subscriber; do not weaken the privacy checks.
+    const CHILD: &str = "FORGE_TEST_CONTEXT_WARNING_CAPTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service::tests::context_privacy::context_store_warning_logs_category_not_private_error_and_run_succeeds",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated warning capture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedMockModel::new(vec![text_reply("still completed")]));
     let store = Arc::new(MemoryContextStore::failing(

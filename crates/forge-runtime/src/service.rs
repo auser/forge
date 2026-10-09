@@ -441,6 +441,7 @@ pub struct AgentService {
     graph: Option<Arc<dyn ProjectGraph>>,
     context_store: Option<Arc<dyn ContextStore>>,
     artifact_store: Option<Arc<dyn forge_context::ArtifactStore>>,
+    compression_enabled: bool,
     /// Stable coding contract and project guidance supplied by the host.
     /// Kept separate from replay: it is current run context, not conversation.
     system_context: Vec<Message>,
@@ -497,6 +498,7 @@ impl AgentService {
             graph: None,
             context_store: None,
             artifact_store: None,
+            compression_enabled: true,
             system_context: Vec::new(),
             model_factory: None,
             needle: None,
@@ -529,6 +531,12 @@ impl AgentService {
         store: Option<Arc<dyn forge_context::ArtifactStore>>,
     ) -> Self {
         self.artifact_store = store;
+        self
+    }
+
+    /// Disable content compression without changing CONTEXT-2 artifact behavior.
+    pub fn with_compression_enabled(mut self, enabled: bool) -> Self {
+        self.compression_enabled = enabled;
         self
     }
 
@@ -1080,17 +1088,18 @@ impl AgentService {
         call: &ToolCall,
         raw: &str,
         source: forge_context::ArtifactSource,
-    ) -> (String, Option<EventKind>) {
+    ) -> (String, Option<EventKind>, Option<EventKind>) {
         if call.name == "retrieve_tool_output" {
             return (
                 self.sessions.redactor().redact_tool_output(&call.name, raw),
+                None,
                 None,
             );
         }
         let sanitized = forge_context::SanitizedOutput::new(self.sessions.redactor(), raw);
         let text = sanitized.as_str();
         if text.len() <= forge_core::MAX_TOOL_OUTPUT_BYTES {
-            return (forge_core::cap_tool_output(text), None);
+            return (forge_core::cap_tool_output(text), None, None);
         }
         let capped = forge_core::cap_tool_output(text);
         let reference = self.artifact_store.as_ref().and_then(|store| {
@@ -1101,10 +1110,51 @@ impl AgentService {
         });
         match reference {
             Some(reference) => {
-                let output = format!(
+                let mut output = format!(
                     "{capped}\n[Complete sanitized output: retrieve_tool_output handle={}]\n",
                     reference.handle
                 );
+                let decision = if self.compression_enabled {
+                    let compressed =
+                        forge_context::compress_tool_output(call, &sanitized, &reference, &output);
+                    if let Some(view) = compressed.view {
+                        output = view;
+                    }
+                    let decision = compressed.decision;
+                    use forge_context::{CompressionKind as K, CompressionReason as R};
+                    use forge_core::events::{
+                        ToolCompressionKind as EK, ToolCompressionReason as ER, ToolCompressionSize,
+                    };
+                    let size = |value: forge_context::ContextSize| ToolCompressionSize {
+                        chars: value.chars,
+                        estimated_tokens: value.estimated_tokens,
+                    };
+                    Some(EventKind::ToolOutputCompression {
+                        event_seq: reference.source.event_seq,
+                        version: decision.version,
+                        kind: match decision.kind {
+                            K::Unknown => EK::Unknown,
+                            K::Log => EK::Log,
+                            K::Search => EK::Search,
+                            K::Json => EK::Json,
+                            K::Jsonl => EK::Jsonl,
+                            K::Table => EK::Table,
+                            K::Diff => EK::Diff,
+                        },
+                        reason: match decision.reason {
+                            R::BelowThreshold => ER::BelowThreshold,
+                            R::Unsupported => ER::Unsupported,
+                            R::NoSavings => ER::NoSavings,
+                            R::Compressed => ER::Compressed,
+                        },
+                        original: size(decision.original),
+                        baseline: size(decision.baseline),
+                        view: size(decision.view),
+                        omitted: decision.omitted,
+                    })
+                } else {
+                    None
+                };
                 let event = EventKind::ToolOutputArtifact {
                     handle: reference.handle,
                     source_session_id: reference.source.session_id,
@@ -1112,10 +1162,11 @@ impl AgentService {
                     call_id: reference.source.call_id,
                     event_seq: reference.source.event_seq,
                 };
-                (output, Some(event))
+                (output, Some(event), decision)
             }
             None => (
                 format!("{capped}\n[Complete sanitized output unavailable]\n"),
+                None,
                 None,
             ),
         }
@@ -2229,9 +2280,9 @@ impl AgentService {
                     },
                 ),
             )?;
-            let (text, artifact) =
+            let (text, artifact, compression) =
                 self.prepare_tool_output(&fast.call, &outcome.result.content, source);
-            if let Some(kind) = artifact {
+            for kind in artifact.into_iter().chain(compression) {
                 self.emit(
                     &sender,
                     &mut collected,
@@ -2800,9 +2851,9 @@ impl AgentService {
                 )?;
                 // Replay record: the result verbatim (capped), as the
                 // model is about to see it.
-                let (model_output, artifact) =
+                let (model_output, artifact, compression) =
                     self.prepare_tool_output(call, &outcome.result.content, source);
-                if let Some(kind) = artifact {
+                for kind in artifact.into_iter().chain(compression) {
                     self.emit(
                         &sender,
                         &mut collected,

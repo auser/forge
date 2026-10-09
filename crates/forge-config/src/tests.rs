@@ -40,6 +40,34 @@ fn write_project_config(root: &Path, contents: &str) {
 }
 
 #[test]
+fn context_compression_defaults_and_rejects_unknown_settings() {
+    assert!(Config::default().context_compression.enabled);
+    let disabled: Config = toml::from_str("[context_compression]\nenabled = false").unwrap();
+    assert!(!disabled.context_compression.enabled);
+    disabled.validate().unwrap();
+    for entry in ["enabled = 1", "threshold = 8192", "enabld = false"] {
+        assert!(
+            toml::from_str::<Config>(&format!("[context_compression]\n{entry}")).is_err(),
+            "{entry}"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn project_can_override_user_compression_setting() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::isolated(user.path());
+    write_user_config(user.path(), "[context_compression]\nenabled = false");
+    let loaded = Config::load(Some(project.path()), &CliOverrides::default()).unwrap();
+    assert!(!loaded.config.context_compression.enabled);
+    write_project_config(project.path(), "[context_compression]\nenabled = true");
+    let loaded = Config::load(Some(project.path()), &CliOverrides::default()).unwrap();
+    assert!(loaded.config.context_compression.enabled);
+}
+
+#[test]
 fn context_artifact_limits_default_and_validate() {
     let defaults = Config::default();
     assert_eq!(

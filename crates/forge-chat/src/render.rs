@@ -243,7 +243,8 @@ impl TranscriptState {
             EventKind::Completed { .. }
             | EventKind::ContextPlanRecorded { .. }
             | EventKind::ContextPlanUnavailable { .. }
-            | EventKind::ToolOutputArtifact { .. } => Vec::new(),
+            | EventKind::ToolOutputArtifact { .. }
+            | EventKind::ToolOutputCompression { .. } => Vec::new(),
         });
         lines
     }

@@ -129,6 +129,20 @@ impl Default for ContextArtifactsConfig {
     }
 }
 
+/// `[context_compression]`: reversible, corpus-qualified tool-output views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextCompressionConfig {
+    /// Disable to retain the CONTEXT-2 cap-and-retrieval view.
+    pub enabled: bool,
+}
+
+impl Default for ContextCompressionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Limit for one tool, reset for every agent run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ToolLimitConfig {
@@ -317,6 +331,8 @@ pub struct Config {
     pub tool_limits: BTreeMap<String, ToolLimitConfig>,
     /// Retention bounds for sanitized tool outputs (`[context_artifacts]`).
     pub context_artifacts: ContextArtifactsConfig,
+    /// Deterministic oversized tool-output compression (`[context_compression]`).
+    pub context_compression: ContextCompressionConfig,
     /// Days a cached OpenRouter model catalogue counts as fresh (see
     /// [`crate::catalogue`]). A stale cache is still used — with a warning
     /// naming its age — because stale prices beat no prices; must be >= 1.
@@ -601,6 +617,7 @@ impl Default for Config {
             budget: BudgetConfig::default(),
             tool_limits: BTreeMap::new(),
             context_artifacts: ContextArtifactsConfig::default(),
+            context_compression: ContextCompressionConfig::default(),
             catalogue_ttl_days: 7,
             // Nothing here was explicitly configured — this *is* the
             // defaults layer.

@@ -233,7 +233,7 @@ fn exact_nested_fork_prefix_grants_not_source_anchor_or_handle_text() {
     let service = test_service(tmp.path())
         .with_artifact_store(Some(Arc::new(MemoryArtifactStore::default())));
     let call = ToolCall::new("call", "read_file", serde_json::json!({"path":"large"}));
-    let (_, grant) = service.prepare_tool_output(&call, &"z".repeat(70_000), source());
+    let (_, grant, _) = service.prepare_tool_output(&call, &"z".repeat(70_000), source());
     let grant = grant.unwrap();
     let handle = match &grant {
         EventKind::ToolOutputArtifact { handle, .. } => handle.clone(),
@@ -298,7 +298,8 @@ fn disabled_and_failed_storage_still_sanitize_and_never_advertise_a_handle() {
     ] {
         let service = test_service(tmp.path()).with_artifact_store(store);
         let raw = format!("{}sk-abcdefghijklmnop", "x".repeat(65_530));
-        let (output, grant) = service.prepare_tool_output(&call, &raw, source());
+        let (output, grant, decision) = service.prepare_tool_output(&call, &raw, source());
+        assert!(decision.is_none());
         assert!(grant.is_none());
         assert!(output.contains("unavailable"));
         assert!(!output.contains("handle="));
@@ -502,6 +503,133 @@ async fn authorized_retrieval_runs_through_model_loop_without_creating_an_artifa
 }
 
 const SECRET_OUTPUT: &str = "private output sk-abcdefghijklmnop";
+
+/// Scripted protocol, not a model-quality test: discovers the opaque handle
+/// from the compressed view and explicitly requests an omitted byte window.
+struct RetrieveCompressedLog {
+    expected_window: String,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for RetrieveCompressedLog {
+    fn name(&self) -> &str {
+        "scripted-retrieval"
+    }
+    fn capabilities(&self) -> forge_core::ModelCapabilities {
+        forge_core::ModelCapabilities {
+            tools: true,
+            max_context: 100_000,
+            ..Default::default()
+        }
+    }
+    async fn complete(
+        &self,
+        request: forge_core::CompletionRequest,
+    ) -> Result<forge_core::CompletionResponse, ForgeError> {
+        let tools: Vec<_> = request
+            .messages
+            .iter()
+            .filter(|m| m.role == forge_core::Role::Tool)
+            .collect();
+        let reply = match tools.len() {
+            0 => tool_reply(
+                "run_command",
+                serde_json::json!({"command":"cargo","args":["test"]}),
+            ),
+            1 => {
+                assert!(tools[0].content.len() < 10_000);
+                let handle = tools[0]
+                    .content
+                    .split("handle=")
+                    .nth(1)
+                    .unwrap()
+                    .split(|c: char| c.is_whitespace() || c == ']')
+                    .next()
+                    .unwrap();
+                tool_reply(
+                    "retrieve_tool_output",
+                    serde_json::json!({
+                        "handle":handle,"start":30000,"end":31024
+                    }),
+                )
+            }
+            2 => {
+                let read: ArtifactRead = serde_json::from_str(&tools[1].content).unwrap();
+                assert_eq!(read.text, self.expected_window);
+                assert_eq!(read.start, 30000);
+                assert_eq!(read.end, 31024);
+                text_reply("verified the omitted original window")
+            }
+            _ => panic!("unexpected extra model turn"),
+        };
+        ScriptedMockModel::new(vec![reply]).complete(request).await
+    }
+}
+
+#[tokio::test]
+async fn compressed_log_omission_is_retrieved_through_the_scripted_model_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Execution's formatter supplies the stdout/stderr envelope.
+    let stdout = format!(
+        "running 1 test\ntest validation::exceptional ... FAILED\n\nwarning: W0042 deprecated fixture mode\n{}error: E0308 mismatched types\n",
+        "warning: W0042 deprecated fixture mode\n".repeat(2400)
+    );
+    let raw = format!("exit 1\nstdout:\n{stdout}\nstderr:\n");
+    // Even a known compressible result must use the old unavailable fallback
+    // if storing its complete sanitized source fails.
+    let failed = test_service(tmp.path()).with_artifact_store(Some(Arc::new(FailingArtifacts)));
+    let call = ToolCall::new(
+        "call",
+        "run_command",
+        serde_json::json!({"command":"cargo","args":["test"]}),
+    );
+    let (fallback, grant, decision) = failed.prepare_tool_output(&call, &raw, source());
+    assert!(grant.is_none() && decision.is_none());
+    assert_eq!(
+        fallback,
+        format!(
+            "{}\n[Complete sanitized output unavailable]\n",
+            forge_core::cap_tool_output(&raw)
+        )
+    );
+    let model = Arc::new(RetrieveCompressedLog {
+        expected_window: raw[30000..31024].to_owned(),
+    });
+    let service = AgentService::new(
+        model,
+        Arc::new(MockRouter::selecting("scripted-retrieval")),
+        Arc::new(SecretExecution {
+            fail: true,
+            approve: false,
+            output: stdout,
+        }),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(tmp.path().join("sessions"))),
+        Config::default(),
+    )
+    .with_artifact_store(Some(Arc::new(MemoryArtifactStore::default())));
+    let outcome = service
+        .run("test and inspect the original repeated warning window")
+        .await
+        .unwrap();
+    assert_eq!(outcome.text, "verified the omitted original window");
+    assert_eq!(outcome.tool_calls, 2);
+    assert_eq!(
+        outcome
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ToolOutputCompression { .. }))
+            .count(),
+        1
+    );
+    assert!(outcome.events.iter().any(|e| matches!(
+        e.kind,
+        EventKind::ToolOutputCompression {
+            reason: forge_core::events::ToolCompressionReason::Compressed,
+            ..
+        }
+    )));
+}
 
 #[async_trait::async_trait]
 impl ExecutionProvider for SecretExecution {
