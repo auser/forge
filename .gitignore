@@ -26,3 +26,7 @@ specs/scratch.md
 .env.*
 !.env.example
 !.env.sample
+.codebase-memory/
+graft/
+docs/issues/
+docs/superpowers/
