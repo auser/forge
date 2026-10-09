@@ -835,6 +835,9 @@ impl ModelProvider for OpenAiCompatibleModel {
             .map_err(|e| send_error(&url, e))?;
 
         let status = response.status();
+        if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
+            return Err(error);
+        }
         // Background calls bound the entire wire envelope before any parsing,
         // including error bodies. Interactive clients retain their old path.
         if let Some(max_bytes) = self.response_max_bytes {
@@ -893,6 +896,9 @@ impl ModelProvider for OpenAiCompatibleModel {
         };
 
         let status = response.status();
+        if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
+            return Err(error);
+        }
         if !status.is_success() {
             // Nothing was shown yet, so exactly one non-streaming retry is
             // safe and cheap — a server that doesn't know `stream_options`
@@ -3022,6 +3028,59 @@ mod tests {
             "the fallback must not retry the stream: {second}"
         );
         assert!(second.get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_streaming_rate_limit_is_typed_and_never_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "37")
+                    .set_body_string("quota detail must not drive retry behavior"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (deltas, response) = stream_with(&model).await;
+        assert!(deltas.is_empty());
+        let error = response.expect_err("rate limit stops the stream");
+        assert!(matches!(
+            error,
+            ForgeError::ProviderRateLimited {
+                ref provider,
+                retry_after_seconds: Some(37),
+            } if provider == "qwen3-coder"
+        ));
+        assert!(error.to_string().contains("retry after 37 seconds"));
+        assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_retry_after_remains_unknown_and_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "not-a-delta")
+                    .set_body_string("rate limited"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = streaming_model(&server.uri());
+        let (_, response) = stream_with(&model).await;
+        assert!(matches!(
+            response,
+            Err(ForgeError::ProviderRateLimited {
+                retry_after_seconds: None,
+                ..
+            })
+        ));
+        assert_eq!(server.received_requests().await.expect("requests").len(), 1);
     }
 
     /// D5: an error payload mid-stream is a typed error; the partial text is
