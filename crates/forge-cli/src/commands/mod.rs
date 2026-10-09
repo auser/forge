@@ -8,6 +8,7 @@ pub mod guidance;
 pub mod init;
 pub mod mcp_cmd;
 pub mod model_cmd;
+pub mod observer_cmd;
 pub mod presets;
 pub mod router_cmd;
 pub mod run_cmd;
@@ -124,6 +125,9 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             crate::cli::AuthCommand::Login { provider } => auth_cmd::login(&ctx, provider),
         },
         Some(Command::Config { command }) => config_cmd::run(&ctx, command),
+        Some(Command::Observer { command }) => match command {
+            crate::cli::ObserverCommand::Status => observer_cmd::status(&ctx),
+        },
 
         Some(Command::Run {
             prompt,
@@ -167,6 +171,7 @@ fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
         Some(Command::Doctor { .. }) => "checking environment",
         Some(Command::Auth { .. }) => "checking authentication",
         Some(Command::Config { .. }) => "resolving configuration",
+        Some(Command::Observer { .. }) => "reading observer status",
         Some(Command::Run { .. }) => "running agent",
         Some(Command::Resume { .. }) => "resuming run",
         Some(Command::Cancel { .. }) => "cancelling run",

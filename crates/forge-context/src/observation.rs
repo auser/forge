@@ -88,14 +88,16 @@ pub struct ObservationBatch {
     pub observer_version: String,
     pub created_at: String,
     pub observations: Vec<Observation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_job_id: Option<String>,
 }
 /// Only the redacting, source-validating constructor can cross the commit boundary.
 pub struct ValidatedObservationBatch {
-    batch: ObservationBatch,
+    pub(crate) batch: ObservationBatch,
     snapshot: Snapshot,
 }
 
-fn identifier(s: &str) -> bool {
+pub(crate) fn identifier(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && s.bytes()
@@ -107,7 +109,7 @@ fn metadata(s: &str, redactor: &Redactor) -> Result<()> {
     }
     Ok(())
 }
-fn hash<T: Serialize + ?Sized>(domain: &str, value: &T) -> Result<String> {
+pub(crate) fn hash<T: Serialize + ?Sized>(domain: &str, value: &T) -> Result<String> {
     let bytes = serde_json::to_vec(value).map_err(|_| ObservationError::InvalidSource)?;
     let mut h = Sha256::new();
     h.update(domain.as_bytes());
@@ -144,11 +146,11 @@ fn source_bytes(event: &Event) -> Result<Vec<u8>> {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Snapshot {
+pub(crate) struct Snapshot {
     hashes: Vec<String>,
-    local_start: u64,
+    pub(crate) local_start: u64,
 }
-fn snapshot(session: &str, events: &[Event], redactor: &Redactor) -> Result<Snapshot> {
+pub(crate) fn snapshot(session: &str, events: &[Event], redactor: &Redactor) -> Result<Snapshot> {
     metadata(session, redactor)?;
     if events.len() > MAX_OBSERVATION_SOURCE_EVENTS {
         return Err(ObservationError::LimitExceeded);
@@ -202,7 +204,7 @@ fn snapshot(session: &str, events: &[Event], redactor: &Redactor) -> Result<Snap
         local_start,
     })
 }
-fn fingerprint(snapshot: &Snapshot, range: SourceRange) -> Result<String> {
+pub(crate) fn fingerprint(snapshot: &Snapshot, range: SourceRange) -> Result<String> {
     if !range.valid(snapshot.hashes.len()) {
         return Err(ObservationError::InvalidSource);
     }
@@ -212,7 +214,7 @@ fn fingerprint(snapshot: &Snapshot, range: SourceRange) -> Result<String> {
     )
 }
 fn batch_id(batch: &ObservationBatch) -> Result<String> {
-    hash(
+    let legacy = hash(
         "forge-observation-batch-v1",
         &(
             &batch.source_session_id,
@@ -226,9 +228,21 @@ fn batch_id(batch: &ObservationBatch) -> Result<String> {
                 .map(|o| (o.scope, o.kind, &o.content))
                 .collect::<Vec<_>>(),
         ),
-    )
+    )?;
+    match &batch.observer_job_id {
+        Some(job_id) => hash("forge-observer-batch-v1", &(legacy, job_id)),
+        None => Ok(legacy),
+    }
 }
 impl ValidatedObservationBatch {
+    pub(crate) fn bind_observer_job(mut self, job_id: &str) -> Result<Self> {
+        self.batch.observer_job_id = Some(job_id.into());
+        self.batch.id = batch_id(&self.batch)?;
+        for (i, observation) in self.batch.observations.iter_mut().enumerate() {
+            observation.id = hash("forge-observation-v1", &(&self.batch.id, i))?;
+        }
+        Ok(self)
+    }
     pub fn new(
         source_session_id: &str,
         source_snapshot: &[Event],
@@ -272,6 +286,7 @@ impl ValidatedObservationBatch {
             observer_version: observer_version.into(),
             created_at: source_snapshot[(range.end - 1) as usize].ts.to_rfc3339(),
             observations,
+            observer_job_id: None,
         };
         batch.id = batch_id(&batch)?;
         for (i, observation) in batch.observations.iter_mut().enumerate() {
@@ -318,6 +333,8 @@ impl LedgerProjection {
 }
 pub trait ObservationStore: Send + Sync {
     fn commit(&self, batch: ValidatedObservationBatch) -> Result<ObservationBatch>;
+    /// True only for a durably initialized fork ledger, including frozen-empty.
+    fn fork_initialized(&self, session_id: &str) -> Result<bool>;
     fn projection(
         &self,
         session_id: &str,
@@ -374,6 +391,9 @@ fn validate(index: &Index) -> Result<()> {
                 || !identifier(&b.observer_version)
                 || b.created_at.len() > 64
                 || b.observations.len() > MAX_OBSERVATIONS_PER_BATCH
+                || b.observer_job_id
+                    .as_ref()
+                    .is_some_and(|id| id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
                 || fingerprint(&ledger.snapshot, b.range)? != b.source_fingerprint
                 || batch_id(b)? != b.id
                 || ledger.batches[..i]
@@ -454,6 +474,12 @@ impl MemoryObservationStore {
 macro_rules! impl_store {
     ($ty:ty) => {
         impl ObservationStore for $ty {
+            fn fork_initialized(&self, session_id: &str) -> Result<bool> {
+                if !identifier(session_id) { return Err(ObservationError::InvalidMetadata); }
+                self.transaction(&mut |files| {
+                    Ok(load(files)?.sessions.get(session_id).is_some_and(|ledger| ledger.snapshot.local_start > 1))
+                })
+            }
             fn commit(&self, batch: ValidatedObservationBatch) -> Result<ObservationBatch> {
                 self.transaction(&mut |files| {
                     let mut index = load(files)?;

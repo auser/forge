@@ -20,6 +20,20 @@ pub(crate) fn observation_transaction<T>(
     filesystem::artifact_transaction(path, "observations", operation)
 }
 
+pub(crate) fn observer_transaction<T>(
+    path: &std::path::Path,
+    operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    filesystem::artifact_transaction(path, "observer-jobs", operation)
+}
+
+pub(crate) fn observer_read(
+    path: &std::path::Path,
+    bound: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    filesystem::observer_read(path, bound)
+}
+
 pub trait ContextStore: Send + Sync {
     fn record(&self, draft: ContextPlanDraft) -> Result<ContextPlan, ForgeError>;
     fn plan(&self, run_id: &str, ordinal: u32) -> Result<Option<ContextPlan>, ForgeError>;
@@ -313,6 +327,18 @@ mod filesystem {
         operation(&mut ArtifactDirectory { root, objects })
     }
 
+    pub(super) fn observer_read(path: &Path, bound: usize) -> io::Result<Option<Vec<u8>>> {
+        let result = (|| {
+            let context = root(path, false)?;
+            let root = directory(&context, "observer-jobs".as_ref(), false)?;
+            super::read_bounded(file(&root, "index.json", OFlags::RDONLY)?, bound).map(Some)
+        })();
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            result => result,
+        }
+    }
+
     pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<ContextPlan> {
         let root = root(path, true)?;
         let locks = directory(&root, "locks".as_ref(), true)?;
@@ -379,6 +405,10 @@ mod filesystem;
 mod filesystem {
     use super::*;
     use std::{io, path::Path};
+
+    pub(super) fn observer_read(_: &Path, _: usize) -> io::Result<Option<Vec<u8>>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
     pub(super) fn artifact_transaction<T>(
         _: &Path,

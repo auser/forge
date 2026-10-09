@@ -2315,7 +2315,11 @@ fn two_sessions_exist(world: &mut BddWorld) {
             name.ends_with(".jsonl") && !name.ends_with(".decisions.jsonl")
         })
         .count();
-    assert_eq!(count, 2, "expected two session files");
+    assert_eq!(
+        count, 2,
+        "expected two session files\nstdout:\n{}\nstderr:\n{}",
+        world.last_stdout, world.last_stderr
+    );
 }
 
 #[then("the chat output says the source session is untouched")]

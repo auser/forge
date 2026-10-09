@@ -221,6 +221,15 @@ pub fn build_service_with(
         forge_providers::model_from_config(&cfg, &root_for_factory)
     };
     let compression_enabled = config.context_compression.enabled;
+    let observer = match super::observer_cmd::build(&config, &root, sessions.clone()) {
+        Ok(observer) => observer,
+        Err(_) => {
+            // Background observation setup must not abort ordinary conversation
+            // or leak provider diagnostics into logs.
+            tracing::warn!("observer unavailable under configured policy");
+            None
+        }
+    };
 
     Ok(
         AgentService::new(model, router, execution, skills, sessions, config)
@@ -228,6 +237,7 @@ pub fn build_service_with(
             .with_context_store(Some(context_store))
             .with_artifact_store(Some(artifact_store))
             .with_compression_enabled(compression_enabled)
+            .with_observer(observer)
             .with_system_context(crate::commands::guidance::system_context(&root))
             .with_model_factory(Arc::new(factory)),
     )

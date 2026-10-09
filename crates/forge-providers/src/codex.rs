@@ -19,6 +19,7 @@ const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 pub struct CodexModel {
     client: reqwest::Client,
+    response_max_bytes: Option<usize>,
     base_url: String,
     model: String,
     access_token: String,
@@ -41,6 +42,7 @@ impl CodexModel {
             .map_err(|e| ForgeError::provider(format!("building HTTP client: {e}")))?;
         Ok(Self {
             client,
+            response_max_bytes: None,
             base_url: base_url
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
                 .trim_end_matches('/')
@@ -49,6 +51,11 @@ impl CodexModel {
             access_token: access_token.into(),
             account_id: account_id.into(),
         })
+    }
+
+    pub(crate) fn with_response_max_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.response_max_bytes = max_bytes;
+        self
     }
 
     fn body(&self, request: &CompletionRequest) -> Value {
@@ -243,6 +250,21 @@ impl ModelProvider for CodexModel {
                 ForgeError::provider(format!("Codex request failed: {}", error_detail(&e)))
             })?;
         let status = response.status();
+        if let Some(max_bytes) = self.response_max_bytes {
+            // Codex complete is SSE on the wire: bound the whole event
+            // envelope, not just the final extracted answer.
+            let bytes = crate::response::bounded_bytes(response, max_bytes).await?;
+            if !status.is_success() {
+                return Err(ForgeError::provider(format!(
+                    "Codex returned HTTP {status}"
+                )));
+            }
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| ForgeError::provider("invalid bounded Codex response UTF-8"))?;
+            return self
+                .parse_wire_response(text)
+                .map_err(|_| ForgeError::provider("invalid bounded Codex response"));
+        }
         let text = response
             .text()
             .await

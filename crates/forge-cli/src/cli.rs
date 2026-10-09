@@ -182,6 +182,12 @@ pub enum Command {
         command: ConfigCommand,
     },
 
+    /// Inspect opt-in background observation without starting model calls.
+    Observer {
+        #[command(subcommand)]
+        command: ObserverCommand,
+    },
+
     /// Check environment and configuration health.
     Doctor {
         /// After the static checks, fire one tiny canary prompt through the
@@ -198,6 +204,12 @@ pub enum Command {
         #[arg(long)]
         build: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ObserverCommand {
+    /// Show configured policy and durable observer job/cost counts.
+    Status,
 }
 
 #[derive(Subcommand)]

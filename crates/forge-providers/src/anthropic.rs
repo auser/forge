@@ -22,6 +22,7 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
 /// and SSE streaming (`stream: true`) requests are supported.
 pub struct AnthropicModel {
     client: reqwest::Client,
+    response_max_bytes: Option<usize>,
     /// The streaming twin of `client`: no total deadline (D7 — see
     /// [`EgressPolicy::streaming_client`]).
     stream_client: reqwest::Client,
@@ -54,6 +55,7 @@ impl AnthropicModel {
         let model = model.into();
         Ok(Self {
             client,
+            response_max_bytes: None,
             stream_client,
             base_url: base_url
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
@@ -71,6 +73,11 @@ impl AnthropicModel {
     /// configured alias in events, routing, and model selection.
     pub fn with_wire_model(mut self, wire_model: impl Into<String>) -> Self {
         self.wire_model = wire_model.into();
+        self
+    }
+
+    pub(crate) fn with_response_max_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.response_max_bytes = max_bytes;
         self
     }
 
@@ -542,6 +549,17 @@ impl ModelProvider for AnthropicModel {
             .map_err(|e| send_error(&url, e))?;
 
         let status = response.status();
+        if let Some(max_bytes) = self.response_max_bytes {
+            let bytes = crate::response::bounded_bytes(response, max_bytes).await?;
+            if !status.is_success() {
+                return Err(ForgeError::provider(format!(
+                    "anthropic endpoint returned {status}"
+                )));
+            }
+            let body = serde_json::from_slice(&bytes)
+                .map_err(|_| ForgeError::provider("invalid bounded anthropic response JSON"))?;
+            return Ok(parse_message_body(&self.model, &body));
+        }
         if !status.is_success() {
             return Err(status_error(&url, status, response).await);
         }
@@ -556,6 +574,9 @@ impl ModelProvider for AnthropicModel {
         request: CompletionRequest,
         on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<CompletionResponse, ForgeError> {
+        if self.response_max_bytes.is_some() {
+            return Err(crate::response::streaming_unsupported());
+        }
         reject_tools_without_capability(&request, self.capabilities)?;
         let url = self.messages_url();
         // Scoped so the body's borrow of `request` ends here: the fallback

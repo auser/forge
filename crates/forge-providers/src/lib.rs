@@ -17,7 +17,9 @@ mod credentials;
 mod jev;
 mod local_only;
 mod model;
+mod observer;
 pub mod openrouter;
+mod response;
 mod router;
 mod scripted;
 mod sse;
@@ -34,6 +36,7 @@ pub use model::{
     AUTH_REQUIRED_MODEL, AvailableModel, MockModel, OpenAiCompatibleModel, automatic_model,
     available_models, is_mock_model, model_endpoint, model_from_config,
 };
+pub use observer::{observer_model_from_config, observer_prices_from_config};
 pub use router::{
     CheapestRouter, FallbackRouter, HttpRouter, LayaRouter, MockRouter, StaticRouter,
     ThresholdRouter, effective_router_name, filter_candidates, jev_credential_present,

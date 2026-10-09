@@ -1707,6 +1707,61 @@ prove their origin on disk. After a fork, local observation ranges start after
 the copied prefix and provenance marker; inherited gaps cannot be re-observed
 as child-local history.
 
+### Opt-in background observers
+
+Background observation is disabled by default and never silently reuses the
+active conversation model. Enabling it requires an explicit model and known
+input/output prices:
+
+```toml
+[observer]
+enabled = false
+model = "local-observer"
+allow_remote = false
+session_usd = 0.05
+daily_usd = 0.25
+```
+
+An explicitly zero-priced local model is allowed; missing or half-specified
+prices are not treated as free. Observer ceilings are separate from interactive
+turn budgets. Estimated maximum cost is reserved before each attempt. Timed-out,
+interrupted or missing-usage attempts remain conservatively charged; a retry can
+incur another provider charge. Reservations are estimates, not a guarantee about
+external vendor billing.
+
+Remote observation requires both an explicit model and `allow_remote = true`.
+The application's `local_only` policy still takes precedence, including redirect
+restrictions. Sanitized session content is sensitive; opting into remote
+observation authorizes sending the selected source projection to that endpoint.
+Observer-built HTTP providers cap accumulated success/error response envelopes
+at 256 KiB before parsing. This is a body-buffer bound, not a total-process
+memory bound: HTTP transport chunks, headers and parsed values add overhead.
+Ordinary interactive provider limits remain unchanged.
+
+Jobs use durable source-bound identities, one project-wide worker lease and at
+most three attempts. Active turns and CLI exit do not wait for observer calls.
+Already-running blocking filesystem operations may finish during runtime
+shutdown; provider cancellation is not a guarantee of instantaneous process exit.
+Pending work resumes on a later startup; exactly-once ledger commitment does
+not imply exactly-once external requests. A new observer version cannot silently
+overwrite or overlap prior observations.
+
+```bash
+forge observer status
+forge observer status --json
+```
+
+Status inspects configured policy and persisted job/cost counts without starting
+workers or invoking a model. Inspection does not create an absent queue, enqueue,
+reserve, or dispatch jobs.
+Reported `prices_known` is not a credential or endpoint-health check.
+
+This phase generates ledger records only. It does not inject observational
+memory into live prompts or promote observations into project instructions.
+Scripted evaluation fixtures measure unsupported claims and useful coverage;
+they do not qualify the quality of a real model. Live model evaluation requires
+separate authorization.
+
 ### Forking a session
 
 ```bash

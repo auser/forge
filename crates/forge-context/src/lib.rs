@@ -9,6 +9,7 @@ mod artifact;
 mod compression;
 mod observation;
 mod observation_render;
+pub mod observer;
 mod plan;
 mod store;
 
@@ -32,6 +33,7 @@ pub use observation_render::{
     OBSERVATION_HEADER, ObservationRender, ObservationSelection, ObservationSelectionReason,
     render_observations,
 };
+pub use observer::*;
 pub use plan::{
     CONTEXT_PLAN_VERSION, ContextComponents, ContextPlan, ContextPlanDraft, ContextPlanSummary,
     ContextSize, StablePrefix, stable_prefix,

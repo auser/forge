@@ -143,6 +143,29 @@ impl Default for ContextCompressionConfig {
     }
 }
 
+/// `[observer]`: opt-in, separately budgeted session observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObserverConfig {
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub allow_remote: bool,
+    pub session_usd: f64,
+    pub daily_usd: f64,
+}
+
+impl Default for ObserverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            allow_remote: false,
+            session_usd: 0.05,
+            daily_usd: 0.25,
+        }
+    }
+}
+
 /// Limit for one tool, reset for every agent run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ToolLimitConfig {
@@ -266,6 +289,10 @@ impl Default for NeedleConfig {
 #[serde(default)]
 pub struct Config {
     pub model: String,
+    /// Internal response-envelope bound for explicitly constructed background
+    /// providers. Not a user setting and not applied to interactive providers.
+    #[serde(skip)]
+    pub model_response_max_bytes: Option<usize>,
     pub model_base_url: Option<String>,
     pub model_key_env: Option<String>,
     /// **Test-only.** Path to a JSON script for `model = "scripted-mock"`
@@ -333,6 +360,8 @@ pub struct Config {
     pub context_artifacts: ContextArtifactsConfig,
     /// Deterministic oversized tool-output compression (`[context_compression]`).
     pub context_compression: ContextCompressionConfig,
+    /// Opt-in background observer model and dedicated spend ceilings.
+    pub observer: ObserverConfig,
     /// Days a cached OpenRouter model catalogue counts as fresh (see
     /// [`crate::catalogue`]). A stale cache is still used — with a warning
     /// naming its age — because stale prices beat no prices; must be >= 1.
@@ -581,6 +610,7 @@ impl Default for Config {
         ];
         Self {
             model: "qwen3-coder".to_string(),
+            model_response_max_bytes: None,
             model_base_url: Some("http://127.0.0.1:8080/v1".to_string()),
             model_key_env: None,
             mock_script: None,
@@ -618,6 +648,7 @@ impl Default for Config {
             tool_limits: BTreeMap::new(),
             context_artifacts: ContextArtifactsConfig::default(),
             context_compression: ContextCompressionConfig::default(),
+            observer: ObserverConfig::default(),
             catalogue_ttl_days: 7,
             // Nothing here was explicitly configured — this *is* the
             // defaults layer.
@@ -752,6 +783,30 @@ impl Config {
     /// can't express. Called at the end of [`Config::load`] so every caller
     /// gets it for free.
     pub fn validate(&self) -> Result<(), ForgeError> {
+        if self.observer.enabled
+            && self
+                .observer
+                .model
+                .as_ref()
+                .is_none_or(|model| model.trim().is_empty())
+        {
+            return Err(ForgeError::config(
+                "observer.enabled requires an explicit observer.model".to_string(),
+            ));
+        }
+        if self.observer.model.as_ref().is_some_and(|model| {
+            model.trim().is_empty() || model.len() > 256 || model.chars().any(char::is_control)
+        }) {
+            return Err(ForgeError::config("invalid observer.model".to_string()));
+        }
+        if [self.observer.session_usd, self.observer.daily_usd]
+            .iter()
+            .any(|limit| !limit.is_finite() || *limit < 0.0)
+        {
+            return Err(ForgeError::config(
+                "observer spend ceilings must be finite and nonnegative".to_string(),
+            ));
+        }
         if !ROUTER_ESCALATE_VALUES.contains(&self.router_escalate.as_str()) {
             return Err(ForgeError::config(format!(
                 "router_escalate must be one of {} (got {:?})",
