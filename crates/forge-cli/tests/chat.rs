@@ -1075,3 +1075,193 @@ fn slash_opens_the_command_menu_on_a_real_terminal() {
     child.wait().ok();
     reader_thread.join().expect("pty reader thread");
 }
+
+/// Keep failed/bounded PTY assertions from leaving a live editor process.
+#[cfg(unix)]
+struct ContextPty {
+    child: std::process::Child,
+    writer: std::fs::File,
+    output: Arc<Mutex<String>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl ContextPty {
+    fn start(tmp: &Path, project: &Path) -> Self {
+        let mut cmd = forge(tmp, project);
+        cmd.env("TERM", "xterm-256color");
+        let (child, master) = pty::spawn(cmd).expect("spawn on pty");
+        let writer = master.try_clone().expect("clone pty writer");
+        let (output, reader) = tail_stream(master);
+        let pty = Self {
+            child,
+            writer,
+            output,
+            reader: Some(reader),
+        };
+        wait_for(&pty.output, "/help for commands", Duration::from_secs(30));
+        wait_for(&pty.output, "> ", Duration::from_secs(30));
+        pty
+    }
+
+    fn type_bytes(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).expect("type into pty");
+    }
+
+    fn expect(&self, marker: &str) -> String {
+        wait_for(&self.output, marker, Duration::from_secs(30))
+    }
+
+    fn expect_count(&self, marker: &str, count: usize) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let output = self
+                .output
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if output.matches(marker).count() >= count {
+                return output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} occurrences of {marker:?}:\n{output}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ContextPty {
+    fn drop(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("pty reader thread");
+        }
+    }
+}
+
+/// Exercise the real CliHost, raw-mode editor, and completion together.
+/// Inspection must not submit a model turn, and the next burst of input must
+/// remain usable after each report (not merely after the startup banner).
+#[cfg(unix)]
+#[test]
+fn context_memory_inspection_and_offset_completion_keep_a_real_prompt_usable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let mut pty = ContextPty::start(tmp.path(), &project);
+
+    pty.type_bytes(b"/context status\n");
+    pty.expect("\"latest_plan\"");
+    pty.type_bytes(b"/memory status\n");
+    let status = pty.expect("\"session consent is off\"");
+    assert!(status.contains("\"desired_enabled\": false"), "{status}");
+    assert!(status.contains("\"effective_eligible\": false"), "{status}");
+    assert!(status.contains("project observer is disabled"), "{status}");
+
+    pty.type_bytes(b"/memory show --off\t");
+    pty.expect("/memory show --offset");
+    pty.type_bytes(b" 20\n");
+    pty.expect("\"next_offset\": null");
+    assert!(
+        !session_log(&project).contains("\"run_started\""),
+        "inspection/completion must not generate a model turn"
+    );
+
+    pty.type_bytes(b"retained prompt after context inspection\n");
+    pty.expect("the answer");
+    let log = session_log(&project);
+    assert!(
+        log.contains("retained prompt after context inspection"),
+        "{log}"
+    );
+    assert_eq!(log.matches("\"run_started\"").count(), 1, "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn context_memory_corruption_and_readiness_are_safe_at_a_real_prompt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold(tmp.path(), "auto");
+    let observations = project.join(".forge/context/observations");
+    std::fs::create_dir_all(&observations).expect("observation directory");
+    let corrupt = b"private corrupt observation contents";
+    std::fs::write(observations.join("index.json"), corrupt).expect("corrupt ledger");
+    let mut pty = ContextPty::start(tmp.path(), &project);
+
+    pty.type_bytes(b"/memory status\n");
+    let status = pty.expect("\"state\": \"corrupt\"");
+    assert!(status.contains("\"desired_enabled\": false"), "{status}");
+    assert!(status.contains("\"effective_eligible\": false"), "{status}");
+    assert!(
+        !status.contains("private corrupt observation contents"),
+        "{status}"
+    );
+    pty.type_bytes(b"/memory on\n");
+    pty.expect("error: configuration error: project observer is disabled");
+    pty.type_bytes(b"/memory off\n");
+    pty.expect("\"raw_event_count\": 1");
+    pty.type_bytes(b"/memory sources --offset 20\n");
+    pty.expect("\"next_offset\": null");
+    pty.type_bytes(b"/quit\n");
+    let exited = wait_for_exit(&mut pty.child, Duration::from_secs(30));
+    assert!(exited.success(), "{exited:?}");
+    let log = session_log(&project);
+    assert!(!log.contains("\"run_started\""), "{log}");
+    assert!(!log.contains("\"enabled\":true"), "{log}");
+    assert_eq!(
+        std::fs::read(observations.join("index.json")).expect("unchanged ledger"),
+        corrupt
+    );
+}
+
+/// A scripted tool holds the local event stream open; commands entered during
+/// it must be serviced before completion. A partially typed next prompt must
+/// survive the remaining stream notifications before Enter submits it.
+#[cfg(unix)]
+#[test]
+fn context_memory_commands_during_a_real_terminal_turn_retain_the_next_prompt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold_sleeping(tmp.path(), "5");
+    let mut pty = ContextPty::start(tmp.path(), &project);
+    pty.type_bytes(b"start the context inspection turn\n");
+    pty.expect("  * run_command");
+    pty.type_bytes(b"/context status\n");
+    pty.expect("\"latest_plan\"");
+    pty.type_bytes(b"/memory status\n");
+    let status = pty.expect("\"desired_enabled\": false");
+    assert!(!status.contains("slow thing done"), "{status}");
+    pty.type_bytes(b"/memory off\n");
+    let off = pty.expect_count("\"desired_enabled\": false", 2);
+    assert!(!off.contains("slow thing done"), "{off}");
+    pty.type_bytes(b"retained followup ");
+    pty.expect("slow thing done");
+    pty.type_bytes(b"after completion\n");
+    pty.expect_count("slow thing done", 2);
+    // The durable user input, not terminal echo, proves the editor delivered it.
+    let log = session_log(&project);
+    let prompts: Vec<String> = log
+        .lines()
+        .filter_map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).expect("session event");
+            (event["type"] == "run_started")
+                .then(|| event["prompt"].as_str().expect("run prompt").to_owned())
+        })
+        .collect();
+    assert_eq!(
+        prompts,
+        [
+            "start the context inspection turn",
+            "retained followup after completion"
+        ],
+        "{log}"
+    );
+    assert_eq!(
+        log.matches("\"memory_observation_changed\"").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains("\"enabled\":false"), "{log}");
+}
