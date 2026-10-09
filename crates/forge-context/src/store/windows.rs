@@ -516,30 +516,39 @@ mod tests {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .unwrap();
-        // Compare owner, group and DACL without repairing any permissions.
-        // SAFETY: the API allocations stay alive while the SDDL is copied.
+        // Compare the object's stored owner, group and DACL. The file-aware
+        // GetSecurityInfo API can reconstruct inheritance flags from the
+        // parent's current ACL; that is not a snapshot of this object's
+        // security descriptor. Do not normalize away any stored ACE flags.
+        // SAFETY: the aligned descriptor buffer stays alive while SDDL is copied.
         unsafe {
             let information =
                 OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-            let mut descriptor = null_mut();
+            let mut needed = 0;
             assert_eq!(
-                GetSecurityInfo(
+                GetKernelObjectSecurity(
                     file.as_raw_handle(),
-                    SE_FILE_OBJECT,
                     information,
                     null_mut(),
-                    null_mut(),
-                    null_mut(),
-                    null_mut(),
-                    &mut descriptor,
+                    0,
+                    &mut needed,
                 ),
                 0
             );
-            let _descriptor = Local(descriptor);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            let mut descriptor = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+            bool_result(GetKernelObjectSecurity(
+                file.as_raw_handle(),
+                information,
+                descriptor.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            ))
+            .unwrap();
             let mut text = null_mut();
             let mut length = 0;
             bool_result(ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                descriptor,
+                descriptor.as_mut_ptr().cast(),
                 SDDL_REVISION_1,
                 information,
                 &mut text,
@@ -671,10 +680,20 @@ mod tests {
         fs::hard_link(&victim, nested.join("link")).unwrap();
         let original_security = security_snapshot(&victim);
         let nested_security = security_snapshot(&nested);
+        let root_security = security_snapshot(&root);
         let tree = Tree::root(&root, false).unwrap();
+        assert_ne!(
+            security_snapshot(&root),
+            root_security,
+            "snapshot must detect the root's deliberate security change"
+        );
         assert_eq!(fs::read_to_string(&victim).unwrap(), "secret victim");
         assert!(security_snapshot(&victim) == original_security);
-        assert!(security_snapshot(&nested) == nested_security);
+        assert_eq!(
+            String::from_utf16_lossy(&security_snapshot(&nested)),
+            String::from_utf16_lossy(&nested_security),
+            "sealing the root changed an unopened descendant's security"
+        );
         drop(tree);
     }
 
