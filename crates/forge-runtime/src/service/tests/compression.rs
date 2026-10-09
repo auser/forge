@@ -45,6 +45,36 @@ fn search_output() -> String {
 }
 
 #[test]
+fn direct_constructor_honors_config_and_builder_overrides_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.context_compression.enabled = false;
+    let service = AgentService::new(
+        Arc::new(ScriptedMockModel::new(vec![])),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(tmp.path().join("sessions"))),
+        config,
+    )
+    .with_artifact_store(Some(Arc::new(MemoryArtifactStore::default())));
+    let (_, _, decision) = service.prepare_tool_output(&search_call(), &search_output(), source());
+    assert!(decision.is_none());
+    let (_, _, decision) = service.with_compression_enabled(true).prepare_tool_output(
+        &search_call(),
+        &search_output(),
+        source(),
+    );
+    assert!(matches!(
+        decision,
+        Some(EventKind::ToolOutputCompression {
+            reason: ToolCompressionReason::Compressed,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn compression_requires_storage_and_disabled_is_exact_context2() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryArtifactStore::default());
@@ -163,7 +193,69 @@ fn threshold_and_retrieval_never_compress() {
     assert!(grant.is_none() && decision.is_none());
 }
 
-struct FixtureGraph;
+#[test]
+fn framing_env_secrets_use_persisted_baseline_and_decline_changed_candidates() {
+    const CHILD: &str = "FORGE_COMPRESSION_FRAMING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Snapshot environment secrets in a child, without mutating the parallel
+        // test process's environment.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service::tests::compression::framing_env_secrets_use_persisted_baseline_and_decline_changed_candidates",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("FORGE_TEST_FRAMING_SECRET", "\"framing_secret\"")
+            .env("FORGE_TEST_BASELINE_SECRET", "[forge: tool output truncated,")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let service = test_service(tmp.path())
+        .with_artifact_store(Some(Arc::new(MemoryArtifactStore::default())));
+    let raw = format!("{}\nlast.rs:1: framing_secret", search_output());
+    for call in [
+        search_call(),
+        ToolCall::new("call", "unknown", serde_json::json!({})),
+    ] {
+        let (output, grant, decision) = service.prepare_tool_output(&call, &raw, source());
+        let sanitized = forge_context::SanitizedOutput::new(service.sessions.redactor(), &raw);
+        let old = format!(
+            "{}\n[Complete sanitized output: retrieve_tool_output handle={}]\n",
+            forge_core::cap_tool_output(sanitized.as_str()),
+            grant_handle(grant)
+        );
+        assert_eq!(output, old);
+        let persisted = service
+            .sessions
+            .redactor()
+            .redact_tool_output(&call.name, &old);
+        assert_ne!(persisted, old);
+        let actual = forge_context::ContextSize::of_serialized(&persisted);
+        let Some(EventKind::ToolOutputCompression {
+            reason,
+            baseline,
+            view,
+            omitted,
+            ..
+        }) = decision
+        else {
+            panic!("missing decision")
+        };
+        assert_eq!(reason, ToolCompressionReason::Unsupported);
+        assert_eq!(omitted, 0);
+        assert_eq!(baseline, view);
+        assert_eq!(view.chars, actual.chars);
+        assert_eq!(view.estimated_tokens, actual.estimated_tokens);
+    }
+}
+
+struct FixtureGraph {
+    trailing_bearer: bool,
+}
 impl ProjectGraph for FixtureGraph {
     fn build(&mut self) -> Result<forge_core::GraphStats, ForgeError> {
         unreachable!("prebuilt fixture")
@@ -178,13 +270,17 @@ impl ProjectGraph for FixtureGraph {
         Vec::new()
     }
     fn grep(&self, _: &str) -> Result<Vec<forge_core::GrepMatch>, ForgeError> {
-        Ok(matches())
+        let mut matches = matches();
+        if self.trailing_bearer {
+            matches.last_mut().unwrap().text = "Bearer ".into();
+        }
+        Ok(matches)
     }
 }
 
 #[tokio::test]
 async fn normal_and_needle_compression_keep_persisted_provider_replay_parity() {
-    for needle in [false, true] {
+    for (needle, trailing_bearer) in [(false, false), (true, false), (false, true), (true, true)] {
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(ScriptedMockModel::new(vec![
             tool_reply("graph_grep", serde_json::json!({"pattern":"fixture"})),
@@ -203,7 +299,7 @@ async fn normal_and_needle_compression_keep_persisted_provider_replay_parity() {
                 Config::default(),
             )
         }
-        .with_graph(Some(Arc::new(FixtureGraph)))
+        .with_graph(Some(Arc::new(FixtureGraph { trailing_bearer })))
         .with_artifact_store(Some(Arc::new(MemoryArtifactStore::default())));
         let outcome = service
             .run(if needle {
@@ -225,13 +321,56 @@ async fn normal_and_needle_compression_keep_persisted_provider_replay_parity() {
                 _ => None,
             })
             .unwrap();
-        assert!(events.iter().any(|e| matches!(
-            e.kind,
-            EventKind::ToolOutputCompression {
-                reason: ToolCompressionReason::Compressed,
-                ..
-            }
-        )));
+        let (reason, baseline, view) = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::ToolOutputCompression {
+                    reason,
+                    baseline,
+                    view,
+                    ..
+                } => Some((reason, baseline, view)),
+                _ => None,
+            })
+            .unwrap();
+        let actual = forge_context::ContextSize::of_serialized(persisted);
+        assert_eq!(view.chars, actual.chars);
+        assert_eq!(view.estimated_tokens, actual.estimated_tokens);
+        if trailing_bearer {
+            assert_eq!(*reason, ToolCompressionReason::Unsupported);
+            assert_eq!(view, baseline);
+            assert!(!persisted.contains("[forge compression"));
+            let raw = FixtureGraph { trailing_bearer }
+                .grep("fixture")
+                .unwrap()
+                .iter()
+                .map(|m| format!("{}:{}: {}", m.file.display(), m.line, m.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let handle = events
+                .iter()
+                .find_map(|event| match &event.kind {
+                    EventKind::ToolOutputArtifact { handle, .. } => Some(handle),
+                    _ => None,
+                })
+                .unwrap();
+            let sanitized = forge_context::SanitizedOutput::new(service.sessions.redactor(), &raw);
+            let old = format!(
+                "{}\n[Complete sanitized output: retrieve_tool_output handle={}]\n",
+                forge_core::cap_tool_output(sanitized.as_str()),
+                handle
+            );
+            assert_eq!(
+                persisted,
+                &service
+                    .sessions
+                    .redactor()
+                    .redact_tool_output("graph_grep", &old)
+            );
+        } else {
+            assert_eq!(*reason, ToolCompressionReason::Compressed);
+            assert!(view.estimated_tokens * 100 <= baseline.estimated_tokens * 70);
+        }
         let replay = crate::replay::conversation_from_events(&events);
         assert!(
             replay

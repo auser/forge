@@ -1046,6 +1046,37 @@ mod tests {
     }
 
     #[test]
+    fn eligible_search_crosses_default_threshold_at_one_byte() {
+        let path = format!("src/{}/file.rs", "long-module-".repeat(20));
+        let row = format!("{path}:1: symbol\n");
+        for bytes in [
+            MAX_TOOL_OUTPUT_BYTES - 1,
+            MAX_TOOL_OUTPUT_BYTES,
+            MAX_TOOL_OUTPUT_BYTES + 1,
+        ] {
+            let prefix = format!("{path}:2: ");
+            let mut text = row.repeat((bytes - prefix.len()) / row.len());
+            text.push_str(&prefix);
+            text.push_str(&"x".repeat(bytes - text.len()));
+            assert_eq!(text.len(), bytes);
+            let (_, output, reference) = stored(&text);
+            let result = compress_tool_output(
+                &call(CompressionKind::Search),
+                &output,
+                &reference,
+                &baseline(&text, &reference),
+            );
+            if bytes <= MAX_TOOL_OUTPUT_BYTES {
+                assert_eq!(result.decision.reason, CompressionReason::BelowThreshold);
+                assert!(result.view.is_none());
+            } else {
+                assert_eq!(result.decision.reason, CompressionReason::Compressed);
+                assert!(result.view.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn threshold_is_strict_and_metadata_can_reject_small_candidates() {
         for bytes in [8192, 16384, 32768, 65536] {
             let text = format!("\"{}\"", "a".repeat(bytes - 2));

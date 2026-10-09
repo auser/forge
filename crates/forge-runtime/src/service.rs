@@ -488,6 +488,7 @@ impl AgentService {
         // The log lives beside the transcripts: sessions.root() is the
         // directory holding `<session-id>.jsonl`.
         let decision_log = Arc::new(DecisionLog::new(sessions.root().to_path_buf()));
+        let compression_enabled = config.context_compression.enabled;
         Self {
             model,
             router,
@@ -498,7 +499,7 @@ impl AgentService {
             graph: None,
             context_store: None,
             artifact_store: None,
-            compression_enabled: true,
+            compression_enabled,
             system_context: Vec::new(),
             model_factory: None,
             needle: None,
@@ -1115,12 +1116,35 @@ impl AgentService {
                     reference.handle
                 );
                 let decision = if self.compression_enabled {
-                    let compressed =
-                        forge_context::compress_tool_output(call, &sanitized, &reference, &output);
+                    // Compare savings against what append will actually persist, but
+                    // retain the original fallback so it traverses that boundary once.
+                    let persisted_baseline = self
+                        .sessions
+                        .redactor()
+                        .redact_tool_output(&call.name, &output);
+                    let compressed = forge_context::compress_tool_output(
+                        call,
+                        &sanitized,
+                        &reference,
+                        &persisted_baseline,
+                    );
+                    let mut decision = compressed.decision;
                     if let Some(view) = compressed.view {
-                        output = view;
+                        // Framing can complete a secret pattern absent from the
+                        // sanitized source. Never publish a structurally changed view.
+                        if self
+                            .sessions
+                            .redactor()
+                            .redact_tool_output(&call.name, &view)
+                            == view
+                        {
+                            output = view;
+                        } else {
+                            decision.reason = forge_context::CompressionReason::Unsupported;
+                            decision.view = decision.baseline;
+                            decision.omitted = 0;
+                        }
                     }
-                    let decision = compressed.decision;
                     use forge_context::{CompressionKind as K, CompressionReason as R};
                     use forge_core::events::{
                         ToolCompressionKind as EK, ToolCompressionReason as ER, ToolCompressionSize,
