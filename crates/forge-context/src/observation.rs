@@ -449,6 +449,37 @@ impl FsObservationStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
+    /// Native read-only snapshot: no locks, repairs, creation or LRU writes.
+    /// `None` means the ledger is absent, not corrupt.
+    pub fn inspect(
+        &self,
+        session_id: &str,
+        events: &[Event],
+        redactor: &Redactor,
+    ) -> Result<Option<LedgerProjection>> {
+        let Some(bytes) =
+            crate::store::namespace_read(&self.root, "observations", MAX_OBSERVATION_LEDGER_BYTES)
+                .map_err(|_| ObservationError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        let index: Index = serde_json::from_slice(&bytes).map_err(|_| ObservationError::Corrupt)?;
+        validate(&index)?;
+        let source = snapshot(session_id, events, redactor)?;
+        let batches = if let Some(ledger) = index.sessions.get(session_id) {
+            compatible(&ledger.snapshot, &source)?;
+            ledger.batches.clone()
+        } else if source.local_start > 1 {
+            return Err(ObservationError::InvalidFork);
+        } else {
+            Vec::new()
+        };
+        Ok(Some(LedgerProjection {
+            session_id: session_id.into(),
+            batches,
+        }))
+    }
+
     fn transaction<T>(
         &self,
         operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> Result<T>,

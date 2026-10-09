@@ -82,6 +82,13 @@ fn append_run(sessions: &JsonlSessionStore, session: &str, run: &str) {
     ] {
         sessions.append(Event::new(run, session, kind)).unwrap();
     }
+    sessions
+        .append(Event::new(
+            forge_session::new_run_id(),
+            session,
+            EventKind::MemoryObservationChanged { enabled: true },
+        ))
+        .unwrap();
 }
 fn output(range: forge_context::SourceRange) -> String {
     serde_json::json!({"range":range,"observations":[]}).to_string()
@@ -248,7 +255,12 @@ async fn stale_attempt_cannot_commit_after_another_worker_claims() {
         finish_reason: None,
         usage: None,
     };
-    assert!(f.supervisor.worker.finish(&old, response).is_err());
+    assert!(
+        f.supervisor
+            .worker
+            .finish(&old, response, usize::MAX)
+            .is_err()
+    );
     assert_eq!(f.queue.status().unwrap().committed, 0);
     let events = f.sessions.events_for("parent").unwrap();
     assert!(
@@ -291,6 +303,137 @@ fn prices_round_up_and_overflow_refuses_dispatch() {
         output_micro_usd_per_million: u64::MAX,
     };
     assert_eq!(huge.cost(u64::MAX, u64::MAX), None);
+}
+
+fn consent(f: &Fixture, enabled: bool) {
+    f.sessions
+        .append(Event::new(
+            forge_session::new_run_id(),
+            "parent",
+            EventKind::MemoryObservationChanged { enabled },
+        ))
+        .unwrap();
+    f.supervisor.notify();
+}
+
+#[test]
+fn default_off_and_pending_off_never_dispatch_or_delete_work() {
+    let f = fixture(false);
+    // Remove only the opt-in fixture's final control event.
+    let lines = f.sessions.raw_lines("parent").unwrap();
+    std::fs::write(
+        f.sessions.root().join("parent.jsonl"),
+        lines[..3].join("\n") + "\n",
+    )
+    .unwrap();
+    assert!(f.supervisor.worker.prepare().unwrap().is_none());
+    assert!(f.queue.jobs().unwrap().is_empty());
+    let chunk = observer_chunks(
+        "parent",
+        &f.sessions.events_for("parent").unwrap(),
+        f.sessions.redactor(),
+        &policy(),
+    )
+    .unwrap()
+    .remove(0);
+    f.queue.enqueue(chunk.job).unwrap();
+    assert!(f.supervisor.worker.prepare().unwrap().is_none());
+    assert_eq!(f.queue.status().unwrap().pending, 1);
+    assert_eq!(f.provider.calls.load(Ordering::Relaxed), 0);
+    consent(&f, true);
+    assert!(f.supervisor.worker.prepare().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn inflight_off_cancels_local_future_and_preserves_ambiguous_charges() {
+    let f = fixture(true);
+    f.supervisor.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), f.provider.started.notified())
+        .await
+        .unwrap();
+    consent(&f, false);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if f.queue.status().unwrap().retryable == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.provider.release.notify_one();
+    let status = f.queue.status().unwrap();
+    assert_eq!(status.committed, 0);
+    assert!(status.unknown_micro_usd > 0);
+    assert_eq!(f.provider.calls.load(Ordering::Relaxed), 1);
+    assert!(f.supervisor.worker.prepare().unwrap().is_none());
+    f.supervisor.shutdown();
+}
+
+#[test]
+fn late_provider_result_after_off_never_commits() {
+    let f = fixture(false);
+    let (lease, _) = f.supervisor.worker.prepare().unwrap().unwrap();
+    let position = f.sessions.events_for("parent").unwrap().len();
+    consent(&f, false);
+    // A quick re-enable cannot resurrect the cancelled in-flight result.
+    consent(&f, true);
+    f.supervisor
+        .worker
+        .finish(
+            &lease,
+            CompletionResponse {
+                model: "observer-test".into(),
+                content: f.provider.output.lock().unwrap().clone(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: Some(forge_core::Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                }),
+            },
+            position,
+        )
+        .unwrap();
+    assert_eq!(f.queue.status().unwrap().committed, 0);
+    assert_eq!(f.queue.status().unwrap().known_micro_usd, 5);
+}
+
+#[test]
+fn toggles_between_and_inside_runs_do_not_stall_chunking() {
+    let f = fixture(false);
+    consent(&f, false);
+    consent(&f, true);
+    f.sessions
+        .append(Event::new(
+            "next-run",
+            "parent",
+            EventKind::RunStarted {
+                provider: "local".into(),
+                model: "local".into(),
+                prompt: "next".into(),
+            },
+        ))
+        .unwrap();
+    consent(&f, false);
+    consent(&f, true);
+    f.sessions
+        .append(Event::new(
+            "next-run",
+            "parent",
+            EventKind::Completed {
+                summary: "done".into(),
+            },
+        ))
+        .unwrap();
+    let events = f.sessions.events_for("parent").unwrap();
+    let chunks = observer_chunks("parent", &events, f.sessions.redactor(), &policy()).unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert!(!chunks[1].request_json.contains("memory_observation"));
+    assert_eq!(chunks[1].job.range.end, events.len() as u64);
+    assert!(crate::inspection::memory_observation_enabled(&events));
 }
 
 fn service(f: &Fixture, observer: Option<Arc<ObserverSupervisor>>) -> crate::AgentService {

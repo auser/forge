@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::inspection::memory_observation_enabled;
 use forge_context::{
     BudgetLimits, OBSERVER_PROMPT, ObservationStore, ObserverChunk, ObserverJobState,
     ObserverLease, ObserverPolicy, ObserverQueue, ObserverStatus, observer_chunks,
@@ -207,6 +208,18 @@ impl Drop for ObserverSupervisor {
 }
 
 impl Worker {
+    fn consent(&self, session: &str, since: usize) -> bool {
+        self.sessions.events_for(session).is_ok_and(|events| {
+            memory_observation_enabled(&events)
+                && !events.iter().skip(since).any(|event| {
+                    matches!(
+                        event.kind,
+                        EventKind::MemoryObservationChanged { enabled: false }
+                    )
+                })
+        })
+    }
+
     async fn run(self: Arc<Self>) {
         loop {
             let worker = Arc::clone(&self);
@@ -251,6 +264,9 @@ impl Worker {
                     continue;
                 }
             };
+            if !memory_observation_enabled(&events) {
+                continue;
+            }
             if !self.fork_ready(&session_id, &events) {
                 blocked += 1;
                 continue;
@@ -293,6 +309,10 @@ impl Worker {
                     continue;
                 }
             };
+            // Pause durable work in place: off is not a failed/blocked job.
+            if !memory_observation_enabled(&events) {
+                continue;
+            }
             if !self.fork_ready(&job.session_id, &events) {
                 self.queue.block(&job.id).map_err(|_| unavailable())?;
                 continue;
@@ -339,6 +359,26 @@ impl Worker {
     }
 
     async fn complete(self: &Arc<Self>, lease: ObserverLease, chunk: ObserverChunk) {
+        let check = Arc::clone(self);
+        let session = lease.job.session_id.clone();
+        let dispatch_position = tokio::task::spawn_blocking(move || {
+            check
+                .sessions
+                .events_for(&session)
+                .ok()
+                .filter(|events| memory_observation_enabled(events))
+                .map(|events| events.len())
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(dispatch_position) = dispatch_position else {
+            let worker = Arc::clone(self);
+            // Nothing was dispatched, so this reservation is known zero.
+            let _ =
+                tokio::task::spawn_blocking(move || worker.queue.discard(&lease, Some(0))).await;
+            return;
+        };
         let mut request = CompletionRequest::new(
             &lease.job.policy.model,
             vec![
@@ -349,10 +389,34 @@ impl Worker {
         request.max_tokens = Some(lease.job.policy.limits.max_output_tokens);
         request.temperature = Some(0.0);
         // No tools, streaming, interactive agent loop or approval machinery.
-        let result = tokio::time::timeout(self.timeout, self.provider.complete(request)).await;
+        let result = {
+            let completion = tokio::time::timeout(self.timeout, self.provider.complete(request));
+            tokio::pin!(completion);
+            loop {
+                tokio::select! {
+                    result = &mut completion => break Some(result),
+                    _ = self.wake.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                }
+                let worker = Arc::clone(self);
+                let session = lease.job.session_id.clone();
+                if !tokio::task::spawn_blocking(move || worker.consent(&session, dispatch_position))
+                    .await
+                    .unwrap_or(false)
+                {
+                    // Dropping completion cancels the local provider future.
+                    // Remote execution may already have incurred charges.
+                    break None;
+                }
+            }
+        };
         let worker = Arc::clone(self);
         let result = tokio::task::spawn_blocking(move || match result {
-            Ok(Ok(response)) => worker.finish(&lease, response),
+            Some(Ok(Ok(response))) => worker.finish(&lease, response, dispatch_position),
+            None => worker
+                .queue
+                .discard(&lease, None)
+                .map_err(|_| unavailable()),
             _ => worker.queue.fail(&lease, true).map_err(|_| unavailable()),
         })
         .await;
@@ -365,7 +429,20 @@ impl Worker {
         &self,
         lease: &ObserverLease,
         response: CompletionResponse,
+        dispatch_position: usize,
     ) -> Result<(), ForgeError> {
+        let _gate = crate::inspection::MEMORY_POLICY_GATE
+            .lock()
+            .map_err(|_| unavailable())?;
+        let actual = response.usage.as_ref().and_then(|usage| {
+            self.prices.cost(
+                u64::from(usage.prompt_tokens),
+                u64::from(usage.completion_tokens),
+            )
+        });
+        if !self.consent(&lease.job.session_id, dispatch_position) {
+            return self.queue.discard(lease, actual).map_err(|_| unavailable());
+        }
         // A provider violating the plain-text contract cannot create a batch.
         if !response.tool_calls.is_empty()
             || response.content.len() > lease.job.policy.limits.max_output_bytes
@@ -393,14 +470,11 @@ impl Worker {
                 return self.queue.fail(lease, retryable).map_err(|_| unavailable());
             }
         };
-        let actual = response.usage.and_then(|usage| {
-            self.prices.cost(
-                u64::from(usage.prompt_tokens),
-                u64::from(usage.completion_tokens),
-            )
-        });
         // Queue owns the critical fence THROUGH ledger.commit. A stale worker
         // cannot commit between lease validation and lease replacement.
+        if !self.consent(&lease.job.session_id, dispatch_position) {
+            return self.queue.discard(lease, actual).map_err(|_| unavailable());
+        }
         self.queue
             .finalize(lease, batch, self.ledger.as_ref(), actual)
             .map_err(|_| unavailable())

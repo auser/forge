@@ -32,6 +32,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/auth", "sign in: /auth <claude|codex|kimi>"),
     ("/approval", "show the approval policy, or /approval <mode>"),
     ("/config", "effective settings, or /config <key> for one"),
+    ("/context", "context estimates and storage: /context status"),
+    (
+        "/memory",
+        "session extraction only (no live injection): /memory status|on|off|show|sources; show/sources [--offset <n>]",
+    ),
     ("/skills", "discovered skills, name and description"),
     ("/graph", "rank project files for a query"),
     ("/queue", "list queued messages, or remove <n>, or clear"),
@@ -51,6 +56,9 @@ pub const COMMANDS: &[(&str, &str)] = &[
 /// Usage of `/fork`, named once: the parser reports it and nothing else
 /// spells it out.
 const FORK_USAGE: &str = "/fork [--at <pos|run-id>]";
+const CONTEXT_USAGE: &str = "/context status";
+const MEMORY_USAGE: &str = "/memory status|on|off|show|sources (show/sources [--offset <n>])";
+const MEMORY_SUBCOMMANDS: &[&str] = &["status", "on", "off", "show", "sources"];
 
 /// At most this many path candidates per completion. The listing is
 /// `CompletionType::List`, which is unusable past a screenful; typing one
@@ -103,6 +111,23 @@ pub enum Parsed {
     Attach(String),
     /// `/show`, optionally `/show <n>`: the nth most recent tool result (1 = latest).
     Show(Option<usize>),
+    Context(ContextCommand),
+    Memory(MemoryCommand),
+}
+
+/// Shared parser/controller data; these never start a model turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContextCommand {
+    Status,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemoryCommand {
+    Status,
+    On,
+    Off,
+    Show { offset: usize },
+    Sources { offset: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,6 +142,31 @@ pub enum QueueCommand {
 /// — and so this `Command` is visibly a different thing from
 /// `forge_cli::cli::Command`, the clap subcommand enum.
 pub struct Command;
+
+fn parse_memory(rest: &str) -> Parsed {
+    let words: Vec<_> = rest.split_whitespace().collect();
+    let command = match words.as_slice() {
+        ["status"] => MemoryCommand::Status,
+        ["on"] => MemoryCommand::On,
+        ["off"] => MemoryCommand::Off,
+        ["show"] => MemoryCommand::Show { offset: 0 },
+        ["sources"] => MemoryCommand::Sources { offset: 0 },
+        [kind @ ("show" | "sources"), "--offset", value]
+            if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let Ok(offset) = value.parse::<usize>() else {
+                return Parsed::Usage(MEMORY_USAGE);
+            };
+            if *kind == "show" {
+                MemoryCommand::Show { offset }
+            } else {
+                MemoryCommand::Sources { offset }
+            }
+        }
+        _ => return Parsed::Usage(MEMORY_USAGE),
+    };
+    Parsed::Memory(command)
+}
 
 impl Command {
     /// What one submitted line means.
@@ -146,6 +196,11 @@ impl Command {
             "auth" => Parsed::Auth(argument),
             "approval" => Parsed::Approval(argument),
             "config" => Parsed::Config(argument),
+            "context" => match rest.as_str() {
+                "status" => Parsed::Context(ContextCommand::Status),
+                _ => Parsed::Usage(CONTEXT_USAGE),
+            },
+            "memory" => parse_memory(&rest),
             "skills" => Parsed::Skills,
             "graph" => match argument {
                 Some(text) => {
@@ -287,16 +342,34 @@ impl Command {
             return (word_start, described(candidates, word));
         }
 
-        // An argument, and only the *first* one: `/model a b` completes
-        // nothing, because there is no second argument to any command.
+        // Most commands have only one argument. Memory paging additionally
+        // offers its named flag; numeric offsets themselves are never guessed.
         let mut before = head[..word_start].split_whitespace();
         let Some(command) = before.next() else {
             return (word_start, Vec::new());
         };
-        if before.next().is_some() {
+        if let Some(subcommand) = before.next() {
+            if command == "/memory"
+                && matches!(subcommand, "show" | "sources")
+                && before.next().is_none()
+                && "--offset".starts_with(word)
+            {
+                return (
+                    word_start,
+                    vec![CompletionCandidate {
+                        display: "--offset".into(),
+                        replacement: "--offset".into(),
+                    }],
+                );
+            }
             return (word_start, Vec::new());
         }
         let candidates: Vec<String> = match command {
+            "/context" => vec!["status".to_string()],
+            "/memory" => MEMORY_SUBCOMMANDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             "/model" => snapshot.models.clone(),
             "/auth" => AUTH_PROVIDERS
                 .iter()
@@ -444,6 +517,104 @@ fn clamp_boundary(line: &str, pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_and_memory_parse_strictly() {
+        let snapshot = CompletionSnapshot::default();
+        assert_eq!(
+            Command::parse("/context status", &snapshot),
+            Parsed::Context(ContextCommand::Status)
+        );
+        for (text, command) in [
+            ("status", MemoryCommand::Status),
+            ("on", MemoryCommand::On),
+            ("off", MemoryCommand::Off),
+            ("show", MemoryCommand::Show { offset: 0 }),
+            ("sources", MemoryCommand::Sources { offset: 0 }),
+            ("show --offset 20", MemoryCommand::Show { offset: 20 }),
+            ("sources --offset 0", MemoryCommand::Sources { offset: 0 }),
+        ] {
+            assert_eq!(
+                Command::parse(&format!("/memory {text}"), &snapshot),
+                Parsed::Memory(command)
+            );
+        }
+        for text in [
+            "/context",
+            "/context on",
+            "/context status extra",
+            "/context status --session other",
+            "/memory",
+            "/memory unknown",
+            "/memory on extra",
+            "/memory off --session other",
+            "/memory status --offset 0",
+            "/memory show 20",
+            "/memory sources --offset",
+            "/memory show --offset -1",
+            "/memory show --offset +1",
+            "/memory show --offset 184467440737095516160",
+            "/memory show --offset 1 extra",
+            "/memory sources --limit 100",
+        ] {
+            assert!(
+                matches!(Command::parse(text, &snapshot), Parsed::Usage(_)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_paging_completes_only_the_supported_flag() {
+        let snapshot = CompletionSnapshot::default();
+        for line in [
+            "/memory show ",
+            "/memory show --o",
+            "/memory sources ",
+            "/memory sources --off",
+        ] {
+            let (start, candidates) = Command::complete(line, line.len(), &snapshot);
+            assert_eq!(start, line.rfind(' ').unwrap() + 1);
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].replacement, "--offset");
+        }
+        for line in [
+            "/memory status --o",
+            "/memory on ",
+            "/memory show --bad",
+            "/memory sources --offset ",
+            "/memory sources --offset 20",
+            "/memory show --offset --o",
+        ] {
+            assert!(
+                Command::complete(line, line.len(), &snapshot).1.is_empty(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_memory_completion_is_pure_and_covers_all_subcommands() {
+        // No host/config/store is available to this API.
+        let snapshot = CompletionSnapshot::default();
+        let (_, context) = Command::complete("/context ", 9, &snapshot);
+        assert_eq!(replacements(&context), vec!["status"]);
+        let (_, memory) = Command::complete("/memory ", 8, &snapshot);
+        assert_eq!(replacements(&memory), MEMORY_SUBCOMMANDS);
+        for text in ["/memory status ", "/memory off ", "/context status "] {
+            assert!(Command::complete(text, text.len(), &snapshot).1.is_empty());
+        }
+        assert!(
+            help_lines()
+                .iter()
+                .any(|line| line.text.contains("/context status"))
+        );
+        assert!(
+            help_lines()
+                .iter()
+                .any(|line| line.text.contains("no live injection"))
+        );
+    }
+
     use super::*;
 
     fn snapshot() -> CompletionSnapshot {

@@ -476,6 +476,7 @@ impl TurnState {
             | EventKind::ContextPlanUnavailable { .. }
             | EventKind::ToolOutputArtifact { .. }
             | EventKind::ToolOutputCompression { .. }
+            | EventKind::MemoryObservationChanged { .. }
             | EventKind::RunStarted { .. }
             | EventKind::ApprovalDecided { .. }
             | EventKind::TurnCompleted { .. }

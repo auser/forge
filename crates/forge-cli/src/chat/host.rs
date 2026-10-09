@@ -78,6 +78,28 @@ pub struct CliHost {
 }
 
 impl CliHost {
+    async fn context_memory(
+        &self,
+        session_id: &str,
+        request: crate::commands::context_cmd::Request,
+    ) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        let config = Arc::new(self.service.config().clone());
+        let sessions = self.service.session_store();
+        let root = self.root.clone();
+        let session_id = session_id.to_owned();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::commands::context_cmd::query(config, sessions, root, &session_id, request, false)
+        })
+        .await
+        .map_err(|_| ForgeError::session("context inspection unavailable"))??;
+        if matches!(request, crate::commands::context_cmd::Request::SetMemory(_)) {
+            self.service.notify_observer();
+        }
+        let rendered = serde_json::to_string_pretty(&report)
+            .map_err(|_| ForgeError::session("context inspection unavailable"))?;
+        Ok(rendered.lines().map(forge_chat::Line::meta).collect())
+    }
+
     /// Build the chat's runtime from `ctx`'s resolved configuration, with
     /// approvals parked (§8.1) from the start.
     pub async fn new(ctx: &Context) -> Result<Self, ForgeError> {
@@ -116,6 +138,64 @@ impl CliHost {
 impl ChatHost for CliHost {
     fn service(&self) -> Arc<AgentService> {
         Arc::clone(&self.service)
+    }
+
+    async fn context_status(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        self.context_memory(
+            session_id,
+            crate::commands::context_cmd::Request::ContextStatus,
+        )
+        .await
+    }
+
+    async fn memory_status(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        self.context_memory(
+            session_id,
+            crate::commands::context_cmd::Request::MemoryStatus,
+        )
+        .await
+    }
+
+    async fn set_memory_observation(
+        &mut self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        self.context_memory(
+            session_id,
+            crate::commands::context_cmd::Request::SetMemory(enabled),
+        )
+        .await
+    }
+
+    async fn memory_show(
+        &mut self,
+        session_id: &str,
+        offset: usize,
+    ) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        self.context_memory(
+            session_id,
+            crate::commands::context_cmd::Request::Show(offset),
+        )
+        .await
+    }
+
+    async fn memory_sources(
+        &mut self,
+        session_id: &str,
+        offset: usize,
+    ) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        self.context_memory(
+            session_id,
+            crate::commands::context_cmd::Request::Sources(offset),
+        )
+        .await
     }
 
     async fn switch(&mut self, change: HostChange) -> Result<(), ForgeError> {

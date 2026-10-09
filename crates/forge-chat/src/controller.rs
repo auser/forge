@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 /// two definitions of it would be two places to get piped mode wrong.
 pub use crate::io::Interactivity;
 
-use crate::command::{APPROVAL_MODES, AUTH_PROVIDERS, Command, Parsed, QueueCommand};
+use crate::command::{
+    APPROVAL_MODES, AUTH_PROVIDERS, Command, ContextCommand, MemoryCommand, Parsed, QueueCommand,
+};
 use crate::host::HostChange;
 use crate::io::{CompletionSnapshot, Line};
 
@@ -137,6 +139,8 @@ pub enum Action {
     Attach(String),
     /// `/show`, optionally `/show <n>`. Read-only: immediate in every state.
     Show(Option<usize>),
+    Context(ContextCommand),
+    Memory(MemoryCommand),
     /// Cancel every live run, recording each cancellation (§10.2). Emitted
     /// only on the way out, and harmless when nothing is live.
     CancelAllJobs,
@@ -293,6 +297,10 @@ impl Controller {
             Parsed::Session => vec![Action::ShowSession],
             // Read-only, so it answers in every state, mid-turn included.
             Parsed::Show(n) => vec![Action::Show(n)],
+            Parsed::Context(command) => vec![Action::Context(command)],
+            // Controls affect observation consent, not the active model turn.
+            // In particular off must remain usable while work is running.
+            Parsed::Memory(command) => vec![Action::Memory(command)],
             Parsed::SessionNew => self.move_session(Action::NewSession),
             Parsed::SessionSwitch(id) => self.move_session(Action::SwitchSession(id)),
             Parsed::Fork(at) => self.move_session(Action::Fork(at)),
@@ -593,6 +601,36 @@ fn prompt_preview(prompt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inspection_and_consent_are_immediate_and_do_not_disturb_active_work() {
+        let mut controller = idle();
+        controller.on_line("original prompt");
+        for (line, expected) in [
+            ("/context status", Action::Context(ContextCommand::Status)),
+            ("/memory status", Action::Memory(MemoryCommand::Status)),
+            ("/memory on", Action::Memory(MemoryCommand::On)),
+            ("/memory off", Action::Memory(MemoryCommand::Off)),
+            (
+                "/memory show --offset 20",
+                Action::Memory(MemoryCommand::Show { offset: 20 }),
+            ),
+            (
+                "/memory sources",
+                Action::Memory(MemoryCommand::Sources { offset: 0 }),
+            ),
+        ] {
+            assert_eq!(controller.on_line(line), vec![expected]);
+            assert_eq!(controller.state(), ChatState::Running);
+            assert_eq!(controller.queued_len(), 0);
+        }
+        controller.on_approval_requested("command");
+        assert_eq!(
+            controller.on_line("/memory off"),
+            vec![Action::Memory(MemoryCommand::Off)]
+        );
+        assert!(controller.pending_approval().is_some());
+    }
+
     use super::*;
 
     fn idle() -> Controller {

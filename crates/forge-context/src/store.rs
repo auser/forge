@@ -31,7 +31,15 @@ pub(crate) fn observer_read(
     path: &std::path::Path,
     bound: usize,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    filesystem::observer_read(path, bound)
+    namespace_read(path, "observer-jobs", bound)
+}
+
+pub(crate) fn namespace_read(
+    path: &std::path::Path,
+    namespace: &str,
+    bound: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    filesystem::namespace_read(path, namespace, bound)
 }
 
 pub trait ContextStore: Send + Sync {
@@ -83,6 +91,14 @@ impl FsContextStore {
         Self { root: root.into() }
     }
 
+    /// Native read-only lookup with typed missing/corrupt/unavailable outcomes.
+    pub fn inspect_plan(&self, run_id: &str, ordinal: u32) -> std::io::Result<Option<ContextPlan>> {
+        if !valid_id(run_id) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        filesystem::plan(&self.root, run_id, ordinal)
+    }
+
     fn validate(run_id: &str, session_id: Option<&str>) -> Result<(), ForgeError> {
         if !valid_id(run_id) || session_id.is_some_and(|id| !valid_id(id)) {
             return Err(ForgeError::session("invalid context plan identifier"));
@@ -110,7 +126,7 @@ impl ContextStore for FsContextStore {
 #[cfg(unix)]
 mod filesystem {
     use std::fs::File;
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
     use std::os::unix::fs::MetadataExt;
     use std::path::{Component, Path};
     use std::time::{Duration, Instant};
@@ -206,13 +222,12 @@ mod filesystem {
     }
 
     fn read<T: serde::de::DeserializeOwned>(parent: &File, name: &str) -> io::Result<Option<T>> {
-        let mut file = match file(parent, name, OFlags::RDONLY) {
+        let file = match file(parent, name, OFlags::RDONLY) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        let bytes = super::read_bounded(file, 64 * 1024)?;
         serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|_| io::ErrorKind::InvalidData.into())
@@ -327,10 +342,14 @@ mod filesystem {
         operation(&mut ArtifactDirectory { root, objects })
     }
 
-    pub(super) fn observer_read(path: &Path, bound: usize) -> io::Result<Option<Vec<u8>>> {
+    pub(super) fn namespace_read(
+        path: &Path,
+        namespace: &str,
+        bound: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
         let result = (|| {
             let context = root(path, false)?;
-            let root = directory(&context, "observer-jobs".as_ref(), false)?;
+            let root = directory(&context, namespace.as_ref(), false)?;
             super::read_bounded(file(&root, "index.json", OFlags::RDONLY)?, bound).map(Some)
         })();
         match result {
@@ -406,7 +425,7 @@ mod filesystem {
     use super::*;
     use std::{io, path::Path};
 
-    pub(super) fn observer_read(_: &Path, _: usize) -> io::Result<Option<Vec<u8>>> {
+    pub(super) fn namespace_read(_: &Path, _: &str, _: usize) -> io::Result<Option<Vec<u8>>> {
         Err(io::ErrorKind::Unsupported.into())
     }
 

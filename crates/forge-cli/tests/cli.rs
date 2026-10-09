@@ -65,6 +65,173 @@ fn forge(tmp: &Path) -> Command {
 }
 
 #[test]
+fn context_memory_inspection_is_json_read_only_and_session_explicit() {
+    use forge_core::{Event, EventKind, SessionStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions = forge_session::JsonlSessionStore::new(tmp.path().join(".forge/sessions"));
+    sessions
+        .append(Event::new(
+            "r",
+            "session-a",
+            EventKind::InputReceived {
+                message: "UNIQUE_SOURCE_TEXT_NOT_STATUS sk-abcdefghijklmnop".into(),
+            },
+        ))
+        .unwrap();
+    for command in [
+        vec!["context", "status"],
+        vec!["memory", "status"],
+        vec!["memory", "show"],
+        vec!["memory", "sources"],
+    ] {
+        let output = forge(tmp.path())
+            .arg("--project")
+            .arg(tmp.path())
+            .args(&command)
+            .args(["--session", "session-a", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(value.is_object());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("UNIQUE_SOURCE_TEXT_NOT_STATUS"));
+        assert!(!text.contains("sk-abcdefghijklmnop"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(!tmp.path().join(".forge/context").exists());
+
+        let missing = forge(tmp.path())
+            .arg("--project")
+            .arg(tmp.path())
+            .args(&command)
+            .output()
+            .unwrap();
+        assert!(!missing.status.success());
+    }
+    let refused = forge(tmp.path())
+        .arg("--project")
+        .arg(tmp.path())
+        .args(["memory", "on", "--session", "session-a", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "on must not bypass disabled project observer"
+    );
+    assert_eq!(sessions.events_for("session-a").unwrap().len(), 1);
+}
+
+#[test]
+fn corrupt_session_inspection_never_prints_private_error_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_dir = tmp.path().join(".forge/sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let secret = "PRIVATE_UNKNOWN_EVENT_TYPE_sk-secret123456";
+    std::fs::write(
+        session_dir.join("corrupt.jsonl"),
+        serde_json::json!({
+            "v": 9, "seq": 1, "ts": "2026-10-10T00:00:00Z",
+            "session_id": "corrupt", "run_id": "r", "type": secret,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for command in [
+        ["context", "status"],
+        ["memory", "status"],
+        ["memory", "show"],
+        ["memory", "sources"],
+        ["memory", "on"],
+        ["memory", "off"],
+    ] {
+        let output = forge(tmp.path())
+            .arg("--project")
+            .arg(tmp.path())
+            .args(command)
+            .args(["--session", "corrupt", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!printed.contains(secret), "{printed}");
+        assert!(!printed.contains(tmp.path().to_str().unwrap()), "{printed}");
+        assert!(
+            printed.contains("session inspection unavailable"),
+            "{printed}"
+        );
+    }
+}
+
+#[test]
+fn cli_memory_consent_persists_without_starting_observer_jobs() {
+    use forge_core::{Event, EventKind, SessionStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions = forge_session::JsonlSessionStore::new(tmp.path().join(".forge/sessions"));
+    sessions
+        .append(Event::new(
+            "r",
+            "session-a",
+            EventKind::InputReceived {
+                message: "fixture".into(),
+            },
+        ))
+        .unwrap();
+    std::fs::write(
+        tmp.path().join(".forge/config.toml"),
+        concat!(
+            "[observer]\nenabled=true\nmodel='mock-local'\n",
+            "[models.mock-local]\ncost_input_per_mtok=0.0\ncost_output_per_mtok=0.0\n"
+        ),
+    )
+    .unwrap();
+    for (verb, expected) in [("on", true), ("off", false)] {
+        let output = forge(tmp.path())
+            .arg("--project")
+            .arg(tmp.path())
+            .args(["memory", verb, "--session", "session-a", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["desired_enabled"], expected);
+        let check = forge(tmp.path())
+            .arg("--project")
+            .arg(tmp.path())
+            .args(["memory", "status", "--session", "session-a", "--json"])
+            .output()
+            .unwrap();
+        assert!(check.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+        assert_eq!(value["desired_enabled"], expected);
+        assert_eq!(value["live_prompt_injection"], false);
+        assert!(
+            !tmp.path().join(".forge/context").exists(),
+            "inspection/control started a worker or mutated derived storage"
+        );
+    }
+    let unknown = forge(tmp.path())
+        .arg("--project")
+        .arg(tmp.path())
+        .args(["memory", "off", "--session", "unknown"])
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert!(!tmp.path().join(".forge/sessions/unknown.jsonl").exists());
+}
+
+#[test]
 fn version_prints_name_and_version() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let output = forge(tmp.path()).arg("version").output().expect("run");

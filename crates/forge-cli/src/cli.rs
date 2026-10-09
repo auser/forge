@@ -182,6 +182,18 @@ pub enum Command {
         command: ConfigCommand,
     },
 
+    /// Inspect request budgets and context-store health for one session.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
+
+    /// Inspect or control session-scoped observation extraction.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+
     /// Inspect opt-in background observation without starting model calls.
     Observer {
         #[command(subcommand)]
@@ -203,6 +215,48 @@ pub enum Command {
         /// Include the source commit and compilation target.
         #[arg(long)]
         build: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ContextCommand {
+    /// Inspect context metrics without starting a model or observer.
+    Status {
+        #[arg(long, value_name = "ID")]
+        session: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MemoryCommand {
+    /// Inspect consent, observations and session-scoped jobs.
+    Status {
+        #[arg(long, value_name = "ID")]
+        session: String,
+    },
+    /// Enable observation extraction, subject to project safeguards.
+    On {
+        #[arg(long, value_name = "ID")]
+        session: String,
+    },
+    /// Stop new observation work; retain existing records and charges.
+    Off {
+        #[arg(long, value_name = "ID")]
+        session: String,
+    },
+    /// Show one bounded page of observations.
+    Show {
+        #[arg(long, value_name = "ID")]
+        session: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Show one bounded page of observation source references.
+    Sources {
+        #[arg(long, value_name = "ID")]
+        session: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
 }
 

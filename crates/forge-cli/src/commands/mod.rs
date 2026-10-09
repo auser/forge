@@ -2,6 +2,7 @@ pub mod acp_cmd;
 pub mod auth_cmd;
 pub mod chat_cmd;
 pub mod config_cmd;
+pub mod context_cmd;
 pub mod doctor;
 pub mod graph_cmd;
 pub mod guidance;
@@ -125,6 +126,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             crate::cli::AuthCommand::Login { provider } => auth_cmd::login(&ctx, provider),
         },
         Some(Command::Config { command }) => config_cmd::run(&ctx, command),
+        Some(Command::Context { command }) => context_cmd::context(&ctx, command),
+        Some(Command::Memory { command }) => context_cmd::memory(&ctx, command),
         Some(Command::Observer { command }) => match command {
             crate::cli::ObserverCommand::Status => observer_cmd::status(&ctx),
         },
@@ -171,6 +174,8 @@ fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
         Some(Command::Doctor { .. }) => "checking environment",
         Some(Command::Auth { .. }) => "checking authentication",
         Some(Command::Config { .. }) => "resolving configuration",
+        Some(Command::Context { .. }) => "reading context status",
+        Some(Command::Memory { .. }) => "reading memory state",
         Some(Command::Observer { .. }) => "reading observer status",
         Some(Command::Run { .. }) => "running agent",
         Some(Command::Resume { .. }) => "resuming run",
