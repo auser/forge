@@ -530,6 +530,7 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
             "routing_decision_made",
             "assistant_message",
             "tool_call_requested",
+            "tool_policy_decision",
             "tool_started",
             "file_changed",
             "tool_completed",
@@ -550,7 +551,7 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
         .iter()
         .map(|e| e["seq"].as_u64().expect("seq"))
         .collect();
-    assert_eq!(seqs, (1..=14).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=15).collect::<Vec<_>>());
     assert!(
         events
             .iter()

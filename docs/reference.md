@@ -482,6 +482,15 @@ forge session show <id>      # full event history (JSONL, one event per line)
 forge session fork <id>      # branch the conversation into a new session
 ```
 
+Every recognized tool call appends one `tool_policy_decision` event before
+execution. The redaction-safe event records the tool name, computed risk,
+active approval policy, typed disposition (`execute`, `require_approval`,
+`deny`, or `block`), and a deterministic reason. It deliberately contains no
+tool arguments. `policy_schema` identifies the policy rules and
+`forge_version` identifies the build, so old decisions remain interpretable
+after Forge's policy evolves. This event is emitted by the shared runtime and
+therefore appears consistently in CLI, chat, REST, MCP, and ACP session logs.
+
 Drive it over HTTP:
 
 ```bash

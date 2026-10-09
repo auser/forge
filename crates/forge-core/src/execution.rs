@@ -32,6 +32,33 @@ pub enum ApprovalPolicy {
     Deny,
 }
 
+/// The policy disposition for a recognized tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPolicyDisposition {
+    Execute,
+    RequireApproval,
+    Deny,
+    Block,
+}
+
+/// Compute the policy disposition from the same risk and policy used by
+/// execution providers.
+pub fn tool_policy_disposition(risk: RiskLevel, policy: ApprovalPolicy) -> ToolPolicyDisposition {
+    if risk == RiskLevel::Safe {
+        return ToolPolicyDisposition::Execute;
+    }
+    match policy {
+        ApprovalPolicy::Auto => ToolPolicyDisposition::Execute,
+        ApprovalPolicy::Prompt => ToolPolicyDisposition::RequireApproval,
+        ApprovalPolicy::PromptDestructive if risk == RiskLevel::Destructive => {
+            ToolPolicyDisposition::RequireApproval
+        }
+        ApprovalPolicy::PromptDestructive => ToolPolicyDisposition::Execute,
+        ApprovalPolicy::Deny => ToolPolicyDisposition::Deny,
+    }
+}
+
 impl ApprovalPolicy {
     /// Parse the `approval` configuration string
     /// (`auto`|`prompt`|`prompt-dangerous`|`deny`).
@@ -259,6 +286,13 @@ pub trait RunningProcess: Send {
 #[async_trait]
 pub trait ExecutionProvider: Send + Sync {
     fn name(&self) -> &str;
+
+    /// The approval policy this provider enforces.
+    fn approval_policy(&self) -> ApprovalPolicy;
+
+    /// Classify a file operation using the same project boundary that
+    /// [`ExecutionProvider::file_op`] enforces.
+    fn file_op_risk(&self, op: &FileOp) -> RiskLevel;
 
     async fn execute(&self, request: ExecRequest) -> Result<ExecResult, ForgeError>;
 

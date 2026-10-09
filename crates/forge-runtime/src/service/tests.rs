@@ -85,6 +85,7 @@ fn event_kinds(outcome: &RunOutcome) -> Vec<&str> {
             EventKind::RoutingDecisionMade { .. } => "routing_decision_made",
             EventKind::SkillActivated { .. } => "skill_activated",
             EventKind::ToolCallRequested { .. } => "tool_call_requested",
+            EventKind::ToolPolicyDecision { .. } => "tool_policy_decision",
             EventKind::ToolStarted { .. } => "tool_started",
             EventKind::ToolCompleted { .. } => "tool_completed",
             EventKind::FileChanged { .. } => "file_changed",
@@ -664,6 +665,7 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
             // v3 replay record of the model's tool-call turn
             "assistant_message",
             "tool_call_requested",
+            "tool_policy_decision",
             "tool_started",
             "file_changed",
             "tool_completed",
@@ -679,9 +681,44 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
             "completed"
         ]
     );
+    let policy_events: Vec<_> = outcome
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolPolicyDecision {
+                tool,
+                risk,
+                approval_policy,
+                disposition,
+                reason,
+                policy_schema,
+                forge_version,
+            } => Some((
+                tool,
+                risk,
+                approval_policy,
+                disposition,
+                reason,
+                policy_schema,
+                forge_version,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(policy_events.len(), 1);
+    assert_eq!(policy_events[0].0, "write_file");
+    assert_eq!(*policy_events[0].1, RiskLevel::Risky);
+    assert_eq!(*policy_events[0].2, forge_core::ApprovalPolicy::Auto);
+    assert_eq!(
+        *policy_events[0].3,
+        forge_core::ToolPolicyDisposition::Execute
+    );
+    assert_eq!(policy_events[0].4, "policy permits this risk level");
+    assert_eq!(*policy_events[0].5, forge_core::TOOL_POLICY_SCHEMA_VERSION);
+    assert!(!policy_events[0].6.is_empty());
     // Sequence numbers are monotonic.
     let seqs: Vec<u64> = outcome.events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=14).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=15).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -2789,6 +2826,7 @@ async fn needle_fast_path_dispatches_exact_tool_prompt_without_the_model() {
             // model
             "assistant_message", // v3: the call the brain made
             "tool_call_requested",
+            "tool_policy_decision",
             "tool_started",
             "tool_completed",
             "tool_result", // v3: its output, for replay

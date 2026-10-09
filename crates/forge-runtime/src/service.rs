@@ -9,7 +9,7 @@ use forge_config::Config;
 use forge_core::{
     CompletionRequest, DecisionRouter, Event, EventKind, ExecutionProvider, ForgeError, Message,
     ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, RunState, SessionStore, Skill,
-    SkillMeta, SkillRegistry, ToolCall, ToolResult,
+    SkillMeta, SkillRegistry, TOOL_POLICY_SCHEMA_VERSION, ToolCall, ToolResult,
 };
 use forge_needle::NeedleEngine;
 use forge_session::{
@@ -69,10 +69,9 @@ const GUARD_SAFE: &str = "safe operation";
 const GUARD_RISKY: &str =
     "destructive operation: delete, remove, rm, rmdir, overwrite, truncate, drop, format, kill";
 
-/// A tool call the brain picked, already executed, ready to be reported.
+/// A tool call the brain picked and vetted, ready for policy evaluation.
 struct FastPathDispatch {
     call: ToolCall,
-    outcome: ToolOutcome,
     confidence: f64,
 }
 
@@ -1663,26 +1662,10 @@ impl AgentService {
             return None;
         }
 
-        let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
-        match dispatcher.dispatch(&tool_call).await {
-            Ok(outcome) if !outcome.result.is_error => Some(FastPathDispatch {
-                call: tool_call,
-                outcome,
-                confidence: call.confidence,
-            }),
-            // A tool error means the operation did not complete, so the loop
-            // is where it belongs: a model may recover from it. (An
-            // `ApprovalRequired` cannot reach here — gate 5 admits only
-            // `Safe` operations — but it is handled the same way for free.)
-            _ => {
-                tracing::debug!(
-                    run_id,
-                    tool = %tool_call.name,
-                    "needle fast path handed the call back to the agent loop"
-                );
-                None
-            }
-        }
+        Some(FastPathDispatch {
+            call: tool_call,
+            confidence: call.confidence,
+        })
     }
 
     /// The turn number this run is in its session, for the decision log:
@@ -1910,6 +1893,27 @@ impl AgentService {
                     },
                 ),
             )?;
+            let dispatcher = ToolDispatcher::new(self.execution.clone(), self.graph.clone());
+            let policy = dispatcher
+                .evaluate_policy(&fast.call)
+                .expect("needle only selects recognized tools");
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::ToolPolicyDecision {
+                        tool: fast.call.name.clone(),
+                        risk: policy.risk,
+                        approval_policy: policy.approval_policy,
+                        disposition: policy.disposition,
+                        reason: policy.reason,
+                        policy_schema: TOOL_POLICY_SCHEMA_VERSION,
+                        forge_version: env!("CARGO_PKG_VERSION").to_string(),
+                    },
+                ),
+            )?;
             self.emit(
                 &sender,
                 &mut collected,
@@ -1921,7 +1925,11 @@ impl AgentService {
                     },
                 ),
             )?;
-            if let Some(path) = &fast.outcome.file_changed {
+            let outcome = match dispatcher.dispatch(&fast.call).await {
+                Ok(outcome) => outcome,
+                Err(e) => return Err(fail(&mut collected, e)),
+            };
+            if let Some(path) = &outcome.file_changed {
                 self.emit(
                     &sender,
                     &mut collected,
@@ -1944,7 +1952,7 @@ impl AgentService {
                     },
                 ),
             )?;
-            let text = fast.outcome.result.content;
+            let text = outcome.result.content;
             self.emit(
                 &sender,
                 &mut collected,
@@ -2306,6 +2314,25 @@ impl AgentService {
                         },
                     ),
                 )?;
+                if let Some(policy) = dispatcher.evaluate_policy(call) {
+                    self.emit(
+                        &sender,
+                        &mut collected,
+                        Event::new(
+                            &run_id,
+                            &session_id,
+                            EventKind::ToolPolicyDecision {
+                                tool: call.name.clone(),
+                                risk: policy.risk,
+                                approval_policy: policy.approval_policy,
+                                disposition: policy.disposition,
+                                reason: policy.reason,
+                                policy_schema: TOOL_POLICY_SCHEMA_VERSION,
+                                forge_version: env!("CARGO_PKG_VERSION").to_string(),
+                            },
+                        ),
+                    )?;
+                }
                 self.emit(
                     &sender,
                     &mut collected,
