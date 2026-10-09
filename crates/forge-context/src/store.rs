@@ -10,7 +10,14 @@ pub(crate) fn artifact_transaction<T>(
     path: &std::path::Path,
     operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    filesystem::artifact_transaction(path, operation)
+    filesystem::artifact_transaction(path, "artifacts", operation)
+}
+
+pub(crate) fn observation_transaction<T>(
+    path: &std::path::Path,
+    operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    filesystem::artifact_transaction(path, "observations", operation)
 }
 
 pub trait ContextStore: Send + Sync {
@@ -282,10 +289,11 @@ mod filesystem {
 
     pub(super) fn artifact_transaction<T>(
         path: &Path,
+        namespace: &str,
         operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> io::Result<T>,
     ) -> io::Result<T> {
         let context = root(path, true)?;
-        let root = directory(&context, "artifacts".as_ref(), true)?;
+        let root = directory(&context, namespace.as_ref(), true)?;
         let lock = file(&root, "lock", OFlags::RDWR | OFlags::CREATE)?;
         fs::fchmod(&lock, Mode::from_raw_mode(0o600))?;
         super::lock_artifacts(&lock)?;
@@ -374,6 +382,7 @@ mod filesystem {
 
     pub(super) fn artifact_transaction<T>(
         _: &Path,
+        _: &str,
         _: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> io::Result<T>,
     ) -> io::Result<T> {
         Err(io::ErrorKind::Unsupported.into())

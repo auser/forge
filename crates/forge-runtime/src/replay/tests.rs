@@ -841,6 +841,204 @@ fn an_empty_history_survives_any_budget() {
     assert!(fit_to_budget(Vec::new(), 0).is_empty());
 }
 
+/// Opt-in ledger rendering uses the real persisted prefix and the existing
+/// replay normalizer. Nothing here installs memory in a runtime request.
+#[test]
+fn observation_fixture_preserves_copied_fork_tails_and_tool_pairs() {
+    use std::num::NonZeroU64;
+
+    use forge_context::{
+        MemoryObservationStore, ObservationDraft, ObservationKind, ObservationScope,
+        ObservationSelectionReason, ObservationStore, SourceRange, ValidatedObservationBatch,
+        render_observations,
+    };
+    use forge_core::SessionStore;
+    use forge_session::JsonlSessionStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = JsonlSessionStore::new(dir.path());
+    let ledger = MemoryObservationStore::default();
+    let call = ToolCall::new(
+        "read-parent",
+        "read_file",
+        serde_json::json!({"path":"a.rs"}),
+    );
+    for event in [
+        run_started("old", 1, "old ask"),
+        assistant("old", 2, "old answer", vec![]),
+        completed("old", 3, "old answer"),
+        run_started("tools", 1, "read a.rs"),
+        assistant("tools", 2, "reading", vec![call]),
+        tool_result("tools", 3, "read-parent", "fn a() {}"),
+        assistant("tools", 4, "read done", vec![]),
+        completed("tools", 5, "read done"),
+        run_started("later", 1, "parent only"),
+        assistant("later", 2, "not inherited", vec![]),
+        completed("later", 3, "not inherited"),
+    ] {
+        sessions.append(event).unwrap();
+    }
+    let parent = sessions.events_for("sess").unwrap();
+    let commit = |session: &str, source: &[Event], start, end, content: &str| {
+        ledger
+            .commit(
+                ValidatedObservationBatch::new(
+                    session,
+                    source,
+                    SourceRange { start, end },
+                    "fixture-v1",
+                    vec![
+                        ObservationDraft {
+                            scope: ObservationScope::Session,
+                            kind: ObservationKind::Outcome,
+                            content: content.into(),
+                        },
+                        ObservationDraft {
+                            scope: ObservationScope::Session,
+                            kind: ObservationKind::State,
+                            content: format!("{content}: second atomic item"),
+                        },
+                    ],
+                    sessions.redactor(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    };
+    // Deliberately reverse arrival order: log positions, not commit order or
+    // per-run seq, determine rendering. Every run resets seq to one.
+    let later = commit("sess", &parent, 9, 11, "parent-only memory");
+    let middle = commit("sess", &parent, 4, 8, "tool memory");
+    let early = commit("sess", &parent, 1, 3, "old memory");
+
+    // copy_prefix is deliberately supplied complete-run boundaries, matching
+    // AgentService's normalized cuts rather than cutting an assistant/tool pair.
+    let copy = |from: &str, to: &str, cut: usize| {
+        assert_eq!(sessions.copy_prefix(from, to, cut).unwrap(), cut);
+        sessions
+            .append(Event::new(
+                format!("fork-{to}"),
+                to,
+                EventKind::SessionForked {
+                    from_session: from.into(),
+                    at_position: cut as u64,
+                },
+            ))
+            .unwrap();
+        sessions.events_for(to).unwrap()
+    };
+    let short = copy("sess", "short", 3);
+    let short_projection = ledger
+        .fork("sess", &parent, "short", &short, 3, sessions.redactor())
+        .unwrap();
+    assert_eq!(short_projection.batches().len(), 1);
+    assert_eq!(short_projection.batches()[0].id, early.id);
+
+    let child_prefix = copy("sess", "child", 8);
+    ledger
+        .fork(
+            "sess",
+            &parent,
+            "child",
+            &child_prefix,
+            8,
+            sessions.redactor(),
+        )
+        .unwrap();
+    assert_eq!(
+        &sessions.raw_lines("child").unwrap()[..8],
+        &sessions.raw_lines("sess").unwrap()[..8],
+        "fork retains original serialized events and source IDs"
+    );
+    let local_call = ToolCall::new(
+        "read-child",
+        "read_file",
+        serde_json::json!({"path":"child.rs"}),
+    );
+    for mut event in [
+        run_started("local", 1, "child ask"),
+        assistant(
+            "local",
+            2,
+            "reading child",
+            vec![
+                local_call,
+                ToolCall::new("unanswered-child", "read_file", serde_json::json!({})),
+            ],
+        ),
+        tool_result("local", 3, "read-child", "child tool output"),
+        assistant("local", 4, "child done", vec![]),
+        completed("local", 5, "child done"),
+    ] {
+        event.session_id = "child".into();
+        sessions.append(event).unwrap();
+    }
+    let child = sessions.events_for("child").unwrap();
+    let local = commit("child", &child, 10, 14, "child memory");
+    let projection = ledger
+        .projection("child", &child, sessions.redactor())
+        .unwrap();
+    assert!(!projection.batches().iter().any(|b| b.id == later.id));
+    let replay = conversation_from_events(&child[3..]);
+    assert!(!replay.degraded);
+    let rendered = render_observations(&projection, NonZeroU64::new(4).unwrap(), &replay.messages);
+    assert_eq!(&rendered.messages[1..], replay.messages);
+    assert_eq!(rendered.selected.len(), 2);
+    assert!(rendered.selected.iter().all(|s| s.batch_id == early.id));
+    assert_eq!(rendered.omitted.len(), 4);
+    assert!(rendered.omitted.iter().all(|s| {
+        (s.batch_id == middle.id || s.batch_id == local.id)
+            && s.reason == ObservationSelectionReason::AtOrAfterRawTail
+    }));
+    assert!(!rendered.messages[0].content.contains("tool memory"));
+    assert_eq!(
+        rendered
+            .messages
+            .iter()
+            .filter(|m| m.content == "fn a() {}")
+            .count(),
+        1,
+        "inherited raw tool output appears exactly once"
+    );
+
+    let nested = copy("child", "nested", 14);
+    let nested_projection = ledger
+        .fork("child", &child, "nested", &nested, 14, sessions.redactor())
+        .unwrap();
+    let nested_replay = conversation_from_events(&nested[9..]);
+    let child_replay = conversation_from_events(&child[9..]);
+    assert_eq!(nested_replay, child_replay, "fork markers are not messages");
+    let nested_render = render_observations(
+        &nested_projection,
+        NonZeroU64::new(10).unwrap(),
+        &nested_replay.messages,
+    );
+    assert_eq!(&nested_render.messages[1..], nested_replay.messages);
+    assert_eq!(nested_render.selected.len(), 4);
+    assert_eq!(nested_render.omitted.len(), 2);
+    assert!(nested_render.omitted.iter().all(|s| s.batch_id == local.id));
+    assert_eq!(
+        nested_render,
+        render_observations(
+            &projection,
+            NonZeroU64::new(10).unwrap(),
+            &child_replay.messages
+        )
+    );
+    assert_eq!(nested_render.messages[0].role, Role::User);
+    assert_eq!(nested_render.messages[2].tool_calls[0].id, "read-child");
+    assert_eq!(
+        nested_render.messages[3].tool_call_id.as_deref(),
+        Some("read-child")
+    );
+    assert_eq!(nested_render.messages[3].content, "child tool output");
+    assert_eq!(
+        nested_render.messages[4].tool_call_id.as_deref(),
+        Some("unanswered-child")
+    );
+    assert_eq!(nested_render.messages[4].content, UNANSWERED_TOOL);
+}
+
 #[test]
 fn the_budget_follows_the_models_context_window_with_a_floor() {
     let big = ModelCapabilities {
