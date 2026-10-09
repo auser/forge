@@ -6,6 +6,7 @@
 //! accessible only through explicit source-authorized bounded retrieval.
 
 mod artifact;
+mod compression;
 mod plan;
 mod store;
 
@@ -14,6 +15,10 @@ pub use artifact::{
     ArtifactStore, FsArtifactStore, MAX_ARTIFACT_MANIFESTS, MAX_ARTIFACT_OBJECTS,
     MAX_ARTIFACT_RESPONSE_BYTES, MemoryArtifactStore, REDACTION_POLICY_VERSION,
     SanitizedArtifactSource, SanitizedOutput,
+};
+pub use compression::{
+    COMPRESSION_VERSION, CompressionDecision, CompressionKind, CompressionReason,
+    CompressionResult, compress_tool_output,
 };
 pub use plan::{
     CONTEXT_PLAN_VERSION, ContextComponents, ContextPlan, ContextPlanDraft, ContextPlanSummary,

@@ -1620,6 +1620,43 @@ Retention can intentionally lose detail absent from the capped session log.
 Redaction remains a heuristic for known secret patterns and captured environment
 secrets, not a guarantee to recognize every sensitive value.
 
+### Content-aware tool views
+
+Deterministic compression is considered only for sanitized tool outputs larger
+than 64 KiB, after complete artifact storage succeeds. Smaller outputs and
+explicit retrieval responses retain their existing behavior. Each supported
+format must pass its own fixture-based fidelity and savings gate.
+
+The initial default-enabled transformations are deliberately narrow:
+recognized `cargo test` logs compact consecutive identical lines with explicit
+repeat counts, and `graph_grep` groups consecutive matches by path while
+retaining their ordered line numbers and text. Each selected view must save at
+least 30% against its capped baseline and fit the previous view budget.
+
+JSON/JSONL record grouping, canonical CSV/TSV grouping, and unified-diff context
+elision have experimental implementations and fidelity tests, but remain
+default-disabled. Repetition-heavy synthetic examples alone do not qualify
+general default activation. See `crates/forge-context/CORPUS.md` for measured
+results, accepted grammars and limits.
+
+```toml
+[context_compression]
+enabled = false # retain cap-and-retrieval views; artifact storage stays enabled
+```
+
+The default is `true`. Thresholds below 64 KiB are corpus experiments, not
+automatic tuning or user-facing settings. Compression savings are estimated
+with the existing character-based estimator over serialized provider text,
+including visible metadata and retrieval instructions, against the previous
+capped provider view. This is not a provider-reported token count.
+
+Unknown, malformed, unsupported or protected outputs retain cap-and-retrieval.
+In particular, git status receives no additional lossy transformation; this does
+not bypass the existing cap for oversized results. User requirements, approval
+events and command invocations are outside this tool-result transformation.
+Compression never automatically expands an artifact or changes its retrieval
+authorization.
+
 ```bash
 forge session list        # sessions with event counts
 forge session show <id>   # full event history, numbered for --at

@@ -220,12 +220,14 @@ pub fn build_service_with(
         cfg.model = name.to_string();
         forge_providers::model_from_config(&cfg, &root_for_factory)
     };
+    let compression_enabled = config.context_compression.enabled;
 
     Ok(
         AgentService::new(model, router, execution, skills, sessions, config)
             .with_graph(graph)
             .with_context_store(Some(context_store))
             .with_artifact_store(Some(artifact_store))
+            .with_compression_enabled(compression_enabled)
             .with_system_context(crate::commands::guidance::system_context(&root))
             .with_model_factory(Arc::new(factory)),
     )

@@ -207,6 +207,7 @@ fn run_messages(events: &[&Event]) -> RunReplay {
             | EventKind::ContextPlanRecorded { .. }
             | EventKind::ContextPlanUnavailable { .. }
             | EventKind::ToolOutputArtifact { .. }
+            | EventKind::ToolOutputCompression { .. }
             | EventKind::Error { .. }
             | EventKind::Cancelled { .. } => {}
         }

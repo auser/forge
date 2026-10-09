@@ -19,6 +19,7 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 /// * v5 adds the redaction-safe `tool_policy_decision` audit event.
 /// * v6 adds compact context accounting plan pointers and failure events.
 /// * v7 adds typed tool artifact retrieval grants, anchored to tool requests.
+/// * v8 adds bounded tool-output compression decisions (not retrieval grants).
 ///
 /// The change is purely additive: no existing kind or field changed
 /// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
@@ -26,10 +27,38 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 /// event kinds an older reader does not know; runs recorded before v3
 /// replay as well as their data allows (see
 /// `forge_runtime::replay::conversation_from_events`).
-pub const EVENT_SCHEMA_VERSION: u32 = 7;
+pub const EVENT_SCHEMA_VERSION: u32 = 8;
 
 /// Version of the tool-policy rules represented by `ToolPolicyDecision`.
 pub const TOOL_POLICY_SCHEMA_VERSION: u32 = 1;
+
+/// Closed vocabulary keeps compression audit records free of source text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCompressionKind {
+    Unknown,
+    Log,
+    Search,
+    Json,
+    Jsonl,
+    Table,
+    Diff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCompressionReason {
+    BelowThreshold,
+    Unsupported,
+    NoSavings,
+    Compressed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCompressionSize {
+    pub chars: usize,
+    pub estimated_tokens: usize,
+}
 
 /// Cap on the tool output stored in an [`EventKind::ToolResult`].
 ///
@@ -249,6 +278,18 @@ pub enum EventKind {
         call_id: String,
         event_seq: u64,
     },
+    /// Content-free compression decision (v8), anchored to the same request
+    /// sequence as its preceding artifact grant. Never grants retrieval itself.
+    ToolOutputCompression {
+        event_seq: u64,
+        version: u32,
+        kind: ToolCompressionKind,
+        reason: ToolCompressionReason,
+        original: ToolCompressionSize,
+        baseline: ToolCompressionSize,
+        view: ToolCompressionSize,
+        omitted: usize,
+    },
 }
 
 impl EventKind {
@@ -365,6 +406,36 @@ mod tool_arg_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compression_decision_is_bounded_typed_and_roundtrips() {
+        let size = ToolCompressionSize {
+            chars: 1024,
+            estimated_tokens: 256,
+        };
+        let event = Event::new(
+            "run",
+            "session",
+            EventKind::ToolOutputCompression {
+                event_seq: 7,
+                version: 1,
+                kind: ToolCompressionKind::Search,
+                reason: ToolCompressionReason::Compressed,
+                original: size,
+                baseline: size,
+                view: size,
+                omitted: 100,
+            },
+        );
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["v"], 8);
+        assert_eq!(value["type"], "tool_output_compression");
+        assert_eq!(value["kind"], "search");
+        assert_eq!(value["reason"], "compressed");
+        assert!(serde_json::to_string(&value).unwrap().len() < 1024);
+        let back: Event = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(back).unwrap(), value);
+    }
 
     #[test]
     fn replay_kinds_serialize_snake_case_and_roundtrip() {

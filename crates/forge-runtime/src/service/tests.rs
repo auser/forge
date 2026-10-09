@@ -4071,4 +4071,5 @@ async fn context_store_failure_is_visible_and_fail_open() {
 }
 
 mod artifacts;
+mod compression;
 mod context_privacy;
