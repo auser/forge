@@ -227,24 +227,43 @@ struct AnthropicTool<'a> {
 /// The transport failure mapping shared by the buffered and streaming send
 /// paths. Source chain included: a `local_only` redirect refusal explains
 /// itself here (see `local_only::error_detail`).
-fn send_error(url: &str, e: reqwest::Error) -> ForgeError {
+fn send_error(model: &str, url: &str, e: reqwest::Error) -> ForgeError {
     if e.is_timeout() {
-        ForgeError::provider(format!("anthropic request to {url} timed out"))
-    } else if e.is_connect() {
+        ForgeError::provider_failure(
+            model,
+            forge_core::ProviderFailureKind::Transient,
+            None,
+            format!("anthropic request to {url} timed out"),
+        )
+    } else if e.is_redirect() {
         ForgeError::provider(format!(
-            "cannot reach Anthropic endpoint at {url} (connection refused)"
-        ))
-    } else {
-        ForgeError::provider(format!(
-            "anthropic request to {url} failed: {}",
+            "anthropic request to {url} was not completed: {}",
             crate::local_only::error_detail(&e)
         ))
+    } else if e.is_connect() {
+        ForgeError::provider_failure(
+            model,
+            forge_core::ProviderFailureKind::Transient,
+            None,
+            format!("cannot reach Anthropic endpoint at {url} (connection refused)"),
+        )
+    } else {
+        ForgeError::provider_failure(
+            model,
+            forge_core::ProviderFailureKind::Transient,
+            None,
+            format!(
+                "anthropic request to {url} failed: {}",
+                crate::local_only::error_detail(&e)
+            ),
+        )
     }
 }
 
 /// A non-2xx answer becomes a typed provider error; the server error body
 /// never contains our credential.
 async fn status_error(
+    model: &str,
     url: &str,
     status: reqwest::StatusCode,
     response: reqwest::Response,
@@ -256,9 +275,11 @@ async fn status_error(
         .chars()
         .take(500)
         .collect();
-    ForgeError::provider(format!(
-        "anthropic endpoint {url} returned {status}: {text}"
-    ))
+    crate::response::http_status_error(
+        model,
+        status,
+        format!("anthropic endpoint {url} returned {status}: {text}"),
+    )
 }
 
 /// The whole-body response shape `complete()` parses — also the shape a
@@ -546,7 +567,7 @@ impl ModelProvider for AnthropicModel {
             )
             .send()
             .await
-            .map_err(|e| send_error(&url, e))?;
+            .map_err(|e| send_error(&self.model, &url, e))?;
 
         let status = response.status();
         if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
@@ -555,16 +576,18 @@ impl ModelProvider for AnthropicModel {
         if let Some(max_bytes) = self.response_max_bytes {
             let bytes = crate::response::bounded_bytes(response, max_bytes).await?;
             if !status.is_success() {
-                return Err(ForgeError::provider(format!(
-                    "anthropic endpoint returned {status}"
-                )));
+                return Err(crate::response::http_status_error(
+                    &self.model,
+                    status,
+                    format!("anthropic endpoint returned {status}"),
+                ));
             }
             let body = serde_json::from_slice(&bytes)
                 .map_err(|_| ForgeError::provider("invalid bounded anthropic response JSON"))?;
             return Ok(parse_message_body(&self.model, &body));
         }
         if !status.is_success() {
-            return Err(status_error(&url, status, response).await);
+            return Err(status_error(&self.model, &url, status, response).await);
         }
         let body: serde_json::Value = response.json().await.map_err(|e| {
             ForgeError::provider(format!("reading anthropic response from {url}: {e}"))
@@ -589,17 +612,20 @@ impl ModelProvider for AnthropicModel {
             self.authed(self.stream_client.post(&url).json(&body))
                 .send()
                 .await
-                .map_err(|e| send_error(&url, e))?
+                .map_err(|e| send_error(&self.model, &url, e))?
         };
 
         let status = response.status();
         if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
             return Err(error);
         }
+        if !status.is_success() && status != reqwest::StatusCode::BAD_REQUEST {
+            return Err(status_error(&self.model, &url, status, response).await);
+        }
         if !status.is_success() {
             // Nothing was shown yet, so exactly one non-streaming retry is
             // safe and cheap.
-            let error = status_error(&url, status, response).await;
+            let error = status_error(&self.model, &url, status, response).await;
             tracing::warn!(
                 model = %self.model,
                 %status,
@@ -836,13 +862,13 @@ mod tests {
             ))
             .await
             .expect_err("401");
-        match err {
-            ForgeError::Provider(msg) => {
-                assert!(msg.contains("401"), "got: {msg}");
-                assert!(!msg.contains("sk-ant-test-key"), "secret echoed: {msg}");
-            }
-            other => panic!("expected provider error, got {other:?}"),
-        }
+        assert_eq!(
+            err.provider_failure_kind(),
+            Some(forge_core::ProviderFailureKind::Authentication)
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "got: {msg}");
+        assert!(!msg.contains("sk-ant-test-key"), "secret echoed: {msg}");
     }
 
     // --- SSE streaming (TICKET-2) ------------------------------------------

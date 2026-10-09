@@ -14,7 +14,7 @@ pub mod session;
 pub mod skill;
 pub mod tool;
 
-pub use error::ForgeError;
+pub use error::{ForgeError, ProviderFailureKind};
 pub use events::{
     EVENT_SCHEMA_VERSION, Event, EventKind, MAX_TOOL_OUTPUT_BYTES, TOOL_POLICY_SCHEMA_VERSION,
     cap_tool_output, tool_arg_field,

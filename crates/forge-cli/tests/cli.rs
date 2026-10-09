@@ -2043,6 +2043,61 @@ fn model_list_does_not_advertise_mocks_without_the_test_env() {
     );
 }
 
+#[test]
+fn model_list_and_doctor_explain_static_model_eligibility() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        r#"
+model = "local-test"
+
+[models.local-test]
+base_url = "http://127.0.0.1:9/v1"
+
+[models.missing-credential]
+base_url = "https://example.invalid/v1"
+key_env = "FORGE_ELIGIBILITY_MISSING_KEY"
+"#,
+    )
+    .expect("write config");
+
+    let output = forge_without_mocks(tmp.path())
+        .env_remove("FORGE_ELIGIBILITY_MISSING_KEY")
+        .args(["--project"])
+        .arg(&project)
+        .args(["--json", "model", "list"])
+        .output()
+        .expect("model list");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    let missing = value["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .find(|model| model["name"] == "missing-credential")
+        .expect("configured model");
+    assert_eq!(missing["eligible"], false);
+    assert_eq!(missing["availability"], "credential unavailable");
+
+    let checks = doctor_checks(tmp.path(), &project, false);
+    let eligibility = checks
+        .iter()
+        .find(|check| check["check"] == "model eligibility")
+        .expect("eligibility check");
+    assert!(
+        eligibility["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("missing-credential (credential unavailable)")),
+        "check: {eligibility}"
+    );
+}
+
 /// Read `forge --json doctor`'s check list for a project.
 fn doctor_checks(tmp: &Path, project: &Path, mocks: bool) -> Vec<serde_json::Value> {
     let mut cmd = if mocks {

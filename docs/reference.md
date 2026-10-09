@@ -107,6 +107,20 @@ the number of seconds; it does not guess a reset time, infer remaining quota,
 or immediately retry a rejected streaming request as a second whole-response
 request. The recorded session remains resumable with `forge resume <id>`.
 
+Provider failures also carry a closed classification for authentication,
+entitlement, invalid-request, and transient failures. A long-lived Forge
+process keeps those typed observations in memory. An unpinned later run omits
+models with an active provider-supplied cooldown, or an observed
+authentication/entitlement failure; its routing event names every exclusion.
+An explicitly selected model remains binding and returns its failure instead
+of silently switching providers. Transient and invalid-request observations do
+not invent a cooldown.
+
+`forge model list` and `forge doctor` report configuration-time eligibility:
+local reachability, credential presence, and `local_only` policy. Temporary
+cooldowns are process-local evidence and appear in routing events; a new CLI
+process does not claim to remember provider state it never observed.
+
 `--local-only` means what it says: forge refuses to build a model provider
 whose endpoint is off this machine (including one a router picked), prunes the
 Jev tier in both roles, degrades an off-device `http`/`laya` router to static,

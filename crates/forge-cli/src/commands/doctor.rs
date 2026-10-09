@@ -208,6 +208,36 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
         if let Some(check) = local_only_check(config) {
             checks.push(check);
         }
+        let model_eligibility = forge_providers::model_eligibility(config);
+        let eligible = model_eligibility
+            .iter()
+            .filter(|model| model.eligible)
+            .map(|model| model.name.as_str())
+            .collect::<Vec<_>>();
+        let unavailable = model_eligibility
+            .iter()
+            .filter(|model| !model.eligible)
+            .map(|model| format!("{} ({})", model.name, model.reason))
+            .collect::<Vec<_>>();
+        let detail = match (eligible.is_empty(), unavailable.is_empty()) {
+            (false, true) => format!("eligible: {}", eligible.join(", ")),
+            (false, false) => format!(
+                "eligible: {}; unavailable: {}",
+                eligible.join(", "),
+                unavailable.join(", ")
+            ),
+            (true, false) => format!("no eligible model; unavailable: {}", unavailable.join(", ")),
+            (true, true) => "no configured models".to_string(),
+        };
+        checks.push(Check {
+            level: if eligible.is_empty() {
+                Level::Warn
+            } else {
+                Level::Ok
+            },
+            label: "model eligibility".into(),
+            detail,
+        });
         // Model provider: a test-only mock is reported as whatever it
         // actually is right now — usable under the gate, broken without it
         // (every run would fail at provider construction, and "why does

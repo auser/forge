@@ -247,7 +247,19 @@ impl ModelProvider for CodexModel {
             .send()
             .await
             .map_err(|e| {
-                ForgeError::provider(format!("Codex request failed: {}", error_detail(&e)))
+                if e.is_redirect() {
+                    ForgeError::provider(format!(
+                        "Codex request was not completed: {}",
+                        error_detail(&e)
+                    ))
+                } else {
+                    ForgeError::provider_failure(
+                        &self.model,
+                        forge_core::ProviderFailureKind::Transient,
+                        None,
+                        format!("Codex request failed: {}", error_detail(&e)),
+                    )
+                }
             })?;
         let status = response.status();
         if let Some(error) = crate::response::rate_limit_error(&self.model, &response) {
@@ -258,9 +270,11 @@ impl ModelProvider for CodexModel {
             // envelope, not just the final extracted answer.
             let bytes = crate::response::bounded_bytes(response, max_bytes).await?;
             if !status.is_success() {
-                return Err(ForgeError::provider(format!(
-                    "Codex returned HTTP {status}"
-                )));
+                return Err(crate::response::http_status_error(
+                    &self.model,
+                    status,
+                    format!("Codex returned HTTP {status}"),
+                ));
             }
             let text = std::str::from_utf8(&bytes)
                 .map_err(|_| ForgeError::provider("invalid bounded Codex response UTF-8"))?;
@@ -273,9 +287,11 @@ impl ModelProvider for CodexModel {
             .await
             .map_err(|e| ForgeError::provider(format!("reading Codex response: {e}")))?;
         if !status.is_success() {
-            return Err(ForgeError::provider(format!(
-                "Codex returned HTTP {status}: {text}"
-            )));
+            return Err(crate::response::http_status_error(
+                &self.model,
+                status,
+                format!("Codex returned HTTP {status}: {text}"),
+            ));
         }
         self.parse_wire_response(&text)
     }
