@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use forge_core::{
-    ExecRequest, ExecutionProvider, FileOp, ForgeError, ProjectGraph, RiskLevel, ToolCall,
-    ToolDefinition, ToolResult,
+    ApprovalPolicy, ExecRequest, ExecutionProvider, FileOp, ForgeError, ProjectGraph, RiskLevel,
+    ToolCall, ToolDefinition, ToolPolicyDisposition, ToolResult, tool_policy_disposition,
 };
 
 /// The tool set offered to models with the `tools` capability.
@@ -99,6 +99,14 @@ pub struct ToolOutcome {
     pub result: ToolResult,
     /// Set when a Write/Edit/Delete actually changed the file.
     pub file_changed: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPolicyEvaluation {
+    pub risk: RiskLevel,
+    pub approval_policy: ApprovalPolicy,
+    pub disposition: ToolPolicyDisposition,
+    pub reason: String,
 }
 
 /// Maps tool calls onto execution and graph providers.
@@ -226,6 +234,60 @@ fn arg_string_vec(args: &serde_json::Value, key: &str) -> Vec<String> {
 impl ToolDispatcher {
     pub fn new(exec: Arc<dyn ExecutionProvider>, graph: Option<Arc<dyn ProjectGraph>>) -> Self {
         Self { exec, graph }
+    }
+
+    /// Evaluate one recognized call without executing it. Parsing and risk
+    /// classification are shared with dispatch so audit and enforcement
+    /// cannot describe different operations.
+    pub fn evaluate_policy(&self, call: &ToolCall) -> Option<ToolPolicyEvaluation> {
+        let policy = self.exec.approval_policy();
+        let (risk, invalid) = if let Some(op) = file_op_for(call) {
+            match op {
+                Ok(op) => (self.exec.file_op_risk(&op), false),
+                Err(_) => (
+                    match call.name.as_str() {
+                        "read_file" => RiskLevel::Safe,
+                        "write_file" | "edit_file" => RiskLevel::Risky,
+                        "delete_file" => RiskLevel::Destructive,
+                        _ => unreachable!(),
+                    },
+                    true,
+                ),
+            }
+        } else {
+            match call.name.as_str() {
+                "run_command" => (
+                    command_risk(&call.arguments),
+                    arg_str(&call.arguments, "command").is_err(),
+                ),
+                "graph_context" => (RiskLevel::Safe, arg_str(&call.arguments, "query").is_err()),
+                "graph_grep" => (
+                    RiskLevel::Safe,
+                    arg_str(&call.arguments, "pattern").is_err(),
+                ),
+                _ => return None,
+            }
+        };
+        let disposition = if invalid {
+            ToolPolicyDisposition::Block
+        } else {
+            tool_policy_disposition(risk, policy)
+        };
+        let reason = match disposition {
+            ToolPolicyDisposition::Execute => "policy permits this risk level",
+            ToolPolicyDisposition::RequireApproval => {
+                "policy requires human approval for this risk level"
+            }
+            ToolPolicyDisposition::Deny => "policy denies this risk level",
+            ToolPolicyDisposition::Block => "recognized tool arguments are invalid",
+        }
+        .to_string();
+        Some(ToolPolicyEvaluation {
+            risk,
+            approval_policy: policy,
+            disposition,
+            reason,
+        })
     }
 
     /// Dispatch a tool call. `Err` is reserved for approval pauses
@@ -407,6 +469,67 @@ mod tests {
 
     fn call(name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall::new("test-1", name, args)
+    }
+
+    fn evaluate(call: &ToolCall, policy: ApprovalPolicy) -> ToolPolicyEvaluation {
+        ToolDispatcher::new(
+            Arc::new(forge_execution::NativeExecution::new(policy, "/project")),
+            None,
+        )
+        .evaluate_policy(call)
+        .expect("recognized tool")
+    }
+
+    #[test]
+    fn safe_call_auto_executes_under_deny_policy() {
+        let decision = evaluate(
+            &call("read_file", serde_json::json!({"path": "src/lib.rs"})),
+            ApprovalPolicy::Deny,
+        );
+        assert_eq!(decision.risk, RiskLevel::Safe);
+        assert_eq!(decision.disposition, ToolPolicyDisposition::Execute);
+    }
+
+    #[test]
+    fn risky_call_auto_executes_under_auto_policy() {
+        let decision = evaluate(
+            &call(
+                "write_file",
+                serde_json::json!({"path": "notes.txt", "content": "redacted"}),
+            ),
+            ApprovalPolicy::Auto,
+        );
+        assert_eq!(decision.risk, RiskLevel::Risky);
+        assert_eq!(decision.disposition, ToolPolicyDisposition::Execute);
+    }
+
+    #[test]
+    fn risky_call_requires_approval_under_prompt_policy() {
+        let decision = evaluate(
+            &call("run_command", serde_json::json!({"command": "cargo"})),
+            ApprovalPolicy::Prompt,
+        );
+        assert_eq!(decision.risk, RiskLevel::Risky);
+        assert_eq!(decision.disposition, ToolPolicyDisposition::RequireApproval);
+    }
+
+    #[test]
+    fn risky_call_is_denied_under_deny_policy() {
+        let decision = evaluate(
+            &call("run_command", serde_json::json!({"command": "cargo"})),
+            ApprovalPolicy::Deny,
+        );
+        assert_eq!(decision.disposition, ToolPolicyDisposition::Deny);
+    }
+
+    #[test]
+    fn invalid_recognized_call_is_blocked() {
+        let decision = evaluate(
+            &call("write_file", serde_json::json!({"path": "notes.txt"})),
+            ApprovalPolicy::Auto,
+        );
+        assert_eq!(decision.risk, RiskLevel::Risky);
+        assert_eq!(decision.disposition, ToolPolicyDisposition::Block);
     }
 
     #[test]

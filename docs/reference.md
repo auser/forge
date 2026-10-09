@@ -482,6 +482,17 @@ forge session show <id>      # full event history (JSONL, one event per line)
 forge session fork <id>      # branch the conversation into a new session
 ```
 
+Every recognized tool call appends one `tool_policy_decision` event before
+execution. The redaction-safe event records the tool name, computed risk,
+active approval policy, typed disposition (`execute`, `require_approval`,
+`deny`, or `block`), and a deterministic reason. It deliberately contains no
+tool arguments. `policy_schema` identifies the policy rules and
+`forge_version` identifies the package version (not a unique Git build).
+Quota refusals use `block`; `execute` means policy permits execution, not that
+the operation succeeded. Completion and result events record actual success
+or failure. This event is emitted by the shared runtime and
+therefore appears consistently in CLI, chat, REST, MCP, and ACP session logs.
+
 Drive it over HTTP:
 
 ```bash
@@ -814,6 +825,7 @@ Key settings (all optional):
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
 | `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
+| `tool_limits.<name>.per_run` | — | — | Maximum attempted calls to the exact tool name in one run |
 | `needle.variant` | `full` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small \| medium \| full); **only `full` has a downloadable artifact today** — Cactus-Compute publishes one 20-layer file, `needle build --layers N` slices smaller ones locally, so `small`/`medium` currently report "no pinned weights artifact" and fall back to static routing. `full` is the default precisely because it's the one that actually fetches; revisit once a smaller rung is hosted |
 | `needle.weights_path` | — | — | Weights override; empty → ~/.cache/forge/models/ |
 | `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~35 MB for `full`) |
@@ -823,6 +835,27 @@ Unknown keys are tolerated, with one deliberate exception: inside a
 `[models.<name>]` entry, `model_base_url`/`model_key_env` are rejected by
 name (they are top-level keys; the in-entry fields are `base_url`/`key_env`).
 Tolerating them would mean an endpoint that silently never applies.
+
+Per-tool run quotas use exact tool names:
+
+```toml
+[tool_limits]
+read_file = { per_run = 20 }
+run_command = { per_run = 5 }
+```
+
+Counters are private to one run (including concurrent runs) and are additional
+to `max_turns` and `[budget]`. Forge reserves quota immediately before tool
+dispatch, so malformed arguments, unknown-tool dispatch errors, and approval
+denials consume an attempt; a call refused because its quota is already
+exhausted does not. `per_run = 0` disables that tool. The refused N+1th call is
+returned to the model as an ordinary error result and is never executed, so the
+model can choose another action or finish. Names not present in `tool_limits`
+remain unlimited. Configured names are matched literally and need not be
+built-in tool names, allowing extension tools; an actually unknown call still
+fails through normal dispatch. Negative, non-integer, missing, or extra fields
+in a limit fail configuration parsing instead of being ignored. Limits from
+later config files override the same tool while preserving other tools.
 
 Inspect the resolved configuration:
 

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::execution::RiskLevel;
+use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 
 /// Current event schema version.
 ///
@@ -16,6 +16,8 @@ use crate::execution::RiskLevel;
 ///   model's in-flight answer. Rendering-only: replay ignores them and
 ///   reads the final `assistant_message`, so a v4 log replays exactly as
 ///   its delta-free equivalent. Purely additive, like v3.
+/// * v5 adds the redaction-safe `tool_policy_decision` audit event.
+/// * v6 adds compact context accounting plan pointers and failure events.
 ///
 /// The change is purely additive: no existing kind or field changed
 /// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
@@ -23,7 +25,10 @@ use crate::execution::RiskLevel;
 /// event kinds an older reader does not know; runs recorded before v3
 /// replay as well as their data allows (see
 /// `forge_runtime::replay::conversation_from_events`).
-pub const EVENT_SCHEMA_VERSION: u32 = 5;
+pub const EVENT_SCHEMA_VERSION: u32 = 6;
+
+/// Version of the tool-policy rules represented by `ToolPolicyDecision`.
+pub const TOOL_POLICY_SCHEMA_VERSION: u32 = 1;
 
 /// Cap on the tool output stored in an [`EventKind::ToolResult`].
 ///
@@ -132,6 +137,17 @@ pub enum EventKind {
         tool: String,
         args_summary: String,
     },
+    /// The redaction-safe policy decision made before a recognized tool call
+    /// can execute. Exactly one is emitted per policy evaluation.
+    ToolPolicyDecision {
+        tool: String,
+        risk: RiskLevel,
+        approval_policy: ApprovalPolicy,
+        disposition: ToolPolicyDisposition,
+        reason: String,
+        policy_schema: u32,
+        forge_version: String,
+    },
     FileChanged {
         path: PathBuf,
     },
@@ -206,7 +222,7 @@ pub enum EventKind {
         from_session: String,
         at_position: u64,
     },
-    /// Compact pointer to a sanitized context accounting plan (v5).
+    /// Compact pointer to a sanitized context accounting plan (v6).
     ContextPlanRecorded {
         plan_id: String,
         request_ordinal: u32,
@@ -217,7 +233,7 @@ pub enum EventKind {
         reserved_output_tokens: Option<u32>,
         plan_path: String,
     },
-    /// Best-effort context accounting failed; generation continued (v5).
+    /// Best-effort context accounting failed; generation continued (v6).
     ContextPlanUnavailable {
         request_ordinal: u32,
         error_category: String,

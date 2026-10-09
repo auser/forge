@@ -345,6 +345,8 @@ impl TurnState {
                 }))]
             }
 
+            EventKind::ToolPolicyDecision { .. } => Vec::new(),
+
             EventKind::ToolStarted { name } => {
                 vec![self.transition(name, ToolCallStatus::InProgress)]
             }
