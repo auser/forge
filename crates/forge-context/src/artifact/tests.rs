@@ -14,13 +14,17 @@ impl Clock {
     }
 }
 
-fn source(session: &str, call: &str) -> ArtifactSource {
-    ArtifactSource {
-        session_id: session.into(),
-        run_id: "run".into(),
-        call_id: call.into(),
-        event_seq: 1,
-    }
+fn source(session: &str, call: &str) -> SanitizedArtifactSource {
+    SanitizedArtifactSource::new(
+        ArtifactSource {
+            session_id: session.into(),
+            run_id: "run".into(),
+            call_id: call.into(),
+            event_seq: 1,
+        },
+        &Redactor::new(),
+    )
+    .unwrap()
 }
 
 fn output(text: &str) -> SanitizedOutput {
@@ -37,6 +41,117 @@ fn read(store: &dyn ArtifactStore, reference: &ArtifactRef) -> Option<ArtifactRe
     store
         .retrieve(&reference.handle, std::slice::from_ref(reference), range())
         .unwrap()
+}
+
+fn check_source_privacy(store: &dyn ArtifactStore, redactor: &Redactor, secrets: &[&str]) {
+    let raw = ArtifactSource {
+        session_id: "session-normal".into(),
+        run_id: "run-normal".into(),
+        call_id: "call-normal".into(),
+        event_seq: 42,
+    };
+    let text = SanitizedOutput::new(redactor, &format!("output {}", secrets.join(" ")));
+    let reference = store
+        .put(
+            SanitizedArtifactSource::new(raw.clone(), redactor).unwrap(),
+            &text,
+        )
+        .unwrap();
+    assert_eq!(reference.source, raw);
+    // A persisted event's deep-redacted metadata must still authorize retrieval.
+    let mut persisted = serde_json::to_value(&reference).unwrap();
+    redactor.redact_value(&mut persisted);
+    let persisted: ArtifactRef = serde_json::from_value(persisted).unwrap();
+    assert_eq!(persisted, reference);
+    assert_eq!(read(store, &persisted).unwrap().text, text.as_str());
+
+    for secret in secrets {
+        assert_ne!(redactor.redact(secret), *secret);
+        for field in 0..3 {
+            let mut sensitive = raw.clone();
+            let id = match field {
+                0 => &mut sensitive.session_id,
+                1 => &mut sensitive.run_id,
+                _ => &mut sensitive.call_id,
+            };
+            *id = format!("prefix-{secret}-suffix");
+            assert!(valid_source(&sensitive), "exercise syntactically valid IDs");
+            let result = SanitizedArtifactSource::new(sensitive, redactor)
+                .and_then(|source| store.put(source, &text));
+            let error = result.expect_err("sensitive source must be rejected");
+            assert_eq!(error.to_string(), unavailable().to_string());
+            assert!(!error.to_string().contains(secret));
+        }
+    }
+    assert_eq!(read(store, &persisted).unwrap().text, text.as_str());
+}
+
+fn assert_no_secrets(bytes: &[u8], secrets: &[&str]) {
+    let text = String::from_utf8_lossy(bytes);
+    for secret in secrets {
+        assert!(
+            !text.contains(secret),
+            "raw persisted bytes contain a secret"
+        );
+    }
+}
+
+#[test]
+fn source_privacy_rejects_each_identifier_before_memory_or_fs_persistence() {
+    let redactor = Redactor::new();
+    let secrets = [
+        "sk-abcdefghi123456",
+        "sk-ant-abcdefgh123456",
+        "ghp_abcdefgh123456",
+        "xoxb-abcdefgh123456",
+    ];
+    check_source_privacy_backends(&redactor, &secrets);
+}
+
+fn check_source_privacy_backends(redactor: &Redactor, secrets: &[&str]) {
+    let memory = MemoryArtifactStore::default();
+    check_source_privacy(&memory, redactor, secrets);
+    let files = memory.files.lock().unwrap();
+    assert_eq!(load(&*files).unwrap().manifests.len(), 1);
+    assert_eq!(files.len(), 2, "only the normal source's index and object");
+    for bytes in files.values() {
+        assert_no_secrets(bytes, secrets);
+    }
+    drop(files);
+
+    let temp = tempfile::tempdir().unwrap();
+    let fs = FsArtifactStore::new(temp.path(), ArtifactLimits::default());
+    check_source_privacy(&fs, redactor, secrets);
+    let index = std::fs::read(temp.path().join("artifacts/index.json")).unwrap();
+    assert_no_secrets(&index, secrets);
+    let index: Index = serde_json::from_slice(&index).unwrap();
+    assert_eq!(index.manifests.len(), 1);
+    assert_eq!(index.objects.len(), 1);
+    for entry in std::fs::read_dir(temp.path().join("artifacts/objects")).unwrap() {
+        assert_no_secrets(&std::fs::read(entry.unwrap().path()).unwrap(), secrets);
+    }
+}
+
+#[test]
+fn source_privacy_uses_supplied_environment_snapshot() {
+    const ENV: &str = "FORGE_TEST_ARTIFACT_SOURCE_SECRET";
+    const SECRET: &str = "artifact-env-value-987654321";
+    // Child-only environment avoids mutating the test runner's shared environment.
+    if std::env::var(ENV).as_deref() != Ok(SECRET) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "artifact::tests::source_privacy_uses_supplied_environment_snapshot",
+                "--nocapture",
+            ])
+            .env(ENV, SECRET)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let redactor = Redactor::new();
+    check_source_privacy_backends(&redactor, &[SECRET]);
 }
 
 #[test]
@@ -275,7 +390,7 @@ fn every_interrupted_transaction_is_recoverable_without_orphans() {
     let mut base = BTreeMap::new();
     put(
         &mut base,
-        source("one", "first"),
+        source("one", "first").0,
         &output("aaaa"),
         limits,
         0,
@@ -289,7 +404,7 @@ fn every_interrupted_transaction_is_recoverable_without_orphans() {
         };
         let _ = put(
             &mut files,
-            source("one", "second"),
+            source("one", "second").0,
             &output("bbbb"),
             limits,
             1,
@@ -297,7 +412,7 @@ fn every_interrupted_transaction_is_recoverable_without_orphans() {
         files.fail_at = usize::MAX;
         let reference = put(
             &mut files,
-            source("one", "retry"),
+            source("one", "retry").0,
             &output("cccc"),
             limits,
             2,

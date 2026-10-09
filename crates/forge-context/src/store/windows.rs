@@ -861,12 +861,16 @@ mod tests {
                 assert!(
                     store
                         .put(
-                            ArtifactSource {
-                                session_id: "session".into(),
-                                run_id: "run".into(),
-                                call_id: "call".into(),
-                                event_seq: 1,
-                            },
+                            crate::SanitizedArtifactSource::new(
+                                ArtifactSource {
+                                    session_id: "session".into(),
+                                    run_id: "run".into(),
+                                    call_id: "call".into(),
+                                    event_seq: 1,
+                                },
+                                &forge_session::Redactor::new()
+                            )
+                            .unwrap(),
                             &output
                         )
                         .is_err()
@@ -898,12 +902,16 @@ mod tests {
             assert!(
                 store
                     .put(
-                        ArtifactSource {
-                            session_id: "session".into(),
-                            run_id: "run".into(),
-                            call_id: "call".into(),
-                            event_seq: 1,
-                        },
+                        crate::SanitizedArtifactSource::new(
+                            ArtifactSource {
+                                session_id: "session".into(),
+                                run_id: "run".into(),
+                                call_id: "call".into(),
+                                event_seq: 1,
+                            },
+                            &forge_session::Redactor::new()
+                        )
+                        .unwrap(),
                         &SanitizedOutput::new(&forge_session::Redactor::new(), "safe")
                     )
                     .is_err()
@@ -928,12 +936,16 @@ mod tests {
             .unwrap();
         FsArtifactStore::new(&root, ArtifactLimits::default())
             .put(
-                ArtifactSource {
-                    session_id: "session".into(),
-                    run_id: "run".into(),
-                    call_id: "call".into(),
-                    event_seq: 1,
-                },
+                crate::SanitizedArtifactSource::new(
+                    ArtifactSource {
+                        session_id: "session".into(),
+                        run_id: "run".into(),
+                        call_id: "call".into(),
+                        event_seq: 1,
+                    },
+                    &forge_session::Redactor::new(),
+                )
+                .unwrap(),
                 &SanitizedOutput::new(&forge_session::Redactor::new(), "private"),
             )
             .unwrap();

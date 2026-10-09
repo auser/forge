@@ -1,7 +1,7 @@
 use super::*;
 use forge_context::{
     ArtifactQuery, ArtifactRead, ArtifactRef, ArtifactSource, ArtifactStore, MemoryArtifactStore,
-    SanitizedOutput,
+    SanitizedArtifactSource, SanitizedOutput,
 };
 
 fn retrieval(handle: &str, start: usize, end: usize) -> ToolCall {
@@ -25,7 +25,11 @@ fn source() -> ArtifactSource {
 
 struct FailingArtifacts;
 impl ArtifactStore for FailingArtifacts {
-    fn put(&self, _: ArtifactSource, _: &SanitizedOutput) -> Result<ArtifactRef, ForgeError> {
+    fn put(
+        &self,
+        _: SanitizedArtifactSource,
+        _: &SanitizedOutput,
+    ) -> Result<ArtifactRef, ForgeError> {
         Err(ForgeError::execution(
             "PRIVATE_STORAGE_FAILURE sk-abcdefghijk",
         ))
@@ -38,6 +42,75 @@ impl ArtifactStore for FailingArtifacts {
     ) -> Result<Option<ArtifactRead>, ForgeError> {
         Err(ForgeError::execution("PRIVATE_STORAGE_FAILURE"))
     }
+}
+
+#[tokio::test]
+async fn redactable_provider_call_id_never_enters_artifact_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let secret_id = "sk-abcdefghi123456";
+    std::fs::write(tmp.path().join("large.txt"), "x".repeat(70_000)).unwrap();
+    let mut reply = tool_reply("read_file", serde_json::json!({"path":"large.txt"}));
+    reply.tool_calls[0].id = secret_id.into();
+    let model = Arc::new(ScriptedMockModel::new(vec![reply, text_reply("done")]));
+    let context_root = tmp.path().join(".forge/context");
+    let service = AgentService::new(
+        model.clone(),
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(NativeExecution::new(
+            forge_core::ApprovalPolicy::Auto,
+            tmp.path(),
+        )),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(tmp.path().join("sessions"))),
+        Config::default(),
+    )
+    .with_artifact_store(Some(Arc::new(forge_context::FsArtifactStore::new(
+        &context_root,
+        forge_context::ArtifactLimits::default(),
+    ))));
+    let outcome = service.run("read large.txt").await.unwrap();
+    let events = serde_json::to_string(&outcome.events).unwrap();
+    assert!(!events.contains(secret_id));
+    assert!(
+        !outcome
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ToolOutputArtifact { .. }))
+    );
+    let output = outcome
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ToolResult { output, .. } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert!(output.contains("Complete sanitized output unavailable"));
+    assert!(!output.contains("handle="));
+    let requests = model.recorded();
+    let provider_tool = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.role == forge_core::Role::Tool)
+        .unwrap();
+    assert_eq!(provider_tool.tool_call_id.as_deref(), Some(secret_id));
+    assert_eq!(&provider_tool.content, output);
+
+    fn inspect_files(path: &std::path::Path, secret: &[u8]) {
+        if !path.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                inspect_files(&path, secret);
+            } else {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(!bytes.windows(secret.len()).any(|window| window == secret));
+            }
+        }
+    }
+    inspect_files(&context_root, secret_id.as_bytes());
 }
 
 #[tokio::test]
@@ -305,6 +378,7 @@ async fn retrieval_uses_normal_quota_policy_and_never_recursively_artifacts() {
 struct SecretExecution {
     fail: bool,
     approve: bool,
+    output: String,
 }
 
 #[tokio::test]
@@ -313,10 +387,10 @@ async fn authorized_retrieval_runs_through_model_loop_without_creating_an_artifa
     let store = Arc::new(MemoryArtifactStore::default());
     let reference = store
         .put(
-            source(),
+            SanitizedArtifactSource::new(source(), &forge_session::Redactor::new()).unwrap(),
             &SanitizedOutput::new(
                 &forge_session::Redactor::new(),
-                &format!("{}TAIL", "x".repeat(70_000)),
+                &format!("{}Bearer ", "x".repeat(70_000)),
             ),
         )
         .unwrap();
@@ -324,7 +398,13 @@ async fn authorized_retrieval_runs_through_model_loop_without_creating_an_artifa
         tool_reply(
             "retrieve_tool_output",
             serde_json::json!({
-                "handle": reference.handle, "start": 70_000, "end": 70_004
+                "handle": reference.handle, "start": 70_000, "end": 70_007
+            }),
+        ),
+        tool_reply(
+            "retrieve_tool_output",
+            serde_json::json!({
+                "handle": reference.handle, "start": 0, "end": 16_384
             }),
         ),
         text_reply("retrieved"),
@@ -362,20 +442,63 @@ async fn authorized_retrieval_runs_through_model_loop_without_creating_an_artifa
         )
         .await
         .unwrap();
-    assert_eq!(outcome.tool_calls, 1);
+    assert_eq!(outcome.tool_calls, 2);
     assert!(
         !outcome
             .events
             .iter()
             .any(|e| matches!(e.kind, EventKind::ToolOutputArtifact { .. }))
     );
-    assert!(outcome.events.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, is_error: false, .. } if output.contains("TAIL"))));
+    let persisted = outcome
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ToolResult {
+                output,
+                is_error: false,
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert!(persisted.len() <= 16 * 1024);
+    let read: ArtifactRead = serde_json::from_str(persisted).unwrap();
+    assert_eq!(read.text, "Bearer ");
+    assert_eq!(read.start, 70_000);
+    assert_eq!(read.end, 70_007);
+    assert_eq!(read.total_bytes, 70_007);
+    assert_eq!(read.next_start, None);
     assert!(
         model.recorded()[1]
             .messages
             .iter()
-            .any(|m| m.role == forge_core::Role::Tool && m.content.contains("TAIL"))
+            .any(|message| message.role == forge_core::Role::Tool && &message.content == persisted)
     );
+    let requests = model.recorded();
+    let provided: Vec<_> = requests[2]
+        .messages
+        .iter()
+        .filter(|message| message.role == forge_core::Role::Tool)
+        .collect();
+    let logged: Vec<_> = outcome
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolResult { output, .. } => Some(output),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(provided.len(), 2);
+    for (message, output) in provided.iter().zip(logged) {
+        assert_eq!(&message.content, output);
+        assert!(output.len() <= 16 * 1024);
+        let _: ArtifactRead = serde_json::from_str(output).unwrap();
+    }
+    let window: ArtifactRead = serde_json::from_str(&provided[1].content).unwrap();
+    assert_eq!(window.start, 0);
+    assert_eq!(window.end, window.text.len());
+    assert_eq!(window.next_start, Some(window.end));
+    assert_eq!(window.total_bytes, 70_007);
 }
 
 const SECRET_OUTPUT: &str = "private output sk-abcdefghijklmnop";
@@ -414,16 +537,16 @@ impl ExecutionProvider for SecretExecution {
     ) -> Result<forge_core::ExecResult, ForgeError> {
         Ok(forge_core::ExecResult {
             exit_code: i32::from(self.fail),
-            stdout: SECRET_OUTPUT.into(),
+            stdout: self.output.clone(),
             stderr: String::new(),
         })
     }
     async fn file_op(&self, _: forge_core::FileOp) -> Result<forge_core::FileOpResult, ForgeError> {
         if self.fail {
-            return Err(ForgeError::execution(SECRET_OUTPUT));
+            return Err(ForgeError::execution(self.output.clone()));
         }
         Ok(forge_core::FileOpResult {
-            content: Some(SECRET_OUTPUT.into()),
+            content: Some(self.output.clone()),
             changed: false,
         })
     }
@@ -436,15 +559,22 @@ impl ExecutionProvider for SecretExecution {
 }
 
 #[tokio::test]
-async fn all_tool_paths_redact_provider_requests_without_artifact_storage() {
-    for (needle, fail, approve) in [
+async fn all_tool_paths_use_the_persisted_sanitized_output() {
+    for (needle, fail, approve, boundary, store_mode) in [
         (false, false, false),
         (false, true, false),
         (false, false, true),
         (false, true, true),
         (true, false, false),
         (true, true, false),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|(needle, fail, approve)| {
+        [false, true].map(move |boundary| (needle, fail, approve, boundary))
+    })
+    .flat_map(|(needle, fail, approve, boundary)| {
+        [0, 1, 2].map(move |store_mode| (needle, fail, approve, boundary, store_mode))
+    }) {
         let tmp = tempfile::tempdir().unwrap();
         let tool = if approve { "run_command" } else { "read_file" };
         let args = if approve {
@@ -458,7 +588,23 @@ async fn all_tool_paths_redact_provider_requests_without_artifact_storage() {
             vec![tool_reply(tool, args), text_reply("done")]
         };
         let model = Arc::new(ScriptedMockModel::new(replies));
-        let execution = Arc::new(SecretExecution { fail, approve });
+        let prefix_len = if approve {
+            format!("exit {}\nstdout:\n", i32::from(fail)).len()
+        } else if fail {
+            "execution error: ".len()
+        } else {
+            0
+        };
+        let output = if boundary {
+            format!("{}BearerXYZ", "x".repeat(65530 - prefix_len))
+        } else {
+            SECRET_OUTPUT.into()
+        };
+        let execution = Arc::new(SecretExecution {
+            fail,
+            approve,
+            output,
+        });
         let service = if needle {
             needle_service(tmp.path(), model.clone(), execution)
         } else {
@@ -471,6 +617,12 @@ async fn all_tool_paths_redact_provider_requests_without_artifact_storage() {
                 Config::default(),
             )
         };
+        let store: Option<Arc<dyn ArtifactStore>> = match store_mode {
+            0 => None,
+            1 => Some(Arc::new(MemoryArtifactStore::default())),
+            _ => Some(Arc::new(FailingArtifacts)),
+        };
+        let service = service.with_artifact_store(store);
         let run_id = forge_session::new_run_id();
         if approve {
             service.send_input(&run_id, "y").unwrap();
@@ -506,6 +658,9 @@ async fn all_tool_paths_redact_provider_requests_without_artifact_storage() {
         if needle && !fail {
             assert!(requests.is_empty());
             assert!(outcome.text.contains("[REDACTED]"));
+            assert!(outcome.events.iter().any(|event| matches!(
+                &event.kind, EventKind::ToolResult { output, .. } if output == &outcome.text
+            )));
         } else {
             let logged = outcome
                 .events

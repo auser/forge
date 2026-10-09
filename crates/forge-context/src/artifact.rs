@@ -62,6 +62,25 @@ pub struct ArtifactSource {
     pub event_seq: u64,
 }
 
+/// Source metadata checked against the runtime/session's existing redactor.
+/// Identifiers must remain unchanged so persisted event authorization and
+/// artifact identity agree. No deserializer or unchecked constructor can
+/// bypass this boundary.
+pub struct SanitizedArtifactSource(ArtifactSource);
+
+impl SanitizedArtifactSource {
+    pub fn new(source: ArtifactSource, redactor: &Redactor) -> Result<Self, ForgeError> {
+        if !valid_source(&source)
+            || [&source.session_id, &source.run_id, &source.call_id]
+                .iter()
+                .any(|id| redactor.redact(id) != **id)
+        {
+            return Err(unavailable());
+        }
+        Ok(Self(source))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactRef {
     pub handle: String,
@@ -95,7 +114,7 @@ pub struct ArtifactRead {
 pub trait ArtifactStore: Send + Sync {
     fn put(
         &self,
-        source: ArtifactSource,
+        source: SanitizedArtifactSource,
         output: &SanitizedOutput,
     ) -> Result<ArtifactRef, ForgeError>;
 
@@ -210,9 +229,10 @@ macro_rules! implement_store {
         impl ArtifactStore for $store {
             fn put(
                 &self,
-                source: ArtifactSource,
+                source: SanitizedArtifactSource,
                 output: &SanitizedOutput,
             ) -> Result<ArtifactRef, ForgeError> {
+                let source = source.0;
                 validate_put(&source, output, self.limits).map_err(|_| unavailable())?;
                 ($transaction)(self, &mut |files: &mut dyn ArtifactFiles| {
                     put(

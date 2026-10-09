@@ -1081,16 +1081,24 @@ impl AgentService {
         raw: &str,
         source: forge_context::ArtifactSource,
     ) -> (String, Option<EventKind>) {
+        if call.name == "retrieve_tool_output" {
+            return (
+                self.sessions.redactor().redact_tool_output(&call.name, raw),
+                None,
+            );
+        }
         let sanitized = forge_context::SanitizedOutput::new(self.sessions.redactor(), raw);
         let text = sanitized.as_str();
-        if text.len() <= forge_core::MAX_TOOL_OUTPUT_BYTES || call.name == "retrieve_tool_output" {
+        if text.len() <= forge_core::MAX_TOOL_OUTPUT_BYTES {
             return (forge_core::cap_tool_output(text), None);
         }
         let capped = forge_core::cap_tool_output(text);
-        let reference = self
-            .artifact_store
-            .as_ref()
-            .and_then(|store| store.put(source, &sanitized).ok());
+        let reference = self.artifact_store.as_ref().and_then(|store| {
+            let source =
+                forge_context::SanitizedArtifactSource::new(source, self.sessions.redactor())
+                    .ok()?;
+            store.put(source, &sanitized).ok()
+        });
         match reference {
             Some(reference) => {
                 let output = format!(
@@ -1150,6 +1158,10 @@ impl AgentService {
                 .map_err(|_| "artifact unavailable")?
                 .ok_or("artifact unavailable")?;
             let output = serde_json::to_string(&read).map_err(|_| "artifact unavailable")?;
+            let output = self
+                .sessions
+                .redactor()
+                .redact_tool_output(&call.name, &output);
             if output.len() > 16 * 1024 {
                 return Err("artifact unavailable");
             }
@@ -1174,11 +1186,21 @@ impl AgentService {
         collected: &mut Vec<Event>,
         event: Event,
     ) -> Result<(), ForgeError> {
+        self.emit_stored(sender, collected, event).map(|_| ())
+    }
+
+    /// Return the persisted view for consumers that forward event content.
+    fn emit_stored(
+        &self,
+        sender: &broadcast::Sender<Event>,
+        collected: &mut Vec<Event>,
+        event: Event,
+    ) -> Result<Event, ForgeError> {
         let stored = self.sessions.append(event)?;
         // No subscribers yet is normal for the CLI; not an error.
         let _ = sender.send(stored.clone());
-        collected.push(stored);
-        Ok(())
+        collected.push(stored.clone());
+        Ok(stored)
     }
 
     /// Activate one skill by name: emit its `skill_activated` event and
@@ -2216,7 +2238,7 @@ impl AgentService {
                     Event::new(&run_id, &session_id, kind),
                 )?;
             }
-            self.emit(
+            let stored = self.emit_stored(
                 &sender,
                 &mut collected,
                 Event::new(
@@ -2230,6 +2252,9 @@ impl AgentService {
                     },
                 ),
             )?;
+            let EventKind::ToolResult { output: text, .. } = stored.kind else {
+                unreachable!("session append preserves event kind");
+            };
             tool_call_count += 1;
             if outcome.result.is_error {
                 failed_fast = Some((fast.call, text));
@@ -2784,7 +2809,7 @@ impl AgentService {
                         Event::new(&run_id, &session_id, kind),
                     )?;
                 }
-                self.emit(
+                let stored = self.emit_stored(
                     &sender,
                     &mut collected,
                     Event::new(
@@ -2798,7 +2823,12 @@ impl AgentService {
                         },
                     ),
                 )?;
-                messages.push(Message::tool(call.id.clone(), model_output));
+                let EventKind::ToolResult { output, .. } = stored.kind else {
+                    unreachable!("session append preserves event kind");
+                };
+                // Preserve the provider's protocol identifier so it matches the
+                // assistant call above; only the output comes from persistence.
+                messages.push(Message::tool(call.id.clone(), output));
             }
             self.emit(
                 &sender,

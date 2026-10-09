@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use forge_core::{Event, ForgeError, SessionStore};
+use forge_core::{Event, EventKind, ForgeError, SessionStore};
 
 use crate::redact::Redactor;
 
@@ -297,13 +297,26 @@ impl SessionStore for JsonlSessionStore {
         std::fs::create_dir_all(&self.root).map_err(ForgeError::Io)?;
         event.seq = self.next_seq(&event.session_id, &event.run_id)?;
         event.v = forge_core::EVENT_SCHEMA_VERSION;
+        // Keep structured tool content out of the generic string traversal.
+        let tool_output = if let EventKind::ToolResult { tool, output, .. } = &mut event.kind {
+            let sanitized = self.redactor.redact_tool_output(tool, output);
+            output.clear();
+            Some(sanitized)
+        } else {
+            None
+        };
         let mut value = serde_json::to_value(&event)
             .map_err(|e| ForgeError::session(format!("serializing event: {e}")))?;
         self.redactor.redact_value(&mut value);
-        let line = serde_json::to_string(&value)
-            .map_err(|e| ForgeError::session(format!("serializing event: {e}")))?;
         let mut redacted: Event = serde_json::from_value(value)
             .map_err(|e| ForgeError::session(format!("re-reading a redacted event: {e}")))?;
+        if let (Some(sanitized), EventKind::ToolResult { output, .. }) =
+            (tool_output, &mut redacted.kind)
+        {
+            *output = sanitized;
+        }
+        let line = serde_json::to_string(&redacted)
+            .map_err(|e| ForgeError::session(format!("serializing event: {e}")))?;
         redacted.ts = event.ts;
 
         let mut file = OpenOptions::new()
@@ -450,6 +463,41 @@ mod tests {
         assert!(!raw.contains(secret), "leaked env secret: {raw}");
         assert!(!raw.contains("Bearer abcdef123"), "leaked bearer: {raw}");
         assert!(raw.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn retrieval_redaction_preserves_json_and_continuation_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(tmp.path());
+        let stored = store
+            .append(Event::new(
+                "run",
+                "session",
+                EventKind::ToolResult {
+                    call_id: "call".into(),
+                    tool: "retrieve_tool_output".into(),
+                    output: serde_json::json!({
+                        "text": "sk-abcdefghijklmnop\nBearer ",
+                        "start": 10, "end": 40, "total_bytes": 100, "next_start": 40
+                    })
+                    .to_string(),
+                    is_error: false,
+                },
+            ))
+            .unwrap();
+        let EventKind::ToolResult { output, .. } = &stored.kind else {
+            panic!("tool result")
+        };
+        let value: serde_json::Value = serde_json::from_str(output).unwrap();
+        assert_eq!(value["text"], "[REDACTED]\nBearer ");
+        assert_eq!(value["start"], 10);
+        assert_eq!(value["end"], 40);
+        assert_eq!(value["total_bytes"], 100);
+        assert_eq!(value["next_start"], 40);
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::to_value(&store.events_for("session").unwrap()[0]).unwrap()
+        );
     }
 
     #[test]

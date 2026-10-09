@@ -12,7 +12,8 @@ mod store;
 pub use artifact::{
     ArtifactClock, ArtifactLimits, ArtifactQuery, ArtifactRead, ArtifactRef, ArtifactSource,
     ArtifactStore, FsArtifactStore, MAX_ARTIFACT_MANIFESTS, MAX_ARTIFACT_OBJECTS,
-    MAX_ARTIFACT_RESPONSE_BYTES, MemoryArtifactStore, REDACTION_POLICY_VERSION, SanitizedOutput,
+    MAX_ARTIFACT_RESPONSE_BYTES, MemoryArtifactStore, REDACTION_POLICY_VERSION,
+    SanitizedArtifactSource, SanitizedOutput,
 };
 pub use plan::{
     CONTEXT_PLAN_VERSION, ContextComponents, ContextPlan, ContextPlanDraft, ContextPlanSummary,
