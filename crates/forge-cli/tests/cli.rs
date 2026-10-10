@@ -617,6 +617,78 @@ fn one_command_workflow_records_plan_checks_review_and_diff() {
     );
 }
 
+#[test]
+fn task_id_resume_continues_an_approval_interruption() {
+    use forge_task::{JsonlTaskStore, TaskState};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(
+        project.join("script.json"),
+        r#"[
+          {"tool_calls":[{"id":"write-1","name":"write_file","arguments":{
+            "path":"note.txt","content":"resumed safely\n"
+          }}]},
+          {"text":"The parked task resumed and completed."}
+        ]"#,
+    )
+    .expect("script");
+    let config = |approval: &str| {
+        format!(
+            "model = \"scripted-mock\"\nmock_script = \"script.json\"\n\
+             router = \"static\"\napproval = \"{approval}\"\n"
+        )
+    };
+    std::fs::write(project.join(".forge/config.toml"), config("prompt")).expect("config");
+
+    let first = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["run", "write the note"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("initial run");
+    assert!(
+        !first.status.success(),
+        "initial run must park for approval"
+    );
+    assert!(!project.join("note.txt").exists());
+
+    let store = JsonlTaskStore::for_project(&project);
+    let task_id = std::fs::read_dir(store.root())
+        .expect("task directory")
+        .flatten()
+        .find_map(|entry| entry.path().file_stem()?.to_str().map(str::to_string))
+        .expect("task id");
+    assert_eq!(
+        store.load(&task_id).unwrap().checkpoint.state("edit"),
+        Some(TaskState::Interrupted)
+    );
+
+    std::fs::write(project.join(".forge/config.toml"), config("auto")).expect("config");
+    let resumed = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["resume", &task_id])
+        .output()
+        .expect("resume");
+    assert!(
+        resumed.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("note.txt")).expect("resumed effect"),
+        "resumed safely\n"
+    );
+    assert_eq!(
+        store.load(&task_id).unwrap().checkpoint.state("review"),
+        Some(TaskState::Succeeded)
+    );
+}
+
 #[tokio::test]
 async fn explicit_multi_model_router_keeps_every_available_candidate() {
     use wiremock::matchers::{method, path};

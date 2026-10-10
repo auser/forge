@@ -53,7 +53,56 @@ pub enum InterruptionReason {
         failure: ProviderFailureKind,
     },
     ApprovalRequired,
+    VerificationFailed {
+        check: String,
+    },
+    TreeConflict {
+        expected: String,
+        actual: String,
+    },
+    AmbiguousEffect {
+        effect_id: String,
+        tool: String,
+    },
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectClass {
+    ReadOnly,
+    Idempotent,
+    NonIdempotent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectState {
+    NotStarted,
+    PossiblyExecuted,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectCheckpoint {
+    pub effect_id: String,
+    pub node_id: String,
+    pub tool: String,
+    pub arguments_hash: String,
+    pub class: EffectClass,
+    pub state: EffectState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCheckpoint {
+    pub head: String,
+    pub fingerprint: String,
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +265,10 @@ impl TaskPlan {
             task_id: self.task_id.clone(),
             sequence: 1,
             nodes,
+            run_id: None,
+            session_id: None,
+            workspace: None,
+            effects: BTreeMap::new(),
         }
     }
 }
@@ -275,6 +328,14 @@ pub struct Checkpoint {
     pub task_id: String,
     pub sequence: u64,
     pub nodes: BTreeMap<String, NodeCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceCheckpoint>,
+    #[serde(default)]
+    pub effects: BTreeMap<String, EffectCheckpoint>,
 }
 
 impl Checkpoint {
@@ -288,6 +349,22 @@ impl Checkpoint {
 
     pub fn state(&self, node_id: &str) -> Option<TaskState> {
         self.nodes.get(node_id).map(|node| node.state)
+    }
+
+    pub fn active_node(&self) -> Option<&str> {
+        self.nodes.iter().find_map(|(id, node)| {
+            matches!(
+                node.state,
+                TaskState::Running | TaskState::WaitingForApproval
+            )
+            .then_some(id.as_str())
+        })
+    }
+
+    pub fn ambiguous_effects(&self) -> impl Iterator<Item = &EffectCheckpoint> {
+        self.effects
+            .values()
+            .filter(|effect| effect.state == EffectState::PossiblyExecuted)
     }
 
     pub(crate) fn apply(

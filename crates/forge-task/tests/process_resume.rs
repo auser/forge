@@ -1,8 +1,8 @@
 use std::process::Command;
 
 use forge_task::{
-    InterruptionReason, JsonlTaskStore, TaskNode, TaskNodeKind, TaskPlan, TaskState,
-    TransitionRequest,
+    EffectClass, EffectRequest, EffectState, InterruptionReason, JsonlTaskStore, TaskNode,
+    TaskNodeKind, TaskPlan, TaskState, TransitionRequest, WorkspaceCheckpoint,
 };
 
 const CHILD_ENV: &str = "FORGE_TASK_PROCESS_BOUNDARY_CHILD";
@@ -82,12 +82,147 @@ fn killed_process_recovers_approval_and_failure_boundaries() {
 }
 
 #[test]
+fn killed_process_preserves_every_workflow_node_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = ["inspect", "edit", "check", "review"];
+    for (index, node) in nodes.iter().enumerate() {
+        crash_at(tmp.path(), &format!("workflow-{node}"));
+        let task_id = format!("workflow-{node}");
+        let store = JsonlTaskStore::new(tmp.path());
+        let loaded = store.load(&task_id).unwrap();
+        for completed in &nodes[..index] {
+            assert_eq!(
+                loaded.checkpoint.state(completed),
+                Some(TaskState::Succeeded)
+            );
+        }
+        assert_eq!(loaded.checkpoint.state(node), Some(TaskState::Running));
+        for pending in &nodes[index + 1..] {
+            assert_eq!(loaded.checkpoint.state(pending), Some(TaskState::Pending));
+        }
+        store
+            .transition(
+                &task_id,
+                TransitionRequest::new(*node, TaskState::Interrupted)
+                    .interrupted_by(InterruptionReason::ProcessInterrupted),
+            )
+            .unwrap();
+        store
+            .transition(&task_id, TransitionRequest::new(*node, TaskState::Running))
+            .unwrap();
+        assert_eq!(
+            store.load(&task_id).unwrap().checkpoint.nodes[*node].attempts,
+            2
+        );
+    }
+}
+
+#[test]
+fn killed_process_preserves_each_effect_commit_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (step, expected) in [
+        ("effect-registered", EffectState::NotStarted),
+        ("effect-started", EffectState::PossiblyExecuted),
+        ("effect-completed", EffectState::Completed),
+    ] {
+        crash_at(tmp.path(), step);
+        let loaded = JsonlTaskStore::new(tmp.path()).load(step).unwrap();
+        assert_eq!(loaded.checkpoint.effects["effect"].state, expected);
+    }
+}
+
+#[test]
 fn task_boundary_child() {
     if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
         return;
     }
     let store = JsonlTaskStore::new(std::env::var(ROOT_ENV).unwrap());
-    match std::env::var(STEP_ENV).unwrap().as_str() {
+    let step = std::env::var(STEP_ENV).unwrap();
+    if let Some(node) = step.strip_prefix("workflow-") {
+        let nodes = ["inspect", "edit", "check", "review"];
+        let mut builder = TaskPlan::builder("four node workflow").with_id(&step);
+        for (index, id) in nodes.iter().enumerate() {
+            let kind = match *id {
+                "inspect" => TaskNodeKind::Inspect,
+                "edit" => TaskNodeKind::Edit,
+                "check" => TaskNodeKind::Check,
+                "review" => TaskNodeKind::Review,
+                _ => unreachable!(),
+            };
+            let mut task_node = TaskNode::new(*id, *id, kind);
+            if index > 0 {
+                task_node = task_node.depends_on(nodes[index - 1]);
+            }
+            builder = builder.add_node(task_node);
+        }
+        store.create(builder.build().unwrap()).unwrap();
+        for id in nodes {
+            store
+                .transition(&step, TransitionRequest::new(id, TaskState::Running))
+                .unwrap();
+            if id == node {
+                std::process::abort();
+            }
+            store
+                .transition(&step, TransitionRequest::new(id, TaskState::Succeeded))
+                .unwrap();
+        }
+        unreachable!();
+    }
+    if step.starts_with("effect-") {
+        let plan = TaskPlan::builder("effect boundary")
+            .with_id(&step)
+            .add_node(TaskNode::new("edit", "Edit", TaskNodeKind::Edit))
+            .build()
+            .unwrap();
+        store.create(plan).unwrap();
+        store
+            .bind_run(
+                &step,
+                "run",
+                "session",
+                WorkspaceCheckpoint {
+                    head: "head".into(),
+                    fingerprint: "before".into(),
+                    changed_paths: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .register_effect(
+                &step,
+                EffectRequest::new(
+                    "effect",
+                    "edit",
+                    "run_command",
+                    "hash",
+                    EffectClass::NonIdempotent,
+                ),
+            )
+            .unwrap();
+        if step == "effect-registered" {
+            std::process::abort();
+        }
+        store.begin_effect(&step, "effect").unwrap();
+        if step == "effect-started" {
+            std::process::abort();
+        }
+        store
+            .complete_effect(
+                &step,
+                "effect",
+                true,
+                None,
+                WorkspaceCheckpoint {
+                    head: "head".into(),
+                    fingerprint: "after".into(),
+                    changed_paths: Vec::new(),
+                },
+            )
+            .unwrap();
+        std::process::abort();
+    }
+    match step.as_str() {
         "create" => {
             let plan = TaskPlan::builder("one side effect")
                 .with_id("kill-task")

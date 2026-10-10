@@ -479,9 +479,11 @@ review, and diff when the run produced a diff. JSON output adds `task_id`,
 run and session fields.
 
 The task checkpoint is written to `.forge/tasks/<task-id>.jsonl`. This first
-workflow integration records enough state to inspect completed and interrupted
-runs; task-level continuation is a separate command from the existing
-conversation-oriented `forge resume` and is not exposed yet.
+workflow integration records completed and interrupted runs. `forge resume`
+accepts either a task ID or the existing run/session IDs. For a task, Forge
+first compares the recorded working-tree fingerprint, refuses any
+possibly-executed tool effect, and then continues the same session. A run or
+session ID retains the existing conversation-oriented behavior.
 
 Well-defined read-only requests skip the LLM entirely. All of these must
 hold: the run's model is tool-capable (a chat-only model's run stays a plain
@@ -512,6 +514,7 @@ Interrupt and continue:
 ```bash
 forge cancel <run-id>        # works from another terminal while a run is live
 forge resume <run-id>        # continues the run, replaying its conversation
+forge resume <task-id>       # validates and continues a parked development task
 forge session list           # what happened, per session
 forge session show <id>      # full event history (JSONL, one event per line)
 forge session fork <id>      # branch the conversation into a new session
@@ -1613,13 +1616,28 @@ capability needs. Each state transition appends a complete
 `Checkpoint` with the node state, attempt count, interruption reason, and
 verification results, then calls `sync_data` before returning.
 
+Calls that can change files or launch commands add a three-state effect record.
+Forge syncs `not_started`, then `possibly_executed` immediately before the
+dispatch boundary, and marks the effect `completed` only after the replayable
+session tool result is durable. A process exit in the dispatch window therefore
+leaves an explicit ambiguity; resume parks instead of repeating the operation.
+Completed effects carry success, changed-path evidence, and the working-tree
+fingerprint observed after the call.
+
+Provider limits, unanswered approvals, failed verification commands, ambiguous
+effects, and working-tree conflicts use typed interruption reasons. A task can
+resume automatically only when its effect journal and current tree prove that
+continuation will not repeat an uncertain operation. This policy is deliberately
+conservative for `run_command`, whose external behavior Forge cannot infer.
+
 Replay validates the plan, dependency graph, event sequence, prior state, and
 transition. An invalid interior record is an error. An incomplete or corrupt
 final record is removed before the next append, so resume continues from the
 last fully written checkpoint. Nodes already marked `succeeded` are never
 returned as ready work. External operations still need their own idempotency
-key when a process could die after the operation succeeds but before Forge can
-record that success.
+key before Forge can automatically resolve a `possibly_executed` checkpoint;
+without that proof, Forge requires inspection instead of retrying the effect.
+Version-one task journals remain readable after the effect schema upgrade.
 
 ### Context accounting
 

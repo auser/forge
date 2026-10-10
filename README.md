@@ -138,6 +138,8 @@ and tradeoffs.
 
 - `forge run` — a bounded inspect/edit/check/review workflow over the
   multi-turn agent loop, with durable task evidence and a reviewable diff.
+- `forge resume <task-id>` — validates the working tree and effect journal,
+  then continues a safely parked task in its existing session.
 - `forge chat` — the same tool-using runtime interactively, with approvals
   (`y`/`n` inline; safe reads never ask).
 - `forge graph` — a deterministic project graph plus an on-device

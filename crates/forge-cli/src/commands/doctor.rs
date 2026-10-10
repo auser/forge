@@ -564,6 +564,7 @@ async fn live_checks(ctx: &Context) -> Vec<Check> {
                 max_turns: Some(LIVE_MAX_TURNS),
                 activate_skills: Vec::new(),
                 development_workflow: false,
+                effect_journal: None,
             },
         ),
     )

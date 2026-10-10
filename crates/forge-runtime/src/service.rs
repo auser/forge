@@ -201,6 +201,26 @@ pub struct ForkOutcome {
     pub events_copied: usize,
 }
 
+/// Synchronous durability boundary around tool calls that can change the
+/// working tree or invoke an external process.
+pub trait EffectJournal: std::fmt::Debug + Send + Sync {
+    fn before_effect(&self, call: &ToolCall) -> Result<(), ForgeError>;
+    fn approval_required(&self, call: &ToolCall) -> Result<(), ForgeError>;
+    fn after_effect(
+        &self,
+        call: &ToolCall,
+        success: bool,
+        changed_path: Option<&std::path::Path>,
+    ) -> Result<(), ForgeError>;
+}
+
+fn has_external_effect(call: &ToolCall) -> bool {
+    matches!(
+        call.name.as_str(),
+        "write_file" | "edit_file" | "delete_file" | "run_command"
+    )
+}
+
 /// Optional parameters for a run.
 #[derive(Debug, Default)]
 pub struct RunOptions {
@@ -217,6 +237,9 @@ pub struct RunOptions {
     /// Add the deterministic inspect/edit/check/review contract as hidden
     /// system context while preserving the user's prompt verbatim.
     pub development_workflow: bool,
+    /// Optional durable boundary invoked synchronously around externally
+    /// visible tool effects.
+    pub effect_journal: Option<Arc<dyn EffectJournal>>,
 }
 
 /// Everything one run needs beyond the ids. Built by
@@ -240,6 +263,7 @@ struct RunPlan {
     /// options and re-runs discovery on the original task.
     activate_skills: Vec<String>,
     development_workflow: bool,
+    effect_journal: Option<Arc<dyn EffectJournal>>,
 }
 
 impl RunPlan {
@@ -250,6 +274,7 @@ impl RunPlan {
         history: Vec<Message>,
         activate_skills: Vec<String>,
         development_workflow: bool,
+        effect_journal: Option<Arc<dyn EffectJournal>>,
     ) -> Self {
         let prompt = prompt.into();
         Self {
@@ -259,6 +284,7 @@ impl RunPlan {
             resumed_from: None,
             activate_skills,
             development_workflow,
+            effect_journal,
         }
     }
 }
@@ -1786,6 +1812,7 @@ impl AgentService {
                 history,
                 options.activate_skills,
                 options.development_workflow,
+                options.effect_journal,
             ),
             &run_id,
             &session_id,
@@ -1872,11 +1899,18 @@ impl AgentService {
         let max_turns = options.max_turns;
         let activate_skills = options.activate_skills;
         let development_workflow = options.development_workflow;
+        let effect_journal = options.effect_journal;
         let handle = tokio::spawn(async move {
             let history = service.session_history(&sid);
             service
                 .run_tracked(
-                    RunPlan::new_prompt(prompt, history, activate_skills, development_workflow),
+                    RunPlan::new_prompt(
+                        prompt,
+                        history,
+                        activate_skills,
+                        development_workflow,
+                        effect_journal,
+                    ),
                     &rid,
                     &sid,
                     max_turns,
@@ -2124,6 +2158,7 @@ impl AgentService {
             resumed_from,
             activate_skills,
             development_workflow,
+            effect_journal,
         } = plan;
         let prompt = prompt.as_str();
         let task = task.as_str();
@@ -2863,11 +2898,16 @@ impl AgentService {
                     event_seq: collected.last().expect("persisted tool request").seq,
                 };
                 let reservation = tool_quotas.reserve(&call.name);
+                let mut effect_may_execute = false;
                 if let Some(mut policy) = dispatcher.evaluate_policy(call) {
                     if reservation.is_err() {
                         policy.disposition = forge_core::ToolPolicyDisposition::Block;
                         policy.reason = "per-run tool quota exhausted".to_string();
                     }
+                    effect_may_execute = matches!(
+                        policy.disposition,
+                        forge_core::ToolPolicyDisposition::Execute
+                    );
                     self.emit(
                         &sender,
                         &mut collected,
@@ -2885,6 +2925,16 @@ impl AgentService {
                             },
                         ),
                     )?;
+                }
+                let mut effect_started = false;
+                if effect_may_execute
+                    && has_external_effect(call)
+                    && let Some(journal) = &effect_journal
+                {
+                    if let Err(error) = journal.before_effect(call) {
+                        return Err(fail(&mut collected, error));
+                    }
+                    effect_started = true;
                 }
                 self.emit(
                     &sender,
@@ -2906,6 +2956,12 @@ impl AgentService {
                 let outcome = match dispatched {
                     Ok(outcome) => outcome,
                     Err(ForgeError::ApprovalRequired { description, risk }) => {
+                        if has_external_effect(call)
+                            && let Some(journal) = &effect_journal
+                            && let Err(error) = journal.approval_required(call)
+                        {
+                            return Err(fail(&mut collected, error));
+                        }
                         self.emit(
                             &sender,
                             &mut collected,
@@ -2935,6 +2991,14 @@ impl AgentService {
                                         },
                                     ),
                                 )?;
+                                if has_external_effect(call)
+                                    && let Some(journal) = &effect_journal
+                                {
+                                    if let Err(error) = journal.before_effect(call) {
+                                        return Err(fail(&mut collected, error));
+                                    }
+                                    effect_started = true;
+                                }
                                 match dispatcher.dispatch_approved(call).await {
                                     Ok(outcome) => outcome,
                                     Err(e) => return Err(fail(&mut collected, e)),
@@ -3038,6 +3102,16 @@ impl AgentService {
                 let EventKind::ToolResult { output, .. } = stored.kind else {
                     unreachable!("session append preserves event kind");
                 };
+                if effect_started
+                    && let Some(journal) = &effect_journal
+                    && let Err(error) = journal.after_effect(
+                        call,
+                        !outcome.result.is_error,
+                        outcome.file_changed.as_deref(),
+                    )
+                {
+                    return Err(fail(&mut collected, error));
+                }
                 // Preserve the provider's protocol identifier so it matches the
                 // assistant call above; only the output comes from persistence.
                 messages.push(Message::tool(call.id.clone(), output));
@@ -3170,6 +3244,25 @@ impl AgentService {
     /// summary and the resume is logged as degraded. A run with no prompt at
     /// all (v1) still cannot be resumed.
     pub async fn resume(&self, session_or_run_id: &str) -> Result<RunOutcome, ForgeError> {
+        self.resume_with_options(session_or_run_id, false, RunOptions::default())
+            .await
+    }
+
+    pub(crate) async fn resume_interrupted(
+        &self,
+        session_or_run_id: &str,
+        options: RunOptions,
+    ) -> Result<RunOutcome, ForgeError> {
+        self.resume_with_options(session_or_run_id, true, options)
+            .await
+    }
+
+    async fn resume_with_options(
+        &self,
+        session_or_run_id: &str,
+        allow_incomplete: bool,
+        options: RunOptions,
+    ) -> Result<RunOutcome, ForgeError> {
         let session_id = match self.sessions.find_run(session_or_run_id)? {
             Some(session) => session,
             None if self.session_exists(session_or_run_id)? => session_or_run_id.to_string(),
@@ -3181,7 +3274,7 @@ impl AgentService {
         };
         // Claimed before anything is read, so a resume of a session that is
         // already running is refused rather than started alongside it.
-        let resumed_run = new_run_id();
+        let resumed_run = options.run_id.unwrap_or_else(new_run_id);
         let claim = self.claim_session(&session_id, &resumed_run)?;
         let events = self.sessions.events_for(&session_id)?;
 
@@ -3223,11 +3316,13 @@ impl AgentService {
         // Only completed runs resume.
         match run_events.last().map(|e| &e.kind) {
             Some(EventKind::Completed { .. }) => {}
+            Some(EventKind::Error { .. } | EventKind::Cancelled { .. }) if allow_incomplete => {}
             Some(EventKind::Error { .. } | EventKind::Cancelled { .. }) => {
                 return Err(ForgeError::agent(format!(
                     "run {target_run} ended without completion; cannot resume"
                 )));
             }
+            _ if allow_incomplete && !run_events.is_empty() => {}
             _ => {
                 return Err(ForgeError::agent(format!(
                     "run {target_run} is still in progress or empty; cannot resume"
@@ -3267,11 +3362,12 @@ impl AgentService {
                 // A resume takes no options: discovery re-runs on the
                 // original task, exactly as the run being continued did.
                 activate_skills: Vec::new(),
-                development_workflow: false,
+                development_workflow: options.development_workflow,
+                effect_journal: options.effect_journal,
             },
             &resumed_run,
             &session_id,
-            None,
+            options.max_turns,
             claim,
         )
         .await

@@ -29,10 +29,12 @@ pub async fn run(
     let run_id = forge_session::new_run_id();
     let feeder = spawn_stdin_feeder(&service, &run_id);
 
-    let task_store = forge_task::JsonlTaskStore::for_project(ctx.project_root()?);
+    let project_root = ctx.project_root()?;
+    let task_store = Arc::new(forge_task::JsonlTaskStore::for_project(&project_root));
     let result = forge_runtime::run_development_workflow(
         service.as_ref(),
-        &task_store,
+        task_store,
+        &project_root,
         &prompt,
         RunOptions {
             run_id: Some(run_id),
