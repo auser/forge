@@ -1,7 +1,8 @@
 use std::process::Command;
 
 use forge_task::{
-    InterruptionReason, JsonlTaskStore, TaskNode, TaskPlan, TaskState, TransitionRequest,
+    InterruptionReason, JsonlTaskStore, TaskNode, TaskNodeKind, TaskPlan, TaskState,
+    TransitionRequest,
 };
 
 const CHILD_ENV: &str = "FORGE_TASK_PROCESS_BOUNDARY_CHILD";
@@ -90,8 +91,15 @@ fn task_boundary_child() {
         "create" => {
             let plan = TaskPlan::builder("one side effect")
                 .with_id("kill-task")
-                .add_node(TaskNode::new("side-effect", "Perform side effect"))
-                .add_node(TaskNode::new("review", "Review result").depends_on("side-effect"))
+                .add_node(TaskNode::new(
+                    "side-effect",
+                    "Perform side effect",
+                    TaskNodeKind::Edit,
+                ))
+                .add_node(
+                    TaskNode::new("review", "Review result", TaskNodeKind::Review)
+                        .depends_on("side-effect"),
+                )
                 .build()
                 .unwrap();
             store.create(plan).unwrap();
@@ -132,7 +140,11 @@ fn task_boundary_child() {
         "approval-create" => {
             let plan = TaskPlan::builder("approval flow")
                 .with_id("approval-task")
-                .add_node(TaskNode::new("approval", "Approval boundary"))
+                .add_node(TaskNode::new(
+                    "approval",
+                    "Approval boundary",
+                    TaskNodeKind::Edit,
+                ))
                 .build()
                 .unwrap();
             store.create(plan).unwrap();
@@ -172,7 +184,11 @@ fn task_boundary_child() {
         "failure-create" => {
             let plan = TaskPlan::builder("failure flow")
                 .with_id("failure-task")
-                .add_node(TaskNode::new("failure", "Failure boundary"))
+                .add_node(TaskNode::new(
+                    "failure",
+                    "Failure boundary",
+                    TaskNodeKind::Check,
+                ))
                 .build()
                 .unwrap();
             store.create(plan).unwrap();

@@ -12,6 +12,7 @@ forge-context.workspace = true
 forge-core.workspace = true
 forge-needle.workspace = true
 forge-session.workspace = true
+forge-task.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -468,6 +468,21 @@ forge run --max-turns 10 "refactor the parser"
 forge run --json "summarize this repo" | jq .text
 ```
 
+Each `forge run` also creates a bounded development plan with four typed steps:
+inspect, edit, check, and review. The provider still operates through Forge's
+existing tool schemas, quotas, risk classification, and approval policy. Forge
+records changed paths and invoked checks, asks the provider to inspect the
+working-tree diff, and returns that review and diff without committing,
+pushing, publishing, or deploying anything. Human output includes the plan,
+review, and diff when the run produced a diff. JSON output adds `task_id`,
+`plan`, `changed_paths`, `checks`, `review`, and `diff` alongside the ordinary
+run and session fields.
+
+The task checkpoint is written to `.forge/tasks/<task-id>.jsonl`. This first
+workflow integration records enough state to inspect completed and interrupted
+runs; task-level continuation is a separate command from the existing
+conversation-oriented `forge resume` and is not exposed yet.
+
 Well-defined read-only requests skip the LLM entirely. All of these must
 hold: the run's model is tool-capable (a chat-only model's run stays a plain
 completion), the embedded Needle brain both picks a tool and fills its
@@ -1593,7 +1608,8 @@ Development plans have a separate source of truth under
 `.forge/tasks/<task-id>.jsonl`. They do not share storage with the source
 `ProjectGraph`, which can be rebuilt, or with the session transcript, which
 records model conversation. A versioned `TaskPlan` fixes stable node IDs,
-dependencies, and capability needs. Each state transition appends a complete
+closed node kinds (`inspect`, `edit`, `check`, and `review`), dependencies, and
+capability needs. Each state transition appends a complete
 `Checkpoint` with the node state, attempt count, interruption reason, and
 verification results, then calls `sync_data` before returning.
 

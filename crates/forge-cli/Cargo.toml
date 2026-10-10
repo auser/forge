@@ -29,6 +29,7 @@ forge-providers.workspace = true
 forge-runtime.workspace = true
 forge-server.workspace = true
 forge-session.workspace = true
+forge-task.workspace = true
 forge-skills.workspace = true
 async-trait.workspace = true
 clap.workspace = true
