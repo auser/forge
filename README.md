@@ -98,6 +98,9 @@ named hermetic wire-contract tests for Claude, Codex, Kimi, and local
 OpenAI-compatible endpoints, and the inspect/edit/check/review acceptance
 workflow. It makes no provider calls.
 
+The current candidate evidence and its provider-specific limitations are in
+[Beta qualification](docs/beta-qualification.md).
+
 Before publishing a release, a **manual canary is still required**: install the
 candidate artifact on a clean machine and complete one real edit/test run with
 each supported subscription provider. The hermetic mock check validates the
