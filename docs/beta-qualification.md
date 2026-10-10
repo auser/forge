@@ -1,8 +1,11 @@
 # Beta qualification
 
-Qualification run: 2026-10-09 on macOS arm64. The tested code commit was
-`01ac8b0a4103b14d466a13c11ad106ed74b52ddc`; only documentation changes follow
-that commit in this branch.
+Qualification run: 2026-10-09 on macOS arm64. The live provider and development
+workflow checks tested commit `01ac8b0a4103b14d466a13c11ad106ed74b52ddc`.
+Follow-up evidence separately covers the locked dependency refresh in
+`015263d1f8e8d296e1bc89c50c93a7933e7dd927` and the test-harness-only PTY
+synchronization in `0a0e875e1d0ce8b249336ccd22e7f3ca5cf19611`. No additional
+live provider call was made for either follow-up.
 
 ## Candidate installation
 
@@ -18,7 +21,10 @@ including checksum verification and PATH-shadow diagnostics. The qualification
 run initially warned that the locked `yoke-derive 0.8.3` release was yanked.
 On 2026-10-10 the lockfile was refreshed narrowly to `yoke-derive 0.8.4`, and a
 fresh `cargo install --locked --path crates/forge-cli` completed without the
-yanked-release warning.
+yanked-release warning. After the PTY test began waiting for the terminal's
+actual raw-mode state, the complete `just harness-gate` also passed on macOS,
+including workspace checks, both clippy modes, unit and integration tests, 66
+BDD scenarios with 273 steps, provider contracts, and the one-command workflow.
 
 ## Development workflow
 
