@@ -1,0 +1,16 @@
+[package]
+name = "forge-task"
+description = "Durable task plans and append-only execution state for Forge"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+forge-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
