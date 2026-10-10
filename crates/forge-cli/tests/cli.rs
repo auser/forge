@@ -3030,3 +3030,158 @@ fn model_refresh_refuses_under_local_only() {
         "no fetch, no cache directory"
     );
 }
+
+#[test]
+fn learning_proposals_are_local_reviewable_explicit_and_measured() {
+    use forge_core::{Event, EventKind, SessionStore};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let init = forge(tmp.path())
+        .arg("--project")
+        .arg(&project)
+        .arg("init")
+        .output()
+        .expect("init");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let sessions = forge_session::JsonlSessionStore::new(project.join(".forge/sessions"));
+    for (session, run) in [("session-a", "run-a"), ("session-b", "run-b")] {
+        sessions
+            .append(Event::new(
+                run,
+                session,
+                EventKind::InputReceived {
+                    message: "Always keep sk-abcdefgh12345678 out of output".into(),
+                },
+            ))
+            .unwrap();
+        sessions
+            .append(Event::new(
+                run,
+                session,
+                EventKind::Error {
+                    message: "compiler unavailable".into(),
+                },
+            ))
+            .unwrap();
+    }
+
+    for args in [
+        vec!["learn", "propose", "--session", "session-a"],
+        vec!["learn", "propose", "--since", "2999-01-01T00:00:00Z"],
+    ] {
+        let scoped = forge(tmp.path())
+            .arg("--project")
+            .arg(&project)
+            .args(args)
+            .output()
+            .expect("scoped proposal");
+        assert!(scoped.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&scoped.stdout).unwrap();
+        assert!(report["proposals"].as_array().unwrap().is_empty());
+    }
+    let unknown = forge(tmp.path())
+        .arg("--project")
+        .arg(&project)
+        .args(["learn", "propose", "--session", "unknown"])
+        .output()
+        .expect("unknown session");
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown session"));
+
+    let proposed = forge(tmp.path())
+        .arg("--project")
+        .arg(&project)
+        .args(["learn", "propose"])
+        .output()
+        .expect("propose");
+    assert!(
+        proposed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proposed.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&proposed.stdout).unwrap();
+    assert_eq!(report["storage"], ".forge/context/learning/index.json");
+    assert_eq!(report["proposals"].as_array().unwrap().len(), 2);
+    let proposals = report["proposals"].as_array().unwrap();
+    let accepted_id = proposals
+        .iter()
+        .find(|proposal| proposal["proposal"]["kind"] == "correction")
+        .unwrap()["proposal"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rejected_id = proposals
+        .iter()
+        .find(|proposal| proposal["proposal"]["kind"] == "failure")
+        .unwrap()["proposal"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stdout = String::from_utf8(proposed.stdout).unwrap();
+    assert!(!stdout.contains("sk-abcdefgh"), "{stdout}");
+    assert!(stdout.contains("[REDACTED]"), "{stdout}");
+    assert!(stdout.contains("session-a"), "{stdout}");
+    assert!(stdout.contains("run-b"), "{stdout}");
+
+    let refused = forge(tmp.path())
+        .arg("--project")
+        .arg(&project)
+        .args(["learn", "apply", &accepted_id])
+        .output()
+        .expect("refuse unconfirmed apply");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("requires --yes"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    for args in [
+        vec!["learn", "apply", &accepted_id, "--yes"],
+        vec!["learn", "reject", &rejected_id],
+    ] {
+        let output = forge(tmp.path())
+            .arg("--project")
+            .arg(&project)
+            .args(args)
+            .output()
+            .expect("decide");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    sessions
+        .append(Event::new(
+            "run-c",
+            "session-c",
+            EventKind::InputReceived {
+                message: "Always keep sk-abcdefgh12345678 out of output".into(),
+            },
+        ))
+        .unwrap();
+    let metrics = forge(tmp.path())
+        .arg("--project")
+        .arg(&project)
+        .args(["learn", "metrics"])
+        .output()
+        .expect("metrics");
+    assert!(metrics.status.success());
+    let metrics: serde_json::Value = serde_json::from_slice(&metrics.stdout).unwrap();
+    assert_eq!(metrics["accepted"], 1);
+    assert_eq!(metrics["rejected"], 1);
+    assert_eq!(metrics["recurrence_after_acceptance"], 1);
+
+    let gitignore = std::fs::read_to_string(project.join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|line| line.trim() == ".forge/"));
+    assert!(project.join(".forge/context/learning/index.json").is_file());
+}

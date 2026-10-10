@@ -200,6 +200,12 @@ pub enum Command {
         command: MemoryCommand,
     },
 
+    /// Mine redacted session evidence into reviewable local guidance proposals.
+    Learn {
+        #[command(subcommand)]
+        command: LearnCommand,
+    },
+
     /// Inspect opt-in background observation without starting model calls.
     Observer {
         #[command(subcommand)]
@@ -221,6 +227,53 @@ pub enum Command {
         /// Include the source commit and compilation target.
         #[arg(long)]
         build: bool,
+    },
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct LearnScopeArgs {
+    /// Restrict analysis to one session log.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+    /// Include events at or after this RFC 3339 timestamp.
+    #[arg(long, value_name = "RFC3339")]
+    pub since: Option<String>,
+    /// Include events at or before this RFC 3339 timestamp.
+    #[arg(long, value_name = "RFC3339")]
+    pub until: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum LearnCommand {
+    /// Analyze recurrence and persist reviewable pending proposals.
+    Propose {
+        #[command(flatten)]
+        scope: LearnScopeArgs,
+    },
+    /// List local proposals and their review state.
+    List,
+    /// Show one proposal with its source citations.
+    Show {
+        #[arg(value_name = "PROPOSAL_ID")]
+        id: String,
+    },
+    /// Accept one proposal into Forge's ignored local guidance.
+    Apply {
+        #[arg(value_name = "PROPOSAL_ID")]
+        id: String,
+        /// Confirm that this proposal should affect later Forge prompts.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reject one pending proposal.
+    Reject {
+        #[arg(value_name = "PROPOSAL_ID")]
+        id: String,
+    },
+    /// Report review totals and recurrence after acceptance.
+    Metrics {
+        #[command(flatten)]
+        scope: LearnScopeArgs,
     },
 }
 

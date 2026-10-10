@@ -796,6 +796,8 @@ forge resume <task-run-or-session-id>  Continue a parked task or completed run
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
 forge session fork <id> [--at X]    Branch a session into a new one
+forge learn propose|list|show|apply|reject|metrics
+                                    Review redacted recurring evidence locally
 forge graph build|check|map|grep|callers|blast|context
 forge skill list|show|test
 forge router serve [--host --port]  Run the local Laya decision-router adapter
@@ -1807,6 +1809,12 @@ forge memory sources --session <id> --offset 0 --json
 forge memory consolidate --session <id> --json
 forge memory search --session <id> --query <text> --json
 forge memory promote --session <id> --topic decisions --yes --json
+forge learn propose [--session <id>] [--since <rfc3339>] [--until <rfc3339>]
+forge learn list
+forge learn show <proposal-id>
+forge learn apply <proposal-id> --yes
+forge learn reject <proposal-id>
+forge learn metrics [--session <id>] [--since <rfc3339>] [--until <rfc3339>]
 ```
 
 `memory on` grants observation-extraction consent only. It does not inject
@@ -1908,6 +1916,32 @@ consolidate its own independent view. Deleting a session event log does not
 silently delete its consolidated or promoted provenance; removing derived
 context storage is an explicit filesystem lifecycle operation, and promoted
 claims remain source-labeled rather than becoming repository guidance.
+
+### Reviewable learning proposals
+
+`forge learn propose` deterministically mines the redacted event log for exact
+recurrence of failures, developer corrections, developer instructions, and
+`retrieve_tool_output` requests. A signal needs two distinct source events;
+copied fork events are deduplicated by their original session, run, sequence,
+and event kind. Unsupported and one-off events do not create proposals. Use
+`--session` for one session log and RFC 3339 `--since`/`--until` bounds for a
+time window. The limits can be combined.
+
+Proposals retain bounded source citations and a recurrence explanation. Forge
+redacts candidate text again before analysis and persistence, including legacy
+event logs, and stores results in the normally ignored local file
+`.forge/context/learning/index.json`. They begin as `pending` and have no effect
+on prompts. `learn show` is the review boundary. `learn apply ... --yes` marks
+one proposal accepted; only then does its bounded recommendation enter later
+Forge coding prompts as explicitly accepted local guidance. `learn reject`
+records a rejection. Neither operation edits tracked instruction files, invokes
+Git, stages files, or creates a commit.
+
+`learn metrics` reports pending, accepted, and rejected totals plus matching
+source events that occurred after a proposal was accepted. Matching is bounded,
+case-insensitive lexical normalization in this phase. Forge does not infer a
+rule from semantically similar wording and does not call a model during
+analysis.
 
 ### Opt-in background observers
 
