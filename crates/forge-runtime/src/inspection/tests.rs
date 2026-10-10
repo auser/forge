@@ -373,11 +373,11 @@ fn absent_queries_are_default_off_and_create_nothing() {
 }
 
 #[test]
-fn consent_is_v9_replay_ignored_and_prerequisites_never_bypassed() {
+fn consent_is_v10_replay_ignored_and_prerequisites_never_bypassed() {
     let (_dir, mut f) = fixture();
     assert!(f.set_memory_enabled("fresh", true).unwrap().desired_enabled);
     let events = f.events("fresh").unwrap();
-    assert_eq!(events[0].v, 9);
+    assert_eq!(events[0].v, forge_core::EVENT_SCHEMA_VERSION);
     assert!(crate::conversation_from_events(&events).messages.is_empty());
     assert!(
         !f.set_memory_enabled("fresh", false)

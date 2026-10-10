@@ -615,6 +615,38 @@ fn one_command_workflow_records_plan_checks_review_and_diff() {
             .iter()
             .any(|verification| verification.status == VerificationStatus::Passed)
     );
+
+    let shown = forge(tmp.path())
+        .arg("--project")
+        .arg(&project)
+        .args(["--json", "task", "show", task_id])
+        .output()
+        .expect("task show");
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("task json");
+    assert_eq!(shown["state"], "succeeded");
+    assert_eq!(shown["route"]["model"], "scripted-mock");
+    assert_eq!(shown["changed_files"], serde_json::json!(["main.rs"]));
+    assert_eq!(shown["checks"][0]["status"], "passed");
+    assert!(
+        shown["terminal_result"]
+            .as_str()
+            .is_some_and(|result| { result.contains("focused check passed") })
+    );
+
+    let listed = forge(tmp.path())
+        .arg("--project")
+        .arg(&project)
+        .args(["--json", "task"])
+        .output()
+        .expect("task list");
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("task list json");
+    assert_eq!(listed[0]["task_id"], task_id);
 }
 
 #[test]
@@ -1193,10 +1225,10 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     assert!(list.status.success());
     let stdout = String::from_utf8(list.stdout).expect("utf8");
     assert!(stdout.contains(session_id), "list output: {stdout}");
-    // run_started, routing_decision_made, context_plan_recorded,
+    // run_started, routing_decision_made, context_plan_recorded, usage_recorded,
     // assistant_message (the v3 replay record of the model's answer),
     // turn_completed, completed.
-    assert!(stdout.contains("6 events"), "list output: {stdout}");
+    assert!(stdout.contains("7 events"), "list output: {stdout}");
     let plan_path = project
         .join(".forge/context/plans")
         .join(run_id)

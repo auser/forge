@@ -47,21 +47,24 @@ fn tools_with_model(
     config: Config,
     model: Arc<dyn forge_core::ModelProvider>,
 ) -> ForgeTools {
-    let service = Arc::new(AgentService::new(
-        model,
-        Arc::new(MockRouter::selecting("mock-local")),
-        Arc::new(MockExecution::new(dir)),
-        // Explicit roots, not `FsSkillRegistry::new`: the real
-        // constructor also scans the developer's `$HOME` skill
-        // directories, which would make these assertions depend on the
-        // machine running them.
-        Arc::new(FsSkillRegistry::with_roots(
-            vec![(SkillSource::ProjectForge, dir.join(".forge").join("skills"))],
-            None,
-        )),
-        Arc::new(JsonlSessionStore::new(dir.join(".forge").join("sessions"))),
-        config,
-    ));
+    let service = Arc::new(
+        AgentService::new(
+            model,
+            Arc::new(MockRouter::selecting("mock-local")),
+            Arc::new(MockExecution::new(dir)),
+            // Explicit roots, not `FsSkillRegistry::new`: the real
+            // constructor also scans the developer's `$HOME` skill
+            // directories, which would make these assertions depend on the
+            // machine running them.
+            Arc::new(FsSkillRegistry::with_roots(
+                vec![(SkillSource::ProjectForge, dir.join(".forge").join("skills"))],
+                None,
+            )),
+            Arc::new(JsonlSessionStore::new(dir.join(".forge").join("sessions"))),
+            config,
+        )
+        .with_task_store(Arc::new(forge_task::JsonlTaskStore::for_project(dir))),
+    );
     ForgeTools::new(service, dir)
 }
 
@@ -359,8 +362,40 @@ fn the_tool_surface_is_the_documented_one_in_a_stable_order() {
             "forge_run_status",
             "forge_run_input",
             "forge_run_cancel",
+            "forge_task_list",
+            "forge_task_show",
         ]
     );
+}
+
+#[tokio::test]
+async fn task_tools_return_redaction_safe_shared_state() {
+    use forge_task::{TaskNode, TaskNodeKind, TaskPlan};
+    let tmp = tempfile::tempdir().expect("tempdir");
+    project(tmp.path());
+    let plan = TaskPlan::builder("secret task request")
+        .with_id("mcp-task")
+        .add_node(TaskNode::new("inspect", "Inspect", TaskNodeKind::Inspect))
+        .build()
+        .expect("plan");
+    forge_task::JsonlTaskStore::for_project(tmp.path())
+        .create(plan)
+        .expect("task");
+    let tools = tools_for(tmp.path(), Config::default());
+
+    let listed = tools
+        .call("forge_task_list", &json!({}))
+        .await
+        .expect("list");
+    assert_eq!(listed.value["tasks"][0]["task_id"], "mcp-task");
+    let shown = tools
+        .call("forge_task_show", &json!({ "task_id": "mcp-task" }))
+        .await
+        .expect("show");
+    assert_eq!(shown.value["current_node"], "inspect");
+    assert!(shown.value.get("request").is_none());
+    assert!(shown.value.get("terminal_result").is_none());
+    assert!(shown.value.get("changed_files").is_none());
 }
 
 #[tokio::test]

@@ -485,6 +485,7 @@ pub struct AgentService {
     execution: Arc<dyn ExecutionProvider>,
     skills: Arc<dyn SkillRegistry>,
     sessions: Arc<JsonlSessionStore>,
+    tasks: Option<Arc<forge_task::JsonlTaskStore>>,
     config: Config,
     graph: Option<Arc<dyn ProjectGraph>>,
     context_store: Option<Arc<dyn ContextStore>>,
@@ -558,6 +559,7 @@ impl AgentService {
             execution,
             skills,
             sessions,
+            tasks: None,
             config,
             graph: None,
             context_store: None,
@@ -583,6 +585,20 @@ impl AgentService {
     pub fn with_graph(mut self, graph: Option<Arc<dyn ProjectGraph>>) -> Self {
         self.graph = graph;
         self
+    }
+
+    /// Attach the project's durable task journal. This is an inspection
+    /// seam only; transports read the same projection and never own task
+    /// lifecycle logic.
+    pub fn with_task_store(mut self, tasks: Arc<forge_task::JsonlTaskStore>) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
+    pub fn task_inspector(&self) -> Option<crate::TaskInspector> {
+        self.tasks
+            .as_ref()
+            .map(|tasks| crate::TaskInspector::new(Arc::clone(tasks), Arc::clone(&self.sessions)))
     }
 
     /// Attach best-effort context accounting. Its failure never blocks a model call.
@@ -1454,10 +1470,11 @@ impl AgentService {
         response: &forge_core::CompletionResponse,
         elapsed_ms: u64,
         costs: &forge_config::CostBook,
-    ) {
+    ) -> Option<f64> {
         let cost_usd = completion_cost(response.usage, costs.price(model_name));
         spend.record(response.usage, cost_usd);
         decisions.record_usage(turn, model_name, response.usage, cost_usd, elapsed_ms);
+        cost_usd
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2736,7 +2753,7 @@ impl AgentService {
                     return Err(fail(&mut collected, e));
                 }
             };
-            self.account_completion(
+            let cost_usd = self.account_completion(
                 &decisions,
                 &mut spend,
                 turn_no,
@@ -2745,6 +2762,19 @@ impl AgentService {
                 complete_started.elapsed().as_millis() as u64,
                 &cost_book,
             );
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::UsageRecorded {
+                        model: decision.selected_model.clone(),
+                        usage: response.usage,
+                        cost_usd,
+                    },
+                ),
+            )?;
             self.emit_assistant_message(&sender, &mut collected, &run_id, &session_id, &response)?;
             let summary: String = response.content.chars().take(80).collect();
             // Same accounting as the loop's final iteration: one model
@@ -2838,7 +2868,7 @@ impl AgentService {
                     return Err(fail(&mut collected, e));
                 }
             };
-            self.account_completion(
+            let cost_usd = self.account_completion(
                 &decisions,
                 &mut spend,
                 turn_no,
@@ -2847,6 +2877,19 @@ impl AgentService {
                 complete_started.elapsed().as_millis() as u64,
                 &cost_book,
             );
+            self.emit(
+                &sender,
+                &mut collected,
+                Event::new(
+                    &run_id,
+                    &session_id,
+                    EventKind::UsageRecorded {
+                        model: selected.clone(),
+                        usage: response.usage,
+                        cost_usd,
+                    },
+                ),
+            )?;
 
             self.emit_assistant_message(&sender, &mut collected, &run_id, &session_id, &response)?;
 

@@ -673,6 +673,14 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Action::SwitchSession(id) => self.do_switch_session(id),
                 Action::Fork(at) => self.do_fork(at),
                 Action::ListJobs => self.do_list_jobs(),
+                Action::ListTasks => {
+                    let result = self.host.task_list().await;
+                    self.emit_inspection(result);
+                }
+                Action::ShowTask(task_id) => {
+                    let result = self.host.task_show(&task_id).await;
+                    self.emit_inspection(result);
+                }
                 Action::Attach(run_id) => self.do_attach(run_id),
                 Action::Show(n) => self.do_show(n),
                 Action::Context(ContextCommand::Status) => {

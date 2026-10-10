@@ -11,6 +11,8 @@
 //! POST /v1/runs/{id}/input       records a run-scoped `note` event
 //! POST /v1/runs/{id}/cancel      aborts in-flight runs, records `cancelled`
 //! GET  /v1/runs/{id}/events      SSE: stored events replayed, then live
+//! GET  /v1/tasks                 durable development tasks
+//! GET  /v1/tasks/{id}            one shared durable-task projection
 //! GET  /v1/skills
 //! GET  /v1/project/graph         stats + freshness (never builds)
 //! POST /v1/project/context       graph-aware context selection
@@ -49,6 +51,8 @@ pub fn build_router(
         .route("/v1/runs/{id}/input", post(handlers::run_input))
         .route("/v1/runs/{id}/cancel", post(handlers::cancel_run))
         .route("/v1/runs/{id}/events", get(handlers::run_events))
+        .route("/v1/tasks", get(handlers::list_tasks))
+        .route("/v1/tasks/{id}", get(handlers::get_task))
         .route("/v1/skills", get(handlers::list_skills))
         .route("/v1/project/graph", get(handlers::graph_status))
         .route("/v1/project/context", post(handlers::project_context))

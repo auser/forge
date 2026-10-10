@@ -230,6 +230,7 @@ fn event_kinds(outcome: &RunOutcome) -> Vec<&str> {
         .map(|e| match &e.kind {
             EventKind::RunStarted { .. } => "run_started",
             EventKind::RoutingDecisionMade { .. } => "routing_decision_made",
+            EventKind::UsageRecorded { .. } => "usage_recorded",
             EventKind::SkillActivated { .. } => "skill_activated",
             EventKind::ToolCallRequested { .. } => "tool_call_requested",
             EventKind::ToolPolicyDecision { .. } => "tool_policy_decision",
@@ -266,6 +267,7 @@ async fn full_run_emits_ordered_events() {
         [
             "run_started",
             "routing_decision_made",
+            "usage_recorded",
             // v3: the model's answer, verbatim, for replay
             "assistant_message",
             // the answer's round trip is a turn too
@@ -279,10 +281,10 @@ async fn full_run_emits_ordered_events() {
         .sessions()
         .events_for(&outcome.session_id)
         .expect("read");
-    assert_eq!(persisted.len(), 5);
+    assert_eq!(persisted.len(), 6);
     assert!(persisted.iter().all(|e| e.run_id == outcome.run_id));
     let seqs: Vec<u64> = persisted.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
 }
 
 // --- token streaming (TICKET-1) ------------------------------------------
@@ -305,6 +307,7 @@ async fn a_streaming_run_emits_ordered_deltas_then_the_same_terminal_events() {
             "routing_decision_made",
             "assistant_delta",
             "assistant_delta",
+            "usage_recorded",
             // the replay record, retained and unchanged
             "assistant_message",
             "turn_completed",
@@ -367,6 +370,7 @@ async fn a_non_streaming_provider_records_no_deltas() {
         [
             "run_started",
             "routing_decision_made",
+            "usage_recorded",
             "assistant_message",
             "turn_completed",
             "completed"
@@ -618,6 +622,7 @@ async fn an_openai_compatible_sse_server_streams_deltas_end_to_end() {
             "routing_decision_made",
             "assistant_delta", // "the " — the runtime's hold-back emits at whitespace
             "assistant_delta", // "answer" — flushed at stream end
+            "usage_recorded",
             "assistant_message",
             "turn_completed",
             "completed"
@@ -809,6 +814,7 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
         [
             "run_started",
             "routing_decision_made",
+            "usage_recorded",
             // v3 replay record of the model's tool-call turn
             "assistant_message",
             "tool_call_requested",
@@ -822,6 +828,7 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
             // v4: the final answer streams as ordered deltas...
             "assistant_delta",
             "assistant_delta",
+            "usage_recorded",
             // v3 replay record of the final answer — itself a turn
             "assistant_message",
             "turn_completed",
@@ -865,7 +872,7 @@ async fn scripted_two_turn_run_writes_file_and_emits_full_trail() {
     assert!(!policy_events[0].6.is_empty());
     // Sequence numbers are monotonic.
     let seqs: Vec<u64> = outcome.events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=15).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=outcome.events.len() as u64).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -3332,6 +3339,7 @@ async fn needle_fast_path_absent_engine_changes_nothing() {
             // v4: the answer streams as ordered deltas...
             "assistant_delta",
             "assistant_delta",
+            "usage_recorded",
             // ...and lands whole in the v3 replay record
             "assistant_message",
             "turn_completed",

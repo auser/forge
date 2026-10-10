@@ -21,6 +21,8 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 /// * v7 adds typed tool artifact retrieval grants, anchored to tool requests.
 /// * v8 adds bounded tool-output compression decisions (not retrieval grants).
 /// * v9 adds session consent for derived observations (never replay content).
+/// * v10 adds provider-reported completion usage and resolved cost so every
+///   task-inspection adapter reads the same spend record.
 ///
 /// The change is purely additive: no existing kind or field changed
 /// meaning, so v1 and v2 logs remain readable (missing `seq` deserializes
@@ -28,7 +30,7 @@ use crate::execution::{ApprovalPolicy, RiskLevel, ToolPolicyDisposition};
 /// event kinds an older reader does not know; runs recorded before v3
 /// replay as well as their data allows (see
 /// `forge_runtime::replay::conversation_from_events`).
-pub const EVENT_SCHEMA_VERSION: u32 = 9;
+pub const EVENT_SCHEMA_VERSION: u32 = 10;
 
 /// Version of the tool-policy rules represented by `ToolPolicyDecision`.
 pub const TOOL_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -154,6 +156,16 @@ pub enum EventKind {
         /// Why this model was selected ("" for older logs).
         #[serde(default)]
         reason: String,
+    },
+    /// Provider-reported usage and the price Forge could resolve for one
+    /// completion. Kept on the run event stream so every adapter can report
+    /// the same spend without reinterpreting provider logs.
+    UsageRecorded {
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
     },
     SkillActivated {
         name: String,

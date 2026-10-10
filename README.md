@@ -140,6 +140,9 @@ and tradeoffs.
   multi-turn agent loop, with durable task evidence and a reviewable diff.
 - `forge resume <task-id>` — validates the working tree and effect journal,
   then continues a safely parked task in its existing session.
+- `forge task [list]` / `forge task show <task-id>` — inspect the current
+  node, route, spend, checks, changed files, parked reason, and terminal result;
+  add `--json` for the shared machine-readable projection.
 - `forge chat` — the same tool-using runtime interactively, with approvals
   (`y`/`n` inline; safe reads never ask).
 - `forge graph` — a deterministic project graph plus an on-device

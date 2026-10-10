@@ -10,6 +10,7 @@ pub mod inspection;
 pub mod observer;
 pub mod replay;
 mod service;
+mod tasks;
 mod tools;
 mod workflow;
 
@@ -21,6 +22,7 @@ pub use service::{
     AgentService, Attachment, EffectJournal, ForkOutcome, NullSkillRegistry, RunOptions,
     RunOutcome, RunSummary, StartedRun,
 };
+pub use tasks::{DurableTaskState, TaskInspector, TaskRoute, TaskSpend, TaskView};
 pub use tools::{ToolDispatcher, tool_definitions};
 pub use workflow::{
     DevelopmentWorkflowOutcome, resume_development_workflow, run_development_workflow,

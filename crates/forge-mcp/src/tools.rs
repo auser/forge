@@ -44,6 +44,28 @@ const STATUS_EVENT_WINDOW: usize = 10;
 /// activation (kept out of per-run sessions, mirroring the CLI's `cli`).
 const MCP_SESSION: &str = "mcp";
 
+fn redacted_task(task: &forge_runtime::TaskView) -> Value {
+    json!({
+        "task_id": task.task_id,
+        "state": task.state,
+        "current_node": task.current_node,
+        "run_id": task.run_id,
+        "session_id": task.session_id,
+        "route": task.route.as_ref().map(|route| json!({
+            "router": route.router,
+            "model": route.model,
+            "confidence": route.confidence,
+            "fallback_used": route.fallback_used,
+        })),
+        "spend": task.spend,
+        "check_count": task.checks.len(),
+        "changed_file_count": task.changed_files.len(),
+        "parked": task.parked_reason.is_some(),
+        "terminal": task.terminal_result.is_some(),
+        "sequence": task.sequence,
+    })
+}
+
 /// Result of a tool call: a JSON value plus whether it is a tool
 /// *execution* error (MCP `isError: true`) rather than a success.
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +215,17 @@ fn run_id_schema() -> Value {
     })
 }
 
+fn task_id_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "task_id": { "type": "string", "description": "Durable task id returned by forge_task_list." }
+        },
+        "required": ["task_id"],
+        "additionalProperties": false
+    })
+}
+
 fn run_input_schema() -> Value {
     json!({
         "type": "object",
@@ -272,6 +305,18 @@ pub fn definitions() -> &'static [ToolDef] {
             description: "Cancel a running forge run.",
             input_schema: run_id_schema,
         },
+        ToolDef {
+            name: "forge_task_list",
+            title: "List durable task states",
+            description: "List redaction-safe durable task lifecycle metadata. Task prompts, output, and changed paths remain local to explicit project inspection.",
+            input_schema: no_args,
+        },
+        ToolDef {
+            name: "forge_task_show",
+            title: "Inspect durable task state",
+            description: "Show redaction-safe lifecycle, route, spend, and verification counts for one durable task.",
+            input_schema: task_id_schema,
+        },
     ]
 }
 
@@ -331,9 +376,37 @@ impl ForgeTools {
             "forge_run_status" => self.run_status(args),
             "forge_run_input" => self.run_input(args),
             "forge_run_cancel" => self.run_cancel(args),
+            "forge_task_list" => self.task_list(),
+            "forge_task_show" => self.task_show(args),
             other => return Err(ToolError::UnknownTool(other.to_string())),
         };
         Ok(outcome)
+    }
+
+    fn task_list(&self) -> ToolOutcome {
+        let Some(inspector) = self.service.task_inspector() else {
+            return ToolOutcome::error("unavailable", "task journal unavailable");
+        };
+        match inspector.list() {
+            Ok(tasks) => ToolOutcome::ok(json!({
+                "tasks": tasks.iter().map(redacted_task).collect::<Vec<_>>()
+            })),
+            Err(error) => ToolOutcome::error("unavailable", error.to_string()),
+        }
+    }
+
+    fn task_show(&self, args: &Value) -> ToolOutcome {
+        let task_id = match require_str(args, "task_id") {
+            Ok(task_id) => task_id,
+            Err(outcome) => return outcome,
+        };
+        let Some(inspector) = self.service.task_inspector() else {
+            return ToolOutcome::error("unavailable", "task journal unavailable");
+        };
+        match inspector.show(task_id) {
+            Ok(task) => ToolOutcome::ok(redacted_task(&task)),
+            Err(error) => ToolOutcome::error("not_found", error.to_string()),
+        }
     }
 
     // --- graph ----------------------------------------------------------

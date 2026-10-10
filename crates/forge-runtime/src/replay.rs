@@ -193,6 +193,7 @@ fn run_messages(events: &[&Event]) -> RunReplay {
 
             // Observability-only, or not part of the model conversation.
             EventKind::RoutingDecisionMade { .. }
+            | EventKind::UsageRecorded { .. }
             | EventKind::SkillActivated { .. }
             | EventKind::ToolStarted { .. }
             | EventKind::ToolCompleted { .. }

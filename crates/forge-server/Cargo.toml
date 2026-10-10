@@ -22,6 +22,7 @@ forge-execution.workspace = true
 forge-providers.workspace = true
 forge-session.workspace = true
 forge-skills.workspace = true
+forge-task.workspace = true
 http-body-util.workspace = true
 reqwest.workspace = true
 serial_test.workspace = true

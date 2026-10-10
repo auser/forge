@@ -69,6 +69,16 @@ pub trait ChatHost: Send + Sync {
             "memory inspection is unavailable in this host",
         ))
     }
+    async fn task_list(&mut self) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "task inspection is unavailable in this host",
+        ))
+    }
+    async fn task_show(&mut self, _task_id: &str) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "task inspection is unavailable in this host",
+        ))
+    }
     fn environment(&self) -> Environment;
     /// User-visible model candidates only: this is where mock entries are
     /// filtered out, in one place (§9.3).

@@ -140,6 +140,39 @@ impl ChatHost for CliHost {
         Arc::clone(&self.service)
     }
 
+    async fn task_list(&mut self) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        let inspector = self
+            .service
+            .task_inspector()
+            .ok_or_else(|| ForgeError::task("task journal unavailable"))?;
+        let tasks = inspector.list()?;
+        if tasks.is_empty() {
+            return Ok(vec![forge_chat::Line::meta("no tasks yet")]);
+        }
+        Ok(tasks
+            .into_iter()
+            .map(|task| {
+                forge_chat::Line::meta(format!(
+                    "{} {} {}",
+                    task.task_id,
+                    task.state.as_str(),
+                    task.current_node.as_deref().unwrap_or("-")
+                ))
+            })
+            .collect())
+    }
+
+    async fn task_show(&mut self, task_id: &str) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        let task = self
+            .service
+            .task_inspector()
+            .ok_or_else(|| ForgeError::task("task journal unavailable"))?
+            .show(task_id)?;
+        let rendered = serde_json::to_string_pretty(&task)
+            .map_err(|error| ForgeError::task(format!("serializing task: {error}")))?;
+        Ok(rendered.lines().map(forge_chat::Line::meta).collect())
+    }
+
     async fn context_status(
         &mut self,
         session_id: &str,

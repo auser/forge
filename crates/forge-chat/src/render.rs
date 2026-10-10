@@ -88,6 +88,7 @@ impl TranscriptState {
         let mut lines = match &event.kind {
             EventKind::AssistantDelta { .. }
             | EventKind::AssistantMessage { .. }
+            | EventKind::UsageRecorded { .. }
             | EventKind::MemoryObservationChanged { .. } => Vec::new(),
             _ => self.close_stream(),
         };
@@ -243,6 +244,7 @@ impl TranscriptState {
             // Its `summary` is an 80-character digest written by the store;
             // the answer comes from `AssistantMessage` or the run outcome.
             EventKind::Completed { .. }
+            | EventKind::UsageRecorded { .. }
             | EventKind::MemoryObservationChanged { .. }
             | EventKind::ContextPlanRecorded { .. }
             | EventKind::ContextPlanUnavailable { .. }

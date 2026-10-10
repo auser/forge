@@ -44,6 +44,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/fork", "fork this conversation, optionally --at <pos>"),
     ("/bg", "detach the running turn and keep talking"),
     ("/jobs", "runs and their states"),
+    ("/tasks", "durable development tasks"),
+    ("/task", "inspect one durable task: /task <id>"),
     ("/attach", "follow a run again by id"),
     (
         "/show",
@@ -108,6 +110,8 @@ pub enum Parsed {
     Fork(Option<String>),
     Background,
     Jobs,
+    Tasks,
+    Task(String),
     Attach(String),
     /// `/show`, optionally `/show <n>`: the nth most recent tool result (1 = latest).
     Show(Option<usize>),
@@ -253,6 +257,11 @@ impl Command {
             "fork" => parse_fork(argument.as_deref()),
             "bg" => Parsed::Background,
             "jobs" => Parsed::Jobs,
+            "tasks" => Parsed::Tasks,
+            "task" => match argument {
+                Some(task_id) => Parsed::Task(task_id),
+                None => Parsed::Usage("/task <id>"),
+            },
             "attach" => match argument {
                 Some(run_id) => Parsed::Attach(run_id),
                 None => Parsed::Usage("/attach <run-id>"),

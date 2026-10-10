@@ -29,7 +29,7 @@ impl ApiError {
 impl From<ForgeError> for ApiError {
     fn from(err: ForgeError) -> Self {
         let status = match &err {
-            ForgeError::Session(_) => StatusCode::NOT_FOUND,
+            ForgeError::Session(_) | ForgeError::Task(_) => StatusCode::NOT_FOUND,
             // The session exists and is fine; it is busy. A retry after the
             // in-flight run finishes succeeds, which is exactly 409.
             ForgeError::SessionBusy { .. } => StatusCode::CONFLICT,
@@ -103,6 +103,32 @@ pub async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
         }));
     }
     Json(serde_json::json!({ "models": models }))
+}
+
+pub async fn list_tasks(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inspector = state
+        .service
+        .task_inspector()
+        .ok_or_else(|| ApiError::not_found("task journal unavailable".to_string()))?;
+    Ok(Json(serde_json::json!({ "tasks": inspector.list()? })))
+}
+
+pub async fn get_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inspector = state
+        .service
+        .task_inspector()
+        .ok_or_else(|| ApiError::not_found("task journal unavailable".to_string()))?;
+    Ok(Json(serde_json::to_value(inspector.show(&id)?).map_err(
+        |error| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        },
+    )?))
 }
 
 #[derive(Debug, Deserialize)]

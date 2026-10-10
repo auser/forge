@@ -131,6 +131,40 @@ async fn i_run_again(world: &mut BddWorld, command: String) {
     i_run(world, command).await;
 }
 
+// ---------------------------------------------------------------------------
+// tasks.feature
+// ---------------------------------------------------------------------------
+
+#[given(expr = "a durable Forge task named {string}")]
+fn a_durable_forge_task(world: &mut BddWorld, task_id: String) {
+    use forge_task::{TaskNode, TaskNodeKind, TaskPlan};
+    let plan = TaskPlan::builder("inspect durable state")
+        .with_id(task_id)
+        .add_node(TaskNode::new("inspect", "Inspect", TaskNodeKind::Inspect))
+        .build()
+        .expect("task plan");
+    forge_task::JsonlTaskStore::for_project(world.project())
+        .create(plan)
+        .expect("create task");
+}
+
+#[then(expr = "the task JSON lists {string} at node {string}")]
+fn task_json_lists(world: &mut BddWorld, task_id: String, node: String) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let tasks: serde_json::Value = serde_json::from_str(&world.last_stdout).expect("task list");
+    assert_eq!(tasks[0]["task_id"], task_id);
+    assert_eq!(tasks[0]["current_node"], node);
+}
+
+#[then(expr = "the task JSON shows {string} at node {string}")]
+fn task_json_shows(world: &mut BddWorld, task_id: String, node: String) {
+    assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    let task: serde_json::Value = serde_json::from_str(&world.last_stdout).expect("task show");
+    assert_eq!(task["task_id"], task_id);
+    assert_eq!(task["current_node"], node);
+    assert_eq!(task["state"], "queued");
+}
+
 #[then(".forge and the project graph exist")]
 fn forge_dirs_and_graph_exist(world: &mut BddWorld) {
     assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
