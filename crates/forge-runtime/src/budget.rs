@@ -79,15 +79,21 @@ impl SpendTracker {
         }
     }
 
-    /// Accrue one recorded completion. Unknown usage or cost adds nothing,
-    /// which is exactly what keeps a zero-priced (local) model off the USD
-    /// ceilings.
+    /// Accrue one recorded completion. Unknown prices remain visible as
+    /// unpriced usage while adding nothing to USD ceilings. An explicit zero
+    /// price remains known-free local usage.
     pub fn record(&mut self, usage: Option<Usage>, cost_usd: Option<f64>) {
         if let Some(usage) = usage {
             self.session.input_tokens += u64::from(usage.prompt_tokens);
             self.session.output_tokens += u64::from(usage.completion_tokens);
             self.daily.input_tokens += u64::from(usage.prompt_tokens);
             self.daily.output_tokens += u64::from(usage.completion_tokens);
+            if cost_usd.is_none() {
+                self.session.unpriced_calls += 1;
+                self.session.unpriced_tokens += u64::from(usage.total_tokens);
+                self.daily.unpriced_calls += 1;
+                self.daily.unpriced_tokens += u64::from(usage.total_tokens);
+            }
         }
         if let Some(cost) = cost_usd {
             self.session.cost_usd += cost;

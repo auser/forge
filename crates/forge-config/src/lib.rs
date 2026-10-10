@@ -500,9 +500,11 @@ impl Default for Config {
                     "Anthropic Claude (subscription via Claude Code, or ANTHROPIC_API_KEY)"
                         .to_string(),
                 ),
-                // Subscription-served: no per-token cost here.
-                cost_input_per_mtok: Some(0.0),
-                cost_output_per_mtok: Some(0.0),
+                // Subscription access has no provider-reported per-token
+                // price. Keep it unpriced so routing and UI never call it
+                // free; plan cost depends on the user's subscription.
+                cost_input_per_mtok: None,
+                cost_output_per_mtok: None,
                 base_url: Some("https://api.anthropic.com".to_string()),
                 key_env: Some("ANTHROPIC_API_KEY".to_string()),
                 provider: Some("anthropic".to_string()),
@@ -536,8 +538,8 @@ impl Default for Config {
                 description: Some(
                     "OpenAI GPT-5.6 Codex through an existing ChatGPT subscription".to_string(),
                 ),
-                cost_input_per_mtok: Some(0.0),
-                cost_output_per_mtok: Some(0.0),
+                cost_input_per_mtok: None,
+                cost_output_per_mtok: None,
                 base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
                 key_env: None,
                 provider: Some("codex".to_string()),
@@ -566,8 +568,8 @@ impl Default for Config {
             },
             ModelEntry {
                 description: Some("Kimi K3 through an existing Kimi Code subscription".to_string()),
-                cost_input_per_mtok: Some(0.0),
-                cost_output_per_mtok: Some(0.0),
+                cost_input_per_mtok: None,
+                cost_output_per_mtok: None,
                 base_url: Some("https://api.kimi.com/coding/v1".to_string()),
                 key_env: None,
                 provider: Some("kimi-code".to_string()),
