@@ -316,8 +316,12 @@ mod tests {
             ]);
         let err = model.complete(request).await.expect_err("must reject");
         match err {
-            ForgeError::Provider(msg) => assert!(msg.contains("tools"), "got: {msg}"),
-            other => panic!("expected provider error, got {other:?}"),
+            ForgeError::ProviderFailure {
+                kind: forge_core::ProviderFailureKind::Capability,
+                message,
+                ..
+            } => assert!(message.contains("tools"), "got: {message}"),
+            other => panic!("expected capability error, got {other:?}"),
         }
     }
 }

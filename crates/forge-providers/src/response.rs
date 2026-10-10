@@ -42,6 +42,18 @@ pub(crate) fn http_status_error(
     ForgeError::provider_failure(provider, kind, Some(status.as_u16()), message)
 }
 
+pub(crate) fn endpoint_error(provider: &str, message: impl Into<String>) -> ForgeError {
+    ForgeError::provider_failure(provider, ProviderFailureKind::Endpoint, None, message)
+}
+
+pub(crate) fn capability_error(provider: &str, message: impl Into<String>) -> ForgeError {
+    ForgeError::provider_failure(provider, ProviderFailureKind::Capability, None, message)
+}
+
+pub(crate) fn response_shape_error(provider: &str, message: impl Into<String>) -> ForgeError {
+    ForgeError::provider_failure(provider, ProviderFailureKind::ResponseShape, None, message)
+}
+
 pub(crate) async fn bounded_bytes(
     mut response: reqwest::Response,
     max_bytes: usize,

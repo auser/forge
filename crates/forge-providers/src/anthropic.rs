@@ -236,15 +236,16 @@ fn send_error(model: &str, url: &str, e: reqwest::Error) -> ForgeError {
             format!("anthropic request to {url} timed out"),
         )
     } else if e.is_redirect() {
-        ForgeError::provider(format!(
-            "anthropic request to {url} was not completed: {}",
-            crate::local_only::error_detail(&e)
-        ))
-    } else if e.is_connect() {
-        ForgeError::provider_failure(
+        crate::response::endpoint_error(
             model,
-            forge_core::ProviderFailureKind::Transient,
-            None,
+            format!(
+                "anthropic request to {url} was not completed: {}",
+                crate::local_only::error_detail(&e)
+            ),
+        )
+    } else if e.is_connect() {
+        crate::response::endpoint_error(
+            model,
             format!("cannot reach Anthropic endpoint at {url} (connection refused)"),
         )
     } else {
@@ -286,40 +287,47 @@ async fn status_error(
 /// server that ignores `stream: true` answers a streaming request with, so
 /// both paths share the one parser and cannot drift. Multiple text blocks
 /// join with `\n`; unknown block types are skipped.
-fn parse_message_body(model: &str, body: &serde_json::Value) -> CompletionResponse {
+fn parse_message_body(
+    model: &str,
+    body: &serde_json::Value,
+) -> Result<CompletionResponse, ForgeError> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
-    if let Some(blocks) = body.get("content").and_then(serde_json::Value::as_array) {
-        for block in blocks {
-            match block.get("type").and_then(serde_json::Value::as_str) {
-                Some("text") => {
-                    if let Some(t) = block.get("text").and_then(serde_json::Value::as_str) {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(t);
+    let blocks = body
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            crate::response::response_shape_error(model, "Anthropic response missing content array")
+        })?;
+    for block in blocks {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(serde_json::Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
                     }
+                    text.push_str(t);
                 }
-                Some("tool_use") => {
-                    let id = block.get("id").and_then(serde_json::Value::as_str);
-                    let name = block.get("name").and_then(serde_json::Value::as_str);
-                    if let (Some(id), Some(name)) = (id, name) {
-                        tool_calls.push(forge_core::ToolCall::new(
-                            id,
-                            name,
-                            block
-                                .get("input")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null),
-                        ));
-                    }
-                }
-                _ => {}
             }
+            Some("tool_use") => {
+                let id = block.get("id").and_then(serde_json::Value::as_str);
+                let name = block.get("name").and_then(serde_json::Value::as_str);
+                if let (Some(id), Some(name)) = (id, name) {
+                    tool_calls.push(forge_core::ToolCall::new(
+                        id,
+                        name,
+                        block
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    ));
+                }
+            }
+            _ => {}
         }
     }
 
-    CompletionResponse {
+    Ok(CompletionResponse {
         model: model.to_string(),
         content: text,
         tool_calls,
@@ -328,7 +336,7 @@ fn parse_message_body(model: &str, body: &serde_json::Value) -> CompletionRespon
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         usage: body.get("usage").and_then(parse_usage),
-    }
+    })
 }
 
 /// The whole-body usage shape: both token counts or no `Usage` at all.
@@ -377,11 +385,15 @@ impl AnthropicStream {
     fn apply(
         &mut self,
         event: &crate::sse::SseEvent,
+        model: &str,
         url: &str,
         on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<(), ForgeError> {
-        let payload: serde_json::Value = serde_json::from_str(&event.data).map_err(|e| {
-            ForgeError::provider(format!("malformed SSE data chunk from {url}: {e}"))
+        let payload: serde_json::Value = serde_json::from_str(&event.data).map_err(|_| {
+            crate::response::response_shape_error(
+                model,
+                format!("malformed SSE data chunk from {url}"),
+            )
         })?;
         match payload.get("type").and_then(serde_json::Value::as_str) {
             Some("message_start") => {
@@ -513,11 +525,16 @@ impl AnthropicStream {
                     .get("message")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown error");
-                return Err(ForgeError::provider(format!(
-                    "anthropic stream from {url} failed after {} answer bytes: \
-                     {message} (type {kind})",
-                    self.content.len()
-                )));
+                return Err(ForgeError::provider_failure(
+                    model,
+                    forge_core::ProviderFailureKind::InvalidRequest,
+                    None,
+                    format!(
+                        "anthropic stream from {url} failed after {} answer bytes: \
+                         {message} (type {kind})",
+                        self.content.len()
+                    ),
+                ));
             }
             // ping, unknown event types: skipped.
             _ => {}
@@ -557,7 +574,7 @@ impl ModelProvider for AnthropicModel {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, ForgeError> {
-        reject_tools_without_capability(&request, self.capabilities)?;
+        reject_tools_without_capability(&request, self.capabilities, &self.model)?;
         let url = self.messages_url();
         let response = self
             .authed(
@@ -582,17 +599,24 @@ impl ModelProvider for AnthropicModel {
                     format!("anthropic endpoint returned {status}"),
                 ));
             }
-            let body = serde_json::from_slice(&bytes)
-                .map_err(|_| ForgeError::provider("invalid bounded anthropic response JSON"))?;
-            return Ok(parse_message_body(&self.model, &body));
+            let body = serde_json::from_slice(&bytes).map_err(|_| {
+                crate::response::response_shape_error(
+                    &self.model,
+                    "invalid bounded anthropic response JSON",
+                )
+            })?;
+            return parse_message_body(&self.model, &body);
         }
         if !status.is_success() {
             return Err(status_error(&self.model, &url, status, response).await);
         }
-        let body: serde_json::Value = response.json().await.map_err(|e| {
-            ForgeError::provider(format!("reading anthropic response from {url}: {e}"))
+        let body: serde_json::Value = response.json().await.map_err(|_| {
+            crate::response::response_shape_error(
+                &self.model,
+                format!("anthropic endpoint {url} returned invalid JSON"),
+            )
         })?;
-        Ok(parse_message_body(&self.model, &body))
+        parse_message_body(&self.model, &body)
     }
 
     async fn stream_complete(
@@ -603,7 +627,7 @@ impl ModelProvider for AnthropicModel {
         if self.response_max_bytes.is_some() {
             return Err(crate::response::streaming_unsupported());
         }
-        reject_tools_without_capability(&request, self.capabilities)?;
+        reject_tools_without_capability(&request, self.capabilities, &self.model)?;
         let url = self.messages_url();
         // Scoped so the body's borrow of `request` ends here: the fallback
         // below moves `request` into `complete`.
@@ -649,10 +673,13 @@ impl ModelProvider for AnthropicModel {
                     .starts_with("text/event-stream")
             });
         if !is_sse {
-            let body: serde_json::Value = response.json().await.map_err(|e| {
-                ForgeError::provider(format!("reading anthropic response from {url}: {e}"))
+            let body: serde_json::Value = response.json().await.map_err(|_| {
+                crate::response::response_shape_error(
+                    &self.model,
+                    format!("anthropic endpoint {url} returned invalid JSON"),
+                )
             })?;
-            return Ok(parse_message_body(&self.model, &body));
+            return parse_message_body(&self.model, &body);
         }
 
         let mut parser = crate::sse::SseParser::new();
@@ -662,31 +689,39 @@ impl ModelProvider for AnthropicModel {
             match response.chunk().await {
                 Ok(Some(bytes)) => {
                     for event in parser.feed(&bytes) {
-                        stream.apply(&event, &url, on_delta)?;
+                        stream.apply(&event, &self.model, &url, on_delta)?;
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    return Err(ForgeError::provider(format!(
-                        "anthropic stream from {url} failed after {} answer bytes: {}",
-                        stream.content.len(),
-                        crate::local_only::error_detail(&e)
-                    )));
+                    return Err(ForgeError::provider_failure(
+                        &self.model,
+                        forge_core::ProviderFailureKind::Transient,
+                        None,
+                        format!(
+                            "anthropic stream from {url} failed after {} answer bytes: {}",
+                            stream.content.len(),
+                            crate::local_only::error_detail(&e)
+                        ),
+                    ));
                 }
             }
         }
         for event in parser.finish() {
-            stream.apply(&event, &url, on_delta)?;
+            stream.apply(&event, &self.model, &url, on_delta)?;
         }
         // EOF with no terminal signal at all is truncation, never a silent
         // partial answer; EOF after a stop_reason without `message_stop` is
         // accepted — real servers omit the final event.
         if !stream.saw_stop && stream.stop_reason.is_none() {
-            return Err(ForgeError::provider(format!(
-                "anthropic stream from {url} ended early: EOF after {} answer bytes with no \
-                 stop_reason and no message_stop",
-                stream.content.len()
-            )));
+            return Err(crate::response::response_shape_error(
+                &self.model,
+                format!(
+                    "anthropic stream from {url} ended early: EOF after {} answer bytes with no \
+                     stop_reason and no message_stop",
+                    stream.content.len()
+                ),
+            ));
         }
         if !stream.saw_stop {
             tracing::debug!(
@@ -1029,8 +1064,13 @@ mod tests {
         let model = model(&server.uri(), CredentialKind::ApiKey);
         let (_deltas, response) = stream_with(&model).await;
         let err = response.expect_err("a mid-stream error must fail the call");
-        let ForgeError::Provider(message) = err else {
-            panic!("expected a provider error");
+        let ForgeError::ProviderFailure {
+            kind: forge_core::ProviderFailureKind::InvalidRequest,
+            message,
+            ..
+        } = err
+        else {
+            panic!("expected an invalid-request provider error");
         };
         assert!(message.contains("overloaded_error"), "{message}");
         assert!(message.contains("Overloaded"), "{message}");
@@ -1055,8 +1095,13 @@ mod tests {
         let model = model(&server.uri(), CredentialKind::ApiKey);
         let (_deltas, response) = stream_with(&model).await;
         let err = response.expect_err("truncation must fail");
-        let ForgeError::Provider(message) = err else {
-            panic!("expected a provider error");
+        let ForgeError::ProviderFailure {
+            kind: forge_core::ProviderFailureKind::ResponseShape,
+            message,
+            ..
+        } = err
+        else {
+            panic!("expected a response-shape provider error");
         };
         assert!(message.contains("ended early"), "{message}");
         assert!(

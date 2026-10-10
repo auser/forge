@@ -93,11 +93,19 @@ binary, and proves its deterministic mock provider can edit a file and execute
 a validation command. `bash tests/install-path.sh` separately checks installer
 verification and PATH-shadow handling with a local fake release asset.
 
+`just harness-gate` is the complete release gate: the workspace checks plus
+named hermetic wire-contract tests for Claude, Codex, Kimi, and local
+OpenAI-compatible endpoints, and the inspect/edit/check/review acceptance
+workflow. It makes no provider calls.
+
 Before publishing a release, a **manual canary is still required**: install the
 candidate artifact on a clean machine and complete one real edit/test run with
 each supported subscription provider. The hermetic mock check validates the
 agent and tool loop, but cannot validate provider authentication, subscription
-entitlements, or upstream API behavior.
+entitlements, or upstream API behavior. Run `just harness-canary MODEL` for
+each model the release claims (for example `claude-sonnet`, `gpt-5.6-sol`, and
+`k3`). Each canary uses only the credential already authorized on that machine;
+it does not rotate accounts or retry around a provider limit.
 
 ## Use from your editor
 

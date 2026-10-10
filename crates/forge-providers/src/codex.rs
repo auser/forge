@@ -123,7 +123,16 @@ impl CodexModel {
     fn parse_response(&self, body: Value) -> Result<CompletionResponse, ForgeError> {
         let mut content = String::new();
         let mut tool_calls = Vec::new();
-        for item in body["output"].as_array().into_iter().flatten() {
+        let output = body
+            .get("output")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                crate::response::response_shape_error(
+                    &self.model,
+                    "Codex response missing output array",
+                )
+            })?;
+        for item in output {
             match item["type"].as_str() {
                 Some("message") => {
                     for part in item["content"].as_array().into_iter().flatten() {
@@ -248,10 +257,15 @@ impl ModelProvider for CodexModel {
             .await
             .map_err(|e| {
                 if e.is_redirect() {
-                    ForgeError::provider(format!(
-                        "Codex request was not completed: {}",
-                        error_detail(&e)
-                    ))
+                    crate::response::endpoint_error(
+                        &self.model,
+                        format!("Codex request was not completed: {}", error_detail(&e)),
+                    )
+                } else if e.is_connect() {
+                    crate::response::endpoint_error(
+                        &self.model,
+                        format!("cannot reach Codex endpoint: {}", error_detail(&e)),
+                    )
                 } else {
                     ForgeError::provider_failure(
                         &self.model,
@@ -276,11 +290,15 @@ impl ModelProvider for CodexModel {
                     format!("Codex returned HTTP {status}"),
                 ));
             }
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|_| ForgeError::provider("invalid bounded Codex response UTF-8"))?;
-            return self
-                .parse_wire_response(text)
-                .map_err(|_| ForgeError::provider("invalid bounded Codex response"));
+            let text = std::str::from_utf8(&bytes).map_err(|_| {
+                crate::response::response_shape_error(
+                    &self.model,
+                    "invalid bounded Codex response UTF-8",
+                )
+            })?;
+            return self.parse_wire_response(text).map_err(|_| {
+                crate::response::response_shape_error(&self.model, "invalid bounded Codex response")
+            });
         }
         let text = response
             .text()
@@ -293,7 +311,12 @@ impl ModelProvider for CodexModel {
                 format!("Codex returned HTTP {status}: {text}"),
             ));
         }
-        self.parse_wire_response(&text)
+        self.parse_wire_response(&text).map_err(|error| {
+            crate::response::response_shape_error(
+                &self.model,
+                format!("invalid Codex response: {error}"),
+            )
+        })
     }
 }
 

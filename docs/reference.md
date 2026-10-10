@@ -1032,6 +1032,23 @@ refresh, logout, and browser/device authorization to the official CLI.
 > `OPENAI_API_KEY` with the built-in `gpt-5` entry remains the stable metered
 > API path.
 
+The supported generation contracts are deliberately small and explicit:
+
+| Forge model | Authentication | Request contract | Capability source |
+| --- | --- | --- | --- |
+| `claude-sonnet` | `ANTHROPIC_API_KEY` or Claude Code OAuth | Anthropic Messages, `POST /v1/messages`; OAuth adds the provider beta header | configured Anthropic entry; streaming and tools are explicit |
+| `gpt-5.6-sol` | Codex CLI ChatGPT OAuth plus account id | ChatGPT Codex Responses, `POST /responses`; Forge consumes the required SSE envelope | fixed Codex subscription contract; non-streaming to callers, tools enabled |
+| `k3` | Kimi Code OAuth | OpenAI-compatible chat completions under `/coding/v1/chat/completions` | configured Kimi entry; streaming, tools, and vision are explicit |
+| local/configured | none unless `key_env` is set | OpenAI-compatible `POST /v1/chat/completions` | selected `[models.<name>]` entry |
+
+Hermetic fixtures assert these paths, auth headers, request families, and
+response mappings without contacting a provider. Provider failures retain a
+closed machine-readable class: `authentication`, `endpoint`, `capability`,
+`response_shape`, `transient`, `invalid_request`, or `entitlement`; HTTP 429
+remains the separate `ProviderRateLimited` error with an optional provider
+supplied `Retry-After` delta. Forge never turns one provider's limit into
+access through another account, and never pools or bypasses quotas.
+
 **Jev escalation** (decision plane, not generation): `TYPESAFE_API_KEY` (or
 `jev_key_env` override) enables the Jev tier (see
 [DecisionRouter](#decisionrouter) below) — set it and `router_escalate =
@@ -2014,6 +2031,8 @@ just lint      # clippy, warnings denied
 just test      # unit + integration tests
 just bdd       # cucumber BDD suite (drives the compiled binary)
 just verify    # fmt --check + check + lint + test + bdd — run before committing
+just harness-gate  # full verify + named provider/workflow release acceptance
+just harness-canary MODEL  # opt-in real doctor --live call for one authorized model
 just build     # debug build
 just release   # release build
 just clean

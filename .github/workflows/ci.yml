@@ -47,6 +47,9 @@ jobs:
           NEEDLE_NO_DOWNLOAD: "1"
         run: cargo clippy -p forge-needle --features needle-e2e --all-targets -- -D warnings
 
+      - name: Provider wire contracts
+        run: cargo test -p forge-providers --test provider_contracts
+
       - name: Tests
         run: cargo test --workspace
 
