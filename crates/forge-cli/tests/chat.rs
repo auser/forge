@@ -807,9 +807,32 @@ fn stdout_carries_the_transcript_and_stderr_carries_diagnostics() {
 #[cfg(unix)]
 mod pty {
     use std::fs::File;
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    /// Wait until the slave side has left canonical, signal-generating mode.
+    /// Prompt bytes can be visible before rustyline's following `tcsetattr`
+    /// completes, so output alone is not a sufficient synchronization point.
+    pub fn wait_until_raw(pty: &File, timeout: Duration) -> std::io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // SAFETY: `termios` is an out-parameter initialized by a
+            // successful `tcgetattr`; `pty` owns a live pseudo-terminal fd.
+            let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+            if unsafe { libc::tcgetattr(pty.as_raw_fd(), &mut termios) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if termios.c_lflag & (libc::ICANON | libc::ISIG) == 0 {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     /// Open a pty pair and spawn `cmd` with the slave end as its
     /// controlling terminal — `setsid` detaches it from this test
@@ -818,7 +841,7 @@ mod pty {
     /// a byte written to the master reach the child exactly as a real
     /// keypress would (default termios: canonical-ish line discipline
     /// with `ISIG` on until `rustyline` puts it in raw mode on its own).
-    pub fn spawn(mut cmd: Command) -> std::io::Result<(Child, File)> {
+    pub fn spawn(mut cmd: Command) -> std::io::Result<(Child, File, File)> {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
         // A real terminal always has a nonzero size; a null `winsize` here
@@ -876,7 +899,31 @@ mod pty {
             });
         }
 
-        let child = cmd.spawn()?;
+        // Keep one parent-owned duplicate of the slave solely for observing
+        // termios. The master can carry bytes without reflecting the slave's
+        // mode flags on macOS.
+        let terminal_fd = unsafe { libc::dup(slave) };
+        if terminal_fd < 0 {
+            // SAFETY: both descriptors are the still-owned `openpty` pair.
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `terminal_fd` is a fresh successful duplicate owned here.
+        let terminal = unsafe { File::from_raw_fd(terminal_fd) };
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                // SAFETY: these are the original pair, still owned here.
+                unsafe {
+                    libc::close(master);
+                    libc::close(slave);
+                }
+                return Err(error);
+            }
+        };
         // SAFETY: this function's only remaining copy of `slave` — the
         // three fds handed to `cmd` above were independent `dup`s, and
         // `cmd.spawn()` (having forked) has no further use for this one.
@@ -885,7 +932,7 @@ mod pty {
         // here on; wrapping it in a `File` makes `Drop` close it exactly
         // once.
         let master = unsafe { File::from_raw_fd(master) };
-        Ok((child, master))
+        Ok((child, master, terminal))
     }
 }
 
@@ -916,8 +963,12 @@ mod pty {
 fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = scaffold(tmp.path(), "auto");
-    let cmd = forge(tmp.path(), &project);
-    let (mut child, master) = pty::spawn(cmd).expect("spawn on pty");
+    // The agent/test shell may export `TERM=dumb`; rustyline correctly skips
+    // raw mode for that terminal, which would make byte 0x03 a real SIGINT.
+    // This test claims to exercise an interactive terminal, so give it one.
+    let mut cmd = forge(tmp.path(), &project);
+    cmd.env("TERM", "xterm-256color");
+    let (mut child, master, terminal) = pty::spawn(cmd).expect("spawn on pty");
     let mut writer = master.try_clone().expect("clone master for writing");
     let (output, reader_thread) = tail_stream(master);
 
@@ -929,14 +980,15 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
     // interrupt reaches the controller", not responsiveness.
     wait_for(&output, "/help for commands", Duration::from_secs(30));
     // …and then wait for the prompt itself to be drawn. The banner is
-    // printed *before* the editor thread enters `readline()`; on a loaded
-    // machine a Ctrl-C written into that gap hits the tty with `ISIG` still
-    // on and arrives as a process signal the test never meant to send,
-    // instead of a raw-mode byte (observed: banner + "^C" echoed by the
-    // line discipline, no hint, green again the moment the machine calmed
-    // down). The prompt text only exists once `readline()` is genuinely
-    // blocked in raw mode on the other end of this pty.
+    // printed before the editor thread enters `readline()`, while the prompt
+    // proves that startup reached the editor. Prompt output can still precede
+    // rustyline's `tcsetattr`, so the termios assertion below is the final
+    // synchronization point before the test injects an interrupt byte.
     wait_for(&output, "> ", Duration::from_secs(30));
+    assert!(
+        pty::wait_until_raw(&terminal, Duration::from_secs(30)).expect("inspect pty terminal mode"),
+        "rustyline did not enter raw terminal mode"
+    );
 
     // A single typed Ctrl-C: on a real terminal in raw mode this is just
     // byte 0x03 arriving on the child's stdin, exactly as it would from a
@@ -972,6 +1024,7 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
 
     // Killed, not asked to `/quit` — see this test's doc for why.
     drop(writer);
+    drop(terminal);
     child.kill().ok();
     child.wait().ok();
     reader_thread.join().expect("pty reader thread");
@@ -1010,18 +1063,20 @@ fn a_tab_on_an_at_word_completes_a_project_path_on_a_real_terminal() {
     // on a clean tree.
     let mut cmd = forge(tmp.path(), &project);
     cmd.env("TERM", "xterm-256color");
-    let (mut child, master) = pty::spawn(cmd).expect("spawn on pty");
+    let (mut child, master, terminal) = pty::spawn(cmd).expect("spawn on pty");
     let mut writer = master.try_clone().expect("clone master for writing");
     let (output, reader_thread) = tail_stream(master);
 
-    // The two-stage wait of the Ctrl-C test above, for the reason written
-    // there: only the drawn prompt proves `readline()` is blocked in raw
-    // mode on the other end of this pty — a Tab written into the gap
-    // before it would be just a byte in the tty buffer with no completer
-    // attached yet. 30 s bounds, not 10, for the same loaded-machine
-    // reason.
+    // Use the Ctrl-C test's two output waits, then confirm raw mode directly.
+    // A Tab written before that transition would be only a byte in the tty
+    // buffer with no completer attached yet. 30 s bounds, not 10, for the
+    // same loaded-machine reason.
     wait_for(&output, "/help for commands", Duration::from_secs(30));
     wait_for(&output, "> ", Duration::from_secs(30));
+    assert!(
+        pty::wait_until_raw(&terminal, Duration::from_secs(30)).expect("inspect pty terminal mode"),
+        "rustyline did not enter raw terminal mode"
+    );
 
     // Exactly one graph file starts with "al" (`alpha.rs`), so
     // `CompletionType::List` completes immediately rather than listing.
@@ -1040,6 +1095,7 @@ fn a_tab_on_an_at_word_completes_a_project_path_on_a_real_terminal() {
     // Killed, not asked to `/quit` — the Ctrl-C test's doc gives the
     // reason (do not race the unrelated outstanding-read hazard).
     drop(writer);
+    drop(terminal);
     child.kill().ok();
     child.wait().ok();
     reader_thread.join().expect("pty reader thread");
@@ -1056,12 +1112,16 @@ fn slash_opens_the_command_menu_on_a_real_terminal() {
     let project = scaffold(tmp.path(), "auto");
     let mut cmd = forge(tmp.path(), &project);
     cmd.env("TERM", "xterm-256color");
-    let (mut child, master) = pty::spawn(cmd).expect("spawn on pty");
+    let (mut child, master, terminal) = pty::spawn(cmd).expect("spawn on pty");
     let mut writer = master.try_clone().expect("clone master for writing");
     let (output, reader_thread) = tail_stream(master);
 
     wait_for(&output, "/help for commands", Duration::from_secs(30));
     wait_for(&output, "> ", Duration::from_secs(30));
+    assert!(
+        pty::wait_until_raw(&terminal, Duration::from_secs(30)).expect("inspect pty terminal mode"),
+        "rustyline did not enter raw terminal mode"
+    );
 
     writer.write_all(b"/").expect("type slash");
     wait_for(&output, "/help", Duration::from_secs(30));
@@ -1071,6 +1131,7 @@ fn slash_opens_the_command_menu_on_a_real_terminal() {
     wait_for(&output, "> /", Duration::from_secs(30));
 
     drop(writer);
+    drop(terminal);
     child.kill().ok();
     child.wait().ok();
     reader_thread.join().expect("pty reader thread");
@@ -1081,6 +1142,7 @@ fn slash_opens_the_command_menu_on_a_real_terminal() {
 struct ContextPty {
     child: std::process::Child,
     writer: std::fs::File,
+    terminal: Option<std::fs::File>,
     output: Arc<Mutex<String>>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
@@ -1090,17 +1152,26 @@ impl ContextPty {
     fn start(tmp: &Path, project: &Path) -> Self {
         let mut cmd = forge(tmp, project);
         cmd.env("TERM", "xterm-256color");
-        let (child, master) = pty::spawn(cmd).expect("spawn on pty");
+        let (child, master, terminal) = pty::spawn(cmd).expect("spawn on pty");
         let writer = master.try_clone().expect("clone pty writer");
         let (output, reader) = tail_stream(master);
         let pty = Self {
             child,
             writer,
+            terminal: Some(terminal),
             output,
             reader: Some(reader),
         };
         wait_for(&pty.output, "/help for commands", Duration::from_secs(30));
         wait_for(&pty.output, "> ", Duration::from_secs(30));
+        assert!(
+            pty::wait_until_raw(
+                pty.terminal.as_ref().expect("pty terminal observer"),
+                Duration::from_secs(30),
+            )
+            .expect("inspect pty terminal mode"),
+            "rustyline did not enter raw terminal mode"
+        );
         pty
     }
 
@@ -1137,6 +1208,7 @@ impl Drop for ContextPty {
     fn drop(&mut self) {
         self.child.kill().ok();
         self.child.wait().ok();
+        drop(self.terminal.take());
         if let Some(reader) = self.reader.take() {
             reader.join().expect("pty reader thread");
         }
