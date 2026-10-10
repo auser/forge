@@ -100,8 +100,12 @@ impl ProviderAvailability {
             ForgeError::ProviderFailure { kind, .. } => Observation {
                 state: match kind {
                     ProviderFailureKind::Authentication => AvailabilityState::AuthenticationFailed,
-                    ProviderFailureKind::Transient => AvailabilityState::TransientFailure,
-                    ProviderFailureKind::InvalidRequest => AvailabilityState::InvalidRequest,
+                    ProviderFailureKind::Endpoint | ProviderFailureKind::Transient => {
+                        AvailabilityState::TransientFailure
+                    }
+                    ProviderFailureKind::Capability
+                    | ProviderFailureKind::ResponseShape
+                    | ProviderFailureKind::InvalidRequest => AvailabilityState::InvalidRequest,
                     ProviderFailureKind::Entitlement => AvailabilityState::EntitlementFailed,
                 },
                 retry_at_millis: None,
@@ -240,5 +244,30 @@ mod tests {
         let snapshot = table.snapshot("expired");
         assert!(!snapshot.eligible);
         assert_eq!(snapshot.state, AvailabilityState::AuthenticationFailed);
+    }
+
+    #[test]
+    fn contract_failures_keep_their_routing_policy_classes() {
+        for (kind, expected) in [
+            (
+                ProviderFailureKind::Endpoint,
+                AvailabilityState::TransientFailure,
+            ),
+            (
+                ProviderFailureKind::Capability,
+                AvailabilityState::InvalidRequest,
+            ),
+            (
+                ProviderFailureKind::ResponseShape,
+                AvailabilityState::InvalidRequest,
+            ),
+        ] {
+            let table = ProviderAvailability::default();
+            table.observe_failure(
+                "model",
+                &ForgeError::provider_failure("model", kind, None, "contract failure"),
+            );
+            assert_eq!(table.snapshot("model").state, expected);
+        }
     }
 }

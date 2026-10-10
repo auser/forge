@@ -48,6 +48,19 @@ bdd:
 verify: check lint lint-ffi test bdd
     cargo fmt --all --check
 
+# Release gate for the drop-in coding harness. `verify` covers the complete
+# workspace; the named tests make the provider wire contracts and the
+# inspect/edit/check/review acceptance path visible in release logs.
+harness-gate: verify
+    cargo test -p forge-providers --test provider_contracts
+    cargo test -p forge-cli --test cli one_command_workflow_records_plan_checks_review_and_diff
+
+# Opt-in, real provider call for a configured model. This uses only the
+# caller's existing authorized credential and never rotates accounts or
+# retries around a provider limit.
+harness-canary model:
+    cargo run -p forge-cli -- --model {{model}} doctor --live
+
 # The libneedle FFI backend, linked for real. The engine is fetched and
 # checksum-verified automatically for the targets listed in
 # crates/needle-sys/build_support.rs (cached under $CARGO_HOME/needle-engine,

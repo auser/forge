@@ -9,6 +9,9 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFailureKind {
     Authentication,
+    Endpoint,
+    Capability,
+    ResponseShape,
     Transient,
     InvalidRequest,
     Entitlement,
@@ -18,6 +21,9 @@ impl fmt::Display for ProviderFailureKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Authentication => "authentication",
+            Self::Endpoint => "endpoint",
+            Self::Capability => "capability",
+            Self::ResponseShape => "response_shape",
             Self::Transient => "transient",
             Self::InvalidRequest => "invalid_request",
             Self::Entitlement => "entitlement",

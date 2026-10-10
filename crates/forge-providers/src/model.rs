@@ -82,7 +82,7 @@ impl ModelProvider for MockModel {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, ForgeError> {
-        reject_tools_without_capability(&request, self.capabilities)?;
+        reject_tools_without_capability(&request, self.capabilities, self.name())?;
         let prompt = request
             .messages
             .iter()
@@ -180,13 +180,17 @@ fn mock_verbose() -> bool {
 pub(crate) fn reject_tools_without_capability(
     request: &CompletionRequest,
     capabilities: ModelCapabilities,
+    provider: &str,
 ) -> Result<(), ForgeError> {
     if !capabilities.tools && !request.tools.is_empty() {
-        return Err(ForgeError::provider(format!(
-            "provider does not support tools (capabilities.tools = false), \
+        return Err(crate::response::capability_error(
+            provider,
+            format!(
+                "provider does not support tools (capabilities.tools = false), \
              but the request carries {} tool definition(s)",
-            request.tools.len()
-        )));
+                request.tools.len()
+            ),
+        ));
     }
     Ok(())
 }
@@ -663,15 +667,16 @@ fn send_error(model: &str, url: &str, e: reqwest::Error) -> ForgeError {
             format!("model request to {url} timed out"),
         )
     } else if e.is_redirect() {
-        ForgeError::provider(format!(
-            "model request to {url} was not completed: {}",
-            crate::local_only::error_detail(&e)
-        ))
-    } else if e.is_connect() {
-        ForgeError::provider_failure(
+        crate::response::endpoint_error(
             model,
-            forge_core::ProviderFailureKind::Transient,
-            None,
+            format!(
+                "model request to {url} was not completed: {}",
+                crate::local_only::error_detail(&e)
+            ),
+        )
+    } else if e.is_connect() {
+        crate::response::endpoint_error(
+            model,
             format!(
                 "cannot reach OpenAI-compatible server at {url} (connection refused); \
                  start your model server (e.g. oMLX) or set model = \"mock-local\" for offline use"
@@ -732,9 +737,10 @@ fn parse_chat_completion(
     body: &serde_json::Value,
 ) -> Result<CompletionResponse, ForgeError> {
     let message = body.pointer("/choices/0/message").ok_or_else(|| {
-        ForgeError::provider(format!(
-            "model response from {url} missing choices[0].message"
-        ))
+        crate::response::response_shape_error(
+            model,
+            format!("model response from {url} missing choices[0].message"),
+        )
     })?;
     let content = message
         .get("content")
@@ -778,6 +784,7 @@ impl OpenAiStream {
     fn apply(
         &mut self,
         event: &crate::sse::SseEvent,
+        model: &str,
         url: &str,
         on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<(), ForgeError> {
@@ -787,8 +794,11 @@ impl OpenAiStream {
             self.saw_done = true;
             return Ok(());
         }
-        let chunk: serde_json::Value = serde_json::from_str(&event.data).map_err(|e| {
-            ForgeError::provider(format!("malformed SSE data chunk from {url}: {e}"))
+        let chunk: serde_json::Value = serde_json::from_str(&event.data).map_err(|_| {
+            crate::response::response_shape_error(
+                model,
+                format!("malformed SSE data chunk from {url}"),
+            )
         })?;
         // A mid-stream error payload (D5): the partial text is discarded
         // with the response — the runtime records a typed Error event and
@@ -803,10 +813,15 @@ impl OpenAiStream {
                 .and_then(serde_json::Value::as_str)
                 .map(|k| format!(" (type {k})"))
                 .unwrap_or_default();
-            return Err(ForgeError::provider(format!(
-                "model stream from {url} failed after {} answer bytes: {message}{kind}",
-                self.content.len()
-            )));
+            return Err(ForgeError::provider_failure(
+                model,
+                forge_core::ProviderFailureKind::InvalidRequest,
+                None,
+                format!(
+                    "model stream from {url} failed after {} answer bytes: {message}{kind}",
+                    self.content.len()
+                ),
+            ));
         }
         // The terminal usage chunk carries `choices: []`; every other chunk
         // carries `usage: null` when include_usage is honored at all.
@@ -905,7 +920,7 @@ impl ModelProvider for OpenAiCompatibleModel {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, ForgeError> {
-        reject_tools_without_capability(&request, self.capabilities)?;
+        reject_tools_without_capability(&request, self.capabilities, &self.model)?;
         let url = self.chat_url();
         let response = self
             .authed_chat_post(&self.client, &url, &self.chat_body(&request, false))
@@ -928,8 +943,12 @@ impl ModelProvider for OpenAiCompatibleModel {
                     format!("model endpoint returned {status}"),
                 ));
             }
-            let body = serde_json::from_slice(&bytes)
-                .map_err(|_| ForgeError::provider("invalid bounded model response JSON"))?;
+            let body = serde_json::from_slice(&bytes).map_err(|_| {
+                crate::response::response_shape_error(
+                    &self.model,
+                    "invalid bounded model response JSON",
+                )
+            })?;
             return parse_chat_completion(&self.model, &url, &body);
         }
         if !status.is_success() {
@@ -951,10 +970,12 @@ impl ModelProvider for OpenAiCompatibleModel {
                 format!("model endpoint {url} returned {status}: {text}{suffix}"),
             ));
         }
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| ForgeError::provider(format!("reading model response from {url}: {e}")))?;
+        let body: serde_json::Value = response.json().await.map_err(|_| {
+            crate::response::response_shape_error(
+                &self.model,
+                format!("model endpoint {url} returned invalid JSON"),
+            )
+        })?;
         parse_chat_completion(&self.model, &url, &body)
     }
 
@@ -966,7 +987,7 @@ impl ModelProvider for OpenAiCompatibleModel {
         if self.response_max_bytes.is_some() {
             return Err(crate::response::streaming_unsupported());
         }
-        reject_tools_without_capability(&request, self.capabilities)?;
+        reject_tools_without_capability(&request, self.capabilities, &self.model)?;
         let url = self.chat_url();
         // Scoped so the body's borrow of `request` ends here: the fallback
         // below moves `request` into `complete`.
@@ -1017,8 +1038,11 @@ impl ModelProvider for OpenAiCompatibleModel {
                     .starts_with("text/event-stream")
             });
         if !is_sse {
-            let body: serde_json::Value = response.json().await.map_err(|e| {
-                ForgeError::provider(format!("reading model response from {url}: {e}"))
+            let body: serde_json::Value = response.json().await.map_err(|_| {
+                crate::response::response_shape_error(
+                    &self.model,
+                    format!("model endpoint {url} returned invalid JSON"),
+                )
             })?;
             return parse_chat_completion(&self.model, &url, &body);
         }
@@ -1030,31 +1054,39 @@ impl ModelProvider for OpenAiCompatibleModel {
             match response.chunk().await {
                 Ok(Some(bytes)) => {
                     for event in parser.feed(&bytes) {
-                        stream.apply(&event, &url, on_delta)?;
+                        stream.apply(&event, &self.model, &url, on_delta)?;
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    return Err(ForgeError::provider(format!(
-                        "model stream from {url} failed after {} answer bytes: {}",
-                        stream.content.len(),
-                        crate::local_only::error_detail(&e)
-                    )));
+                    return Err(ForgeError::provider_failure(
+                        &self.model,
+                        forge_core::ProviderFailureKind::Transient,
+                        None,
+                        format!(
+                            "model stream from {url} failed after {} answer bytes: {}",
+                            stream.content.len(),
+                            crate::local_only::error_detail(&e)
+                        ),
+                    ));
                 }
             }
         }
         for event in parser.finish() {
-            stream.apply(&event, &url, on_delta)?;
+            stream.apply(&event, &self.model, &url, on_delta)?;
         }
         // EOF with no terminal signal at all is truncation, never a silent
         // partial answer; EOF after a finish_reason without the [DONE]
         // sentinel is accepted — real servers omit it.
         if !stream.saw_done && stream.finish_reason.is_none() {
-            return Err(ForgeError::provider(format!(
-                "model stream from {url} ended early: EOF after {} answer bytes with no \
-                 finish_reason and no [DONE] sentinel",
-                stream.content.len()
-            )));
+            return Err(crate::response::response_shape_error(
+                &self.model,
+                format!(
+                    "model stream from {url} ended early: EOF after {} answer bytes with no \
+                     finish_reason and no [DONE] sentinel",
+                    stream.content.len()
+                ),
+            ));
         }
         if !stream.saw_done {
             tracing::debug!(
@@ -2180,7 +2212,10 @@ mod tests {
                 ),
             ]);
         let err = model.complete(request).await.expect_err("must reject");
-        assert!(matches!(err, ForgeError::Provider(_)));
+        assert_eq!(
+            err.provider_failure_kind(),
+            Some(forge_core::ProviderFailureKind::Capability)
+        );
     }
 
     #[tokio::test]
@@ -3206,8 +3241,13 @@ mod tests {
         let model = streaming_model(&server.uri());
         let (_deltas, response) = stream_with(&model).await;
         let err = response.expect_err("a mid-stream error must fail the call");
-        let ForgeError::Provider(message) = err else {
-            panic!("expected a provider error");
+        let ForgeError::ProviderFailure {
+            kind: forge_core::ProviderFailureKind::InvalidRequest,
+            message,
+            ..
+        } = err
+        else {
+            panic!("expected an invalid-request provider error");
         };
         assert!(message.contains("overloaded"), "{message}");
     }
@@ -3228,8 +3268,13 @@ mod tests {
         let model = streaming_model(&server.uri());
         let (_deltas, response) = stream_with(&model).await;
         let err = response.expect_err("truncation must fail");
-        let ForgeError::Provider(message) = err else {
-            panic!("expected a provider error");
+        let ForgeError::ProviderFailure {
+            kind: forge_core::ProviderFailureKind::ResponseShape,
+            message,
+            ..
+        } = err
+        else {
+            panic!("expected a response-shape provider error");
         };
         assert!(message.contains("ended early"), "{message}");
         assert!(
