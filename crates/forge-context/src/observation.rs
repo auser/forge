@@ -3,7 +3,11 @@
 //! The bounded index is physically replaced atomically under a permanent native
 //! lock. Logically commits only append batches: existing batch prefixes are
 //! immutable. Supplied event snapshots are trusted caller input, not disk proof.
-use std::{collections::BTreeMap, path::PathBuf, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Mutex,
+};
 
 use forge_core::{EVENT_SCHEMA_VERSION, Event, EventKind};
 use forge_session::Redactor;
@@ -300,6 +304,7 @@ impl ValidatedObservationBatch {
 pub struct LedgerProjection {
     session_id: String,
     batches: Vec<ObservationBatch>,
+    tombstoned: BTreeSet<String>,
 }
 impl LedgerProjection {
     pub fn session_id(&self) -> &str {
@@ -307,6 +312,12 @@ impl LedgerProjection {
     }
     pub fn batches(&self) -> &[ObservationBatch] {
         &self.batches
+    }
+    pub fn is_tombstoned(&self, observation_id: &str) -> bool {
+        self.tombstoned.contains(observation_id)
+    }
+    pub fn tombstoned(&self) -> &BTreeSet<String> {
+        &self.tombstoned
     }
     /// Empty batches count as processed intervals, not as rendered source coverage.
     pub fn covered_intervals(&self) -> Vec<SourceRange> {
@@ -341,6 +352,13 @@ pub trait ObservationStore: Send + Sync {
         source_snapshot: &[Event],
         redactor: &Redactor,
     ) -> Result<LedgerProjection>;
+    fn tombstone(
+        &self,
+        session_id: &str,
+        observation_ids: &BTreeSet<String>,
+        source_snapshot: &[Event],
+        redactor: &Redactor,
+    ) -> Result<LedgerProjection>;
     #[allow(clippy::too_many_arguments)]
     fn fork(
         &self,
@@ -357,6 +375,8 @@ pub trait ObservationStore: Send + Sync {
 struct Ledger {
     snapshot: Snapshot,
     batches: Vec<ObservationBatch>,
+    #[serde(default)]
+    tombstoned_batches: BTreeSet<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -411,6 +431,14 @@ fn validate(index: &Index) -> Result<()> {
                 }
             }
         }
+        let known: BTreeSet<_> = ledger.batches.iter().map(|batch| &batch.id).collect();
+        if ledger
+            .tombstoned_batches
+            .iter()
+            .any(|batch_id| !known.contains(batch_id))
+        {
+            return Err(ObservationError::Corrupt);
+        }
     }
     if index.sessions.len() > 1024 {
         return Err(ObservationError::LimitExceeded);
@@ -437,6 +465,19 @@ fn save(files: &mut dyn crate::artifact::ArtifactFiles, index: &Index) -> Result
     files
         .write("index.json", &bytes)
         .map_err(|_| ObservationError::Unavailable)
+}
+fn tombstoned_observation_ids(ledger: &Ledger) -> BTreeSet<String> {
+    ledger
+        .batches
+        .iter()
+        .filter(|batch| ledger.tombstoned_batches.contains(&batch.id))
+        .flat_map(|batch| {
+            batch
+                .observations
+                .iter()
+                .map(|observation| observation.id.clone())
+        })
+        .collect()
 }
 #[derive(Default)]
 pub struct MemoryObservationStore {
@@ -477,6 +518,10 @@ impl FsObservationStore {
         Ok(Some(LedgerProjection {
             session_id: session_id.into(),
             batches,
+            tombstoned: index
+                .sessions
+                .get(session_id)
+                .map_or_else(BTreeSet::new, tombstoned_observation_ids),
         }))
     }
 
@@ -519,7 +564,7 @@ macro_rules! impl_store {
                         return Err(ObservationError::InvalidFork);
                     }
                     let ledger = index.sessions.entry(session.clone()).or_insert_with(|| Ledger {
-                        snapshot: batch.snapshot.clone(), batches: Vec::new(),
+                        snapshot: batch.snapshot.clone(), batches: Vec::new(), tombstoned_batches: BTreeSet::new(),
                     });
                     // Disjoint jobs may finish out of order with shorter snapshots.
                     if ledger.snapshot.hashes.len() <= batch.snapshot.hashes.len() {
@@ -542,7 +587,39 @@ macro_rules! impl_store {
                         compatible(&ledger.snapshot, &source)?;
                         ledger.batches.clone()
                     } else { Vec::new() };
-                    Ok(LedgerProjection { session_id: session_id.into(), batches })
+                    let tombstoned = index.sessions.get(session_id)
+                        .map_or_else(BTreeSet::new, tombstoned_observation_ids);
+                    Ok(LedgerProjection { session_id: session_id.into(), batches, tombstoned })
+                })
+            }
+            fn tombstone(&self, session_id: &str, observation_ids: &BTreeSet<String>, source_snapshot: &[Event], redactor: &Redactor) -> Result<LedgerProjection> {
+                if !identifier(session_id) { return Err(ObservationError::InvalidMetadata); }
+                let source = snapshot(session_id, source_snapshot, redactor)?;
+                self.transaction(&mut |files| {
+                    let mut index = load(files)?;
+                    let ledger = index.sessions.get_mut(session_id).ok_or(ObservationError::InvalidSource)?;
+                    compatible(&ledger.snapshot, &source)?;
+                    let known: BTreeSet<_> = ledger.batches.iter().flat_map(|batch| {
+                        batch.observations.iter().map(|observation| observation.id.clone())
+                    }).collect();
+                    if observation_ids.iter().any(|id| !known.contains(id)) {
+                        return Err(ObservationError::InvalidSource);
+                    }
+                    let selected_batches: BTreeSet<_> = ledger.batches.iter()
+                        .filter(|batch| batch.observations.iter().any(|observation| observation_ids.contains(&observation.id)))
+                        .map(|batch| batch.id.clone())
+                        .collect();
+                    let partial_batch = ledger.batches.iter()
+                        .filter(|batch| selected_batches.contains(&batch.id))
+                        .any(|batch| batch.observations.iter().any(|observation| !observation_ids.contains(&observation.id)));
+                    if partial_batch {
+                        return Err(ObservationError::InvalidSource);
+                    }
+                    ledger.tombstoned_batches.extend(selected_batches);
+                    let batches = ledger.batches.clone();
+                    let tombstoned = tombstoned_observation_ids(ledger);
+                    save(files, &index)?;
+                    Ok(LedgerProjection { session_id: session_id.into(), batches, tombstoned })
                 })
             }
             fn fork(&self, parent_session: &str, parent_snapshot: &[Event], child_session: &str,
@@ -563,9 +640,12 @@ macro_rules! impl_store {
                         compatible(&ledger.snapshot, &parent)?;
                         ledger.batches.iter().filter(|b| b.range.end <= cut).cloned().collect()
                     } else { Vec::new() };
-                    index.sessions.insert(child_session.into(), Ledger { snapshot: child.clone(), batches: batches.clone() });
+                    // Consolidated topic files are session-local. A fork gets
+                    // the source observations so it can consolidate its own
+                    // durable view instead of inheriting hidden tombstones.
+                    index.sessions.insert(child_session.into(), Ledger { snapshot: child.clone(), batches: batches.clone(), tombstoned_batches: BTreeSet::new() });
                     save(files, &index)?;
-                    Ok(LedgerProjection { session_id: child_session.into(), batches })
+                    Ok(LedgerProjection { session_id: child_session.into(), batches, tombstoned: BTreeSet::new() })
                 })
             }
         }

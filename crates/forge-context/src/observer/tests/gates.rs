@@ -86,6 +86,15 @@ fn queue_gate_serializes_ledger_commit_against_reclaim() {
         ) -> Result<crate::LedgerProjection, crate::ObservationError> {
             self.inner.projection(id, events, r)
         }
+        fn tombstone(
+            &self,
+            id: &str,
+            observation_ids: &std::collections::BTreeSet<String>,
+            events: &[Event],
+            r: &Redactor,
+        ) -> Result<crate::LedgerProjection, crate::ObservationError> {
+            self.inner.tombstone(id, observation_ids, events, r)
+        }
         fn fork(
             &self,
             p: &str,

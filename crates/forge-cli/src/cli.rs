@@ -275,6 +275,28 @@ pub enum MemoryCommand {
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
+    /// Consolidate active observations into durable session topic files.
+    Consolidate {
+        #[arg(long, value_name = "ID")]
+        session: String,
+    },
+    /// Search consolidated session and explicitly promoted project memory.
+    Search {
+        #[arg(long, value_name = "ID")]
+        session: String,
+        #[arg(long, value_name = "TEXT")]
+        query: String,
+    },
+    /// Explicitly promote one session topic into project memory.
+    Promote {
+        #[arg(long, value_name = "ID")]
+        session: String,
+        #[arg(long, value_name = "TOPIC")]
+        topic: String,
+        /// Confirm the project-scope promotion.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -63,6 +63,9 @@ pub fn render_observations(
         let mut observations: Vec<_> = batch.observations.iter().collect();
         observations.sort_by(|a, b| a.id.cmp(&b.id));
         for observation in observations {
+            if projection.is_tombstoned(&observation.id) {
+                continue;
+            }
             let reason = if batch.range.start >= raw_tail_start.get() {
                 ObservationSelectionReason::AtOrAfterRawTail
             } else if batch.range.end >= raw_tail_start.get() {

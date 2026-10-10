@@ -310,6 +310,75 @@ fn native_corrupt_and_oversized_reads_fail_closed() {
         assert!(store.commit(batch("s", &source, 1, 1, "v2")).is_err());
     }
 }
+
+#[test]
+fn fork_reexposes_source_observations_without_inheriting_session_topic_tombstones() {
+    let store = MemoryObservationStore::default();
+    let redactor = Redactor::default();
+    let parent = events("parent", 4);
+    let committed = store.commit(batch("parent", &parent, 1, 2, "v1")).unwrap();
+    let ids = committed
+        .observations
+        .iter()
+        .map(|observation| observation.id.clone())
+        .collect();
+    let parent_projection = store.tombstone("parent", &ids, &parent, &redactor).unwrap();
+    assert_eq!(parent_projection.tombstoned(), &ids);
+
+    let child_events = child(&parent, "parent", "child", 3);
+    let child_projection = store
+        .fork("parent", &parent, "child", &child_events, 3, &redactor)
+        .unwrap();
+    assert!(child_projection.tombstoned().is_empty());
+    assert_eq!(child_projection.batches()[0], committed);
+}
+
+#[test]
+fn tombstones_require_complete_batches() {
+    let store = MemoryObservationStore::default();
+    let redactor = Redactor::default();
+    let source = events("s", 2);
+    let committed = store
+        .commit(
+            ValidatedObservationBatch::new(
+                "s",
+                &source,
+                SourceRange { start: 1, end: 2 },
+                "v1",
+                vec![
+                    ObservationDraft {
+                        scope: ObservationScope::Session,
+                        kind: ObservationKind::Decision,
+                        content: "first".into(),
+                    },
+                    ObservationDraft {
+                        scope: ObservationScope::Session,
+                        kind: ObservationKind::Constraint,
+                        content: "second".into(),
+                    },
+                ],
+                &redactor,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let partial = BTreeSet::from([committed.observations[0].id.clone()]);
+
+    assert_eq!(
+        store
+            .tombstone("s", &partial, &source, &redactor)
+            .unwrap_err(),
+        ObservationError::InvalidSource
+    );
+    assert!(
+        store
+            .projection("s", &source, &redactor)
+            .unwrap()
+            .tombstoned()
+            .is_empty()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn native_symlink_hardlink_and_private_modes() {
