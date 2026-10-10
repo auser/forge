@@ -7,6 +7,7 @@
 
 mod artifact;
 mod compression;
+mod consolidation;
 mod observation;
 mod observation_render;
 pub mod observer;
@@ -22,6 +23,11 @@ pub use artifact::{
 pub use compression::{
     COMPRESSION_VERSION, CompressionDecision, CompressionKind, CompressionReason,
     CompressionResult, compress_tool_output,
+};
+pub use consolidation::{
+    CONSOLIDATION_VERSION, ClaimSource, ConsolidationError, ConsolidationReport,
+    ConsolidationStatus, FsConsolidationStore, LexicalMatch, PromotionReport, TopicClaim,
+    TopicFile,
 };
 pub use observation::{
     FsObservationStore, LedgerProjection, MAX_OBSERVATION_BATCHES, MAX_OBSERVATION_CONTENT_BYTES,

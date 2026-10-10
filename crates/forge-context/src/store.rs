@@ -27,6 +27,13 @@ pub(crate) fn observer_transaction<T>(
     filesystem::artifact_transaction(path, "observer-jobs", operation)
 }
 
+pub(crate) fn consolidation_transaction<T>(
+    path: &std::path::Path,
+    operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    filesystem::artifact_transaction(path, "consolidation", operation)
+}
+
 pub(crate) fn observer_read(
     path: &std::path::Path,
     bound: usize,

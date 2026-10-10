@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use forge_context::{FsConsolidationStore, FsObservationStore, ObservationStore};
 use forge_core::ForgeError;
 use forge_runtime::inspection::{ContextMemoryService, ObserverReadiness};
 use forge_session::JsonlSessionStore;
@@ -109,6 +110,91 @@ fn run(ctx: &Context, session: String, request: Request) -> Result<(), ForgeErro
     Ok(())
 }
 
+fn output(value: &impl serde::Serialize) -> Result<(), ForgeError> {
+    let rendered = serde_json::to_string_pretty(value)
+        .map_err(|_| ForgeError::session("memory serialization unavailable"))?;
+    println!("{rendered}");
+    Ok(())
+}
+
+fn consolidation_root(ctx: &Context) -> Result<(PathBuf, Arc<JsonlSessionStore>), ForgeError> {
+    let root = ctx.project_root()?;
+    Ok((
+        root.clone(),
+        Arc::new(JsonlSessionStore::new(root.join(".forge/sessions"))),
+    ))
+}
+
+fn consolidate(ctx: &Context, session: String) -> Result<(), ForgeError> {
+    let (root, sessions) = consolidation_root(ctx)?;
+    let events = sessions
+        .events_for(&session)
+        .map_err(|_| ForgeError::session("session inspection unavailable"))?;
+    if events.is_empty() {
+        return Err(ForgeError::session("unknown session"));
+    }
+    let context_root = root.join(".forge/context");
+    let observations = FsObservationStore::new(&context_root);
+    let projection = observations
+        .inspect(&session, &events, sessions.redactor())
+        .map_err(|_| ForgeError::session("observation ledger unavailable"))?
+        .ok_or_else(|| ForgeError::session("observation ledger missing"))?;
+    let report = FsConsolidationStore::new(&context_root)
+        .consolidate(&projection)
+        .map_err(|_| ForgeError::session("memory consolidation unavailable"))?;
+    // Topic objects and their index are durable before observations become
+    // inactive. If this step is interrupted, rerunning is idempotent.
+    observations
+        .tombstone(
+            &session,
+            &report.consumed_observation_ids,
+            &events,
+            sessions.redactor(),
+        )
+        .map_err(|_| ForgeError::session("memory consolidation needs resume"))?;
+    output(&report)
+}
+
+fn search(ctx: &Context, session: String, query: String) -> Result<(), ForgeError> {
+    let (root, sessions) = consolidation_root(ctx)?;
+    if sessions
+        .events_for(&session)
+        .map_err(|_| ForgeError::session("session inspection unavailable"))?
+        .is_empty()
+    {
+        return Err(ForgeError::session("unknown session"));
+    }
+    let matches = FsConsolidationStore::new(root.join(".forge/context"))
+        .search(&session, &query)
+        .map_err(|_| ForgeError::session("memory search unavailable"))?;
+    output(&matches)
+}
+
+fn promote(
+    ctx: &Context,
+    session: String,
+    topic: String,
+    confirmed: bool,
+) -> Result<(), ForgeError> {
+    if !confirmed {
+        return Err(ForgeError::session(
+            "project memory promotion requires --yes",
+        ));
+    }
+    let (root, sessions) = consolidation_root(ctx)?;
+    if sessions
+        .events_for(&session)
+        .map_err(|_| ForgeError::session("session inspection unavailable"))?
+        .is_empty()
+    {
+        return Err(ForgeError::session("unknown session"));
+    }
+    let report = FsConsolidationStore::new(root.join(".forge/context"))
+        .promote(&session, &topic)
+        .map_err(|_| ForgeError::session("project memory promotion unavailable"))?;
+    output(&report)
+}
+
 pub fn context(ctx: &Context, command: ContextCommand) -> Result<(), ForgeError> {
     match command {
         ContextCommand::Status { session } => run(ctx, session, Request::ContextStatus),
@@ -122,5 +208,12 @@ pub fn memory(ctx: &Context, command: MemoryCommand) -> Result<(), ForgeError> {
         MemoryCommand::Off { session } => run(ctx, session, Request::SetMemory(false)),
         MemoryCommand::Show { session, offset } => run(ctx, session, Request::Show(offset)),
         MemoryCommand::Sources { session, offset } => run(ctx, session, Request::Sources(offset)),
+        MemoryCommand::Consolidate { session } => consolidate(ctx, session),
+        MemoryCommand::Search { session, query } => search(ctx, session, query),
+        MemoryCommand::Promote {
+            session,
+            topic,
+            yes,
+        } => promote(ctx, session, topic, yes),
     }
 }

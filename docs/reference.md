@@ -1804,6 +1804,9 @@ forge memory on --session <id>
 forge memory off --session <id>
 forge memory show --session <id> --offset 0 --json
 forge memory sources --session <id> --offset 0 --json
+forge memory consolidate --session <id> --json
+forge memory search --session <id> --query <text> --json
+forge memory promote --session <id> --topic decisions --yes --json
 ```
 
 `memory on` grants observation-extraction consent only. It does not inject
@@ -1823,9 +1826,9 @@ cancelled attempts can exhaust a job, which remains visible as failed.
 
 Context status separates latest request budgets and prefix drift, cumulative
 compression/retrieval metrics, and project-level artifact metadata health.
-Memory status distinguishes raw events, session observations, jobs and desired
-consent versus effective eligibility. Live prompt injection and consolidated
-memory are explicitly reported unavailable; neither is implied by `on`.
+Memory status distinguishes raw events, active session observations,
+consolidated topic/claim counts, jobs and desired consent versus effective
+eligibility. Live prompt injection remains off and is not implied by `on`.
 Missing or unreadable derived stores are not presented as empty healthy stores.
 
 Observation and source pages are bounded, ordered and report continuation.
@@ -1864,7 +1867,8 @@ through existing replay normalization and remain unchanged.
 Rendered observations are explicitly labeled derived, untrusted data—not
 project or system instructions. Source existence and scope validation do not
 prove that an observation's content is true. Project-scope records do not imply
-automatic promotion or cross-session selection; those remain later work.
+automatic promotion or cross-session selection. Promotion requires the explicit
+`memory promote ... --yes` command.
 
 The filesystem ledger uses a private bounded atomic index under
 `.forge/context/observations/`. Commits preserve immutable logical batch prefixes;
@@ -1879,6 +1883,31 @@ raw-tail boundary. Fingerprints detect changes to those snapshots; they do not
 prove their origin on disk. After a fork, local observation ranges start after
 the copied prefix and provenance marker; inherited gaps cannot be re-observed
 as child-local history.
+
+### Durable consolidation and promotion
+
+`memory consolidate` groups active observations into the closed topic set
+`decisions`, `constraints`, `outcomes`, `questions`, and `state`. Topic objects
+are versioned and content addressed under `.forge/context/consolidation/`.
+Every claim retains its observation ID, batch ID, source session, inclusive
+event range, and source fingerprint. The topic objects and index commit before
+their source observations are tombstoned. If interruption lands between those
+commits, rerunning the same command reuses the deterministic topic contents and
+completes the tombstones.
+
+Consolidation is a derived session view. It does not edit `AGENTS.md`, project
+instructions, or prompts. Cross-session project memory exists only after
+`memory promote` names a topic and receives `--yes`; the promoted entry retains
+the original session and source IDs. `memory search` performs bounded
+case-insensitive lexical matching over the current session topics and explicitly
+promoted project topics. There is no semantic retrieval path in this phase.
+
+Forks do not copy session topic files or tombstones. They receive the frozen
+source observation batches through the existing fork contract, so the child can
+consolidate its own independent view. Deleting a session event log does not
+silently delete its consolidated or promoted provenance; removing derived
+context storage is an explicit filesystem lifecycle operation, and promoted
+claims remain source-labeled rather than becoming repository guidance.
 
 ### Opt-in background observers
 

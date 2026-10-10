@@ -232,6 +232,142 @@ fn cli_memory_consent_persists_without_starting_observer_jobs() {
 }
 
 #[test]
+fn consolidated_memory_is_durable_searchable_and_promoted_only_with_confirmation() {
+    use forge_context::{
+        FsObservationStore, ObservationDraft, ObservationKind, ObservationScope, ObservationStore,
+        SourceRange, ValidatedObservationBatch,
+    };
+    use forge_core::{Event, EventKind, SessionStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions = forge_session::JsonlSessionStore::new(tmp.path().join(".forge/sessions"));
+    for session in ["session-a", "session-b"] {
+        sessions
+            .append(Event::new(
+                "r",
+                session,
+                EventKind::InputReceived {
+                    message: "source fixture".into(),
+                },
+            ))
+            .unwrap();
+    }
+    let source = sessions.events_for("session-a").unwrap();
+    let observations = FsObservationStore::new(tmp.path().join(".forge/context"));
+    observations
+        .commit(
+            ValidatedObservationBatch::new(
+                "session-a",
+                &source,
+                SourceRange { start: 1, end: 1 },
+                "observer-v1",
+                vec![ObservationDraft {
+                    scope: ObservationScope::Session,
+                    kind: ObservationKind::Decision,
+                    content: "use the lexical durable memory index".into(),
+                }],
+                sessions.redactor(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let consolidated = forge(tmp.path())
+        .arg("--project")
+        .arg(tmp.path())
+        .args(["memory", "consolidate", "--session", "session-a", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        consolidated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&consolidated.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&consolidated.stdout).unwrap();
+    assert_eq!(report["claims_written"], 1);
+    let projection = observations
+        .projection("session-a", &source, sessions.redactor())
+        .unwrap();
+    assert_eq!(projection.tombstoned().len(), 1);
+    let status = forge(tmp.path())
+        .arg("--project")
+        .arg(tmp.path())
+        .args(["memory", "status", "--session", "session-a", "--json"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["consolidated_memory"]["state"], "available");
+    assert_eq!(status["consolidated_memory"]["value"]["session_claims"], 1);
+
+    let search = forge(tmp.path())
+        .arg("--project")
+        .arg(tmp.path())
+        .args([
+            "memory",
+            "search",
+            "--session",
+            "session-a",
+            "--query",
+            "lexical",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let matches: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(matches[0]["project_memory"], false);
+    assert_eq!(matches[0]["session_id"], "session-a");
+
+    let refused = forge(tmp.path())
+        .arg("--project")
+        .arg(tmp.path())
+        .args([
+            "memory",
+            "promote",
+            "--session",
+            "session-a",
+            "--topic",
+            "decisions",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("requires --yes"));
+    let promoted = forge(tmp.path())
+        .arg("--project")
+        .arg(tmp.path())
+        .args([
+            "memory",
+            "promote",
+            "--session",
+            "session-a",
+            "--topic",
+            "decisions",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    std::fs::remove_file(tmp.path().join(".forge/sessions/session-a.jsonl")).unwrap();
+    let project_search = forge(tmp.path())
+        .arg("--project")
+        .arg(tmp.path())
+        .args([
+            "memory",
+            "search",
+            "--session",
+            "session-b",
+            "--query",
+            "lexical",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let matches: serde_json::Value = serde_json::from_slice(&project_search.stdout).unwrap();
+    assert_eq!(matches[0]["project_memory"], true);
+    assert!(!tmp.path().join("AGENTS.md").exists());
+}
+
+#[test]
 fn version_prints_name_and_version() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let output = forge(tmp.path()).arg("version").output().expect("run");

@@ -4,9 +4,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use forge_config::Config;
 use forge_context::{
-    ArtifactLimits, ArtifactMetadata, ContextPlan, FsArtifactStore, FsContextStore,
-    FsObservationStore, FsObserverQueue, ObservationBatch, ObservationError, ObservationKind,
-    ObserverError, ObserverStatus, SourceRange,
+    ArtifactLimits, ArtifactMetadata, ConsolidationStatus, ContextPlan, FsArtifactStore,
+    FsConsolidationStore, FsContextStore, FsObservationStore, FsObserverQueue, ObservationBatch,
+    ObservationError, ObservationKind, ObserverError, ObserverStatus, SourceRange,
 };
 use forge_core::{Event, EventKind, ForgeError, SessionStore};
 use forge_session::JsonlSessionStore;
@@ -69,7 +69,7 @@ pub struct MemoryStatus {
     pub unavailable_reasons: Vec<String>,
     pub raw_event_count: usize,
     pub session_observations: StoreInspection<usize>,
-    pub consolidated_memory: String,
+    pub consolidated_memory: StoreInspection<ConsolidationStatus>,
     pub live_prompt_injection: bool,
     pub live_prompt_injection_unavailable_reason: String,
     /// Persisted session-filtered snapshot, not live worker telemetry.
@@ -211,7 +211,19 @@ impl ContextMemoryService {
     fn batches(&self, session: &str, events: &[Event]) -> StoreInspection<Vec<ObservationBatch>> {
         match FsObservationStore::new(&self.root).inspect(session, events, self.sessions.redactor())
         {
-            Ok(Some(projection)) => StoreInspection::Available(projection.batches().to_vec()),
+            Ok(Some(projection)) => StoreInspection::Available(
+                projection
+                    .batches()
+                    .iter()
+                    .cloned()
+                    .map(|mut batch| {
+                        batch
+                            .observations
+                            .retain(|observation| !projection.is_tombstoned(&observation.id));
+                        batch
+                    })
+                    .collect(),
+            ),
             Ok(None) => StoreInspection::Missing,
             Err(
                 ObservationError::Corrupt
@@ -269,6 +281,12 @@ impl ContextMemoryService {
             Err(ObserverError::Corrupt) => StoreInspection::Corrupt,
             Err(_) => StoreInspection::Unavailable,
         };
+        let consolidated = match FsConsolidationStore::new(&self.root).status(session) {
+            Ok(Some(status)) => StoreInspection::Available(status),
+            Ok(None) => StoreInspection::Missing,
+            Err(forge_context::ConsolidationError::Corrupt) => StoreInspection::Corrupt,
+            Err(_) => StoreInspection::Unavailable,
+        };
         let reservation = self.inspection_reservation(session, &events, &batches);
         let charged = match &jobs {
             StoreInspection::Missing => Some(0),
@@ -311,7 +329,7 @@ impl ContextMemoryService {
             unavailable_reasons: reasons,
             raw_event_count: events.len(),
             session_observations: observations,
-            consolidated_memory: "unavailable (CONTEXT-7)".into(),
+            consolidated_memory: consolidated,
             live_prompt_injection: false,
             live_prompt_injection_unavailable_reason: "observations are not injected into requests"
                 .into(),

@@ -52,6 +52,33 @@ fn at(position: u64) -> NonZeroU64 {
 }
 
 #[test]
+fn consolidated_observations_are_tombstoned_out_of_rendering() {
+    let source = snapshot();
+    let store = MemoryObservationStore::default();
+    let committed = store
+        .commit(batch(
+            &source,
+            1,
+            2,
+            &[("already consolidated claim", ObservationScope::Session)],
+        ))
+        .unwrap();
+    let ids = committed
+        .observations
+        .iter()
+        .map(|observation| observation.id.clone())
+        .collect();
+    let projection = store
+        .tombstone("parent", &ids, &source, &Redactor::new())
+        .unwrap();
+    let rendered = render_observations(&projection, at(13), &[]);
+    assert!(rendered.messages.is_empty());
+    assert!(rendered.selected.is_empty());
+    assert!(rendered.omitted.is_empty());
+    assert_eq!(rendered.memory.estimated_tokens, 0);
+}
+
+#[test]
 fn source_order_json_escaping_scope_and_accounting() {
     let source = snapshot();
     let store = MemoryObservationStore::default();
