@@ -136,8 +136,10 @@ and tradeoffs.
 
 ## What you get
 
-- `forge run` / `forge chat` — the multi-turn, tool-using agent loop with
-  approvals (`y`/`n` inline; safe reads never ask).
+- `forge run` — a bounded inspect/edit/check/review workflow over the
+  multi-turn agent loop, with durable task evidence and a reviewable diff.
+- `forge chat` — the same tool-using runtime interactively, with approvals
+  (`y`/`n` inline; safe reads never ask).
 - `forge graph` — a deterministic project graph plus an on-device
   semantic index: `graph build`, `graph context "auth flow"
   [--steer "prefer tests"]`, `graph grep`, `graph map`.

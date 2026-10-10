@@ -214,6 +214,9 @@ pub struct RunOptions {
     /// matches lexically. An unknown name is a typed error at the entry
     /// point — the caller asked for it, so never run without it.
     pub activate_skills: Vec<String>,
+    /// Add the deterministic inspect/edit/check/review contract as hidden
+    /// system context while preserving the user's prompt verbatim.
+    pub development_workflow: bool,
 }
 
 /// Everything one run needs beyond the ids. Built by
@@ -236,6 +239,7 @@ struct RunPlan {
     /// Skills the caller named explicitly. Empty on a resume, which has no
     /// options and re-runs discovery on the original task.
     activate_skills: Vec<String>,
+    development_workflow: bool,
 }
 
 impl RunPlan {
@@ -245,6 +249,7 @@ impl RunPlan {
         prompt: impl Into<String>,
         history: Vec<Message>,
         activate_skills: Vec<String>,
+        development_workflow: bool,
     ) -> Self {
         let prompt = prompt.into();
         Self {
@@ -253,6 +258,7 @@ impl RunPlan {
             history,
             resumed_from: None,
             activate_skills,
+            development_workflow,
         }
     }
 }
@@ -1775,7 +1781,12 @@ impl AgentService {
         let claim = self.claim_session(&session_id, &run_id)?;
         let history = self.session_history(&session_id);
         self.run_tracked(
-            RunPlan::new_prompt(prompt, history, options.activate_skills),
+            RunPlan::new_prompt(
+                prompt,
+                history,
+                options.activate_skills,
+                options.development_workflow,
+            ),
             &run_id,
             &session_id,
             options.max_turns,
@@ -1860,11 +1871,12 @@ impl AgentService {
         let (rid, sid) = (run_id.clone(), session_id.clone());
         let max_turns = options.max_turns;
         let activate_skills = options.activate_skills;
+        let development_workflow = options.development_workflow;
         let handle = tokio::spawn(async move {
             let history = service.session_history(&sid);
             service
                 .run_tracked(
-                    RunPlan::new_prompt(prompt, history, activate_skills),
+                    RunPlan::new_prompt(prompt, history, activate_skills, development_workflow),
                     &rid,
                     &sid,
                     max_turns,
@@ -2111,6 +2123,7 @@ impl AgentService {
             history,
             resumed_from,
             activate_skills,
+            development_workflow,
         } = plan;
         let prompt = prompt.as_str();
         let task = task.as_str();
@@ -2533,6 +2546,18 @@ impl AgentService {
         // System first is what providers expect, and the history is a real
         // user/assistant/tool transcript that must arrive in its own order.
         let mut messages = self.system_context.clone();
+        if development_workflow {
+            messages.push(Message::system(
+                "Complete this coding request as one bounded workflow: inspect the relevant \n\
+                 repository context before changing files; make only the requested edits; run \n\
+                 focused checks defined by repository instructions or the affected project; then \n\
+                 review the working-tree changes. During review, use run_command with `git diff \n\
+                 --no-ext-diff --` so Forge can return the reviewable diff. Do not commit, push, \n\
+                 publish, deploy, or contact external services. Keep the final review concise and \n\
+                 state which checks ran."
+                    .to_string(),
+            ));
+        }
         let system_end = messages.len();
         // Explicitly requested skills activate first, in caller order with
         // duplicates collapsed — ahead of, never instead of, lexical
@@ -3242,6 +3267,7 @@ impl AgentService {
                 // A resume takes no options: discovery re-runs on the
                 // original task, exactly as the run being continued did.
                 activate_skills: Vec::new(),
+                development_workflow: false,
             },
             &resumed_run,
             &session_id,

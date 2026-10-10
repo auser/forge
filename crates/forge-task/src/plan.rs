@@ -3,7 +3,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use forge_core::{ForgeError, ProviderFailureKind};
 use serde::{Deserialize, Serialize};
 
-pub const TASK_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const TASK_PLAN_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskNodeKind {
+    Inspect,
+    Edit,
+    Check,
+    Review,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +91,7 @@ impl Verification {
 pub struct TaskNode {
     pub id: String,
     pub title: String,
+    pub kind: TaskNodeKind,
     #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
@@ -89,10 +99,11 @@ pub struct TaskNode {
 }
 
 impl TaskNode {
-    pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>, title: impl Into<String>, kind: TaskNodeKind) -> Self {
         Self {
             id: id.into(),
             title: title.into(),
+            kind,
             dependencies: Vec::new(),
             capability_needs: Vec::new(),
         }
@@ -423,15 +434,15 @@ mod tests {
     fn plans_reject_missing_dependencies_and_cycles() {
         let missing = TaskPlan::builder("work")
             .with_id("task")
-            .add_node(TaskNode::new("a", "A").depends_on("missing"))
+            .add_node(TaskNode::new("a", "A", TaskNodeKind::Inspect).depends_on("missing"))
             .build()
             .expect_err("missing dependency");
         assert!(missing.to_string().contains("missing node"));
 
         let cycle = TaskPlan::builder("work")
             .with_id("task")
-            .add_node(TaskNode::new("a", "A").depends_on("b"))
-            .add_node(TaskNode::new("b", "B").depends_on("a"))
+            .add_node(TaskNode::new("a", "A", TaskNodeKind::Inspect).depends_on("b"))
+            .add_node(TaskNode::new("b", "B", TaskNodeKind::Edit).depends_on("a"))
             .build()
             .expect_err("cycle");
         assert!(cycle.to_string().contains("cycle"));
@@ -441,8 +452,8 @@ mod tests {
     fn transitions_promote_dependencies_and_never_requeue_success() {
         let plan = TaskPlan::builder("work")
             .with_id("task")
-            .add_node(TaskNode::new("inspect", "Inspect"))
-            .add_node(TaskNode::new("edit", "Edit").depends_on("inspect"))
+            .add_node(TaskNode::new("inspect", "Inspect", TaskNodeKind::Inspect))
+            .add_node(TaskNode::new("edit", "Edit", TaskNodeKind::Edit).depends_on("inspect"))
             .build()
             .unwrap();
         let initial = plan.initial_checkpoint();

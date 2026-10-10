@@ -29,17 +29,19 @@ pub async fn run(
     let run_id = forge_session::new_run_id();
     let feeder = spawn_stdin_feeder(&service, &run_id);
 
-    let result = service
-        .run_with_options(
-            &prompt,
-            RunOptions {
-                run_id: Some(run_id),
-                max_turns,
-                activate_skills: skills,
-                ..RunOptions::default()
-            },
-        )
-        .await;
+    let task_store = forge_task::JsonlTaskStore::for_project(ctx.project_root()?);
+    let result = forge_runtime::run_development_workflow(
+        service.as_ref(),
+        &task_store,
+        &prompt,
+        RunOptions {
+            run_id: Some(run_id),
+            max_turns,
+            activate_skills: skills,
+            ..RunOptions::default()
+        },
+    )
+    .await;
 
     if let Some(handle) = feeder {
         handle.abort();
@@ -53,7 +55,14 @@ pub async fn run(
                 .map_err(|e| ForgeError::session(format!("serializing run outcome: {e}")))?
         );
     } else {
-        println!("{}", outcome.text);
+        if outcome.diff.is_empty() {
+            println!("{}", outcome.review);
+        } else {
+            println!(
+                "Plan:\n{}\n\nReview:\n{}\n\nDiff:\n{}",
+                outcome.plan, outcome.review, outcome.diff
+            );
+        }
     }
     Ok(())
 }

@@ -517,6 +517,106 @@ fn compiled_forge_initializes_then_edits_and_validates_a_project() {
     );
 }
 
+#[test]
+fn one_command_workflow_records_plan_checks_review_and_diff() {
+    use forge_task::{JsonlTaskStore, TaskState, VerificationStatus};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
+    std::fs::write(project.join("main.rs"), "fn value() -> u8 { 1 }\n").expect("source");
+    std::fs::write(
+        project.join("check.sh"),
+        "#!/bin/sh\ngrep -q 'value() -> u8 { 2 }' main.rs\n",
+    )
+    .expect("check");
+    let init = Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .arg(&project)
+        .output()
+        .expect("git init");
+    assert!(init.status.success(), "git init: {init:?}");
+    let add = Command::new("git")
+        .current_dir(&project)
+        .args(["add", "main.rs", "check.sh"])
+        .output()
+        .expect("git add");
+    assert!(add.status.success(), "git add: {add:?}");
+
+    std::fs::write(
+        project.join("script.json"),
+        r#"[
+          {"tool_calls":[{"id":"inspect-1","name":"read_file","arguments":{"path":"main.rs"}}]},
+          {"tool_calls":[{"id":"edit-1","name":"edit_file","arguments":{
+            "path":"main.rs",
+            "old":"fn value() -> u8 { 1 }",
+            "new":"fn value() -> u8 { 2 }"
+          }}]},
+          {"tool_calls":[{"id":"check-1","name":"run_command","arguments":{
+            "command":"sh","args":["check.sh"],"risk":"risky"
+          }}]},
+          {"tool_calls":[{"id":"diff-1","name":"run_command","arguments":{
+            "command":"git","args":["diff","--no-ext-diff","--"],"risk":"safe"
+          }}]},
+          {"text":"Changed value to two; the focused check passed and the diff is ready for review."}
+        ]"#,
+    )
+    .expect("script");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        "model = \"scripted-mock\"\nmock_script = \"script.json\"\n\
+         router = \"static\"\napproval = \"auto\"\n",
+    )
+    .expect("config");
+
+    let output = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args([
+            "--json",
+            "run",
+            "change value to two, check it, and review the diff",
+        ])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json outcome");
+    let task_id = outcome["task_id"].as_str().expect("task id");
+    assert_eq!(outcome["changed_paths"], serde_json::json!(["main.rs"]));
+    assert_eq!(outcome["checks"][0]["status"], "passed");
+    assert!(
+        outcome["review"]
+            .as_str()
+            .is_some_and(|review| review.contains("focused check passed"))
+    );
+    assert!(
+        outcome["diff"]
+            .as_str()
+            .is_some_and(|diff| diff.contains("-fn value() -> u8 { 1 }")
+                && diff.contains("+fn value() -> u8 { 2 }"))
+    );
+
+    let task = JsonlTaskStore::for_project(&project)
+        .load(task_id)
+        .expect("durable task");
+    for node in ["inspect", "edit", "check", "review"] {
+        assert_eq!(task.checkpoint.state(node), Some(TaskState::Succeeded));
+    }
+    assert!(
+        task.checkpoint.nodes["check"]
+            .verifications
+            .iter()
+            .any(|verification| verification.status == VerificationStatus::Passed)
+    );
+}
+
 #[tokio::test]
 async fn explicit_multi_model_router_keeps_every_available_candidate() {
     use wiremock::matchers::{method, path};

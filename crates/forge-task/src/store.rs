@@ -357,13 +357,13 @@ fn load_file(path: &Path, task_id: &str) -> Result<Replay, ForgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InterruptionReason, TaskNode, Verification, VerificationStatus};
+    use crate::{InterruptionReason, TaskNode, TaskNodeKind, Verification, VerificationStatus};
 
     fn plan() -> TaskPlan {
         TaskPlan::builder("inspect, edit, and verify")
             .with_id("task-1")
-            .add_node(TaskNode::new("inspect", "Inspect"))
-            .add_node(TaskNode::new("edit", "Edit").depends_on("inspect"))
+            .add_node(TaskNode::new("inspect", "Inspect", TaskNodeKind::Inspect))
+            .add_node(TaskNode::new("edit", "Edit", TaskNodeKind::Edit).depends_on("inspect"))
             .build()
             .unwrap()
     }

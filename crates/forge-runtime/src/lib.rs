@@ -11,6 +11,7 @@ pub mod observer;
 pub mod replay;
 mod service;
 mod tools;
+mod workflow;
 
 pub use availability::{AvailabilitySnapshot, AvailabilityState, ProviderAvailability};
 pub use budget::{BudgetTrip, SpendTracker, completion_cost};
@@ -21,3 +22,4 @@ pub use service::{
     StartedRun,
 };
 pub use tools::{ToolDispatcher, tool_definitions};
+pub use workflow::{DevelopmentWorkflowOutcome, run_development_workflow};
