@@ -186,8 +186,12 @@ impl CodexModel {
             if data.is_empty() || data == "[DONE]" {
                 continue;
             }
-            let event: Value = serde_json::from_str(data)
-                .map_err(|e| ForgeError::provider(format!("invalid Codex SSE event: {e}")))?;
+            let event: Value = serde_json::from_str(data).map_err(|e| {
+                crate::response::response_shape_error(
+                    &self.model,
+                    format!("invalid Codex SSE event: {e}"),
+                )
+            })?;
             match event["type"].as_str() {
                 Some("response.completed") => completed = event.get("response").cloned(),
                 Some("response.output_item.done") => {
@@ -201,16 +205,31 @@ impl CodexModel {
                     }
                 }
                 Some("response.failed") => {
-                    return Err(ForgeError::provider(format!(
-                        "Codex response failed: {}",
-                        event.get("response").unwrap_or(&event)
-                    )));
+                    let failure_code = event
+                        .pointer("/response/error/code")
+                        .or_else(|| event.pointer("/response/error/type"))
+                        .or_else(|| event.pointer("/error/code"))
+                        .or_else(|| event.pointer("/error/type"))
+                        .and_then(Value::as_str);
+                    let message = failure_code.map_or_else(
+                        || "Codex response failed".to_owned(),
+                        |code| format!("Codex response failed ({code})"),
+                    );
+                    return Err(ForgeError::provider_failure(
+                        &self.model,
+                        forge_core::ProviderFailureKind::InvalidRequest,
+                        None,
+                        message,
+                    ));
                 }
                 _ => {}
             }
         }
         let mut response = completed.ok_or_else(|| {
-            ForgeError::provider("Codex stream ended without a response.completed event")
+            crate::response::response_shape_error(
+                &self.model,
+                "Codex stream ended without a response.completed event",
+            )
         })?;
         let terminal_has_output = response
             .get("output")
@@ -296,14 +315,16 @@ impl ModelProvider for CodexModel {
                     "invalid bounded Codex response UTF-8",
                 )
             })?;
-            return self.parse_wire_response(text).map_err(|_| {
-                crate::response::response_shape_error(&self.model, "invalid bounded Codex response")
-            });
+            return self.parse_wire_response(text);
         }
-        let text = response
-            .text()
-            .await
-            .map_err(|e| ForgeError::provider(format!("reading Codex response: {e}")))?;
+        let text = response.text().await.map_err(|e| {
+            ForgeError::provider_failure(
+                &self.model,
+                forge_core::ProviderFailureKind::Transient,
+                None,
+                format!("reading Codex response failed: {}", error_detail(&e)),
+            )
+        })?;
         if !status.is_success() {
             return Err(crate::response::http_status_error(
                 &self.model,
@@ -311,19 +332,15 @@ impl ModelProvider for CodexModel {
                 format!("Codex returned HTTP {status}: {text}"),
             ));
         }
-        self.parse_wire_response(&text).map_err(|error| {
-            crate::response::response_shape_error(
-                &self.model,
-                format!("invalid Codex response: {error}"),
-            )
-        })
+        self.parse_wire_response(&text)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_core::{Message, ToolDefinition};
+    use forge_core::{Message, ProviderFailureKind, ToolDefinition};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, header, method, path},
@@ -525,6 +542,94 @@ mod tests {
                 json!({"path":"src/lib.rs"})
             )]
         );
+    }
+
+    #[test]
+    fn failed_sse_is_an_invalid_request_without_exposing_provider_body() {
+        let model = CodexModel::new(
+            Some("http://localhost".into()),
+            "gpt-test",
+            "token",
+            "account",
+            Duration::from_secs(1),
+            EgressPolicy::Unrestricted,
+        )
+        .unwrap();
+        let error = model
+            .parse_wire_response(
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\",\"message\":\"PRIVATE\"}}}\n\n",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ForgeError::ProviderFailure {
+                kind: ProviderFailureKind::InvalidRequest,
+                message,
+                ..
+            } if message.contains("invalid_prompt") && !message.contains("PRIVATE")
+        ));
+    }
+
+    #[test]
+    fn malformed_and_incomplete_sse_are_response_shape_failures() {
+        let model = CodexModel::new(
+            Some("http://localhost".into()),
+            "gpt-test",
+            "token",
+            "account",
+            Duration::from_secs(1),
+            EgressPolicy::Unrestricted,
+        )
+        .unwrap();
+        for wire in ["data: {not json}\n\n", "data: [DONE]\n\n"] {
+            assert!(matches!(
+                model.parse_wire_response(wire),
+                Err(ForgeError::ProviderFailure {
+                    kind: ProviderFailureKind::ResponseShape,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_success_body_is_transient() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\ndata: PRIVATE")
+                .await
+                .unwrap();
+        });
+        let model = CodexModel::new(
+            Some(url),
+            "gpt-test",
+            "token",
+            "account",
+            Duration::from_secs(2),
+            EgressPolicy::Unrestricted,
+        )
+        .unwrap();
+        let error = model
+            .complete(CompletionRequest::new(
+                "gpt-test",
+                vec![Message::user("ping")],
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ForgeError::ProviderFailure {
+                kind: ProviderFailureKind::Transient,
+                message,
+                ..
+            } if !message.contains("PRIVATE")
+        ));
+        server.await.unwrap();
     }
 
     #[test]
