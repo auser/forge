@@ -16,6 +16,7 @@ members = [
     "crates/forge-server",
     "crates/forge-session",
     "crates/forge-skills",
+    "crates/forge-task",
     "crates/needle-sys",
 ]
 
@@ -39,6 +40,7 @@ forge-runtime = { path = "crates/forge-runtime" }
 forge-server = { path = "crates/forge-server" }
 forge-session = { path = "crates/forge-session" }
 forge-skills = { path = "crates/forge-skills" }
+forge-task = { path = "crates/forge-task" }
 needle-sys = { path = "crates/needle-sys" }
 
 async-trait = "0.1"

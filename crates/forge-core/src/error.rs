@@ -75,6 +75,9 @@ pub enum ForgeError {
     #[error("session error: {0}")]
     Session(String),
 
+    #[error("task state error: {0}")]
+    Task(String),
+
     /// A run was asked to start in a session that already has one in flight.
     ///
     /// Its own variant, not a [`Session`](Self::Session) string, because the
@@ -173,6 +176,10 @@ impl ForgeError {
 
     pub fn session(message: impl Into<String>) -> Self {
         Self::Session(message.into())
+    }
+
+    pub fn task(message: impl Into<String>) -> Self {
+        Self::Task(message.into())
     }
 
     pub fn session_busy(session_id: impl Into<String>, run_id: impl Into<String>) -> Self {

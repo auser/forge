@@ -1587,6 +1587,24 @@ fallback flags. Secret-looking values (API-key patterns, `Bearer` tokens,
 values of `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` env vars) are redacted to
 `[REDACTED]` before anything is written — replay payloads included.
 
+### Durable task plans
+
+Development plans have a separate source of truth under
+`.forge/tasks/<task-id>.jsonl`. They do not share storage with the source
+`ProjectGraph`, which can be rebuilt, or with the session transcript, which
+records model conversation. A versioned `TaskPlan` fixes stable node IDs,
+dependencies, and capability needs. Each state transition appends a complete
+`Checkpoint` with the node state, attempt count, interruption reason, and
+verification results, then calls `sync_data` before returning.
+
+Replay validates the plan, dependency graph, event sequence, prior state, and
+transition. An invalid interior record is an error. An incomplete or corrupt
+final record is removed before the next append, so resume continues from the
+last fully written checkpoint. Nodes already marked `succeeded` are never
+returned as ready work. External operations still need their own idempotency
+key when a process could die after the operation succeeds but before Forge can
+record that success.
+
 ### Context accounting
 
 Production frontends account for every model request. Sanitized, rebuildable
@@ -2123,6 +2141,7 @@ crates/
                     laya, http, static and cheapest routers
                     (+ test-only mocks)
   forge-session     append-only JSONL store + secret redaction
+  forge-task        durable task plans, dependencies and execution checkpoints
   forge-skills      SKILL.md discovery, progressive disclosure
   forge-graph       deterministic incremental project graph
   forge-needle      embedded Needle brain: decide/embed/extract/tool-call,
