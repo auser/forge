@@ -14,9 +14,11 @@ forge 0.2.6 (commit 01ac8b0a4103, target aarch64-apple-darwin)
 ```
 
 The offline installer verification in `tests/install-path.sh` also passed,
-including checksum verification and PATH-shadow diagnostics. Cargo warned that
-the locked `yoke-derive 0.8.3` release is yanked; installation still completed,
-but the lockfile should be refreshed separately before a public release.
+including checksum verification and PATH-shadow diagnostics. The qualification
+run initially warned that the locked `yoke-derive 0.8.3` release was yanked.
+On 2026-10-10 the lockfile was refreshed narrowly to `yoke-derive 0.8.4`, and a
+fresh `cargo install --locked --path crates/forge-cli` completed without the
+yanked-release warning.
 
 ## Development workflow
 
