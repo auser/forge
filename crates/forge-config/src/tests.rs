@@ -233,6 +233,13 @@ fn defaults_when_nothing_set() {
     assert_eq!(models.len(), 8);
     assert_eq!(models["qwen3-coder"].cost_input_per_mtok, Some(0.0));
     assert_eq!(models["deepseek-chat"].cost_input_per_mtok, Some(0.14));
+    for subscription in ["claude-sonnet", "gpt-5.6-sol", "k3"] {
+        assert_eq!(
+            models[subscription].costs(),
+            None,
+            "subscription pricing is unknown, not free: {subscription}"
+        );
+    }
     assert_eq!(
         models["kimi-k2.7-code"].key_env.as_deref(),
         Some("MOONSHOT_API_KEY")

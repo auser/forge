@@ -1312,17 +1312,21 @@ fn budget_check(root: &Path, config: &forge_config::Config) -> Check {
     }
     let sessions = root.join(".forge").join("sessions");
     let (_, daily) = forge_session::scan_spend_today(&sessions, None);
-    let detail = if ceilings.is_empty() {
-        format!(
-            "no budget configured ([budget] absent); spent ${:.4} today",
-            daily.cost_usd
-        )
+    let spend = if daily.unpriced_calls == 0 {
+        format!("spent ${:.4} today", daily.cost_usd)
     } else {
         format!(
-            "{}; on_exceeded = {:?}; spent ${:.4} today",
+            "known spend ${:.4} today; {} tokens across {} unpriced calls not included",
+            daily.cost_usd, daily.unpriced_tokens, daily.unpriced_calls
+        )
+    };
+    let detail = if ceilings.is_empty() {
+        format!("no budget configured ([budget] absent); {spend}")
+    } else {
+        format!(
+            "{}; on_exceeded = {:?}; {spend}",
             ceilings.join(", "),
-            budget.on_exceeded,
-            daily.cost_usd
+            budget.on_exceeded
         )
     };
     Check {
@@ -2117,6 +2121,40 @@ mod tests {
         );
         assert!(
             check.detail.contains("spent $0.0000 today"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn budget_check_discloses_unpriced_usage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join(".forge").join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let log = std::sync::Arc::new(forge_session::DecisionLog::new(&sessions));
+        let handle = forge_session::DecisionLog::handle(&log, "s1");
+        handle.record_usage(
+            1,
+            "gpt-5.6-sol",
+            Some(forge_core::Usage {
+                prompt_tokens: 20,
+                completion_tokens: 5,
+                total_tokens: 25,
+            }),
+            None,
+            1,
+        );
+
+        let check = budget_check(tmp.path(), &forge_config::Config::default());
+        assert!(
+            check.detail.contains("known spend $0.0000"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("25 tokens across 1 unpriced calls not included"),
             "{}",
             check.detail
         );

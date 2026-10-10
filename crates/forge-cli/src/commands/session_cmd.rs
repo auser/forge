@@ -357,6 +357,10 @@ pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
                         if let Some(usage) = record.usage {
                             totals.input_tokens += u64::from(usage.prompt_tokens);
                             totals.output_tokens += u64::from(usage.completion_tokens);
+                            if record.cost_usd.is_none() {
+                                totals.unpriced_calls += 1;
+                                totals.unpriced_tokens += u64::from(usage.total_tokens);
+                            }
                         }
                         if let Some(cost) = record.cost_usd {
                             totals.cost_usd += cost;
@@ -389,6 +393,8 @@ pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
             "input_tokens": t.input_tokens,
             "output_tokens": t.output_tokens,
             "cost_usd": t.cost_usd,
+            "unpriced_calls": t.unpriced_calls,
+            "unpriced_tokens": t.unpriced_tokens,
         }))).collect::<serde_json::Map<String, serde_json::Value>>(),
     });
 
@@ -410,8 +416,16 @@ pub fn decisions(ctx: &Context) -> Result<(), ForgeError> {
         for (name, t) in &models {
             // Six decimals: per-call costs are often below a cent, and
             // "$0.0000" for real spend would read as "free".
+            let unpriced = if t.unpriced_calls == 0 {
+                String::new()
+            } else {
+                format!(
+                    ", {} tokens across {} unpriced calls not included",
+                    t.unpriced_tokens, t.unpriced_calls
+                )
+            };
             println!(
-                "model   {name}: {} calls, {} in / {} out tokens, ${:.6}",
+                "model   {name}: {} calls, {} in / {} out tokens, ${:.6} known spend{unpriced}",
                 t.calls, t.input_tokens, t.output_tokens, t.cost_usd
             );
         }

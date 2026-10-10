@@ -231,15 +231,18 @@ impl DecisionLogHandle {
     }
 }
 
-/// Token/USD totals accumulated from `Complete` records. A cost that was
-/// never recorded simply does not accrue, so a local (zero-priced) model
-/// leaves `cost_usd` at 0.0 — which is true, not a placeholder.
+/// Token/USD totals accumulated from `Complete` records. Unknown prices are
+/// counted separately so known spend can never make unpriced usage look free.
+/// A local model with an explicit zero price has `cost_usd = 0.0` and no
+/// unpriced usage, which is free for true.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SpendTotals {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+    pub unpriced_calls: u64,
+    pub unpriced_tokens: u64,
 }
 
 impl SpendTotals {
@@ -252,6 +255,10 @@ impl SpendTotals {
         if let Some(usage) = record.usage {
             self.input_tokens += u64::from(usage.prompt_tokens);
             self.output_tokens += u64::from(usage.completion_tokens);
+            if record.cost_usd.is_none() {
+                self.unpriced_calls += 1;
+                self.unpriced_tokens += u64::from(usage.total_tokens);
+            }
         }
         if let Some(cost) = record.cost_usd {
             self.cost_usd += cost;
@@ -555,9 +562,13 @@ mod tests {
         assert_eq!(session.calls, 2);
         assert_eq!(session.input_tokens, 200);
         assert_eq!(session.output_tokens, 100);
+        assert_eq!(session.unpriced_calls, 1);
+        assert_eq!(session.unpriced_tokens, 150);
         assert!((session.cost_usd - 0.01).abs() < 1e-12, "{session:?}");
         // Daily spans sessions: all three completions happened today.
         assert_eq!(daily.calls, 3);
+        assert_eq!(daily.unpriced_calls, 1);
+        assert_eq!(daily.unpriced_tokens, 150);
         assert!((daily.cost_usd - 0.03).abs() < 1e-12, "{daily:?}");
         // A different day sees nothing.
         let (_, daily_yesterday) = scan_spend(tmp.path(), Some("s1"), yesterday);
