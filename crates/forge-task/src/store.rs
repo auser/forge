@@ -7,9 +7,12 @@ use chrono::{DateTime, Utc};
 use forge_core::ForgeError;
 use serde::{Deserialize, Serialize};
 
-use crate::{Checkpoint, InterruptionReason, TaskPlan, TaskState, TransitionRequest, Verification};
+use crate::{
+    Checkpoint, EffectCheckpoint, EffectClass, EffectState, InterruptionReason, TaskPlan,
+    TaskState, TransitionRequest, Verification, WorkspaceCheckpoint,
+};
 
-pub const TASK_EVENT_SCHEMA_VERSION: u32 = 1;
+pub const TASK_EVENT_SCHEMA_VERSION: u32 = 2;
 
 pub fn new_task_id() -> String {
     ulid::Ulid::new().to_string()
@@ -46,13 +49,83 @@ enum TaskEventKind {
         verifications: Vec<Verification>,
         checkpoint: Checkpoint,
     },
+    CheckpointUpdated {
+        update: TaskCheckpointUpdate,
+        checkpoint: Checkpoint,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum TaskCheckpointUpdate {
+    RunBound {
+        run_id: String,
+        session_id: String,
+        workspace: WorkspaceCheckpoint,
+    },
+    EffectRegistered {
+        effect: EffectCheckpoint,
+    },
+    EffectStarted {
+        effect_id: String,
+    },
+    EffectCompleted {
+        effect_id: String,
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changed_path: Option<String>,
+        workspace: WorkspaceCheckpoint,
+    },
+    WorkspaceUpdated {
+        workspace: WorkspaceCheckpoint,
+    },
 }
 
 impl TaskEvent {
     fn checkpoint(&self) -> &Checkpoint {
         match &self.kind {
             TaskEventKind::PlanCreated { checkpoint, .. }
-            | TaskEventKind::NodeTransitioned { checkpoint, .. } => checkpoint,
+            | TaskEventKind::NodeTransitioned { checkpoint, .. }
+            | TaskEventKind::CheckpointUpdated { checkpoint, .. } => checkpoint,
+        }
+    }
+}
+
+pub struct EffectRequest {
+    effect_id: String,
+    node_id: String,
+    tool: String,
+    arguments_hash: String,
+    class: EffectClass,
+}
+
+impl EffectRequest {
+    pub fn new(
+        effect_id: impl Into<String>,
+        node_id: impl Into<String>,
+        tool: impl Into<String>,
+        arguments_hash: impl Into<String>,
+        class: EffectClass,
+    ) -> Self {
+        Self {
+            effect_id: effect_id.into(),
+            node_id: node_id.into(),
+            tool: tool.into(),
+            arguments_hash: arguments_hash.into(),
+            class,
+        }
+    }
+
+    fn checkpoint(self) -> EffectCheckpoint {
+        EffectCheckpoint {
+            effect_id: self.effect_id,
+            node_id: self.node_id,
+            tool: self.tool,
+            arguments_hash: self.arguments_hash,
+            class: self.class,
+            state: EffectState::NotStarted,
+            success: None,
+            changed_path: None,
         }
     }
 }
@@ -68,6 +141,7 @@ pub struct LoadedTask {
 
 /// Append-only task journal. Call [`JsonlTaskStore::for_project`] for the
 /// conventional `<project>/.forge/tasks` location.
+#[derive(Debug)]
 pub struct JsonlTaskStore {
     root: PathBuf,
     mutation: Mutex<()>,
@@ -143,6 +217,8 @@ impl JsonlTaskStore {
             .unwrap_or_else(|error| error.into_inner());
         let path = self.file_for(task_id)?;
         let replay = load_file(&path, task_id)?;
+        let recovered_tail = replay.loaded.recovered_tail;
+        let valid_bytes = replay.valid_bytes;
         let current = replay.loaded;
         let from = current
             .checkpoint
@@ -163,14 +239,118 @@ impl JsonlTaskStore {
                 checkpoint: checkpoint.clone(),
             },
         };
-        if current.recovered_tail {
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(ForgeError::Io)?;
-            file.set_len(replay.valid_bytes).map_err(ForgeError::Io)?;
-            file.sync_data().map_err(ForgeError::Io)?;
-        }
+        prepare_append(&path, valid_bytes, recovered_tail)?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(ForgeError::Io)?;
+        write_event(&mut file, &event)?;
+        Ok(LoadedTask {
+            plan: current.plan,
+            checkpoint,
+            recovered_tail: false,
+        })
+    }
+
+    pub fn bind_run(
+        &self,
+        task_id: &str,
+        run_id: impl Into<String>,
+        session_id: impl Into<String>,
+        workspace: WorkspaceCheckpoint,
+    ) -> Result<LoadedTask, ForgeError> {
+        self.update(
+            task_id,
+            TaskCheckpointUpdate::RunBound {
+                run_id: run_id.into(),
+                session_id: session_id.into(),
+                workspace,
+            },
+        )
+    }
+
+    pub fn register_effect(
+        &self,
+        task_id: &str,
+        request: EffectRequest,
+    ) -> Result<LoadedTask, ForgeError> {
+        self.update(
+            task_id,
+            TaskCheckpointUpdate::EffectRegistered {
+                effect: request.checkpoint(),
+            },
+        )
+    }
+
+    pub fn begin_effect(
+        &self,
+        task_id: &str,
+        effect_id: impl Into<String>,
+    ) -> Result<LoadedTask, ForgeError> {
+        self.update(
+            task_id,
+            TaskCheckpointUpdate::EffectStarted {
+                effect_id: effect_id.into(),
+            },
+        )
+    }
+
+    pub fn complete_effect(
+        &self,
+        task_id: &str,
+        effect_id: impl Into<String>,
+        success: bool,
+        changed_path: Option<String>,
+        workspace: WorkspaceCheckpoint,
+    ) -> Result<LoadedTask, ForgeError> {
+        self.update(
+            task_id,
+            TaskCheckpointUpdate::EffectCompleted {
+                effect_id: effect_id.into(),
+                success,
+                changed_path,
+                workspace,
+            },
+        )
+    }
+
+    pub fn update_workspace(
+        &self,
+        task_id: &str,
+        workspace: WorkspaceCheckpoint,
+    ) -> Result<LoadedTask, ForgeError> {
+        self.update(
+            task_id,
+            TaskCheckpointUpdate::WorkspaceUpdated { workspace },
+        )
+    }
+
+    fn update(
+        &self,
+        task_id: &str,
+        update: TaskCheckpointUpdate,
+    ) -> Result<LoadedTask, ForgeError> {
+        let _guard = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = self.file_for(task_id)?;
+        let replay = load_file(&path, task_id)?;
+        let recovered_tail = replay.loaded.recovered_tail;
+        let valid_bytes = replay.valid_bytes;
+        let current = replay.loaded;
+        let checkpoint = apply_update(&current.checkpoint, &current.plan, &update)?;
+        let event = TaskEvent {
+            v: TASK_EVENT_SCHEMA_VERSION,
+            task_id: task_id.to_string(),
+            sequence: checkpoint.sequence,
+            ts: Utc::now(),
+            kind: TaskEventKind::CheckpointUpdated {
+                update,
+                checkpoint: checkpoint.clone(),
+            },
+        };
+        prepare_append(&path, valid_bytes, recovered_tail)?;
         let mut file = OpenOptions::new()
             .append(true)
             .open(&path)
@@ -187,6 +367,88 @@ impl JsonlTaskStore {
         validate_task_id(task_id)?;
         Ok(self.root.join(format!("{task_id}.jsonl")))
     }
+}
+
+fn prepare_append(path: &Path, valid_bytes: u64, recovered_tail: bool) -> Result<(), ForgeError> {
+    if recovered_tail {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(ForgeError::Io)?;
+        file.set_len(valid_bytes).map_err(ForgeError::Io)?;
+        file.sync_data().map_err(ForgeError::Io)?;
+    }
+    Ok(())
+}
+
+fn apply_update(
+    checkpoint: &Checkpoint,
+    plan: &TaskPlan,
+    update: &TaskCheckpointUpdate,
+) -> Result<Checkpoint, ForgeError> {
+    let mut next = checkpoint.clone();
+    next.sequence = next.sequence.saturating_add(1);
+    match update {
+        TaskCheckpointUpdate::RunBound {
+            run_id,
+            session_id,
+            workspace,
+        } => {
+            if run_id.is_empty() || session_id.is_empty() {
+                return Err(ForgeError::task("run and session ids cannot be empty"));
+            }
+            next.run_id = Some(run_id.clone());
+            next.session_id = Some(session_id.clone());
+            next.workspace = Some(workspace.clone());
+        }
+        TaskCheckpointUpdate::EffectRegistered { effect } => {
+            if effect.effect_id.is_empty()
+                || effect.state != EffectState::NotStarted
+                || !plan.nodes.iter().any(|node| node.id == effect.node_id)
+                || next.effects.contains_key(&effect.effect_id)
+            {
+                return Err(ForgeError::task("invalid or duplicate task effect"));
+            }
+            next.effects
+                .insert(effect.effect_id.clone(), effect.clone());
+        }
+        TaskCheckpointUpdate::EffectStarted { effect_id } => {
+            let effect = next
+                .effects
+                .get_mut(effect_id)
+                .ok_or_else(|| ForgeError::task(format!("unknown task effect {effect_id}")))?;
+            if effect.state != EffectState::NotStarted {
+                return Err(ForgeError::task(format!(
+                    "task effect {effect_id} was already started"
+                )));
+            }
+            effect.state = EffectState::PossiblyExecuted;
+        }
+        TaskCheckpointUpdate::EffectCompleted {
+            effect_id,
+            success,
+            changed_path,
+            workspace,
+        } => {
+            let effect = next
+                .effects
+                .get_mut(effect_id)
+                .ok_or_else(|| ForgeError::task(format!("unknown task effect {effect_id}")))?;
+            if effect.state != EffectState::PossiblyExecuted {
+                return Err(ForgeError::task(format!(
+                    "task effect {effect_id} was not in flight"
+                )));
+            }
+            effect.state = EffectState::Completed;
+            effect.success = Some(*success);
+            effect.changed_path.clone_from(changed_path);
+            next.workspace = Some(workspace.clone());
+        }
+        TaskCheckpointUpdate::WorkspaceUpdated { workspace } => {
+            next.workspace = Some(workspace.clone());
+        }
+    }
+    Ok(next)
 }
 
 fn validate_task_id(task_id: &str) -> Result<(), ForgeError> {
@@ -263,7 +525,7 @@ fn load_file(path: &Path, task_id: &str) -> Result<Replay, ForgeError> {
                 )));
             }
         };
-        if event.v != TASK_EVENT_SCHEMA_VERSION {
+        if !matches!(event.v, 1 | TASK_EVENT_SCHEMA_VERSION) {
             return Err(ForgeError::task(format!(
                 "unsupported task event version {} at {}:{line_number}",
                 event.v,
@@ -332,6 +594,24 @@ fn load_file(path: &Path, task_id: &str) -> Result<Replay, ForgeError> {
                 if &expected != event_checkpoint {
                     return Err(ForgeError::task(format!(
                         "task checkpoint does not match transition at {}:{line_number}",
+                        path.display()
+                    )));
+                }
+            }
+            TaskEventKind::CheckpointUpdated {
+                update,
+                checkpoint: event_checkpoint,
+            } => {
+                let Some(previous) = &checkpoint else {
+                    return Err(ForgeError::task("task journal does not start with a plan"));
+                };
+                let event_plan = plan
+                    .as_ref()
+                    .ok_or_else(|| ForgeError::task("task journal does not start with a plan"))?;
+                let expected = apply_update(previous, event_plan, update)?;
+                if &expected != event_checkpoint {
+                    return Err(ForgeError::task(format!(
+                        "task checkpoint does not match update at {}:{line_number}",
                         path.display()
                     )));
                 }
@@ -411,6 +691,62 @@ mod tests {
     }
 
     #[test]
+    fn effect_journal_distinguishes_not_started_possible_and_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlTaskStore::new(tmp.path());
+        store.create(plan()).unwrap();
+        let workspace = WorkspaceCheckpoint {
+            head: "abc".into(),
+            fingerprint: "before".into(),
+            changed_paths: Vec::new(),
+        };
+        store
+            .bind_run("task-1", "run-1", "session-1", workspace.clone())
+            .unwrap();
+        store
+            .register_effect(
+                "task-1",
+                EffectRequest::new(
+                    "effect-1",
+                    "inspect",
+                    "run_command",
+                    "args-hash",
+                    EffectClass::NonIdempotent,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            store.load("task-1").unwrap().checkpoint.effects["effect-1"].state,
+            EffectState::NotStarted
+        );
+        store.begin_effect("task-1", "effect-1").unwrap();
+        assert_eq!(
+            store.load("task-1").unwrap().checkpoint.effects["effect-1"].state,
+            EffectState::PossiblyExecuted
+        );
+        let after = WorkspaceCheckpoint {
+            fingerprint: "after".into(),
+            changed_paths: vec!["main.rs".into()],
+            ..workspace
+        };
+        let loaded = store
+            .complete_effect(
+                "task-1",
+                "effect-1",
+                true,
+                Some("main.rs".into()),
+                after.clone(),
+            )
+            .unwrap();
+        let effect = &loaded.checkpoint.effects["effect-1"];
+        assert_eq!(effect.state, EffectState::Completed);
+        assert_eq!(effect.success, Some(true));
+        assert_eq!(effect.changed_path.as_deref(), Some("main.rs"));
+        assert_eq!(loaded.checkpoint.workspace, Some(after));
+        assert_eq!(loaded.checkpoint.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
     fn persisted_contracts_are_versioned_and_use_closed_snake_case_values() {
         let tmp = tempfile::tempdir().unwrap();
         let store = JsonlTaskStore::new(tmp.path());
@@ -425,6 +761,24 @@ mod tests {
         assert_eq!(value["type"], "plan_created");
         assert_eq!(value["checkpoint"]["nodes"]["inspect"]["state"], "ready");
         assert_eq!(value["checkpoint"]["nodes"]["edit"]["state"], "pending");
+    }
+
+    #[test]
+    fn version_one_task_journals_remain_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlTaskStore::new(tmp.path());
+        store.create(plan()).unwrap();
+        let path = tmp.path().join("task-1.jsonl");
+        let journal = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            journal.replacen(&format!("\"v\":{TASK_EVENT_SCHEMA_VERSION}"), "\"v\":1", 1),
+        )
+        .unwrap();
+        assert_eq!(
+            store.load("task-1").unwrap().checkpoint.state("inspect"),
+            Some(TaskState::Ready)
+        );
     }
 
     #[test]

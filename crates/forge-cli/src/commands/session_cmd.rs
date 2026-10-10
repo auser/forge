@@ -1,8 +1,9 @@
 use forge_core::{Event, EventKind, ForgeError};
 use forge_session::JsonlSessionStore;
+use std::sync::Arc;
 
 use crate::commands::Context;
-use crate::commands::service::build_service;
+use crate::commands::service::{build_run_service, build_service};
 
 fn store(ctx: &Context) -> Result<JsonlSessionStore, ForgeError> {
     Ok(JsonlSessionStore::new(
@@ -165,6 +166,40 @@ fn print_events(ctx: &Context, events: &[Event]) -> Result<(), ForgeError> {
 /// from the event log, and print the new run's output. (`forge session
 /// show` for pure history.)
 pub async fn resume(ctx: &Context, id: &str) -> Result<(), ForgeError> {
+    let project_root = ctx.project_root()?;
+    if id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        let task_store = Arc::new(forge_task::JsonlTaskStore::for_project(&project_root));
+        if task_store.root().join(format!("{id}.jsonl")).is_file() {
+            let service = build_run_service(ctx).await?;
+            let outcome = forge_runtime::resume_development_workflow(
+                &service,
+                task_store,
+                &project_root,
+                id,
+                forge_runtime::RunOptions::default(),
+            )
+            .await?;
+            if ctx.global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&outcome).map_err(|error| {
+                        ForgeError::session(format!("serializing task outcome: {error}"))
+                    })?
+                );
+            } else if outcome.diff.is_empty() {
+                println!("{}", outcome.review);
+            } else {
+                println!(
+                    "Plan:\n{}\n\nReview:\n{}\n\nDiff:\n{}",
+                    outcome.plan, outcome.review, outcome.diff
+                );
+            }
+            return Ok(());
+        }
+    }
     let service = build_service(ctx)?;
     let outcome = service.resume(id).await?;
     if ctx.global.json {

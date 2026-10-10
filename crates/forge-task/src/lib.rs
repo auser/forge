@@ -5,7 +5,10 @@ mod plan;
 mod store;
 
 pub use plan::{
-    CapabilityNeed, Checkpoint, InterruptionReason, NodeCheckpoint, TaskNode, TaskNodeKind,
-    TaskPlan, TaskPlanBuilder, TaskState, TransitionRequest, Verification, VerificationStatus,
+    CapabilityNeed, Checkpoint, EffectCheckpoint, EffectClass, EffectState, InterruptionReason,
+    NodeCheckpoint, TaskNode, TaskNodeKind, TaskPlan, TaskPlanBuilder, TaskState,
+    TransitionRequest, Verification, VerificationStatus, WorkspaceCheckpoint,
 };
-pub use store::{JsonlTaskStore, LoadedTask, TASK_EVENT_SCHEMA_VERSION, new_node_id, new_task_id};
+pub use store::{
+    EffectRequest, JsonlTaskStore, LoadedTask, TASK_EVENT_SCHEMA_VERSION, new_node_id, new_task_id,
+};

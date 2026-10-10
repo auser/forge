@@ -18,8 +18,10 @@ pub use budget::{BudgetTrip, SpendTracker, completion_cost};
 
 pub use replay::{Replay, conversation_from_events, fit_to_budget, history_budget_chars};
 pub use service::{
-    AgentService, Attachment, ForkOutcome, NullSkillRegistry, RunOptions, RunOutcome, RunSummary,
-    StartedRun,
+    AgentService, Attachment, EffectJournal, ForkOutcome, NullSkillRegistry, RunOptions,
+    RunOutcome, RunSummary, StartedRun,
 };
 pub use tools::{ToolDispatcher, tool_definitions};
-pub use workflow::{DevelopmentWorkflowOutcome, run_development_workflow};
+pub use workflow::{
+    DevelopmentWorkflowOutcome, resume_development_workflow, run_development_workflow,
+};
