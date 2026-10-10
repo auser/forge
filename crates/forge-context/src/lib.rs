@@ -8,6 +8,7 @@
 mod artifact;
 mod compression;
 mod consolidation;
+mod learning;
 mod observation;
 mod observation_render;
 pub mod observer;
@@ -28,6 +29,11 @@ pub use consolidation::{
     CONSOLIDATION_VERSION, ClaimSource, ConsolidationError, ConsolidationReport,
     ConsolidationStatus, FsConsolidationStore, LexicalMatch, PromotionReport, TopicClaim,
     TopicFile,
+};
+pub use learning::{
+    EvidenceKind, FsLearningStore, LEARNING_VERSION, LearningError, LearningMetrics,
+    LearningProposal, LearningRecord, LearningScope, LearningSession, LearningSource,
+    ProposalStatus,
 };
 pub use observation::{
     FsObservationStore, LedgerProjection, MAX_OBSERVATION_BATCHES, MAX_OBSERVATION_CONTENT_BYTES,

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use forge_context::FsLearningStore;
 use forge_core::Message;
 
 const CODING_CONTRACT: &str = "\
@@ -21,6 +22,8 @@ Working rules:
 const INSTRUCTION_NAMES: &[&str] = &["AGENTS.md", "AGENT.md", "CLAUDE.md"];
 const MAX_DISCOVERED_FILES: usize = 128;
 const MAX_ROOT_INSTRUCTION_BYTES: usize = 64 * 1024;
+const MAX_ACCEPTED_LEARNING_BYTES: usize = 32 * 1024;
+const MAX_ACCEPTED_LEARNING_PROPOSALS: usize = 32;
 
 /// Coding contract plus progressively disclosed project instruction files.
 ///
@@ -67,6 +70,24 @@ pub fn system_context(root: &Path) -> Vec<Message> {
              Read the nearest applicable file before editing in its subtree:\n- {}",
             nested.join("\n- ")
         )));
+    }
+    if let Ok(records) = FsLearningStore::new(root.join(".forge/context")).accepted_guidance() {
+        let mut remaining = MAX_ACCEPTED_LEARNING_BYTES;
+        let mut accepted = Vec::new();
+        for record in records.into_iter().take(MAX_ACCEPTED_LEARNING_PROPOSALS) {
+            let recommendation = record.proposal.recommendation;
+            if recommendation.len() > remaining {
+                break;
+            }
+            remaining -= recommendation.len();
+            accepted.push(format!("- {recommendation}"));
+        }
+        if !accepted.is_empty() {
+            messages.push(Message::system(format!(
+                "Explicitly accepted local Forge learning guidance:\n{}",
+                accepted.join("\n")
+            )));
+        }
     }
     messages
 }
@@ -146,5 +167,55 @@ mod tests {
             !text.contains("nested rule"),
             "nested bodies use progressive disclosure"
         );
+    }
+
+    #[test]
+    fn only_explicitly_accepted_local_learning_enters_system_context() {
+        use forge_context::{FsLearningStore, LearningScope, LearningSession, ProposalStatus};
+        use forge_core::{Event, EventKind};
+        use forge_session::Redactor;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = ["session-a", "session-b"]
+            .into_iter()
+            .map(|session| {
+                let mut event = Event::new(
+                    format!("run-{session}"),
+                    session,
+                    EventKind::InputReceived {
+                        message: "Always run the focused formatter".into(),
+                    },
+                );
+                event.seq = 1;
+                LearningSession::new(session, vec![event])
+            })
+            .collect::<Vec<_>>();
+        let store = FsLearningStore::new(tmp.path().join(".forge/context"));
+        let proposal = store
+            .propose(&sessions, &LearningScope::new(), &Redactor::default())
+            .unwrap()
+            .remove(0);
+
+        let pending = system_context(tmp.path())
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!pending.contains("focused formatter"));
+
+        store
+            .decide(
+                &proposal.proposal.id,
+                ProposalStatus::Accepted,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let accepted = system_context(tmp.path())
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(accepted.contains("Explicitly accepted local Forge learning guidance"));
+        assert!(accepted.contains("focused formatter"));
     }
 }

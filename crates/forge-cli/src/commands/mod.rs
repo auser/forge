@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod graph_cmd;
 pub mod guidance;
 pub mod init;
+pub mod learn_cmd;
 pub mod mcp_cmd;
 pub mod model_cmd;
 pub mod observer_cmd;
@@ -129,6 +130,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
         Some(Command::Config { command }) => config_cmd::run(&ctx, command),
         Some(Command::Context { command }) => context_cmd::context(&ctx, command),
         Some(Command::Memory { command }) => context_cmd::memory(&ctx, command),
+        Some(Command::Learn { command }) => learn_cmd::run(&ctx, command),
         Some(Command::Observer { command }) => match command {
             crate::cli::ObserverCommand::Status => observer_cmd::status(&ctx),
         },
@@ -181,6 +183,7 @@ fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
         Some(Command::Config { .. }) => "resolving configuration",
         Some(Command::Context { .. }) => "reading context status",
         Some(Command::Memory { .. }) => "reading memory state",
+        Some(Command::Learn { .. }) => "analyzing learning evidence",
         Some(Command::Observer { .. }) => "reading observer status",
         Some(Command::Run { .. }) => "running agent",
         Some(Command::Resume { .. }) => "resuming run",
