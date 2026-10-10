@@ -52,21 +52,7 @@ pub fn compress_tool_output(
     artifact: &ArtifactRef,
     baseline: &str,
 ) -> CompressionResult {
-    let mut result = compress_at(call, output, artifact, baseline, MAX_TOOL_OUTPUT_BYTES);
-    // The checked-in corpus has not qualified structured records or diff for rollout.
-    if matches!(
-        result.decision.kind,
-        CompressionKind::Json
-            | CompressionKind::Jsonl
-            | CompressionKind::Table
-            | CompressionKind::Diff
-    ) {
-        result.view = None;
-        result.decision.reason = CompressionReason::Unsupported;
-        result.decision.view = result.decision.baseline;
-        result.decision.omitted = 0;
-    }
-    result
+    compress_at(call, output, artifact, baseline, MAX_TOOL_OUTPUT_BYTES)
 }
 
 fn compress_at(
@@ -560,6 +546,78 @@ mod tests {
         ]
     }
 
+    // Mixed ordinary and repetition-heavy fixtures qualify the remaining
+    // format families. The ordinary half must keep the CONTEXT-2 baseline;
+    // the repetitive half must preserve every distinct record while earning
+    // enough savings for the aggregate per-kind rollout gate below.
+    fn rollout_corpus(records: usize) -> Vec<(&'static str, CompressionKind, String)> {
+        let json_rows = (0..records)
+            .map(|n| {
+                format!(
+                    r#"{{"id":{n},"status":"ready","requirement":"authorization remains explicit","error_code":"E0042"}}"#
+                )
+            })
+            .collect::<Vec<_>>();
+        let repeated_json = r#"{"id":0,"status":"ready","requirement":"authorization remains explicit","error_code":"E0042"}"#;
+        let csv_rows = (0..records)
+            .map(|n| {
+                format!(
+                    "{n},ready,authorization remains explicit,E0042,cargo test --workspace --locked"
+                )
+            })
+            .collect::<Vec<_>>();
+        let repeated_csv =
+            "0,ready,authorization remains explicit,E0042,cargo test --workspace --locked";
+        let context = (0..records)
+            .map(|n| {
+                format!(
+                    " unchanged authorization requirement record {n:04} remains available through bounded retrieval\n"
+                )
+            })
+            .collect::<String>();
+        vec![
+            (
+                "distinct-jsonl",
+                CompressionKind::Jsonl,
+                json_rows.join("\n"),
+            ),
+            (
+                "repeated-json",
+                CompressionKind::Json,
+                format!("[{}]", vec![repeated_json; records].join(",")),
+            ),
+            (
+                "repeated-jsonl",
+                CompressionKind::Jsonl,
+                vec![repeated_json; records].join("\n"),
+            ),
+            (
+                "distinct-csv",
+                CompressionKind::Table,
+                format!(
+                    "id,status,requirement,error_code,validation_command\n{}\n",
+                    csv_rows.join("\n")
+                ),
+            ),
+            (
+                "repeated-csv",
+                CompressionKind::Table,
+                format!(
+                    "id,status,requirement,error_code,validation_command\n{}\n",
+                    vec![repeated_csv; records].join("\n")
+                ),
+            ),
+            (
+                "long-context-diff",
+                CompressionKind::Diff,
+                format!(
+                    "--- a/src/policy.rs\n+++ b/src/policy.rs\n@@ -1,{count} +1,{count} @@ authorization_policy\n{context}-const ERROR_CODE: &str = \"E0041\";\n+const ERROR_CODE: &str = \"E0042\";\n",
+                    count = records + 1
+                ),
+            ),
+        ]
+    }
+
     #[test]
     fn corpus_report_and_structural_tasks() {
         for (records, name, kind, text) in [120, 300, 600, 1200].into_iter().flat_map(|records| {
@@ -650,11 +708,18 @@ mod tests {
     }
 
     #[test]
-    fn default_per_kind_gate_and_rollout_exclusions() {
-        for kind in [CompressionKind::Log, CompressionKind::Search] {
+    fn default_per_kind_gate() {
+        for kind in [
+            CompressionKind::Log,
+            CompressionKind::Search,
+            CompressionKind::Json,
+            CompressionKind::Jsonl,
+            CompressionKind::Table,
+            CompressionKind::Diff,
+        ] {
             let mut baseline_tokens = 0;
             let mut view_tokens = 0;
-            for (_, sample_kind, text) in corpus(1200) {
+            for (_, sample_kind, text) in corpus(1200).into_iter().chain(rollout_corpus(1200)) {
                 if sample_kind != kind {
                     continue;
                 }
@@ -674,36 +739,22 @@ mod tests {
                 (baseline_tokens - view_tokens) * 100 / baseline_tokens
             );
         }
-        for kind in [CompressionKind::Json, CompressionKind::Diff] {
-            let (_, _, text) = corpus(1200)
-                .into_iter()
-                .find(|(_, k, _)| *k == kind)
-                .unwrap();
-            let (_, output, reference) = stored(&text);
-            let result = compress_tool_output(
-                &call(kind),
-                &output,
-                &reference,
-                &baseline(output.as_str(), &reference),
-            );
-            assert!(result.view.is_none());
-        }
     }
 
     #[test]
     fn diff_keeps_changes_headers_and_markers_retrieves_omitted_context() {
-        let context = (0..1000)
+        let context = (0..3000)
             .map(|n| format!(" unchanged context record {n}\n"))
             .collect::<String>();
         let text = format!(
-            "--- a/example\n+++ b/example\n@@ -1,1001 +1,1001 @@ section\n{context}-old protected change\n+new protected change\n\\ No newline at end of file\n"
+            "--- a/example\n+++ b/example\n@@ -1,3001 +1,3001 @@ section\n{context}-old protected change\n+new protected change\n\\ No newline at end of file\n"
         );
         let (store, output, reference) = stored(&text);
         let body = diff(output.as_str()).unwrap();
         for required in [
             "--- a/example",
             "+++ b/example",
-            "@@ -1,1001 +1,1001 @@ section",
+            "@@ -1,3001 +1,3001 @@ section",
             "-old protected change",
             "+new protected change",
             "\\ No newline at end of file",
@@ -712,7 +763,15 @@ mod tests {
         }
         let answer = " unchanged context record 500\n";
         assert!(!body.contains(answer));
-        assert!(body.contains("996 unchanged context lines omitted"));
+        assert!(body.contains("2996 unchanged context lines omitted"));
+        let baseline = baseline(output.as_str(), &reference);
+        let selected =
+            compress_tool_output(&call(CompressionKind::Diff), &output, &reference, &baseline);
+        assert_eq!(selected.decision.reason, CompressionReason::Compressed);
+        let selected = selected.view.unwrap();
+        assert!(selected.contains("-old protected change"));
+        assert!(selected.contains("+new protected change"));
+        assert!(!selected.contains(answer));
         let read = store
             .retrieve(
                 &reference.handle,
@@ -932,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_candidate_corpus_report_and_default_exclusion() {
+    fn structured_candidate_corpus_report_and_default_selection() {
         for records in [120, 300, 600, 1200] {
             for repeated in [false, true] {
                 let mut json_rows = Vec::new();
@@ -1035,10 +1094,10 @@ mod tests {
                             result.decision.reason
                         );
                     }
-                    assert!(
-                        compress_tool_output(&call, &output, &reference, &baseline)
-                            .view
-                            .is_none()
+                    let selected = compress_tool_output(&call, &output, &reference, &baseline);
+                    assert_eq!(
+                        selected.view.is_some(),
+                        repeated && output.as_str().len() > MAX_TOOL_OUTPUT_BYTES
                     );
                 }
             }

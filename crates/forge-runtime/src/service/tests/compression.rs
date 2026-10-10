@@ -130,6 +130,43 @@ fn compression_requires_storage_and_disabled_is_exact_context2() {
 }
 
 #[test]
+fn qualified_structured_output_uses_the_runtime_compression_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repeated = r#"{"status":"ready","requirement":"authorization remains explicit","command":"cargo test --workspace --locked","error_code":"E0042"}"#;
+    let exceptional = r#"{"status":"failed","requirement":"authorization remains explicit","command":"cargo test --workspace --locked","error_code":"E0308"}"#;
+    let raw = format!("[{},{}]", vec![repeated; 800].join(","), exceptional);
+    let call = ToolCall::new(
+        "call",
+        "read_file",
+        serde_json::json!({"path":"validation.json"}),
+    );
+    let service = test_service(tmp.path())
+        .with_artifact_store(Some(Arc::new(MemoryArtifactStore::default())));
+
+    let (view, grant, decision) = service.prepare_tool_output(&call, &raw, source());
+
+    assert!(grant.is_some());
+    assert!(view.contains("records 1..=800 count=800"));
+    assert!(view.contains(exceptional));
+    assert_eq!(view.matches(repeated).count(), 1);
+    let EventKind::ToolOutputCompression {
+        kind,
+        reason,
+        baseline,
+        view: size,
+        omitted,
+        ..
+    } = decision.unwrap()
+    else {
+        panic!("missing decision");
+    };
+    assert_eq!(kind, ToolCompressionKind::Json);
+    assert_eq!(reason, ToolCompressionReason::Compressed);
+    assert_eq!(omitted, 0, "record grouping retains every distinct record");
+    assert!(size.estimated_tokens * 100 <= baseline.estimated_tokens * 70);
+}
+
+#[test]
 fn unsupported_malformed_protected_and_no_savings_preserve_exact_old_view() {
     let tmp = tempfile::tempdir().unwrap();
     let raw = search_output();

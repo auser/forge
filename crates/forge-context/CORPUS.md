@@ -1,4 +1,4 @@
-# Pure compression corpus (CONTEXT-3 candidate implementation)
+# Pure compression corpus (CONTEXT-3)
 
 Run the deterministic report with:
 
@@ -28,6 +28,18 @@ greater than 64 KiB.
   list `[path, [[line, exact match], ...]]`; every match and path/line pair is
   retained. Unicode and Windows paths, escaping, ordering and repeated rows
   have direct structural checks.
+- **JSON:** `.json` file origin and strict raw JSON parsing. Top-level arrays
+  with consecutive byte-identical elements receive readable record grouping;
+  other JSON receives raw-lexeme whitespace compaction.
+- **JSONL:** `.jsonl` file origin and one complete strict raw JSON value per
+  nonempty physical line. Consecutive exact records are grouped with their
+  one-based positions and count.
+- **CSV/TSV:** `.csv`/`.tsv` file origins and a canonical, writer-roundtripped
+  subset. Headers and original records remain verbatim; consecutive exact data
+  records are grouped with positions and counts.
+- **Diff:** `.diff`/`.patch` file origins and validated ordinary unified hunks.
+  Long unchanged runs retain two context lines at each edge, while every
+  change, file/hunk header, and no-newline marker stays visible.
 
 Each individual accepted view must save at least 30% estimated tokens against
 its real baseline and cannot exceed its byte or character budget.
@@ -42,26 +54,38 @@ Representative report at 1200 records, 64 KiB threshold (estimated tokens):
 | graph-symbols | 23447 | 16633 | 6450 | Compressed |
 | generated-diff | 52846 | 17203 | 17203 | NoSavings |
 
-The two log fixtures aggregate to baseline 33327 / selected 16790 (~49.6%
-savings); this is driven by repeated warnings and does **not** establish a
-general log benefit. Search baseline 16633 / selected 6450 is ~61.2%.
-Distinct short-path search results additionally assert no-savings fallback.
-These are small synthetic eligibility checks, not evidence of model quality
-or representative production savings.
+The checked-in default gate mixes no-savings fixtures with repetition- or
+context-heavy fixtures for every kind. At 1200 records and the 64 KiB rollout
+threshold it measures:
 
-## Implemented but not qualified for default rollout
+| Kind | Aggregate baseline | Aggregate selected | Savings |
+|---|---:|---:|---:|
+| Log | 33327 | 16790 | 49% |
+| Search | 16633 | 6450 | 61% |
+| JSON | 38589 | 19862 | 48% |
+| JSONL | 38019 | 19116 | 49% |
+| CSV/TSV | 33261 | 16781 | 49% |
+| Diff | 33799 | 17426 | 48% |
+
+Every kind therefore clears the 30% aggregate rollout gate while retaining
+per-view rejection: distinct structured data, short-context diffs, and unique
+logs keep the existing capped baseline when compression cannot save 30%.
+These are deterministic synthetic qualification checks, not evidence of model
+quality or representative production savings.
+
+## Structured and diff contracts
 
 - **JSON:** `.json` file origin and strict raw JSON parsing. Top-level arrays
   with consecutive byte-identical elements receive readable record grouping;
   other JSON receives raw-lexeme whitespace compaction. This preserves key
   order, duplicate keys, numeric precision/spelling (including numbers outside
   machine floating-point range), all distinct values and exceptional records.
-  Nested arrays are not recursively grouped. Default disabled.
+  Nested arrays are not recursively grouped.
 - **JSONL:** `.jsonl` origin and one complete strict raw JSON value per nonempty
   physical line. Consecutive exact records become an original record with
   one-based inclusive positions and count. Different records stay visible in
   order, including schema changes. Blank lines, multiline JSON values and
-  trailing garbage decline. Default disabled.
+  trailing garbage decline.
 - **CSV/TSV:** `.csv`/`.tsv` origins, explicit comma/tab delimiter, a retained
   header and consistent field count. The `csv` crate parses records; an exact
   per-record writer roundtrip restricts acceptance to a canonical subset.
@@ -70,34 +94,34 @@ or representative production savings.
   CRLF separators, optional unnecessary quotes, blank rows, ragged records
   and malformed/permissively parsed syntax decline. This intentionally rejects
   some valid CSV rather than repairing ambiguous input. Header and original
-  records are retained verbatim, with data-record positions/counts. Default
-  disabled; no new handwritten CSV parser.
+  records are retained verbatim, with data-record positions/counts. No new
+  handwritten CSV parser is used.
 - **Diff:** `.diff`/`.patch` origin, ordinary unified file/hunk headers, validated
   old/new line counts. Candidate context elision preserves two unchanged lines
   on each side of long runs, every changed line, every file/hunk header and
   no-newline markers. Omitted context is explicitly counted. Normal short-hunk
-  diffs do not save enough; default disabled. Extended Git/binary/combined
+  diffs do not save enough and retain the baseline. Extended Git/binary/combined
   formats decline rather than silently dropping metadata.
 
-The candidate-only diff test verifies changed-line/header/no-newline visibility,
+The selected diff test verifies changed-line/header/no-newline visibility,
 asserts a particular unchanged-context answer is absent, then explicitly
-retrieves that answer through an authorized bounded artifact search. This is
-not a test of a default-selected diff view. JSON semantic/raw-lexeme tests
-likewise validate the experimental candidate, not default activation.
+retrieves that answer through an authorized bounded artifact search. JSON
+semantic/raw-lexeme tests validate exact preservation independently of the
+savings gate.
 
-### Structured-record candidate report
+### Structured-record report
 
 The additional matrix covers JSON arrays, JSONL, CSV and TSV at all four
 thresholds and workload sizes. Each has distinct-record negative fixtures and
 repetition-positive fixtures with a final exceptional record. Direct assertions
 check every original record, schema, exception, raw duplicate keys and numeric
 lexemes, ordering positions and counts, Unicode, quotes and embedded newlines.
-No default activation follows from these synthetic repetition-positive fixtures.
+The mixed default gate above pairs these cases so repetitive successes cannot
+hide a missing no-savings fallback.
 
-At 1200 records / 64 KiB (complete serialized estimates; these are experimental
-candidate decisions, **not** default-selected views):
+At 1200 records / 64 KiB (complete serialized estimates):
 
-| Format / workload | Original | Capped baseline | Experimental selected view | Decision |
+| Format / workload | Original | Capped baseline | Selected view | Decision |
 |---|---:|---:|---:|---|
 | JSON array / distinct | 39325 | 18704 | 18704 | NoSavings |
 | JSON array / repeated | 38703 | 18740 | 183 | Compressed |
@@ -116,7 +140,7 @@ No opaque dictionaries or hidden distinct values are introduced.
 
 ## Assertions and limitations
 
-- Direct candidate structural checks and exact deterministic decisions.
+- Direct structural checks and exact deterministic decisions.
 - Selected views must contain the same checked readable candidate and match
   exact full serialized size accounting.
 - Strict threshold boundaries, no-savings fallback, unknown/protected origins,
@@ -125,7 +149,7 @@ No opaque dictionaries or hidden distinct values are introduced.
 - No filesystem, model, clock, randomness, network or retrieval expansion in
   classification/compression. Store use occurs only in tests/caller.
 
-The pure module now has candidates for all requested format families. This does
-not claim every format is qualified for rollout, that the whole CONTEXT-3
-runtime/configuration ticket is complete, or that deterministic scripted
-assertions establish live model task quality.
+The pure module and runtime entry point now select all requested format
+families when an individual view and its aggregate per-kind corpus both clear
+the threshold. Deterministic scripted assertions do not establish live model
+task quality.
