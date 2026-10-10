@@ -471,6 +471,7 @@ impl TurnState {
             // its tool calls as `tool_call` updates, so narrating the
             // replay records as well would duplicate the transcript.
             EventKind::ToolResult { .. }
+            | EventKind::UsageRecorded { .. }
             | EventKind::SessionForked { .. }
             | EventKind::ContextPlanRecorded { .. }
             | EventKind::ContextPlanUnavailable { .. }

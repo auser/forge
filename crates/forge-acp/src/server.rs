@@ -93,6 +93,28 @@ struct TurnSlotGuard {
     session: Arc<Session>,
 }
 
+fn redacted_task(task: &forge_runtime::TaskView) -> Value {
+    serde_json::json!({
+        "taskId": task.task_id,
+        "state": task.state,
+        "currentNode": task.current_node,
+        "runId": task.run_id,
+        "sessionId": task.session_id,
+        "route": task.route.as_ref().map(|route| serde_json::json!({
+            "router": route.router,
+            "model": route.model,
+            "confidence": route.confidence,
+            "fallbackUsed": route.fallback_used,
+        })),
+        "spend": task.spend,
+        "checkCount": task.checks.len(),
+        "changedFileCount": task.changed_files.len(),
+        "parked": task.parked_reason.is_some(),
+        "terminal": task.terminal_result.is_some(),
+        "sequence": task.sequence,
+    })
+}
+
 impl Drop for TurnSlotGuard {
     fn drop(&mut self) {
         let mut turn = self.session.turn.lock().unwrap_or_else(|e| e.into_inner());
@@ -249,6 +271,25 @@ impl ForgeAcpServer {
                 self.respond(id, result).await;
             }
 
+            method::FORGE_TASK_LIST => {
+                let result = self.inspect_tasks(params, None);
+                self.respond(id, result).await;
+            }
+
+            method::FORGE_TASK_SHOW => {
+                let task_id = params
+                    .get("taskId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let result = match task_id {
+                    Some(task_id) => self.inspect_tasks(params, Some(&task_id)),
+                    None => Err(RpcError::invalid_params(
+                        "forge/tasks/show requires `taskId`",
+                    )),
+                };
+                self.respond(id, result).await;
+            }
+
             other => {
                 self.send(Outgoing::error(id, RpcError::method_not_found(other)))
                     .await;
@@ -263,6 +304,32 @@ impl ForgeAcpServer {
                 tracing::debug!(code = error.code, message = %error.message, "request failed");
                 self.send(Outgoing::error(id, error)).await;
             }
+        }
+    }
+
+    fn inspect_tasks(&self, params: Value, task_id: Option<&str>) -> Result<Value, RpcError> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("task inspection requires `sessionId`"))?;
+        let session = self
+            .sessions()
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| RpcError::invalid_params("unknown ACP session"))?;
+        let inspector = session
+            .service
+            .task_inspector()
+            .ok_or_else(|| RpcError::internal("task journal unavailable"))?;
+        match task_id {
+            Some(task_id) => inspector
+                .show(task_id)
+                .map(|task| redacted_task(&task))
+                .map_err(|error| RpcError::invalid_params(error.to_string())),
+            None => inspector
+                .list()
+                .map(|tasks| Value::Array(tasks.iter().map(redacted_task).collect()))
+                .map_err(|error| RpcError::internal(error.to_string())),
         }
     }
 
@@ -979,22 +1046,60 @@ mod tests {
     use super::*;
 
     fn service(root: &Path) -> Arc<AgentService> {
-        Arc::new(AgentService::new(
-            Arc::new(forge_providers::MockModel::new()),
-            Arc::new(forge_providers::MockRouter::selecting("mock-local")),
-            Arc::new(forge_execution::MockExecution::new(root)),
-            Arc::new(forge_skills::FsSkillRegistry::with_roots(vec![], None)),
-            Arc::new(forge_session::JsonlSessionStore::new(
-                root.join(".forge").join("sessions"),
-            )),
-            forge_config::Config::default(),
-        ))
+        Arc::new(
+            AgentService::new(
+                Arc::new(forge_providers::MockModel::new()),
+                Arc::new(forge_providers::MockRouter::selecting("mock-local")),
+                Arc::new(forge_execution::MockExecution::new(root)),
+                Arc::new(forge_skills::FsSkillRegistry::with_roots(vec![], None)),
+                Arc::new(forge_session::JsonlSessionStore::new(
+                    root.join(".forge").join("sessions"),
+                )),
+                forge_config::Config::default(),
+            )
+            .with_task_store(Arc::new(forge_task::JsonlTaskStore::for_project(root))),
+        )
     }
 
     fn server() -> (Arc<ForgeAcpServer>, mpsc::Receiver<Outgoing>) {
         let (tx, rx) = mpsc::channel(64);
         let factory = Arc::new(FnFactory(|root: &Path| Ok(service(root))));
         (Arc::new(ForgeAcpServer::new(factory, tx)), rx)
+    }
+
+    #[tokio::test]
+    async fn task_extensions_share_redaction_safe_durable_state() {
+        use forge_task::{TaskNode, TaskNodeKind, TaskPlan};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plan = TaskPlan::builder("secret task request")
+            .with_id("acp-task")
+            .add_node(TaskNode::new("inspect", "Inspect", TaskNodeKind::Inspect))
+            .build()
+            .expect("plan");
+        forge_task::JsonlTaskStore::for_project(tmp.path())
+            .create(plan)
+            .expect("task");
+        let (server, _rx) = server();
+        let created = server
+            .new_session(json!({ "cwd": tmp.path(), "mcpServers": [] }))
+            .await
+            .expect("session");
+        let session_id = created["sessionId"].as_str().expect("id");
+
+        let list = server
+            .inspect_tasks(json!({ "sessionId": session_id }), None)
+            .expect("list");
+        assert_eq!(list[0]["taskId"], "acp-task");
+        let shown = server
+            .inspect_tasks(
+                json!({ "sessionId": session_id, "taskId": "acp-task" }),
+                Some("acp-task"),
+            )
+            .expect("show");
+        assert_eq!(shown["currentNode"], "inspect");
+        assert!(shown.get("request").is_none());
+        assert!(shown.get("terminalResult").is_none());
+        assert!(shown.get("changedFiles").is_none());
     }
 
     /// Claim then drive — exactly the two steps `handle_request` performs,

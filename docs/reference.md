@@ -515,6 +515,9 @@ Interrupt and continue:
 forge cancel <run-id>        # works from another terminal while a run is live
 forge resume <run-id>        # continues the run, replaying its conversation
 forge resume <task-id>       # validates and continues a parked development task
+forge task                   # concise durable-task list
+forge task show <task-id>    # route, spend, checks, files, parked reason, result
+forge --json task show <task-id>
 forge session list           # what happened, per session
 forge session show <id>      # full event history (JSONL, one event per line)
 forge session fork <id>      # branch the conversation into a new session
@@ -782,12 +785,14 @@ process, lexical-only skill discovery).
 forge init                          Initialize a project (idempotent)
 forge run [--max-turns N] [--skill NAME]... <prompt>
                                     Run the multi-turn agent loop
+forge task [list]                   List durable development tasks
+forge task show <task-id>           Inspect one durable task
 forge chat [--continue|--session]   Open the interactive chat (also: bare forge)
 forge serve [--host --port]         Start the REST/SSE server
 forge mcp                           Serve MCP over stdio (editors, agents)
 forge acp                           Serve ACP over stdio (forge as the agent
                                     in Zed and other ACP editors)
-forge resume <run-or-session-id>    Continue a completed run in its session
+forge resume <task-run-or-session-id>  Continue a parked task or completed run
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
 forge session fork <id> [--at X]    Branch a session into a new one
@@ -1638,6 +1643,24 @@ returned as ready work. External operations still need their own idempotency
 key before Forge can automatically resolve a `possibly_executed` checkpoint;
 without that proof, Forge requires inspection instead of retrying the effect.
 Version-one task journals remain readable after the effect schema upgrade.
+
+`forge task` reads those journals without starting a provider. `task show`
+joins the checkpoint to its bound run events and renders one transport-neutral
+view: lifecycle state and current node, the recorded routing decision,
+provider-reported tokens and resolved cost, verification evidence, changed
+files, the typed parked reason, and the terminal result. Unknown prices remain
+`null`/`unknown`; Forge never renders missing price data as zero cost.
+
+The same projection backs `GET /v1/tasks`, `GET /v1/tasks/{id}`, chat's
+`/tasks` and `/task <id>`, MCP's `forge_task_list`/`forge_task_show`, and ACP's
+`forge/tasks/list`/`forge/tasks/show` extension methods. MCP and ACP return a
+redaction-safe projection (ids, lifecycle, route, spend, counts, and terminal
+flags) because those protocols can be connected to another client; prompts,
+terminal text, and changed paths stay on explicit local CLI/chat/REST
+inspection surfaces.
+
+Task inspection and resume never commit, push, open a pull request, or deploy.
+Those remain explicit developer actions outside the workflow.
 
 ### Context accounting
 

@@ -206,6 +206,26 @@ impl JsonlTaskStore {
         Ok(load_file(&path, task_id)?.loaded)
     }
 
+    /// All durable tasks, newest ids first. ULID task ids sort by creation
+    /// time, while custom ids used by tests and importers remain stable.
+    pub fn list(&self) -> Result<Vec<LoadedTask>, ForgeError> {
+        if !self.root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut ids = std::fs::read_dir(&self.root)
+            .map_err(ForgeError::Io)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+                    .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by(|left, right| right.cmp(left));
+        ids.into_iter().map(|id| self.load(&id)).collect()
+    }
+
     pub fn transition(
         &self,
         task_id: &str,

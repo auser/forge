@@ -146,6 +146,12 @@ pub enum Command {
         command: Option<SessionCommand>,
     },
 
+    /// Inspect durable development tasks (defaults to `list`).
+    Task {
+        #[command(subcommand)]
+        command: Option<TaskCommand>,
+    },
+
     /// Project graph operations.
     Graph {
         #[command(subcommand)]
@@ -215,6 +221,17 @@ pub enum Command {
         /// Include the source commit and compilation target.
         #[arg(long)]
         build: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TaskCommand {
+    /// List durable tasks for this project.
+    List,
+    /// Show one task's route, spend, checks, files, and recovery state.
+    Show {
+        #[arg(value_name = "TASK_ID")]
+        id: String,
     },
 }
 

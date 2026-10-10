@@ -29,6 +29,19 @@ fn format_event(event: &Event) -> String {
         } => format!(
             "routing_decision router={router} model={selected_model} confidence={confidence:.2} fallback={fallback_used}"
         ),
+        EventKind::UsageRecorded {
+            model,
+            usage,
+            cost_usd,
+        } => format!(
+            "usage_recorded model={model} tokens={} cost_usd={}",
+            usage
+                .map(|value| value.total_tokens.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            cost_usd
+                .map(|value| format!("{value:.6}"))
+                .unwrap_or_else(|| "unknown".into())
+        ),
         EventKind::SkillActivated { name, path } => {
             format!("skill_activated name={name} path={}", path.display())
         }

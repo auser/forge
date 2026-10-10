@@ -188,6 +188,10 @@ pub mod method {
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_CLOSE: &str = "session/close";
+    /// Forge extension methods. They inspect redaction-safe lifecycle
+    /// metadata for the project already authorized by `session/new`.
+    pub const FORGE_TASK_LIST: &str = "forge/tasks/list";
+    pub const FORGE_TASK_SHOW: &str = "forge/tasks/show";
 }
 
 /// Client-side methods we call (schema `CLIENT_METHOD_NAMES`).

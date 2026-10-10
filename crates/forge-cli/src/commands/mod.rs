@@ -17,6 +17,7 @@ pub mod serve_cmd;
 pub mod service;
 pub mod session_cmd;
 pub mod skill_cmd;
+pub mod task_cmd;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -26,7 +27,7 @@ use std::time::{Duration, Instant};
 use forge_config::CliOverrides;
 use forge_core::{ForgeError, find_project_root};
 
-use crate::cli::{Cli, Command, GlobalOpts, GraphCommand, SessionCommand};
+use crate::cli::{Cli, Command, GlobalOpts, GraphCommand, SessionCommand, TaskCommand};
 
 /// Per-invocation context derived from global flags.
 pub struct Context {
@@ -145,6 +146,10 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             SessionCommand::Fork { id, at } => session_cmd::fork(&ctx, &id, at.as_deref()),
             SessionCommand::Decisions => session_cmd::decisions(&ctx),
         },
+        Some(Command::Task { command }) => match command.unwrap_or(TaskCommand::List) {
+            TaskCommand::List => task_cmd::list(&ctx),
+            TaskCommand::Show { id } => task_cmd::show(&ctx, &id),
+        },
         Some(Command::Model { command }) => model_cmd::run(&ctx, command).await,
         Some(Command::Router { command }) => match command {
             crate::cli::RouterCommand::Serve { host, port } => {
@@ -181,6 +186,7 @@ fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
         Some(Command::Resume { .. }) => "resuming run",
         Some(Command::Cancel { .. }) => "cancelling run",
         Some(Command::Session { .. }) => "reading sessions",
+        Some(Command::Task { .. }) => "reading tasks",
         Some(Command::Model { .. }) => "checking models",
         Some(Command::Router { .. }) => "starting router",
         Some(Command::Graph {

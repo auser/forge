@@ -136,6 +136,8 @@ pub enum Action {
     /// `/fork`, optionally `--at <pos|run-id>`.
     Fork(Option<String>),
     ListJobs,
+    ListTasks,
+    ShowTask(String),
     Attach(String),
     /// `/show`, optionally `/show <n>`. Read-only: immediate in every state.
     Show(Option<usize>),
@@ -306,6 +308,8 @@ impl Controller {
             Parsed::Fork(at) => self.move_session(Action::Fork(at)),
             Parsed::Background => self.on_background(),
             Parsed::Jobs => vec![Action::ListJobs],
+            Parsed::Tasks => vec![Action::ListTasks],
+            Parsed::Task(task_id) => vec![Action::ShowTask(task_id)],
             Parsed::Attach(run_id) => {
                 // The attached run becomes the foreground one (§10), so a
                 // prompt typed while it finishes queues behind it. `detached`

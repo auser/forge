@@ -23,16 +23,19 @@ fn test_app_with(
     execution: Arc<dyn ExecutionProvider>,
     config: Config,
 ) -> Router {
-    let service = Arc::new(AgentService::new(
-        model,
-        Arc::new(MockRouter::selecting("mock-local")),
-        execution,
-        Arc::new(FsSkillRegistry::with_roots(vec![], None)),
-        Arc::new(JsonlSessionStore::new(
-            project.join(".forge").join("sessions"),
-        )),
-        config.clone(),
-    ));
+    let service = Arc::new(
+        AgentService::new(
+            model,
+            Arc::new(MockRouter::selecting("mock-local")),
+            execution,
+            Arc::new(FsSkillRegistry::with_roots(vec![], None)),
+            Arc::new(JsonlSessionStore::new(
+                project.join(".forge").join("sessions"),
+            )),
+            config.clone(),
+        )
+        .with_task_store(Arc::new(forge_task::JsonlTaskStore::for_project(project))),
+    );
     let skills = service.skills().clone();
     let graph = Arc::new(LocalGraph::open(project).expect("open graph"));
     forge_server::build_router(service, skills, Some(graph), config)
@@ -156,6 +159,7 @@ async fn run_lifecycle_end_to_end() {
         [
             "run_started",
             "routing_decision_made",
+            "usage_recorded",
             // v3 replay record of the model's answer
             "assistant_message",
             // the answer's round trip is a turn too
@@ -163,6 +167,31 @@ async fn run_lifecycle_end_to_end() {
             "completed"
         ]
     );
+}
+
+#[tokio::test]
+async fn task_endpoints_share_the_durable_projection() {
+    use forge_task::{TaskNode, TaskNodeKind, TaskPlan};
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = TaskPlan::builder("inspect task state")
+        .with_id("rest-task")
+        .add_node(TaskNode::new("inspect", "Inspect", TaskNodeKind::Inspect))
+        .build()
+        .expect("plan");
+    forge_task::JsonlTaskStore::for_project(tmp.path())
+        .create(plan)
+        .expect("task");
+    let app = test_app(tmp.path());
+
+    let (status, list) = get_json(&app, "/v1/tasks").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["tasks"][0]["task_id"], "rest-task");
+    let (status, task) = get_json(&app, "/v1/tasks/rest-task").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(task["current_node"], "inspect");
+    assert_eq!(task["state"], "queued");
+    let (status, _) = get_json(&app, "/v1/tasks/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -528,6 +557,7 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
         [
             "run_started",
             "routing_decision_made",
+            "usage_recorded",
             "assistant_message",
             "tool_call_requested",
             "tool_policy_decision",
@@ -539,6 +569,7 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
             // v4: the final answer streams as ordered deltas...
             "assistant_delta",
             "assistant_delta",
+            "usage_recorded",
             // ...and lands whole in the replay record
             "assistant_message",
             "turn_completed",
@@ -551,7 +582,7 @@ async fn sse_streams_v2_tool_and_turn_events_in_order() {
         .iter()
         .map(|e| e["seq"].as_u64().expect("seq"))
         .collect();
-    assert_eq!(seqs, (1..=15).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=17).collect::<Vec<_>>());
     assert!(
         events
             .iter()
