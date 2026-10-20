@@ -1307,8 +1307,13 @@ the caller asked for. `forge skill test <name>` runs the skill's
 — no model calls, no network — stored at `.forge/graph/graph.json` (git-ignored).
 It indexes files, directories, symbols, imports, tests, and basic call sites for
 Rust, Python, JS/TS, and Go (regex-based extraction). Rebuilds are incremental:
-only files whose mtime+hash changed are re-parsed. The graph itself stays
-model-free by design — this never changes even when a needle engine is available.
+only files whose mtime+hash changed are re-parsed. The walker skips common noise
+directories (`.git`, `target`, `node_modules`, …) and never descends into a
+nested checkout — a directory carrying its own `.git` file (a worktree) or
+`.git` directory (a clone) is another project's source, not this one's, and
+indexing it would duplicate symbols the root checkout already has. The graph
+itself stays model-free by design — this never changes even when a needle
+engine is available.
 
 ```bash
 forge graph build              # build / incrementally refresh

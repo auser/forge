@@ -279,3 +279,42 @@ fn skips_common_directories() {
             .all(|s| !s.name.starts_with("junk"))
     );
 }
+
+#[test]
+fn skips_nested_git_worktrees_and_clones() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fixture(tmp.path());
+    // A worktree carries a `.git` *file*; a nested clone a `.git` directory.
+    // Both are other checkouts, not this project's source.
+    write(
+        tmp.path(),
+        ".delta/worktrees/wt/src/lib.rs",
+        "fn junk_worktree() {}\n",
+    );
+    write(
+        tmp.path(),
+        ".delta/worktrees/wt/.git",
+        "gitdir: /elsewhere\n",
+    );
+    write(
+        tmp.path(),
+        "vendor/clone/src/lib.rs",
+        "fn junk_clone() {}\n",
+    );
+    write(
+        tmp.path(),
+        "vendor/clone/.git/HEAD",
+        "ref: refs/heads/main\n",
+    );
+
+    let mut graph = LocalGraph::open(tmp.path()).expect("open");
+    let stats = graph.build().expect("build");
+    assert_eq!(stats.files, 5);
+    assert!(
+        graph
+            .state()
+            .symbols
+            .iter()
+            .all(|s| !s.name.starts_with("junk"))
+    );
+}
