@@ -27,6 +27,7 @@ built-in defaults. Check where any value comes from with
 | [`configs/hybrid-needle.toml`](configs/hybrid-needle.toml) | Local model for easy tasks, hosted models when the on-device brain says the task is hard | a local model server; hosted keys optional |
 | [`configs/budget-hosted.toml`](configs/budget-hosted.toml) | No local GPU; always route to the cheapest capable hosted model | A provider API key in `.env` |
 | [`configs/hybrid-laya.toml`](configs/hybrid-laya.toml) | You specifically want the Laya adapter doing the routing instead of the embedded brain | `pip install laya` + `forge router serve` |
+| [`configs/hybrid-laya-native.toml`](configs/hybrid-laya-native.toml) | You want Laya's decision model in-process, with no Python or adapter | ~847 MB download on first route (or a locally provisioned checkpoint) |
 
 No preset for "just trying it out": forge's project graph, skills, doctor and
 MCP tools need no model and no config at all — `forge init` then `forge graph
@@ -34,9 +35,9 @@ context "..."`. Only the agent loop (`forge run`) needs a model, so pick one of
 the presets above. (Forge's own test suites drive a mock model, but mocks are
 test-only: configuration refuses them unless `FORGE_TEST_MOCKS=1`.)
 
-`router = "laya"` is a legacy setting: the built-in default is now the
-embedded needle brain. Only `hybrid-laya.toml` sets it, and only because
-that preset is *about* the adapter.
+`router = "laya"` is the legacy HTTP/Python-adapter setting; the built-in
+default is the embedded needle brain. `router = "laya-native"` is the
+in-process Rust alternative. Both Laya modes are opt-in.
 
 Inside a `[models.<name>]` entry the endpoint/key fields are `base_url` and
 `key_env` — **not** `model_base_url`/`model_key_env`, which are top-level

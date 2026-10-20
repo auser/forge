@@ -42,6 +42,7 @@ forge-session = { path = "crates/forge-session" }
 forge-skills = { path = "crates/forge-skills" }
 forge-task = { path = "crates/forge-task" }
 needle-sys = { path = "crates/needle-sys" }
+laya = "0.1.1"
 
 async-trait = "0.1"
 axum = "0.8"

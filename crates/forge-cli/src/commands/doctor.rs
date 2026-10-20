@@ -1287,6 +1287,7 @@ fn router_note(router: &str) -> &'static str {
         "cheapest" => "lowest-cost capable candidate, available offline",
         "http" => "System One-compatible HTTP router (uses router_url)",
         "laya" => "Laya typed-questions router (uses router_url, default 127.0.0.1:8788)",
+        "laya-native" => "in-process Rust Laya router (uses laya.weights_path)",
         "jev" => {
             "Jev/OpenJev System One router (TYPESAFE_API_KEY or router_url for self-hosted OpenJev)"
         }

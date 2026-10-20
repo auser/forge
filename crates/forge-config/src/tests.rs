@@ -632,6 +632,19 @@ fn needle_defaults() {
 }
 
 #[test]
+fn laya_defaults_and_autofetch_override() {
+    let c = Config::default();
+    assert_eq!(c.laya.weights_path, "");
+    assert!(c.laya.autofetch);
+
+    let configured: Config =
+        toml::from_str("[laya]\nweights_path = \"/models/laya\"\nautofetch = false")
+            .expect("parses");
+    assert_eq!(configured.laya.weights_path, "/models/laya");
+    assert!(!configured.laya.autofetch);
+}
+
+#[test]
 fn needle_section_parses_and_validates() {
     let c: Config =
         toml::from_str("[needle]\nvariant = \"small\"\nautofetch = false").expect("parses");

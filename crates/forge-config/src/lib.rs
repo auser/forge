@@ -285,6 +285,30 @@ impl Default for NeedleConfig {
     }
 }
 
+/// `[laya]`: checkpoint lifecycle for the native Rust Laya router.
+///
+/// When `autofetch` is enabled (the default), Forge downloads the pinned
+/// `typed-decisions` checkpoint on first use. An empty `weights_path` uses
+/// the Forge model cache; set `autofetch = false` for offline deployments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayaConfig {
+    /// Directory containing `model.safetensors`, `encoder/`, `tokenizer/`,
+    /// and `rl_agent_config.json` for a Laya checkpoint.
+    pub weights_path: String,
+    /// Whether the pinned Laya checkpoint may be downloaded on first use.
+    pub autofetch: bool,
+}
+
+impl Default for LayaConfig {
+    fn default() -> Self {
+        Self {
+            weights_path: String::new(),
+            autofetch: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -350,6 +374,9 @@ pub struct Config {
     /// `router = "needle"`. When the weights are missing, routing built on
     /// it degrades to `router_fallback`.
     pub needle: NeedleConfig,
+    /// Optional native Rust Laya checkpoint configuration. Used only by
+    /// `router = "laya-native"`.
+    pub laya: LayaConfig,
     /// Spend ceilings enforced by the agent loop (`[budget]`); all ceilings
     /// absent means no budget.
     pub budget: BudgetConfig,
@@ -646,6 +673,7 @@ impl Default for Config {
             .into_iter()
             .collect(),
             needle: NeedleConfig::default(),
+            laya: LayaConfig::default(),
             budget: BudgetConfig::default(),
             tool_limits: BTreeMap::new(),
             context_artifacts: ContextArtifactsConfig::default(),
@@ -748,6 +776,8 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_NEEDLE_VARIANT", "needle.variant"),
     ("FORGE_NEEDLE_AUTOFETCH", "needle.autofetch"),
     ("FORGE_NEEDLE_WEIGHTS_SHA256", "needle.weights_sha256"),
+    ("FORGE_LAYA_WEIGHTS_PATH", "laya.weights_path"),
+    ("FORGE_LAYA_AUTOFETCH", "laya.autofetch"),
     ("FORGE_BUDGET_SESSION_TOKENS", "budget.session_tokens"),
     ("FORGE_BUDGET_SESSION_USD", "budget.session_usd"),
     ("FORGE_BUDGET_DAILY_USD", "budget.daily_usd"),
