@@ -750,24 +750,12 @@ says so once.
 `--json` promises stdout is one machine-readable value, which a
 conversation cannot honour. Use `forge run --json` instead.
 
-### Known chat-specific limitations
+### Terminal behavior
 
-One is a real gap, not yet fixed, and worth knowing before you rely on the
-behaviour it touches:
-
-- **A background notice can land mid-line.** `notify()` no longer
-  coordinates with an in-progress prompt: an out-of-band line (a
-  `/bg` job finishing, an approval another job needs) prints wherever
-  the cursor happens to be rather than being drawn cleanly above the
-  prompt. This is a deliberate trade, not an oversight: `rustyline`
-  18.0.1's `select()` is missing a buffer-check its sibling `poll()` has,
-  so keeping the `ExternalPrinter` that would coordinate the two meant
-  *any* multi-byte burst arriving at once — a paste, fast type-ahead, a
-  line typed right after Ctrl-C — permanently wedged the editor thread.
-  Interleaved output was judged the smaller cost. The fix already exists
-  upstream (rustyline commit `f2bbcc5`, verified against forge's own pty
-  reproduction); when a release after 18.0.1 ships, the dependency bump
-  restores the `ExternalPrinter` and notices draw above the prompt again.
+Background notices coordinate with the active line editor: a `/bg` job
+finishing or asking for approval is drawn above the prompt, then the prompt
+and any partially typed input are restored. This relies on rustyline 19's
+buffered-input fix and is covered through Forge's real pseudo-terminal tests.
 
 Note that `/graph` in the chat *does* blend semantically when the build
 has a working needle engine and a semantic index (`forge graph build`
@@ -776,9 +764,9 @@ maintains one whenever the engine is available): the same
 now-async `ChatHost::graph_context`. Without an engine or index it is the
 plain lexical ranking — the same degradation as outside the chat.
 
-Beyond those three, see [Known limitations](#known-limitations-v03) for the
-ones shared with the rest of forge (background runs not surviving the
-process, lexical-only skill discovery).
+See [Known limitations](#known-limitations-v03) for constraints shared with
+the rest of forge (background runs not surviving the process, lexical-only
+skill discovery).
 
 ## Command line
 
