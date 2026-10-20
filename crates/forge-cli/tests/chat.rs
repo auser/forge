@@ -27,44 +27,14 @@
 //! answered, closing a gap an earlier pass through this test left open: the
 //! very next `Editor::readline()` used to hang forever.
 //!
-//! That hang was never really about Ctrl-C. It traced to
-//! `rustyline` 18.0.1's `PosixRawReader::select` (`tty/unix.rs`), used for
-//! every keystroke's wait for as long as an `ExternalPrinter` exists
-//! (`editor.create_external_printer()`, once called, routes
-//! `wait_for_input` there for the rest of that `Editor`'s life instead of
-//! through the plain, self-buffering `next_key`). `select`'s sibling
-//! `poll` guards its blocking OS call with `if self.tty_in.buffer().len() >
-//! 0 { return Ok(true) }`; `select` has no such guard. Whenever a single
-//! kernel-level read hands rustyline more than one byte at once, only the
-//! first is consumed — the rest sit forever in that private buffer, and
-//! every subsequent wait blocks for a byte the OS will never re-deliver
-//! (it already handed it over). `diag`-style reproduction (not checked in)
-//! confirmed this hangs on the *first* line of a session with no Ctrl-C
-//! anywhere in it, purely by writing the line in one `write_all` rather
-//! than one byte at a time, and separately confirmed that a Ctrl-C followed
-//! by a line typed one byte at a time (with a delay between bytes) never
-//! hangs. Ctrl-C was a reliable *trigger* — the near-instant return to a
-//! fresh `readline()` narrows the window in which a fast-typed or
-//! type-ahead-queued follow-up line arrives as more than one byte in a
-//! single kernel read — but not the *cause*: a paste, or the type-ahead
-//! this app's raw-mode setup deliberately preserves across a turn
-//! (`terminal_io.rs`'s module doc, the `TCSADRAIN` note), hits the exact
-//! same defect with no interrupt involved at all.
-//!
-//! `TerminalIo::editor_thread_main` no longer calls
-//! `create_external_printer` at all (see its own comment there), which
-//! keeps every keystroke on the safe `next_key` path. `notify()` — the
-//! only feature that used the external printer, background-job notices
-//! landing while a prompt is on screen (design §10.1) — now always uses the
-//! `StdoutPrinter` fallback that previously covered only dumb/unsupported
-//! terminals: unsynchronized with an in-progress prompt (a notice can print
-//! awkwardly mid-line) but never able to wedge the next read. That is a
-//! real, deliberate product tradeoff, not a silent one: the alternative
-//! (patching rustyline's `select` to add the same buffer check `poll`
-//! already has, three lines, mirroring an existing pattern in the same
-//! file) was verified working against this exact suite but was not applied
-//! here, since it means vendoring a patched copy of a third-party crate
-//! into the tree rather than a workspace-declared dependency version bump.
+//! That hang was never really about Ctrl-C. It traced to rustyline 18.0.1's
+//! `wait_for_input`: while an `ExternalPrinter` existed, a multi-byte read
+//! could leave bytes in rustyline's private buffer and then poll the OS for
+//! bytes it had already received. Rustyline 19 includes upstream fix
+//! f2bbcc5, which drains the private buffer first. Forge therefore uses the
+//! coordinated printer again so a background notice clears and redraws a
+//! partially typed prompt. The burst-written line after Ctrl-C below keeps
+//! the upstream input fix covered through Forge's real terminal path.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1015,12 +985,11 @@ fn a_typed_ctrl_c_on_a_real_terminal_interrupts_without_killing_the_chat() {
     writer
         .write_all(b"explain alpha.rs\n")
         .expect("write a further line after the interrupt");
-    // "the answer" only ever reaches stdout via a real run: the scripted
-    // model replying to *this* submitted line. Not asserting on the
-    // echoed prompt text itself — rustyline redraws it interleaved with
-    // ANSI synchronized-update escapes, which a literal substring check
-    // would be too fragile to survive.
-    wait_for(&output, "the answer", Duration::from_secs(30));
+    // The completed-turn footer only reaches stdout after this submitted
+    // line has run through the model. Do not assert on streamed answer text:
+    // rustyline may redraw the prompt between fragments, so adjacent words
+    // are not guaranteed to remain adjacent in the raw terminal byte stream.
+    wait_for(&output, "  = 1 turn, 0 tool calls", Duration::from_secs(30));
 
     // Killed, not asked to `/quit` — see this test's doc for why.
     drop(writer);
@@ -1090,7 +1059,7 @@ fn a_tab_on_an_at_word_completes_a_project_path_on_a_real_terminal() {
     // The completed line submits as a real turn against the scripted mock,
     // proving the completed text is what the prompt actually held.
     writer.write_all(b"\n").expect("submit the completed line");
-    wait_for(&output, "the answer", Duration::from_secs(30));
+    wait_for(&output, "  = 1 turn, 0 tool calls", Duration::from_secs(30));
 
     // Killed, not asked to `/quit` — the Ctrl-C test's doc gives the
     // reason (do not race the unrelated outstanding-read hazard).
@@ -1243,7 +1212,7 @@ fn context_memory_inspection_and_offset_completion_keep_a_real_prompt_usable() {
     );
 
     pty.type_bytes(b"retained prompt after context inspection\n");
-    pty.expect("the answer");
+    pty.expect("  = 1 turn, 0 tool calls");
     let log = session_log(&project);
     assert!(
         log.contains("retained prompt after context inspection"),
@@ -1296,22 +1265,29 @@ fn context_memory_corruption_and_readiness_are_safe_at_a_real_prompt() {
 #[test]
 fn context_memory_commands_during_a_real_terminal_turn_retain_the_next_prompt() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let project = scaffold_sleeping(tmp.path(), "5");
+    // Inspection prints enough lines that a heavily loaded parallel test run
+    // can consume most of a five-second tool call just drawing them. Keep the
+    // turn open long enough for the commands themselves to remain the thing
+    // under test, then only wait for the second run to start below.
+    let project = scaffold_sleeping(tmp.path(), "15");
     let mut pty = ContextPty::start(tmp.path(), &project);
     pty.type_bytes(b"start the context inspection turn\n");
     pty.expect("  * run_command");
     pty.type_bytes(b"/context status\n");
-    pty.expect("\"latest_plan\"");
+    pty.expect("\"project_artifact_metadata\"");
+    pty.expect("\"state\": \"missing\"");
     pty.type_bytes(b"/memory status\n");
     let status = pty.expect("\"desired_enabled\": false");
     assert!(!status.contains("slow thing done"), "{status}");
+    pty.expect("\"project_daily_budget_usd\": 0.25");
     pty.type_bytes(b"/memory off\n");
     let off = pty.expect_count("\"desired_enabled\": false", 2);
     assert!(!off.contains("slow thing done"), "{off}");
+    pty.expect_count("\"project_daily_budget_usd\": 0.25", 2);
     pty.type_bytes(b"retained followup ");
-    pty.expect("slow thing done");
+    pty.expect("  = 2 turns, 1 tool call");
     pty.type_bytes(b"after completion\n");
-    pty.expect_count("slow thing done", 2);
+    pty.expect_count("  - working...", 2);
     // The durable user input, not terminal echo, proves the editor delivered it.
     let log = session_log(&project);
     let prompts: Vec<String> = log
@@ -1336,4 +1312,40 @@ fn context_memory_commands_during_a_real_terminal_turn_retain_the_next_prompt() 
         "{log}"
     );
     assert!(log.contains("\"enabled\":false"), "{log}");
+}
+
+/// A detached job can finish while the user is composing the next prompt.
+/// The notice must be drawn above that input and the complete buffer must be
+/// redrawn afterward; submitting the suffix proves the redraw did not alter
+/// the editor's actual buffer either.
+#[cfg(unix)]
+#[test]
+fn a_background_notice_redraws_a_partially_typed_prompt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = scaffold_sleeping(tmp.path(), "2");
+    let mut pty = ContextPty::start(tmp.path(), &project);
+
+    pty.type_bytes(b"start the background job\n");
+    pty.expect("  * run_command");
+    pty.type_bytes(b"/bg\n");
+    pty.expect("detached run");
+    pty.type_bytes(b"retained followup ");
+
+    let completed = pty.expect(" completed");
+    let after_notice = completed
+        .rsplit_once(" completed")
+        .map(|(_, tail)| tail)
+        .expect("completion notice in terminal output");
+    assert!(
+        after_notice.contains("> retained followup "),
+        "the prompt and input were not redrawn after the background notice:\n{completed}"
+    );
+
+    pty.type_bytes(b"after completion\n");
+    pty.expect("  = 2 turns, 1 tool call");
+    let log = session_log(&project);
+    assert!(
+        log.contains("\"prompt\":\"retained followup after completion\""),
+        "the redrawn input was not submitted intact:\n{log}"
+    );
 }

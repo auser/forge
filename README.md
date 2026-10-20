@@ -172,14 +172,14 @@ everything. The three keys you'll actually touch:
 
 ```toml
 model = "..."            # from `forge model list`
-router = "needle"        # default; also static, cheapest, jev, laya
+router = "needle"        # default; also static, cheapest, jev, laya, laya-native
 approval = "prompt-dangerous" # ordinary edits run; destructive operations ask
 ```
 
 Presets live in [`examples/configs/`](examples/configs/) — or let init
 write one: `forge init --preset claude` (also `codex`, `kimi`, `kev`,
 `decider`, `jev`, `local-first`, `hybrid-needle`, `budget-hosted`,
-`hybrid-laya`).
+`hybrid-laya`, `hybrid-laya-native`).
 
 ## Where to read more
 

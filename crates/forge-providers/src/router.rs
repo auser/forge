@@ -8,7 +8,9 @@ use forge_core::{
     RoutingRequest,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
+use crate::laya_weights;
 use crate::local_only::EgressPolicy;
 
 /// Drop candidates that lack any required capability.
@@ -440,6 +442,172 @@ pub(crate) fn optimistic_caps() -> ModelCapabilities {
 const LAYA_LEGACY_HINT: &str = "hint: laya is no longer the default — delete the `router` line to use the embedded \
      needle brain, or run `forge router serve` to serve laya";
 
+/// Native, in-process Laya router. This keeps Laya's checkpoint and inference
+/// out of the async runtime: one blocking worker owns the loaded Candle model,
+/// and a timeout releases no second inference while the first is still using
+/// the model.
+///
+/// This is intentionally a distinct mode from [`LayaRouter`]. `laya` has
+/// always meant "dial a System One-compatible HTTP endpoint"; changing it to
+/// mean "load a local checkpoint" would break existing deployments that set
+/// `router_url` or use the bundled Python adapter.
+pub struct NativeLayaRouter {
+    laya: forge_config::LayaConfig,
+    criteria: std::collections::HashMap<String, String>,
+    timeout: Duration,
+    agent: Arc<Mutex<Option<laya::Agent>>>,
+    inference_permit: Arc<Semaphore>,
+}
+
+impl NativeLayaRouter {
+    pub fn new(
+        laya: forge_config::LayaConfig,
+        criteria: std::collections::HashMap<String, String>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            laya,
+            criteria,
+            timeout,
+            agent: Arc::new(Mutex::new(None)),
+            // Candle's model is mutable only during loading, but the upstream
+            // port has not documented concurrent inference. One worker also
+            // prevents multiple requests from each loading a 2+ GiB CPU model.
+            inference_permit: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    async fn decide(
+        &self,
+        task: &RoutingRequest,
+        candidates: Vec<String>,
+    ) -> Result<(String, f64), ForgeError> {
+        let timeout = self.timeout;
+        let permit = tokio::time::timeout(timeout, self.inference_permit.clone().acquire_owned())
+            .await
+            .map_err(|_| {
+                ForgeError::router("native laya: decision timed out waiting for inference")
+            })?
+            .map_err(|_| ForgeError::router("native laya: inference worker is unavailable"))?;
+        // Once the agent is loaded its checkpoint has already been validated.
+        // Avoid rehashing the 847 MB safetensors file for every decision.
+        let needs_checkpoint = self
+            .agent
+            .lock()
+            .map_err(|_| ForgeError::router("native laya model lock was poisoned"))?
+            .is_none();
+        let path = if needs_checkpoint {
+            // Initial provisioning can move 847 MB, so it has its own
+            // deliberately generous transfer timeout. `router_timeout_ms`
+            // applies to normal routing, not to a one-time installation.
+            laya_weights::ensure_weights(&self.laya).await?
+        } else {
+            laya_weights::weights_path(&self.laya)
+        };
+        let criteria = self.criteria.clone();
+        let state = serde_json::json!({
+            "task": task.task.clone(),
+            "required_capabilities": task.required_capabilities.clone(),
+        });
+        let agent = Arc::clone(&self.agent);
+
+        let work = tokio::task::spawn_blocking(move || -> Result<(String, f64), String> {
+            // Keep the permit in this closure. If the async caller times out,
+            // the active inference still owns the only slot until it finishes;
+            // a second request cannot race the loaded model or multiply memory.
+            let _permit = permit;
+            let mut slot = agent
+                .lock()
+                .map_err(|_| "native laya model lock was poisoned".to_string())?;
+            if slot.is_none() {
+                let loaded =
+                    laya::Agent::from_dir(&path, laya::Options::default()).map_err(|e| {
+                        format!(
+                            "native laya could not load checkpoint {}: {e}",
+                            path.display()
+                        )
+                    })?;
+                *slot = Some(loaded);
+            }
+
+            let mut options = serde_json::Map::new();
+            for candidate in &candidates {
+                let description = criteria
+                    .get(candidate)
+                    .cloned()
+                    .unwrap_or_else(|| format!("model {candidate}"));
+                options.insert(candidate.clone(), serde_json::Value::String(description));
+            }
+            let questions = vec![(
+                "model".to_string(),
+                laya::Question {
+                    qtype: laya::QType::Choice,
+                    instructions: serde_json::Value::String(
+                        "Which model should handle this software task? Prefer the least \
+                             expensive model that can correctly complete it."
+                            .to_string(),
+                    ),
+                    criteria: Some(serde_json::Value::Object(options)),
+                },
+            )];
+            let response = slot
+                .as_ref()
+                .expect("agent was initialized above")
+                .system_one(&state, &questions)
+                .map_err(|e| format!("native laya inference failed: {e}"))?;
+            let answer = response
+                .answers
+                .get("model")
+                .ok_or_else(|| "native laya response omitted the model answer".to_string())?;
+            let choice = answer
+                .get("choice")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "native laya response omitted model.choice".to_string())?
+                .to_string();
+            let confidence = answer
+                .get("confidence")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            Ok((choice, confidence))
+        });
+
+        tokio::time::timeout(timeout, work)
+            .await
+            .map_err(|_| ForgeError::router("native laya: decision timed out"))?
+            .map_err(|e| ForgeError::router(format!("native laya worker failed: {e}")))?
+            .map_err(ForgeError::router)
+    }
+}
+
+#[async_trait]
+impl DecisionRouter for NativeLayaRouter {
+    async fn route(&self, task: &RoutingRequest) -> Result<RoutingDecision, ForgeError> {
+        let candidates = if task.candidates.is_empty() {
+            let mut configured: Vec<_> = self.criteria.keys().cloned().collect();
+            configured.sort();
+            configured
+        } else {
+            task.candidates.clone()
+        };
+        if candidates.is_empty() {
+            return Err(ForgeError::router("native laya: no candidate models"));
+        }
+        let (choice, confidence) = self.decide(task, candidates.clone()).await?;
+        if !candidates.contains(&choice) {
+            return Err(ForgeError::router(format!(
+                "native laya answered unknown model {choice:?} (not among candidates)"
+            )));
+        }
+        Ok(RoutingDecision {
+            selected_model: choice,
+            confidence,
+            router_name: "laya-native".to_string(),
+            fallback_used: false,
+            reason: format!("native laya choice (confidence {confidence:.2})"),
+        })
+    }
+}
+
 /// Laya router: System One-compatible HTTP router specialized for Laya's
 /// typed-questions shape. POSTs
 /// `{"state": {"task", "required_capabilities"}, "questions": {"model":
@@ -566,7 +734,7 @@ impl DecisionRouter for LayaRouter {
             "questions": {
                 "model": {
                     "type": "choice",
-                    "instructions": "Which model should handle this software task?",
+                    "instructions": "Which model should handle this software task? Prefer the least expensive model that can correctly complete it.",
                     "criteria": criteria,
                 }
             }
@@ -663,7 +831,8 @@ impl DecisionRouter for ThresholdRouter {
 type RouterCtor =
     fn(&Config, &[(String, ModelCapabilities)]) -> Result<Arc<dyn DecisionRouter>, ForgeError>;
 
-/// `static`, `mock`, `cheapest` are local; `http`/`laya` are HTTP; `needle`
+/// `static`, `mock`, `cheapest`, and `laya-native` are local; `http`/`laya`
+/// are HTTP; `needle`
 /// is the embedded on-device Needle 3 decision router (env
 /// `FORGE_NEEDLE_BACKEND=hash` selects the deterministic test/BDD backend
 /// instead of the real weights-backed engine); `jev` here is always the
@@ -676,6 +845,7 @@ const ROUTER_CTORS: &[(&str, RouterCtor)] = &[
     ("cheapest", build_cheapest),
     ("http", build_http),
     ("laya", build_laya),
+    ("laya-native", build_native_laya),
     ("needle", build_needle),
     ("jev", build_jev_primary),
 ];
@@ -704,7 +874,7 @@ fn build_router(
         // listed: it is test-only and refused without FORGE_TEST_MOCKS, so
         // advertising it here would be pointing users at a dead end.
         None => Err(ForgeError::router(format!(
-            "unknown router {name:?} (expected needle, jev, laya, http, static, or cheapest)"
+            "unknown router {name:?} (expected needle, jev, laya, laya-native, http, static, or cheapest)"
         ))),
     }
 }
@@ -768,19 +938,7 @@ fn build_laya(
     config: &Config,
     _registry: &[(String, ModelCapabilities)],
 ) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
-    let criteria = config
-        .model_entries()
-        .iter()
-        .map(|(name, entry)| {
-            (
-                name.clone(),
-                entry
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| format!("model {name}")),
-            )
-        })
-        .collect();
+    let criteria = cost_aware_laya_criteria(config);
     Ok(Arc::new(
         LayaRouter::builder()
             .url(config.router_url.clone())
@@ -790,6 +948,55 @@ fn build_laya(
             .egress(EgressPolicy::from_config(config))
             .build()?,
     ))
+}
+
+fn build_native_laya(
+    config: &Config,
+    _registry: &[(String, ModelCapabilities)],
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    let criteria = cost_aware_laya_criteria(config);
+    Ok(Arc::new(NativeLayaRouter::new(
+        forge_config::LayaConfig {
+            autofetch: config.laya.autofetch && !config.local_only,
+            ..config.laya.clone()
+        },
+        criteria,
+        Duration::from_millis(config.router_timeout_ms),
+    )))
+}
+
+/// Model criteria given to Laya include real configured/catalogue prices, not
+/// just a name such as "cheap" in prose. Laya remains free to select an
+/// expensive specialist when a task needs it; the price is the explicit
+/// default preference when two candidates can both do the work.
+fn cost_aware_laya_criteria(config: &Config) -> std::collections::HashMap<String, String> {
+    let catalogue = forge_config::catalogue::load_for_routing(config);
+    let book = forge_config::CostBook::new(
+        config.model_entries(),
+        catalogue.as_ref().map(|cached| &cached.catalogue),
+    );
+    let prices: std::collections::HashMap<_, _> = book.priced().collect();
+    config
+        .model_entries()
+        .iter()
+        .map(|(name, entry)| {
+            let description = entry
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("model {name}"));
+            let criterion = match prices.get(name.as_str()) {
+                Some((input, output)) => format!(
+                    "{description}. Price: ${input:.4}/million input tokens and \
+                     ${output:.4}/million output tokens; prefer it when its capabilities are sufficient."
+                ),
+                None => format!(
+                    "{description}. Price is not configured; prefer a known-priced candidate \
+                     unless this model's capabilities are required."
+                ),
+            };
+            (name.clone(), criterion)
+        })
+        .collect()
 }
 
 fn build_needle(
@@ -887,8 +1094,8 @@ fn build_jev(
 /// disclosure just like a remote model endpoint; the two planes share
 /// [`crate::endpoint_is_local`] so "local" means one thing.
 ///
-/// `static`, `cheapest`, `needle` and the test-only `mock` never leave the
-/// process, so they are always allowed.
+/// `static`, `cheapest`, `needle`, `laya-native`, and the test-only `mock`
+/// never leave the process, so they are always allowed.
 ///
 /// `http`/`laya` are judged on their **endpoint**, not their name, because
 /// their endpoint is very often local: `LayaRouter::DEFAULT_URL` is
@@ -1005,7 +1212,7 @@ impl<'a> RouterStackBuilder<'a> {
     }
 
     /// Reject-below-threshold gate for the router classes that report a
-    /// meaningful confidence (`http`/`laya`/`needle`/`jev`); everything else
+    /// meaningful confidence (`http`/`laya`/`laya-native`/`needle`/`jev`); everything else
     /// (`static`, `mock`, `cheapest`) passes through unwrapped, since their
     /// confidence is always 1.0 by construction.
     fn threshold_wrap(
@@ -1013,7 +1220,7 @@ impl<'a> RouterStackBuilder<'a> {
         name: &str,
         router: Arc<dyn DecisionRouter>,
     ) -> Arc<dyn DecisionRouter> {
-        if matches!(name, "http" | "laya" | "needle" | "jev") {
+        if matches!(name, "http" | "laya" | "laya-native" | "needle" | "jev") {
             Arc::new(ThresholdRouter::new(
                 router,
                 self.config.router_confidence_threshold,
@@ -1099,7 +1306,7 @@ impl<'a> RouterStackBuilder<'a> {
 }
 
 /// Build the decision router from configuration: `static`, `mock`,
-/// `cheapest`, `http`, `laya`, `needle`, or `jev`. See [`RouterStackBuilder`]
+/// `cheapest`, `http`, `laya`, `laya-native`, `needle`, or `jev`. See [`RouterStackBuilder`]
 /// for the decomposed steps (primary resolution, threshold gating,
 /// needle -> jev escalation, and the outer fallback wrap).
 pub fn router_from_config(
@@ -1898,7 +2105,7 @@ mod tests {
         assert!(local_only_block("http", &remote).is_some());
         assert!(local_only_block("laya", &remote).is_some());
         assert!(local_only_block("jev", &remote).is_some());
-        for local in ["static", "cheapest", "needle", "mock"] {
+        for local in ["static", "cheapest", "needle", "laya-native", "mock"] {
             assert!(
                 local_only_block(local, &remote).is_none(),
                 "{local} never leaves the process"
@@ -2649,6 +2856,58 @@ mod tests {
             .expect("fallback routes");
         assert_eq!(decision.selected_model, "local-coder");
         assert!(decision.fallback_used);
+    }
+
+    #[tokio::test]
+    async fn native_laya_missing_checkpoint_falls_back_to_cheapest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            router: "laya-native".to_string(),
+            router_fallback: "cheapest".to_string(),
+            router_timeout_ms: 1_000,
+            ..Config::default()
+        };
+        config.laya.weights_path = tmp.path().join("missing-checkpoint").display().to_string();
+        config.laya.autofetch = false;
+        config.models.clear();
+        config.models.insert(
+            "cheap".to_string(),
+            forge_config::ModelEntry {
+                cost_input_per_mtok: Some(0.1),
+                cost_output_per_mtok: Some(0.2),
+                ..forge_config::ModelEntry::default()
+            },
+        );
+        config.models.insert(
+            "strong".to_string(),
+            forge_config::ModelEntry {
+                cost_input_per_mtok: Some(5.0),
+                cost_output_per_mtok: Some(10.0),
+                ..forge_config::ModelEntry::default()
+            },
+        );
+        let registry = [
+            ("cheap".to_string(), caps(true)),
+            ("strong".to_string(), caps(true)),
+        ];
+        let router = router_from_config(&config, &registry).expect("native laya builds lazily");
+        let decision = router
+            .route(&RoutingRequest {
+                task: "simple rename".to_string(),
+                required_capabilities: vec![],
+                candidates: vec!["strong".to_string(), "cheap".to_string()],
+            })
+            .await
+            .expect("cheapest fallback routes");
+
+        assert_eq!(decision.selected_model, "cheap");
+        assert_eq!(decision.router_name, "cheapest");
+        assert!(decision.fallback_used);
+        assert!(
+            decision.reason.contains("native laya"),
+            "{}",
+            decision.reason
+        );
     }
 
     #[tokio::test]

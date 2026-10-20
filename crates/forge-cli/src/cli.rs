@@ -37,7 +37,7 @@ pub struct GlobalOpts {
     #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Override the configured router (needle|jev|laya|http|static|cheapest).
+    /// Override the configured router (needle|jev|laya|laya-native|http|static|cheapest).
     // `mock` is deliberately absent from that list: it is a test-only
     // router that `router_from_config` refuses unless FORGE_TEST_MOCKS=1
     // (see `forge_config::test_mocks`). The flag still accepts it — the
@@ -88,7 +88,7 @@ pub enum Command {
     Init {
         /// Write this named preset as the starter config instead of the
         /// default stack: claude, codex, kimi, local-first, hybrid-needle,
-        /// budget-hosted, hybrid-laya.
+        /// budget-hosted, hybrid-laya, hybrid-laya-native.
         #[arg(long, value_name = "NAME")]
         preset: Option<String>,
     },

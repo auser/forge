@@ -415,8 +415,9 @@ hardware), `decider` (hosted routing from meraGPT's Decider 1) and `jev`
 (hosted TypeSafe Jev as needle's escalation tier — nothing to configure;
 `export TYPESAFE_API_KEY=...` is the one step that arms it), plus
 `local-first` (the default stack, made explicit), `hybrid-needle` (local
-first, hosted escalation), `budget-hosted`, and `hybrid-laya` (the
-Laya-adapter example), and an [`env.example`](examples/env.example)
+first, hosted escalation), `budget-hosted`, `hybrid-laya` (the Laya-adapter
+example), and `hybrid-laya-native` (in-process Rust Laya), and an
+[`env.example`](examples/env.example)
 template for provider keys. An existing config is never overwritten —
 `--preset` says so instead. Unit tests parse every preset (on disk and
 embedded) against the current config schema, so a preset never drifts out
@@ -749,24 +750,12 @@ says so once.
 `--json` promises stdout is one machine-readable value, which a
 conversation cannot honour. Use `forge run --json` instead.
 
-### Known chat-specific limitations
+### Terminal behavior
 
-One is a real gap, not yet fixed, and worth knowing before you rely on the
-behaviour it touches:
-
-- **A background notice can land mid-line.** `notify()` no longer
-  coordinates with an in-progress prompt: an out-of-band line (a
-  `/bg` job finishing, an approval another job needs) prints wherever
-  the cursor happens to be rather than being drawn cleanly above the
-  prompt. This is a deliberate trade, not an oversight: `rustyline`
-  18.0.1's `select()` is missing a buffer-check its sibling `poll()` has,
-  so keeping the `ExternalPrinter` that would coordinate the two meant
-  *any* multi-byte burst arriving at once — a paste, fast type-ahead, a
-  line typed right after Ctrl-C — permanently wedged the editor thread.
-  Interleaved output was judged the smaller cost. The fix already exists
-  upstream (rustyline commit `f2bbcc5`, verified against forge's own pty
-  reproduction); when a release after 18.0.1 ships, the dependency bump
-  restores the `ExternalPrinter` and notices draw above the prompt again.
+Background notices coordinate with the active line editor: a `/bg` job
+finishing or asking for approval is drawn above the prompt, then the prompt
+and any partially typed input are restored. This relies on rustyline 19's
+buffered-input fix and is covered through Forge's real pseudo-terminal tests.
 
 Note that `/graph` in the chat *does* blend semantically when the build
 has a working needle engine and a semantic index (`forge graph build`
@@ -775,9 +764,9 @@ maintains one whenever the engine is available): the same
 now-async `ChatHost::graph_context`. Without an engine or index it is the
 plain lexical ranking — the same degradation as outside the chat.
 
-Beyond those three, see [Known limitations](#known-limitations-v03) for the
-ones shared with the rest of forge (background runs not surviving the
-process, lexical-only skill discovery).
+See [Known limitations](#known-limitations-v03) for constraints shared with
+the rest of forge (background runs not surviving the process, lexical-only
+skill discovery).
 
 ## Command line
 
@@ -816,7 +805,7 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
---router <r>          override the router (needle|jev|laya|http|static|cheapest)
+--router <r>          override the router (needle|jev|laya|laya-native|http|static|cheapest)
 --execution <p>       override the execution provider (native)
 --local-only          refuse any provider or router endpoint that is not on
                       this machine (see "What --local-only restricts")
@@ -854,14 +843,14 @@ Key settings (all optional):
 | `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.). **Setting this overrides *every* model's endpoint**, including hosted `[models]` entries like `claude-sonnet` and `gpt-5` — setting it to the default value still counts as setting it. Per-model endpoints belong in `[models.<name>] base_url`. Combinations that cannot work are refused at startup, naming both settings: an `anthropic`-family model whose endpoint ends in `/v1` (the client appends `/v1/messages`, so it would 404), or an entry whose `provider` contradicts the endpoint (`provider = "anthropic"` pointed at `api.openai.com`) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
+| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `jev` \| `laya` \| `laya-native` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key. Same primary-only fallback rule as `router_url` — the escalation tier never uses it (see `jev_key_env`) |
 | `router_escalate` | `auto` | `FORGE_ROUTER_ESCALATE` | `auto` \| `off` — when `router = "needle"`, escalate to the Jev tier before the static fallback once a Jev credential is present (`auto`, the default) or never (`off`); no-op unless a credential exists and `--local-only` is off |
 | `jev_url` | — | `FORGE_JEV_URL` | Jev/OpenJev endpoint, default `https://api.typesafe.ai/v1/systemone` (or a self-hosted OpenJev server's `/v1/systemone`). Scoped separately from `router_url` so a leftover http/laya `router_url` can never be hijacked into carrying the Jev credential to the wrong host — the escalation tier resolves **only** `jev_url` (or the default); `router = "jev"` as primary also accepts `router_url` as a secondary fallback |
 | `jev_key_env` | — | `FORGE_JEV_KEY_ENV` | Name of the env var holding the Jev credential, default `TYPESAFE_API_KEY`. Same scoping as `jev_url`: the escalation tier never falls back to `router_key_env` |
-| `router_timeout_ms` | `5000` | — | HTTP/needle/jev router timeout |
-| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle/jev decisions escalate to the fallback |
+| `router_timeout_ms` | `5000` | — | HTTP/native-Laya/needle/jev router timeout |
+| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/laya-native/needle/jev decisions escalate to the fallback |
 | `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` |
@@ -873,6 +862,8 @@ Key settings (all optional):
 | `tool_limits.<name>.per_run` | — | — | Maximum attempted calls to the exact tool name in one run |
 | `needle.variant` | `full` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small \| medium \| full); **only `full` has a downloadable artifact today** — Cactus-Compute publishes one 20-layer file, `needle build --layers N` slices smaller ones locally, so `small`/`medium` currently report "no pinned weights artifact" and fall back to static routing. `full` is the default precisely because it's the one that actually fetches; revisit once a smaller rung is hosted |
 | `needle.weights_path` | — | — | Weights override; empty → ~/.cache/forge/models/ |
+| `laya.weights_path` | — | `FORGE_LAYA_WEIGHTS_PATH` | Native Laya checkpoint directory; empty → `~/.cache/forge/models/laya/typed-decisions` |
+| `laya.autofetch` | `true` | `FORGE_LAYA_AUTOFETCH` | Download the pinned ~847 MB native Laya checkpoint on first use; disabled automatically under `local_only` |
 | `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~35 MB for `full`) |
 | `needle.weights_sha256` | — | `FORGE_NEEDLE_WEIGHTS_SHA256` | Operator override for the expected weights checksum (64 hex chars); empty → use the compiled-in pin. Pairs with `weights_path`/a custom base URL to run your own weights without recompiling |
 
@@ -1120,13 +1111,15 @@ Seven modes:
   to static when unreachable or uncredentialed),
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
+- `laya-native` (the same typed-decision model in-process through the Rust
+  `laya` crate; requires a locally provisioned checkpoint),
 - `static` (deterministic rules),
 - `cheapest` (lowest-cost candidate from the `[models]` cost table;
   tie-breaks by output cost then name),
 - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
   to `router_url`, bearer token from `router_key_env`).
 
-`http`/`laya`/`needle`/`jev` decisions below `router_confidence_threshold`
+`http`/`laya`/`laya-native`/`needle`/`jev` decisions below `router_confidence_threshold`
 (default 0.7) are rejected and escalate through the fallback chain: any
 router is wrapped in a fallback (`router_fallback`, default `static`, may be
 `cheapest`), so an unreachable, timing-out, unconfident, or (for `needle`)
@@ -1232,6 +1225,32 @@ Without Forge, the same adapter ships as a plain script:
 `{"answers": {"model": {"choice", "confidence"}}}`. The adapter is optional;
 Forge never requires Python.
 
+### Native Rust Laya
+
+`router = "laya-native"` loads the Laya checkpoint in Forge's process through
+the Rust `laya` crate, so it needs neither Python nor the HTTP adapter. Keep
+the legacy `laya` setting when you intentionally use a compatible external
+endpoint. On its first routing decision, native Laya streams the pinned
+~847 MB `typed-decisions` checkpoint into Forge's cache and verifies the
+model file's SHA-256. Set `autofetch = false` to require an already present
+checkpoint. Keep `router_fallback = "cheapest"` so a download failure, a
+timeout, or low confidence selects the least expensive capable model instead
+of blocking a run.
+
+```toml
+router = "laya-native"
+router_fallback = "cheapest"
+
+[laya]
+# Empty uses ~/.cache/forge/models/laya/typed-decisions.
+# weights_path = "/absolute/path/to/laya/typed-decisions"
+autofetch = true
+```
+
+The directory contains `model.safetensors`, `encoder/`, `tokenizer/`, and
+`rl_agent_config.json`. `local_only = true` disables the automatic download;
+provide the directory first in that case.
+
 ### ExecutionProvider
 
 All command/script execution AND file reads/writes/edits/deletes go through
@@ -1288,8 +1307,13 @@ the caller asked for. `forge skill test <name>` runs the skill's
 — no model calls, no network — stored at `.forge/graph/graph.json` (git-ignored).
 It indexes files, directories, symbols, imports, tests, and basic call sites for
 Rust, Python, JS/TS, and Go (regex-based extraction). Rebuilds are incremental:
-only files whose mtime+hash changed are re-parsed. The graph itself stays
-model-free by design — this never changes even when a needle engine is available.
+only files whose mtime+hash changed are re-parsed. The walker skips common noise
+directories (`.git`, `target`, `node_modules`, …) and never descends into a
+nested checkout — a directory carrying its own `.git` file (a worktree) or
+`.git` directory (a clone) is another project's source, not this one's, and
+indexing it would duplicate symbols the root checkout already has. The graph
+itself stays model-free by design — this never changes even when a needle
+engine is available.
 
 ```bash
 forge graph build              # build / incrementally refresh

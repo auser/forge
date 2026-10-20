@@ -111,21 +111,21 @@ Cross-process background runs (daemon/socket) stay deferred at Phase A level.
 
 ### TICKET-7 — Clean out-of-band printing (rustyline bump)
 
-- Scope: when a rustyline release >18.0.1 ships with upstream `f2bbcc5`,
-  bump it and restore the coordinating `ExternalPrinter`, removing the
-  notify-prints-mid-line artifact; interim `StdoutPrinter` stays until then.
+- Status: complete. Rustyline 19 shipped with upstream `f2bbcc5`; Forge now
+  uses the coordinating `ExternalPrinter`, with `StdoutPrinter` retained only
+  as the unsupported-terminal fallback.
 - Acceptance: `/bg` watcher notices never corrupt a half-typed line in a
   pty test; `docs/reference.md:665-694` limitation 1 removed.
 - Context: `crates/forge-cli/src/chat/terminal_io.rs:292-302` (bug +
   upstream commit reference).
 - Files: forge-cli chat shell, Cargo.toml. ~100–200 lines.
-- Depends on: none (but **externally blocked** on the upstream release).
+- Depends on: none.
 
 ### TICKET-8 — Bounded/incremental `list_runs`
 
-- Scope: runtime-side bounded/incremental session-run listing — today one
-  submitted line re-reads and re-parses every session's whole JSONL log —
-  and completion-snapshot reads move off the executor.
+- Status: complete. Runtime run listing skips historical session logs once
+  its bounded result is full; completion uses parse-free session ids and
+  performs both filesystem reads on Tokio's blocking pool.
 - Acceptance: completion-refresh cost stops scaling with total session-log
   size; `/jobs` and session pickers stay correct; every front end gets the
   improvement through the runtime, not per-adapter patches.
@@ -141,17 +141,18 @@ Cross-process background runs (daemon/socket) stay deferred at Phase A level.
 TICKET-1 (streaming core) ──▶ TICKET-2 (real provider SSE)
                         └──▶ TICKET-3 (chat + ACP render)
 
-TICKET-4, TICKET-5, TICKET-6, TICKET-8   fully independent
-TICKET-7                                  independent, blocked on upstream rustyline release
+TICKET-4, TICKET-5, TICKET-6             fully independent
+TICKET-7                                  complete on rustyline 19
+TICKET-8                                  complete
 ```
 
 ## Suggested execution order
 
-- **Wave 1 (parallel worktrees):** TICKET-1, TICKET-4, TICKET-5, TICKET-6
-  (TICKET-8 also independent — add if a fifth lane exists).
+- **Wave 1 (parallel worktrees):** TICKET-1, TICKET-4, TICKET-5, TICKET-6.
 - **Wave 2:** TICKET-2 and TICKET-3, planned only after TICKET-1 is
   *implemented* (its shape informs theirs).
-- **Opportunistic:** TICKET-7 when rustyline >18.0.1 ships.
+- **Completed:** TICKET-7 after rustyline 19 shipped the required fix;
+  TICKET-8 after bounded runtime listing and off-executor completion reads.
 
 Each ticket enters its own PIV loop via `/piv-plan-implementation`; the
 per-ticket context above is what makes that possible without re-reading

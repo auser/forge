@@ -23,6 +23,14 @@ const SKIP_DIRS: &[&str] = &[
     ".svn",
 ];
 
+/// A directory holding its own `.git` entry — a worktree's `.git` file or a
+/// nested clone's `.git` directory — is a different checkout, not part of
+/// this project's source. Indexing it duplicates symbols the root checkout
+/// already has and drowns ranked context in stale copies.
+fn is_nested_git_root(path: &Path) -> bool {
+    path.join(".git").symlink_metadata().is_ok()
+}
+
 const GRAPH_REL_PATH: &str = ".forge/graph/graph.json";
 
 /// What a build did, per file. Exposed so tests and users can see the
@@ -100,7 +108,8 @@ impl LocalGraph {
             .filter_entry(|e| {
                 !(e.file_type().is_dir()
                     && e.depth() > 0
-                    && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+                    && (SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
+                        || is_nested_git_root(e.path())))
             })
         {
             let entry = entry.map_err(|e| ForgeError::graph(format!("walking project: {e}")))?;

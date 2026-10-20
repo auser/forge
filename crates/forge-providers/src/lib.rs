@@ -15,6 +15,7 @@ mod anthropic;
 mod codex;
 mod credentials;
 mod jev;
+mod laya_weights;
 mod local_only;
 mod model;
 mod observer;

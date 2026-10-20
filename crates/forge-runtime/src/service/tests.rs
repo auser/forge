@@ -2378,6 +2378,55 @@ async fn list_runs_skips_session_files_untouched_since_before_the_cutoff() {
     );
 }
 
+#[tokio::test]
+async fn list_runs_parses_only_the_appended_suffix_after_warmup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let finished = service.run("ask").await.expect("run");
+    service.list_runs().expect("warm the run projection");
+
+    let path = service
+        .sessions()
+        .root()
+        .join(format!("{}.jsonl", finished.session_id));
+    // Poison one byte in the already-indexed prefix. This is test
+    // instrumentation: a full reread now fails, while an incremental read
+    // begins at the old EOF and sees only the valid line appended below.
+    let mut bytes = std::fs::read(&path).expect("read transcript");
+    bytes[0] = b'!';
+    std::fs::write(&path, bytes).expect("poison indexed prefix");
+    let appended = Event::new(
+        "incremental-run",
+        &finished.session_id,
+        EventKind::RunStarted {
+            provider: "mock".into(),
+            model: "mock-local".into(),
+            prompt: "new".into(),
+        },
+    );
+    let mut line = serde_json::to_string(&appended).expect("serialize");
+    line.push('\n');
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open append")
+        .write_all(line.as_bytes())
+        .expect("append event");
+
+    let listed = service
+        .list_runs()
+        .expect("the indexed prefix is not parsed a second time");
+    assert!(
+        listed.iter().any(|run| run.run_id == "incremental-run"),
+        "the appended suffix was folded into the projection: {listed:?}"
+    );
+}
+
 // --- fork ---------------------------------------------------------------
 
 /// Bytes of a session's log file, for "the source was not touched" checks.

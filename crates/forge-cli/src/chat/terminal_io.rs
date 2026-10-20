@@ -198,15 +198,17 @@ impl ChatIo for TerminalIo {
 
     fn notify(&mut self, line: &Line) {
         let text = self.palette.paint(line.style, &line.text);
-        // A fragment continues the line in flight: no trailing newline.
-        // `StdoutPrinter::print` flushes, so it shows now either way.
-        let msg = if line.fragment {
-            text
+        if line.fragment {
+            // Notices are complete lines today. Preserve the trait contract
+            // if a fragment is introduced without forcing a newline through
+            // rustyline's ExternalPrinter, which always adds one.
+            print!("{text}");
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
         } else {
-            format!("{text}\n")
-        };
-        if let Err(e) = self.printer.print(msg) {
-            tracing::debug!(error = %e, "notice print failed; it may be delayed or lost");
+            if let Err(error) = self.printer.print(format!("{text}\n")) {
+                tracing::debug!(%error, "notice print failed; it may be delayed or lost");
+            }
         }
     }
 
@@ -282,41 +284,21 @@ fn editor_thread_main(
         );
     }
 
-    // Deliberately *never* `editor.create_external_printer()`: doing so
-    // switches every keystroke's wait, for the rest of this `Editor`'s life,
-    // from `PosixRawReader::next_key` (which drains its own `BufReader`
-    // before ever asking the OS for more) onto `PosixRawReader::select`
-    // (rustyline 18.0.1, `tty/unix.rs`), which does not — `select`'s sibling
-    // `poll` guards its blocking OS call with `if self.tty_in.buffer().len()
-    // > 0 { return Ok(true) }`; `select` has no such guard before calling
-    // `select::select(..)`. Whenever a single kernel-level read hands
-    // rustyline more than one byte at once — a paste, or exactly the
-    // type-ahead this app means to preserve across a turn (see this
-    // module's doc) — only the first byte is consumed; the rest sit
-    // forever in that private buffer, and the *next* wait for input blocks
-    // in `select` for a new byte that will never arrive, because the OS
-    // already delivered everything it had. `crates/forge-cli/tests/
-    // chat.rs`'s pty tests reproduced this with no Ctrl-C involved at all
-    // (a single `write_all` of a whole line, first read of the session),
-    // and also confirmed a typed Ctrl-C followed by a line typed one byte
-    // at a time never wedges — Ctrl-C itself adds nothing; it is just one
-    // easy way to end up typing the next line quickly enough to burst.
-    // `notify()` therefore always uses [`StdoutPrinter`]: plain, uncoloured,
-    // and unsynchronized with an in-progress prompt, but never able to wedge
-    // the next `readline()`. A notice printed awkwardly beats a chat that
-    // stops accepting input.
-    //
-    // The fix for this already exists upstream: rustyline commit f2bbcc5
-    // ("Check input buffer before polling", 2026-09-12) adds exactly the
-    // guard described above to `wait_for_input`, but no release after
-    // 18.0.1 contains it yet. Verified against this module's own
-    // reproduction (burst-written line after a Ctrl-C, real
-    // `ExternalPrinter` restored, pty suite green) on a `[patch.crates-io]`
-    // build of rustyline master. When a release > 18.0.1 ships: bump the
-    // dependency and restore `editor.create_external_printer()` here
-    // (synchronized notices, prompt redraw included), keeping
-    // `StdoutPrinter` only for terminals that cannot do that.
-    let printer: Box<dyn ExternalPrinter + Send> = Box::new(StdoutPrinter);
+    // Coordinated out-of-band output clears the active input row, prints
+    // the notice above it, then redraws the prompt and the user's buffer.
+    // Rustyline 18.0.1 could wedge after a multi-byte input burst whenever
+    // an ExternalPrinter existed because `wait_for_input` polled the OS
+    // before draining its private buffer. Rustyline 19 contains upstream
+    // fix f2bbcc5 and the real-pty regression below keeps that property
+    // covered. Unsupported terminals still get a functioning, if
+    // uncoordinated, stdout printer.
+    let printer: Box<dyn ExternalPrinter + Send> = editor
+        .create_external_printer()
+        .map(|printer| Box::new(printer) as Box<dyn ExternalPrinter + Send>)
+        .unwrap_or_else(|error| {
+            tracing::debug!(%error, "coordinated terminal notices unavailable");
+            Box::new(StdoutPrinter)
+        });
     if ready_tx.send(StartupResult::Ready(printer)).is_err() {
         return; // the caller gave up before we were ready
     }
@@ -410,11 +392,10 @@ fn build_editor(
     Ok(editor)
 }
 
-/// The only [`ExternalPrinter`] this module uses (see `editor_thread_main`'s
-/// comment on why `create_external_printer` is never called): plain stdout,
-/// unsynchronized with an in-progress prompt. Not wired through [`Palette`]
-/// itself because [`TerminalIo::notify`] already paints the line before
-/// handing it to `print`; this just writes bytes.
+/// Plain-output fallback for terminals where rustyline cannot create its
+/// coordinated printer. Not wired through [`Palette`] itself because
+/// [`TerminalIo::notify`] already paints the line before handing it to
+/// `print`; this just writes bytes.
 struct StdoutPrinter;
 
 impl ExternalPrinter for StdoutPrinter {
