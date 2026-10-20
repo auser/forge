@@ -141,7 +141,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     fn new(io: Io, host: Host) -> Self {
         let interactivity = io.interactivity();
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
-        let mut app = Self {
+        Self {
             io,
             host,
             controller: Controller::new(CompletionSnapshot::default(), interactivity),
@@ -156,9 +156,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             bg_rx,
             input_ended: false,
             exit_code: None,
-        };
-        app.refresh_completions();
-        app
+        }
     }
 
     // --- startup ------------------------------------------------------
@@ -178,7 +176,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 self.render_session_transcript(&id, true);
             }
         }
-        self.refresh_completions();
+        self.refresh_completions().await;
         self.print_banner();
         if let Some(prompt) = start.first_prompt {
             let actions = self.controller.on_line(&prompt);
@@ -198,10 +196,9 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
         self.host
             .service()
             .sessions()
-            .list_sessions()
+            .list_session_ids()
             .ok()?
             .into_iter()
-            .map(|info| info.session_id)
             .max()
     }
 
@@ -327,9 +324,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     }
 
     /// Rebuild the Tab-completion snapshot: discovered skills, user-visible
-    /// models, and — the two calls that matter here — `list_runs()` and
-    /// `sessions().list_sessions()`, both synchronous filesystem reads, the
-    /// former re-reading and re-parsing every session's whole JSONL log.
+    /// models, and the stored run/session names.
     /// The project file list for `@`-completion arrives the same way the
     /// models and skills do — through the host (`ChatHost::project_files`),
     /// which is required to keep that read bounded (`CliHost` mtime-gates
@@ -340,7 +335,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     /// `io.read`, so refreshing on every event a running turn emits would
     /// be doing this filesystem work, scaling with session count and log
     /// size, once per event instead of once per prompt.
-    fn refresh_completions(&mut self) {
+    async fn refresh_completions(&mut self) {
         let skills = self
             .host
             .skills()
@@ -348,20 +343,21 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
             .map(|s| (s.name, s.description))
             .collect();
         let models = self.host.models().into_iter().map(|m| m.name).collect();
-        let jobs = self
-            .host
-            .service()
-            .list_runs()
-            .map(|runs| runs.into_iter().map(|r| r.run_id).collect())
-            .unwrap_or_default();
-        let sessions = self
-            .host
-            .service()
-            .sessions()
-            .list_sessions()
-            .map(|infos| infos.into_iter().map(|s| s.session_id).collect())
-            .unwrap_or_default();
         let paths = self.host.project_files();
+        // Both calls touch the filesystem. Keep them together on Tokio's
+        // blocking pool so scanning on-disk history never occupies an async
+        // executor worker.
+        let service = self.host.service();
+        let (jobs, sessions) = tokio::task::spawn_blocking(move || {
+            let jobs = service
+                .list_runs()
+                .map(|runs| runs.into_iter().map(|run| run.run_id).collect())
+                .unwrap_or_default();
+            let sessions = service.sessions().list_session_ids().unwrap_or_default();
+            (jobs, sessions)
+        })
+        .await
+        .unwrap_or_default();
         self.snapshot = CompletionSnapshot {
             skills,
             models,
@@ -382,7 +378,7 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 // Refresh here, not in the main loop, and not for every
                 // event a running turn emits — see `refresh_completions`'s
                 // doc for why that would be the wrong frequency.
-                self.refresh_completions();
+                self.refresh_completions().await;
             }
             ReadOutcome::Interrupt => self.handle_signal(Signal::Interrupt).await,
             ReadOutcome::Eof => {

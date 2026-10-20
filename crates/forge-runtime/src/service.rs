@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -465,6 +467,40 @@ struct SessionClaim {
     session_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct CachedRunSummary {
+    run_id: String,
+    state: RunState,
+    started_at: DateTime<Utc>,
+    last_event_at: DateTime<Utc>,
+    last_seq: u64,
+    meaningful: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CachedSessionRuns {
+    /// Number of transcript bytes already folded into `runs`.
+    bytes: u64,
+    /// Number of physical lines already read, for useful corruption errors.
+    lines: usize,
+    runs: HashMap<String, CachedRunSummary>,
+}
+
+impl CachedSessionRuns {
+    fn prune_terminal_history(&mut self) {
+        let mut terminal: Vec<(String, DateTime<Utc>)> = self
+            .runs
+            .iter()
+            .filter(|(_, run)| run.state.is_terminal())
+            .map(|(id, run)| (id.clone(), run.last_event_at))
+            .collect();
+        terminal.sort_by_key(|(_, stamp)| std::cmp::Reverse(*stamp));
+        for (id, _) in terminal.into_iter().skip(LISTED_TERMINAL_RUNS) {
+            self.runs.remove(&id);
+        }
+    }
+}
+
 impl Drop for SessionClaim {
     fn drop(&mut self) {
         self.sessions.release(&self.session_id);
@@ -527,6 +563,9 @@ pub struct AgentService {
     /// kept in memory. A turn is a run today; the counter exists so the
     /// log's `turn` column stops being a hardcoded 1 on every record.
     session_turns: Mutex<HashMap<String, u32>>,
+    /// Incremental projection of append-only session logs for `list_runs`.
+    /// A warm listing parses only bytes appended since the previous one.
+    run_listing: Mutex<HashMap<String, CachedSessionRuns>>,
 }
 
 impl AgentService {
@@ -578,6 +617,7 @@ impl AgentService {
             live_sessions: Arc::new(LiveSessions::default()),
             decision_log,
             session_turns: Mutex::new(HashMap::new()),
+            run_listing: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1033,32 +1073,19 @@ impl AgentService {
         // first; the cutoff for skipping old session files unparsed.
         let mut terminal_stamps: Vec<DateTime<Utc>> = Vec::new();
 
-        for (session_id, _path, modified) in self.sessions.session_files_by_recency()? {
+        for (session_id, path, modified) in self.sessions.session_files_by_recency()? {
             if terminal_stamps.len() >= LISTED_TERMINAL_RUNS {
                 let cutoff = terminal_stamps[LISTED_TERMINAL_RUNS - 1];
                 if DateTime::<Utc>::from(modified) <= cutoff {
                     continue;
                 }
             }
-            let events = self.sessions.events_for(&session_id)?;
-            let mut runs: Vec<String> = Vec::new();
-            for event in &events {
-                if !runs.contains(&event.run_id) {
-                    runs.push(event.run_id.clone());
-                }
-            }
-            for run_id in runs {
-                let own: Vec<&Event> = events.iter().filter(|e| e.run_id == run_id).collect();
+            for cached in self.cached_runs_for(&session_id, &path)? {
                 // A fork marker is provenance, not a run.
-                if own.iter().all(|e| {
-                    matches!(
-                        e.kind,
-                        EventKind::SessionForked { .. }
-                            | EventKind::MemoryObservationChanged { .. }
-                    )
-                }) {
+                if !cached.meaningful {
                     continue;
                 }
+                let run_id = cached.run_id;
                 let state = self
                     .finished
                     .lock()
@@ -1066,17 +1093,10 @@ impl AgentService {
                     .states
                     .get(&run_id)
                     .copied()
-                    .unwrap_or_else(|| {
-                        // Only the last event decides; borrow it rather than
-                        // cloning the whole run to ask.
-                        own.last().map_or(RunState::Running, |last| {
-                            RunState::of_events(std::slice::from_ref(*last))
-                        })
-                    });
+                    .unwrap_or(cached.state);
                 seen.insert(run_id.clone());
-                if state.is_terminal()
-                    && let Some(stamp) = own.last().map(|e| e.ts)
-                {
+                if state.is_terminal() {
+                    let stamp = cached.last_event_at;
                     // Keep newest-first so the cutoff is a plain index.
                     let slot = terminal_stamps
                         .binary_search_by(|probe| stamp.cmp(probe))
@@ -1087,9 +1107,9 @@ impl AgentService {
                     run_id,
                     session_id: Some(session_id.clone()),
                     state,
-                    started_at: own.first().map(|e| e.ts),
-                    last_event_at: own.last().map(|e| e.ts),
-                    last_seq: own.iter().map(|e| e.seq).max().unwrap_or(0),
+                    started_at: Some(cached.started_at),
+                    last_event_at: Some(cached.last_event_at),
+                    last_seq: cached.last_seq,
                 });
             }
         }
@@ -1132,6 +1152,74 @@ impl AgentService {
         let mut out = live;
         out.extend(terminal.into_iter().take(LISTED_TERMINAL_RUNS));
         Ok(out)
+    }
+
+    /// Fold the unread suffix of one append-only session log into its
+    /// process-local run summaries. The first call reads the file once;
+    /// later calls read only bytes appended since that snapshot.
+    fn cached_runs_for(
+        &self,
+        session_id: &str,
+        path: &std::path::Path,
+    ) -> Result<Vec<CachedRunSummary>, ForgeError> {
+        let file_len = std::fs::metadata(path).map_err(ForgeError::Io)?.len();
+        let mut listing = self.run_listing.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached = listing.get(session_id).cloned().unwrap_or_default();
+        if file_len < cached.bytes {
+            cached = CachedSessionRuns::default();
+        }
+        if file_len > cached.bytes {
+            let mut file = File::open(path).map_err(ForgeError::Io)?;
+            file.seek(SeekFrom::Start(cached.bytes))
+                .map_err(ForgeError::Io)?;
+            let unread = file_len - cached.bytes;
+            let mut reader = BufReader::new(file.take(unread));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = reader.read_line(&mut line).map_err(ForgeError::Io)?;
+                if read == 0 {
+                    break;
+                }
+                cached.lines += 1;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event: Event = serde_json::from_str(&line).map_err(|e| {
+                    ForgeError::session(format!(
+                        "corrupt event at {}:{}: {e}",
+                        path.display(),
+                        cached.lines
+                    ))
+                })?;
+                let meaningful = !matches!(
+                    &event.kind,
+                    EventKind::SessionForked { .. } | EventKind::MemoryObservationChanged { .. }
+                );
+                let state = RunState::of_events(std::slice::from_ref(&event));
+                cached
+                    .runs
+                    .entry(event.run_id.clone())
+                    .and_modify(|run| {
+                        run.state = state;
+                        run.last_event_at = event.ts;
+                        run.last_seq = run.last_seq.max(event.seq);
+                        run.meaningful |= meaningful;
+                    })
+                    .or_insert_with(|| CachedRunSummary {
+                        run_id: event.run_id,
+                        state,
+                        started_at: event.ts,
+                        last_event_at: event.ts,
+                        last_seq: event.seq,
+                        meaningful,
+                    });
+            }
+            cached.bytes = file_len;
+            cached.prune_terminal_history();
+            listing.insert(session_id.to_string(), cached.clone());
+        }
+        Ok(cached.runs.into_values().collect())
     }
 
     /// Close a run's input channel. The loop treats a closed channel
