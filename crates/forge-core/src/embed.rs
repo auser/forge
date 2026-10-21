@@ -8,6 +8,19 @@ use crate::error::ForgeError;
 #[async_trait]
 pub trait Embedder: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ForgeError>;
+
+    /// Embed corpus entries. Retrieval models may apply a document-specific
+    /// instruction; symmetric embedders keep their existing behaviour.
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ForgeError> {
+        self.embed(texts).await
+    }
+
+    /// Embed search text. Retrieval models may apply a query-specific
+    /// instruction; symmetric embedders keep their existing behaviour.
+    async fn embed_queries(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ForgeError> {
+        self.embed(texts).await
+    }
+
     fn dimensions(&self) -> usize;
     fn model_id(&self) -> String;
 }

@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,8 +14,8 @@ use forge_context::{
 };
 use forge_core::{
     CompletionRequest, DecisionRouter, Event, EventKind, ExecutionProvider, ForgeError, Message,
-    ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, RunState, SessionStore, Skill,
-    SkillMeta, SkillRegistry, TOOL_POLICY_SCHEMA_VERSION, ToolCall, ToolResult,
+    ModelProvider, ProjectGraph, RiskLevel, RoutingPhase, RoutingRequest, RunState, SessionStore,
+    Skill, SkillMeta, SkillRegistry, TOOL_POLICY_SCHEMA_VERSION, ToolCall, ToolResult,
 };
 use forge_needle::NeedleEngine;
 use forge_session::{
@@ -222,7 +224,26 @@ fn has_external_effect(call: &ToolCall) -> bool {
 }
 
 /// Optional parameters for a run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAccess {
+    #[default]
+    All,
+    ReadOnly,
+    None,
+}
+
+impl ToolAccess {
+    fn allows(self, tool: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::ReadOnly => matches!(tool, "read_file" | "graph_context" | "graph_grep"),
+            Self::None => false,
+        }
+    }
+}
+
+/// Optional parameters for a run.
+#[derive(Debug, Default, Clone)]
 pub struct RunOptions {
     /// Pre-generated run id (defaults to a fresh ULID).
     pub run_id: Option<String>,
@@ -237,6 +258,16 @@ pub struct RunOptions {
     /// Add the deterministic inspect/edit/check/review contract as hidden
     /// system context while preserving the user's prompt verbatim.
     pub development_workflow: bool,
+    /// Development phase exposed to model routing and durable route events.
+    pub routing_phase: RoutingPhase,
+    /// Override the text used for routing while preserving `prompt` as the
+    /// actual conversation turn.
+    pub routing_task: Option<String>,
+    /// Restrict the model-visible tool surface for this run.
+    pub tool_access: ToolAccess,
+    /// Ask a read-only planning model to produce the implementation plan
+    /// before the ordinary development workflow executes it.
+    pub plan_before_execute: bool,
     /// Optional durable boundary invoked synchronously around externally
     /// visible tool effects.
     pub effect_journal: Option<Arc<dyn EffectJournal>>,
@@ -263,28 +294,26 @@ struct RunPlan {
     /// options and re-runs discovery on the original task.
     activate_skills: Vec<String>,
     development_workflow: bool,
+    routing_phase: RoutingPhase,
+    tool_access: ToolAccess,
     effect_journal: Option<Arc<dyn EffectJournal>>,
 }
 
 impl RunPlan {
     /// A new instruction: the prompt is the task, and `history` is whatever
     /// the session it lands in already contains (empty for a fresh session).
-    fn new_prompt(
-        prompt: impl Into<String>,
-        history: Vec<Message>,
-        activate_skills: Vec<String>,
-        development_workflow: bool,
-        effect_journal: Option<Arc<dyn EffectJournal>>,
-    ) -> Self {
+    fn new_prompt(prompt: impl Into<String>, history: Vec<Message>, options: RunOptions) -> Self {
         let prompt = prompt.into();
         Self {
-            task: prompt.clone(),
+            task: options.routing_task.unwrap_or_else(|| prompt.clone()),
             prompt,
             history,
             resumed_from: None,
-            activate_skills,
-            development_workflow,
-            effect_journal,
+            activate_skills: options.activate_skills,
+            development_workflow: options.development_workflow,
+            routing_phase: options.routing_phase,
+            tool_access: options.tool_access,
+            effect_journal: options.effect_journal,
         }
     }
 }
@@ -465,6 +494,40 @@ struct SessionClaim {
     session_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct CachedRunSummary {
+    run_id: String,
+    state: RunState,
+    started_at: DateTime<Utc>,
+    last_event_at: DateTime<Utc>,
+    last_seq: u64,
+    meaningful: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CachedSessionRuns {
+    /// Number of transcript bytes already folded into `runs`.
+    bytes: u64,
+    /// Number of physical lines already read, for useful corruption errors.
+    lines: usize,
+    runs: HashMap<String, CachedRunSummary>,
+}
+
+impl CachedSessionRuns {
+    fn prune_terminal_history(&mut self) {
+        let mut terminal: Vec<(String, DateTime<Utc>)> = self
+            .runs
+            .iter()
+            .filter(|(_, run)| run.state.is_terminal())
+            .map(|(id, run)| (id.clone(), run.last_event_at))
+            .collect();
+        terminal.sort_by_key(|(_, stamp)| std::cmp::Reverse(*stamp));
+        for (id, _) in terminal.into_iter().skip(LISTED_TERMINAL_RUNS) {
+            self.runs.remove(&id);
+        }
+    }
+}
+
 impl Drop for SessionClaim {
     fn drop(&mut self) {
         self.sessions.release(&self.session_id);
@@ -488,6 +551,9 @@ pub struct AgentService {
     tasks: Option<Arc<forge_task::JsonlTaskStore>>,
     config: Config,
     graph: Option<Arc<dyn ProjectGraph>>,
+    /// Reviewed repository knowledge linked to paths in the project graph.
+    /// Unlike `system_context`, this is selected per task.
+    project_learnings: Vec<forge_context::ProjectLearning>,
     context_store: Option<Arc<dyn ContextStore>>,
     artifact_store: Option<Arc<dyn forge_context::ArtifactStore>>,
     observer: Option<Arc<crate::observer::ObserverSupervisor>>,
@@ -527,6 +593,9 @@ pub struct AgentService {
     /// kept in memory. A turn is a run today; the counter exists so the
     /// log's `turn` column stops being a hardcoded 1 on every record.
     session_turns: Mutex<HashMap<String, u32>>,
+    /// Incremental projection of append-only session logs for `list_runs`.
+    /// A warm listing parses only bytes appended since the previous one.
+    run_listing: Mutex<HashMap<String, CachedSessionRuns>>,
 }
 
 impl AgentService {
@@ -562,6 +631,7 @@ impl AgentService {
             tasks: None,
             config,
             graph: None,
+            project_learnings: Vec::new(),
             context_store: None,
             artifact_store: None,
             observer: None,
@@ -578,12 +648,23 @@ impl AgentService {
             live_sessions: Arc::new(LiveSessions::default()),
             decision_log,
             session_turns: Mutex::new(HashMap::new()),
+            run_listing: Mutex::new(HashMap::new()),
         }
     }
 
     /// Attach a project graph for context seeding and graph tools.
     pub fn with_graph(mut self, graph: Option<Arc<dyn ProjectGraph>>) -> Self {
         self.graph = graph;
+        self
+    }
+
+    /// Attach repository-owned learnings. They remain data until a task and
+    /// graph slice identify them as relevant.
+    pub fn with_project_learnings(
+        mut self,
+        learnings: Vec<forge_context::ProjectLearning>,
+    ) -> Self {
+        self.project_learnings = learnings;
         self
     }
 
@@ -1033,32 +1114,19 @@ impl AgentService {
         // first; the cutoff for skipping old session files unparsed.
         let mut terminal_stamps: Vec<DateTime<Utc>> = Vec::new();
 
-        for (session_id, _path, modified) in self.sessions.session_files_by_recency()? {
+        for (session_id, path, modified) in self.sessions.session_files_by_recency()? {
             if terminal_stamps.len() >= LISTED_TERMINAL_RUNS {
                 let cutoff = terminal_stamps[LISTED_TERMINAL_RUNS - 1];
                 if DateTime::<Utc>::from(modified) <= cutoff {
                     continue;
                 }
             }
-            let events = self.sessions.events_for(&session_id)?;
-            let mut runs: Vec<String> = Vec::new();
-            for event in &events {
-                if !runs.contains(&event.run_id) {
-                    runs.push(event.run_id.clone());
-                }
-            }
-            for run_id in runs {
-                let own: Vec<&Event> = events.iter().filter(|e| e.run_id == run_id).collect();
+            for cached in self.cached_runs_for(&session_id, &path)? {
                 // A fork marker is provenance, not a run.
-                if own.iter().all(|e| {
-                    matches!(
-                        e.kind,
-                        EventKind::SessionForked { .. }
-                            | EventKind::MemoryObservationChanged { .. }
-                    )
-                }) {
+                if !cached.meaningful {
                     continue;
                 }
+                let run_id = cached.run_id;
                 let state = self
                     .finished
                     .lock()
@@ -1066,17 +1134,10 @@ impl AgentService {
                     .states
                     .get(&run_id)
                     .copied()
-                    .unwrap_or_else(|| {
-                        // Only the last event decides; borrow it rather than
-                        // cloning the whole run to ask.
-                        own.last().map_or(RunState::Running, |last| {
-                            RunState::of_events(std::slice::from_ref(*last))
-                        })
-                    });
+                    .unwrap_or(cached.state);
                 seen.insert(run_id.clone());
-                if state.is_terminal()
-                    && let Some(stamp) = own.last().map(|e| e.ts)
-                {
+                if state.is_terminal() {
+                    let stamp = cached.last_event_at;
                     // Keep newest-first so the cutoff is a plain index.
                     let slot = terminal_stamps
                         .binary_search_by(|probe| stamp.cmp(probe))
@@ -1087,9 +1148,9 @@ impl AgentService {
                     run_id,
                     session_id: Some(session_id.clone()),
                     state,
-                    started_at: own.first().map(|e| e.ts),
-                    last_event_at: own.last().map(|e| e.ts),
-                    last_seq: own.iter().map(|e| e.seq).max().unwrap_or(0),
+                    started_at: Some(cached.started_at),
+                    last_event_at: Some(cached.last_event_at),
+                    last_seq: cached.last_seq,
                 });
             }
         }
@@ -1132,6 +1193,74 @@ impl AgentService {
         let mut out = live;
         out.extend(terminal.into_iter().take(LISTED_TERMINAL_RUNS));
         Ok(out)
+    }
+
+    /// Fold the unread suffix of one append-only session log into its
+    /// process-local run summaries. The first call reads the file once;
+    /// later calls read only bytes appended since that snapshot.
+    fn cached_runs_for(
+        &self,
+        session_id: &str,
+        path: &std::path::Path,
+    ) -> Result<Vec<CachedRunSummary>, ForgeError> {
+        let file_len = std::fs::metadata(path).map_err(ForgeError::Io)?.len();
+        let mut listing = self.run_listing.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached = listing.get(session_id).cloned().unwrap_or_default();
+        if file_len < cached.bytes {
+            cached = CachedSessionRuns::default();
+        }
+        if file_len > cached.bytes {
+            let mut file = File::open(path).map_err(ForgeError::Io)?;
+            file.seek(SeekFrom::Start(cached.bytes))
+                .map_err(ForgeError::Io)?;
+            let unread = file_len - cached.bytes;
+            let mut reader = BufReader::new(file.take(unread));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = reader.read_line(&mut line).map_err(ForgeError::Io)?;
+                if read == 0 {
+                    break;
+                }
+                cached.lines += 1;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event: Event = serde_json::from_str(&line).map_err(|e| {
+                    ForgeError::session(format!(
+                        "corrupt event at {}:{}: {e}",
+                        path.display(),
+                        cached.lines
+                    ))
+                })?;
+                let meaningful = !matches!(
+                    &event.kind,
+                    EventKind::SessionForked { .. } | EventKind::MemoryObservationChanged { .. }
+                );
+                let state = RunState::of_events(std::slice::from_ref(&event));
+                cached
+                    .runs
+                    .entry(event.run_id.clone())
+                    .and_modify(|run| {
+                        run.state = state;
+                        run.last_event_at = event.ts;
+                        run.last_seq = run.last_seq.max(event.seq);
+                        run.meaningful |= meaningful;
+                    })
+                    .or_insert_with(|| CachedRunSummary {
+                        run_id: event.run_id,
+                        state,
+                        started_at: event.ts,
+                        last_event_at: event.ts,
+                        last_seq: event.seq,
+                        meaningful,
+                    });
+            }
+            cached.bytes = file_len;
+            cached.prune_terminal_history();
+            listing.insert(session_id.to_string(), cached.clone());
+        }
+        Ok(cached.runs.into_values().collect())
     }
 
     /// Close a run's input channel. The loop treats a closed channel
@@ -1819,21 +1948,16 @@ impl AgentService {
         options: RunOptions,
     ) -> Result<RunOutcome, ForgeError> {
         self.validate_activate_skills(&options.activate_skills)?;
-        let run_id = options.run_id.unwrap_or_else(new_run_id);
-        let session_id = options.session_id.unwrap_or_else(new_session_id);
+        let run_id = options.run_id.clone().unwrap_or_else(new_run_id);
+        let session_id = options.session_id.clone().unwrap_or_else(new_session_id);
+        let max_turns = options.max_turns;
         let claim = self.claim_session(&session_id, &run_id)?;
         let history = self.session_history(&session_id);
         self.run_tracked(
-            RunPlan::new_prompt(
-                prompt,
-                history,
-                options.activate_skills,
-                options.development_workflow,
-                options.effect_journal,
-            ),
+            RunPlan::new_prompt(prompt, history, options),
             &run_id,
             &session_id,
-            options.max_turns,
+            max_turns,
             claim,
         )
         .await
@@ -1904,8 +2028,8 @@ impl AgentService {
         options: RunOptions,
     ) -> Result<StartedRun, ForgeError> {
         self.validate_activate_skills(&options.activate_skills)?;
-        let run_id = options.run_id.unwrap_or_else(new_run_id);
-        let session_id = options.session_id.unwrap_or_else(new_session_id);
+        let run_id = options.run_id.clone().unwrap_or_else(new_run_id);
+        let session_id = options.session_id.clone().unwrap_or_else(new_session_id);
         let claim = self.claim_session(&session_id, &run_id)?;
         // Create the broadcast channel now so subscribers connecting right
         // after the ids are handed out miss nothing.
@@ -1914,20 +2038,11 @@ impl AgentService {
         let prompt = prompt.into();
         let (rid, sid) = (run_id.clone(), session_id.clone());
         let max_turns = options.max_turns;
-        let activate_skills = options.activate_skills;
-        let development_workflow = options.development_workflow;
-        let effect_journal = options.effect_journal;
         let handle = tokio::spawn(async move {
             let history = service.session_history(&sid);
             service
                 .run_tracked(
-                    RunPlan::new_prompt(
-                        prompt,
-                        history,
-                        activate_skills,
-                        development_workflow,
-                        effect_journal,
-                    ),
+                    RunPlan::new_prompt(prompt, history, options),
                     &rid,
                     &sid,
                     max_turns,
@@ -2175,6 +2290,8 @@ impl AgentService {
             resumed_from,
             activate_skills,
             development_workflow,
+            routing_phase,
+            tool_access,
             effect_journal,
         } = plan;
         let prompt = prompt.as_str();
@@ -2274,7 +2391,10 @@ impl AgentService {
         let decide_tools = tool_definitions();
         // `tool_definitions()` is a fixed surface, so it is always
         // non-empty and does not gate the fast path.
-        let fast = if resumed_from.is_none() && activate_skills.is_empty() {
+        let fast = if resumed_from.is_none()
+            && activate_skills.is_empty()
+            && tool_access == ToolAccess::All
+        {
             let started = std::time::Instant::now();
             let outcome = self.needle_fast_path(prompt, &run_id, &decide_tools).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -2325,6 +2445,7 @@ impl AgentService {
                     EventKind::RoutingDecisionMade {
                         router: NEEDLE_DISPATCH.to_string(),
                         selected_model: "none".to_string(),
+                        phase: routing_phase,
                         confidence: fast.confidence,
                         fallback_used: false,
                         reason: format!(
@@ -2528,6 +2649,7 @@ impl AgentService {
         }
         let routing_request = RoutingRequest {
             task: task.to_string(),
+            phase: routing_phase,
             required_capabilities: Vec::new(),
             candidates,
         };
@@ -2586,6 +2708,7 @@ impl AgentService {
                 EventKind::RoutingDecisionMade {
                     router: decision.router_name.clone(),
                     selected_model: decision.selected_model.clone(),
+                    phase: routing_phase,
                     confidence: decision.confidence,
                     fallback_used: decision.fallback_used,
                     reason: decision.reason.clone(),
@@ -2598,15 +2721,34 @@ impl AgentService {
         // System first is what providers expect, and the history is a real
         // user/assistant/tool transcript that must arrive in its own order.
         let mut messages = self.system_context.clone();
+        if routing_phase == RoutingPhase::Plan {
+            messages.push(Message::system(
+                "Plan this coding request without changing the working tree. Inspect relevant \n\
+                 repository context with the available read-only tools, identify affected files \n\
+                 and invariants, and finish with a concise ordered implementation plan and its \n\
+                 verification steps. Do not claim that edits or checks have already happened."
+                    .to_string(),
+            ));
+        }
+        if routing_phase == RoutingPhase::Review {
+            messages.push(Message::system(
+                "Independently review the completed implementation without changing the working \
+                 tree. Use the available read-only tools only when needed. Prioritize correctness, \
+                 security, regressions, and missing verification. Report actionable findings first \
+                 and say clearly when there are none."
+                    .to_string(),
+            ));
+        }
         if development_workflow {
             messages.push(Message::system(
                 "Complete this coding request as one bounded workflow: inspect the relevant \n\
                  repository context before changing files; make only the requested edits; run \n\
                  focused checks defined by repository instructions or the affected project; then \n\
-                 review the working-tree changes. During review, use run_command with `git diff \n\
-                 --no-ext-diff --` so Forge can return the reviewable diff. Do not commit, push, \n\
-                 publish, deploy, or contact external services. Keep the final review concise and \n\
-                 state which checks ran."
+                 capture the working-tree changes once with run_command using `git diff \n\
+                 --no-ext-diff --` so Forge can return the reviewable diff. Do not reread files \n\
+                 merely to confirm successful edits. Once the requested change and focused checks \n\
+                 are complete, stop using tools and summarize; Forge performs an independent \n\
+                 review next. Do not commit, push, publish, deploy, or contact external services."
                     .to_string(),
             ));
         }
@@ -2648,7 +2790,7 @@ impl AgentService {
             }
         }
         let skills_end = messages.len();
-        if let Some(graph) = &self.graph {
+        let graph_paths = if let Some(graph) = &self.graph {
             let hits = graph.context(task, 5);
             if !hits.is_empty() {
                 let listing = hits
@@ -2660,6 +2802,28 @@ impl AgentService {
                     "Relevant project files (from the project graph):\n{listing}"
                 )));
             }
+            hits.into_iter().map(|hit| hit.path).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let learnings =
+            forge_context::relevant_project_learnings(&self.project_learnings, task, &graph_paths);
+        if !learnings.is_empty() {
+            let listing = learnings
+                .iter()
+                .map(|learning| {
+                    format!(
+                        "- {:?} ({}): {}",
+                        learning.kind,
+                        learning.path.display(),
+                        learning.guidance
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            messages.push(Message::system(format!(
+                "Relevant reviewed project learnings. Follow guardrails and use decisions as context:\n{listing}"
+            )));
         }
         let graph_end = messages.len();
         messages.extend(history);
@@ -2691,11 +2855,21 @@ impl AgentService {
         // offered the full surface above regardless of this — a chat-only
         // model receives zero tools, exactly as before the reorder.
         let mut tools = if model.capabilities().tools {
-            decide_tools
+            match tool_access {
+                ToolAccess::All => decide_tools,
+                ToolAccess::ReadOnly => decide_tools
+                    .into_iter()
+                    .filter(|tool| tool_access.allows(&tool.name))
+                    .collect(),
+                ToolAccess::None => Vec::new(),
+            }
         } else {
             Vec::new()
         };
-        if model.capabilities().tools && self.artifact_store.is_some() {
+        if tool_access == ToolAccess::All
+            && model.capabilities().tools
+            && self.artifact_store.is_some()
+        {
             tools.push(crate::tools::artifact_tool_definition());
         }
 
@@ -2940,7 +3114,14 @@ impl AgentService {
                     call_id: call.id.clone(),
                     event_seq: collected.last().expect("persisted tool request").seq,
                 };
-                let reservation = tool_quotas.reserve(&call.name);
+                let reservation = if tool_access.allows(&call.name) {
+                    tool_quotas.reserve(&call.name)
+                } else {
+                    Err(format!(
+                        "tool `{}` is unavailable during the {:?} phase",
+                        call.name, routing_phase
+                    ))
+                };
                 let mut effect_may_execute = false;
                 if let Some(mut policy) = dispatcher.evaluate_policy(call) {
                     if reservation.is_err() {
@@ -3406,6 +3587,8 @@ impl AgentService {
                 // original task, exactly as the run being continued did.
                 activate_skills: Vec::new(),
                 development_workflow: options.development_workflow,
+                routing_phase: options.routing_phase,
+                tool_access: options.tool_access,
                 effect_journal: options.effect_journal,
             },
             &resumed_run,

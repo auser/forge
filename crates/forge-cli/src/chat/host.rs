@@ -29,9 +29,9 @@ use forge_chat::{
     ChatHost, ConfigLine, ContextLine, Environment, HostChange, ModelChoice, NeedleState,
     SkillChoice,
 };
+use forge_core::embed::Embedder;
 use forge_core::{ForgeError, ProjectGraph as _};
 use forge_execution::ApprovalChannel;
-use forge_needle::EngineEmbedder;
 use forge_runtime::AgentService;
 
 use crate::cli::AuthProvider;
@@ -60,14 +60,13 @@ pub struct CliHost {
     /// needle is even in play) never changes for the life of a
     /// conversation — only the model and the approval mode do.
     needle: NeedleState,
-    /// The on-device embedder for `/context`'s semantic blend, when this
-    /// build has a working engine and weights. Built once at construction
+    /// The configured embedder for `/context`'s semantic blend. Built once at construction
     /// for the same reason as `needle`: nothing a chat session does can
     /// change it (a brain fetched by `forge init` in another window is
     /// picked up on the next chat, not mid-conversation). `None` means
     /// `/context` ranks lexically — the same degradation `forge graph
     /// context` has without an engine.
-    embedder: Option<EngineEmbedder>,
+    embedder: Option<Arc<dyn Embedder>>,
     /// `project_files`' cache: the loaded path list keyed by the graph
     /// file's mtime (`None` = the file was absent at load). `refresh_
     /// completions` calls this once per submitted line, so the steady
@@ -113,15 +112,12 @@ impl CliHost {
         };
         let service = build_run_service_with(&ctx, options.clone()).await?;
         let needle = needle_state(service.config()).await;
-        // Embedding is an engine capability, not a routing choice: no
-        // `router = "needle"` gate here, mirroring `forge graph context`'s
-        // `context_embedder`. A second `info()` round-trip on the shared,
-        // cached engine — cheap. An embedder that fails to build degrades
-        // to lexical ranking rather than failing chat startup.
-        let embedder = match forge_needle::engine_if_available(service.config()).await {
-            Some(engine) => EngineEmbedder::new(engine).await.ok(),
-            None => None,
-        };
+        // Embedding is independent from routing. An unavailable provider
+        // degrades chat context to lexical ranking rather than blocking chat.
+        let embedder = forge_providers::embedder_from_config(service.config())
+            .await
+            .ok()
+            .flatten();
         Ok(Self {
             ctx,
             root,
@@ -353,7 +349,7 @@ impl ChatHost for CliHost {
         steering: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ContextLine>, ForgeError> {
-        context_lines(&self.root, self.embedder.as_ref(), query, steering, limit).await
+        context_lines(&self.root, self.embedder.as_deref(), query, steering, limit).await
     }
 }
 
@@ -371,20 +367,13 @@ impl ChatHost for CliHost {
 /// nothing.
 async fn context_lines(
     root: &Path,
-    embedder: Option<&EngineEmbedder>,
+    embedder: Option<&dyn Embedder>,
     query: &str,
     steering: Option<&str>,
     limit: usize,
 ) -> Result<Vec<ContextLine>, ForgeError> {
     let graph = forge_graph::LocalGraph::open(root)?;
-    let hits = forge_graph::blended_context(
-        &graph,
-        embedder.map(|e| e as &dyn forge_core::embed::Embedder),
-        query,
-        steering,
-        limit,
-    )
-    .await?;
+    let hits = forge_graph::blended_context(&graph, embedder, query, steering, limit).await?;
     Ok(hits
         .into_iter()
         .map(|hit| ContextLine {

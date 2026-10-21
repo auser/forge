@@ -64,7 +64,7 @@ fn matching_index(graph: &LocalGraph, embedder: &dyn Embedder) -> Option<Embeddi
 /// contract.
 async fn embed_one(embedder: &dyn Embedder, text: &str) -> Result<Vec<f32>, ForgeError> {
     embedder
-        .embed(&[text.to_string()])
+        .embed_queries(&[text.to_string()])
         .await?
         .into_iter()
         .next()
@@ -199,8 +199,7 @@ async fn blend(
 
 /// Search the semantic index instead of literal/regex matching. Requires a
 /// working embedder AND an index built by a matching model; either gap is
-/// reported the same way, since the fix is the same either way (`forge
-/// init` to fetch weights, then `forge graph build`).
+/// reported as an actionable graph error.
 pub async fn semantic_grep(
     graph: &LocalGraph,
     embedder: Option<&dyn Embedder>,
@@ -208,7 +207,7 @@ pub async fn semantic_grep(
     limit: usize,
 ) -> Result<Vec<(String, f32)>, ForgeError> {
     let embedder = embedder.ok_or_else(|| {
-        ForgeError::graph("semantic search needs needle weights (run forge init)")
+        ForgeError::graph("semantic search needs an available embedding provider")
     })?;
     let index = matching_index(graph, embedder).ok_or_else(|| {
         ForgeError::graph("semantic index not built or stale; run `forge graph build --semantic`")
@@ -404,7 +403,7 @@ mod tests {
         let err = semantic_grep(&graph, None, "needle", 5)
             .await
             .expect_err("no embedder");
-        assert!(err.to_string().contains("forge init"), "{err}");
+        assert!(err.to_string().contains("embedding provider"), "{err}");
     }
 
     #[tokio::test]

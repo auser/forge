@@ -7,7 +7,7 @@ Feature: First-run diagnostics
   Scenario: A pre-needle laya router setting is called out by init
     Given a project config sets the router to "laya"
     When I run "forge init"
-    Then the init output mentions "embedded needle brain"
+    Then the init output mentions "native Laya"
 
   Scenario: A pre-needle laya router setting is called out by doctor
     Given a project config sets the router to "laya"

@@ -37,7 +37,7 @@ pub struct GlobalOpts {
     #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Override the configured router (needle|jev|laya|http|static|cheapest).
+    /// Override the configured router (needle|jev|laya|laya-native|http|static|cheapest).
     // `mock` is deliberately absent from that list: it is a test-only
     // router that `router_from_config` refuses unless FORGE_TEST_MOCKS=1
     // (see `forge_config::test_mocks`). The flag still accepts it — the
@@ -88,7 +88,7 @@ pub enum Command {
     Init {
         /// Write this named preset as the starter config instead of the
         /// default stack: claude, codex, kimi, local-first, hybrid-needle,
-        /// budget-hosted, hybrid-laya.
+        /// budget-hosted, hybrid-laya, hybrid-laya-native.
         #[arg(long, value_name = "NAME")]
         preset: Option<String>,
     },
@@ -104,6 +104,9 @@ pub enum Command {
         /// the prompt matches. An unknown name is an error.
         #[arg(long = "skill", value_name = "NAME")]
         skills: Vec<String>,
+        /// Route a read-only planning pass before the implementation run.
+        #[arg(long)]
+        plan: bool,
     },
 
     /// Serve the Model Context Protocol over stdio (for editors and agent
@@ -245,6 +248,20 @@ pub struct LearnScopeArgs {
 
 #[derive(Subcommand)]
 pub enum LearnCommand {
+    /// Add a reviewed repository learning. With no `--touch`, Forge links it
+    /// to the files currently changed in git.
+    Add {
+        #[arg(value_name = "GUIDANCE")]
+        guidance: String,
+        /// One repository-relative file affected by this learning (repeatable).
+        #[arg(long, value_name = "PATH")]
+        touch: Vec<String>,
+        /// decision, preference, guardrail, or runbook (defaults to decision).
+        #[arg(long, default_value = "decision", value_name = "KIND")]
+        kind: String,
+    },
+    /// Show reviewed learnings affected by the current working-tree diff.
+    Check,
     /// Analyze recurrence and persist reviewable pending proposals.
     Propose {
         #[command(flatten)]
@@ -397,7 +414,7 @@ pub enum GraphCommand {
         #[arg(value_name = "PATTERN")]
         pattern: String,
         /// Search the local semantic embedding index instead of literal
-        /// text/regex matching (requires needle weights; see `forge init`).
+        /// text/regex matching (requires a configured embedding provider).
         #[arg(long)]
         semantic: bool,
     },

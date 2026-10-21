@@ -542,10 +542,12 @@ fn init_is_idempotent() {
 
     let gitignore = std::fs::read_to_string(project.join(".gitignore")).expect("gitignore");
     assert_eq!(
-        gitignore.lines().filter(|l| *l == ".forge/").count(),
+        gitignore.lines().filter(|l| *l == ".forge/*").count(),
         1,
-        "gitignore must contain exactly one .forge/ line"
+        "gitignore must contain exactly one .forge/* line"
     );
+    assert!(gitignore.lines().any(|l| l == "!.forge/learnings/"));
+    assert!(gitignore.lines().any(|l| l == "!.forge/learnings/*.md"));
     assert!(project.join(".forge/graph").is_dir());
     assert!(project.join(".forge/sessions").is_dir());
     assert!(project.join(".forge/config.toml").is_file());
@@ -1181,7 +1183,7 @@ fn run_works_offline_with_mock_model() {
     // Mock is opt-in: request it explicitly.
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"mock-local\"\n",
+        "model = \"mock-local\"\nrouter = \"static\"\n",
     )
     .expect("write config");
 
@@ -1249,7 +1251,7 @@ fn project_with_demo_skill(tmp: &Path) -> PathBuf {
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"mock-local\"\n",
+        "model = \"mock-local\"\nrouter = \"static\"\n",
     )
     .expect("write config");
     let skill = project.join(".forge").join("skills").join("demo");
@@ -1335,7 +1337,7 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"mock-local\"\n",
+        "model = \"mock-local\"\nrouter = \"static\"\n",
     )
     .expect("write config");
 
@@ -1541,7 +1543,7 @@ fn graph_build_check_map_and_stale_detection() {
 }
 
 #[test]
-fn graph_semantic_grep_needs_needle_weights_without_an_engine() {
+fn graph_semantic_grep_needs_an_available_embedding_provider() {
     // No engine available to this run (engine-less build, or engine-linked
     // but the hermetic HOME has no weights, and no FORGE_NEEDLE_BACKEND hook):
     // `engine_if_available` must report unavailable, and `graph grep
@@ -1568,9 +1570,74 @@ fn graph_semantic_grep_needs_needle_weights_without_an_engine() {
     assert!(!grep.status.success());
     let stderr = String::from_utf8_lossy(&grep.stderr);
     assert!(
-        stderr.contains("semantic search needs needle weights (run forge init)"),
+        stderr.contains("semantic search needs an available embedding provider"),
         "stderr: {stderr}"
     );
+}
+
+#[tokio::test]
+async fn graph_semantic_build_and_search_use_embeddinggemma2() {
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let mut vector = vec![0.0; 128];
+    vector[0] = 1.0;
+    for input in [
+        "title: none | text: function main in src/main.rs",
+        "task: code retrieval | query: find entry point",
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(serde_json::json!({
+                "model": "embeddinggemma-2-test",
+                "input": [input]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"index": 0, "embedding": vector.clone()}]
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join("src")).expect("mkdir");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir config");
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write source");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        format!(
+            "[embedding]\nprovider = \"embeddinggemma2\"\nbase_url = \"{}/v1\"\nmodel = \"embeddinggemma-2-test\"\ndimensions = 128\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+
+    let build = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "build", "--semantic"])
+        .output()
+        .expect("build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let search = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "grep", "--semantic", "find entry point"])
+        .output()
+        .expect("search");
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    assert!(String::from_utf8_lossy(&search.stdout).contains("src/main.rs::main"));
 }
 
 #[test]
@@ -1772,7 +1839,7 @@ fn scripted_mock_loop_edits_file_and_emits_tool_events() {
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"scripted-mock\"\nmock_script = \"script.json\"\napproval = \"auto\"\n",
+        "model = \"scripted-mock\"\nmock_script = \"script.json\"\nrouter = \"static\"\napproval = \"auto\"\n",
     )
     .expect("write config");
 
@@ -1841,7 +1908,7 @@ fn max_turns_flag_bounds_the_loop() {
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"scripted-mock\"\nmock_script = \"script.json\"\n",
+        "model = \"scripted-mock\"\nmock_script = \"script.json\"\nrouter = \"static\"\n",
     )
     .expect("write config");
 
@@ -3182,6 +3249,7 @@ fn learning_proposals_are_local_reviewable_explicit_and_measured() {
     assert_eq!(metrics["recurrence_after_acceptance"], 1);
 
     let gitignore = std::fs::read_to_string(project.join(".gitignore")).unwrap();
-    assert!(gitignore.lines().any(|line| line.trim() == ".forge/"));
+    assert!(gitignore.contains(".forge/*"), "{gitignore}");
+    assert!(gitignore.contains("!.forge/learnings/*.md"), "{gitignore}");
     assert!(project.join(".forge/context/learning/index.json").is_file());
 }

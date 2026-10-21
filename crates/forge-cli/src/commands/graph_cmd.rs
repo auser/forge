@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 use forge_core::embed::Embedder;
 use forge_core::{ForgeError, ProjectGraph};
 use forge_graph::{EMBEDDINGS_REL_PATH, EmbeddingIndex, LocalGraph};
-use forge_needle::EngineEmbedder;
 
 use crate::cli::GraphCommand;
 use crate::commands::Context;
@@ -90,16 +89,15 @@ async fn build(ctx: &Context, semantic: bool) -> Result<(), ForgeError> {
 
 /// After a successful `build_report()`, refresh the local semantic index —
 /// Graph structure itself stays model-free; this explicit, additive step
-/// requires a working needle engine. The index is saved after every batch so
+/// requires a working embedding provider. The index is saved after every batch so
 /// an interrupted first build resumes from its latest completed checkpoint.
 async fn embed_after_build(ctx: &Context, graph: &LocalGraph) -> Result<usize, ForgeError> {
     let resolved = ctx.resolve_config()?;
-    let Some(engine) = forge_needle::engine_if_available(&resolved.config).await else {
+    let Some(embedder) = forge_providers::embedder_from_config(&resolved.config).await? else {
         return Err(ForgeError::graph(
-            "semantic graph build needs needle weights (run forge init)",
+            "semantic graph build needs an available embedding provider",
         ));
     };
-    let embedder = EngineEmbedder::new(engine).await?;
 
     let index_path = graph.root().join(EMBEDDINGS_REL_PATH);
     // A stored index built with a different model/dimensionality is not
@@ -130,7 +128,7 @@ async fn embed_after_build(ctx: &Context, graph: &LocalGraph) -> Result<usize, F
     }
     for batch in pending.chunks(EMBED_BATCH_SIZE) {
         let texts: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
-        let vectors = embedder.embed(&texts).await?;
+        let vectors = embedder.embed_documents(&texts).await?;
         for ((key, hash, _), vector) in batch.iter().zip(vectors) {
             index.upsert(key.clone(), hash.clone(), vector);
             embedded += 1;
@@ -241,20 +239,11 @@ fn grep(ctx: &Context, pattern: &str) -> Result<(), ForgeError> {
 }
 
 /// Search the local semantic index instead of literal/regex matching.
-/// Requires a genuinely working needle engine (not just a constructible
-/// one — see `engine_if_available`) and an index built by a matching
-/// model; either gap is reported the same way, since the fix is the same
-/// either way (`forge init` to fetch weights, then `forge graph build`).
+/// Requires a working configured embedder and an index built by that model.
 async fn grep_semantic(ctx: &Context, query: &str) -> Result<(), ForgeError> {
     let graph = open_built(ctx)?;
     let embedder = context_embedder(ctx).await?;
-    let results = forge_graph::semantic_grep(
-        &graph,
-        embedder.as_ref().map(|e| e as &dyn Embedder),
-        query,
-        20,
-    )
-    .await?;
+    let results = forge_graph::semantic_grep(&graph, embedder.as_deref(), query, 20).await?;
 
     if ctx.global.json {
         let out: Vec<serde_json::Value> = results
@@ -337,14 +326,8 @@ async fn context(ctx: &Context, query: &str, steer: Option<&str>) -> Result<(), 
     // One ranking implementation for every adapter: `forge_graph_context`
     // over MCP calls the same function with the same embedder seam.
     let embedder = context_embedder(ctx).await?;
-    let blended = forge_graph::blended_context(
-        &graph,
-        embedder.as_ref().map(|e| e as &dyn Embedder),
-        query,
-        steer,
-        10,
-    )
-    .await?;
+    let blended =
+        forge_graph::blended_context(&graph, embedder.as_deref(), query, steer, 10).await?;
 
     if ctx.global.json {
         let out: Vec<serde_json::Value> = blended
@@ -375,10 +358,9 @@ async fn context(ctx: &Context, query: &str, steer: Option<&str>) -> Result<(), 
 
 /// The on-device embedder when one is genuinely usable, else `None`
 /// (which keeps ranking lexical). Absence is normal, never an error.
-async fn context_embedder(ctx: &Context) -> Result<Option<EngineEmbedder>, ForgeError> {
+async fn context_embedder(
+    ctx: &Context,
+) -> Result<Option<std::sync::Arc<dyn Embedder>>, ForgeError> {
     let resolved = ctx.resolve_config()?;
-    let Some(engine) = forge_needle::engine_if_available(&resolved.config).await else {
-        return Ok(None);
-    };
-    Ok(Some(EngineEmbedder::new(engine).await?))
+    forge_providers::embedder_from_config(&resolved.config).await
 }

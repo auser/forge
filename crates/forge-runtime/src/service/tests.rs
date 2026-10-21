@@ -2378,6 +2378,55 @@ async fn list_runs_skips_session_files_untouched_since_before_the_cutoff() {
     );
 }
 
+#[tokio::test]
+async fn list_runs_parses_only_the_appended_suffix_after_warmup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let service = scripted_service(
+        tmp.path(),
+        vec![text_reply("done")],
+        forge_core::ApprovalPolicy::Auto,
+    );
+    let finished = service.run("ask").await.expect("run");
+    service.list_runs().expect("warm the run projection");
+
+    let path = service
+        .sessions()
+        .root()
+        .join(format!("{}.jsonl", finished.session_id));
+    // Poison one byte in the already-indexed prefix. This is test
+    // instrumentation: a full reread now fails, while an incremental read
+    // begins at the old EOF and sees only the valid line appended below.
+    let mut bytes = std::fs::read(&path).expect("read transcript");
+    bytes[0] = b'!';
+    std::fs::write(&path, bytes).expect("poison indexed prefix");
+    let appended = Event::new(
+        "incremental-run",
+        &finished.session_id,
+        EventKind::RunStarted {
+            provider: "mock".into(),
+            model: "mock-local".into(),
+            prompt: "new".into(),
+        },
+    );
+    let mut line = serde_json::to_string(&appended).expect("serialize");
+    line.push('\n');
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open append")
+        .write_all(line.as_bytes())
+        .expect("append event");
+
+    let listed = service
+        .list_runs()
+        .expect("the indexed prefix is not parsed a second time");
+    assert!(
+        listed.iter().any(|run| run.run_id == "incremental-run"),
+        "the appended suffix was folded into the projection: {listed:?}"
+    );
+}
+
 // --- fork ---------------------------------------------------------------
 
 /// Bytes of a session's log file, for "the source was not touched" checks.
@@ -2633,6 +2682,53 @@ async fn run_seeds_graph_context_when_available() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(system.contains("src/util.rs"), "system context: {system}");
+}
+
+#[tokio::test]
+async fn run_injects_only_project_learnings_linked_by_the_graph() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("src")).expect("mkdir");
+    std::fs::write(tmp.path().join("src/payments.rs"), "fn charge() {}\n").expect("write");
+    std::fs::write(tmp.path().join("src/other.rs"), "fn unrelated() {}\n").expect("write");
+    let mut graph = forge_graph::LocalGraph::open(tmp.path()).expect("open");
+    forge_core::ProjectGraph::build(&mut graph).expect("build");
+    let learnings = vec![
+        forge_context::ProjectLearning {
+            path: ".forge/learnings/payment.md".into(),
+            kind: forge_context::ProjectLearningKind::Guardrail,
+            touches: vec!["src/payments.rs".into()],
+            guidance: "Never log card tokens.".into(),
+        },
+        forge_context::ProjectLearning {
+            path: ".forge/learnings/other.md".into(),
+            kind: forge_context::ProjectLearningKind::Decision,
+            touches: vec!["src/other.rs".into()],
+            guidance: "This must stay out of the request.".into(),
+        },
+    ];
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("done")]));
+    let recorded = model.clone();
+    let service = AgentService::new(
+        model,
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(tmp.path().join(".forge/sessions"))),
+        Config::default(),
+    )
+    .with_graph(Some(Arc::new(graph)))
+    .with_project_learnings(learnings);
+
+    service.run("fix charge").await.expect("run");
+    let system = recorded.recorded()[0]
+        .messages
+        .iter()
+        .filter(|message| message.role == forge_core::Role::System)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(system.contains("Never log card tokens."), "{system}");
+    assert!(!system.contains("stay out of the request"), "{system}");
 }
 
 #[tokio::test]

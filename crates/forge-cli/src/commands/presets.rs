@@ -22,6 +22,10 @@ pub const PRESETS: &[(&str, &str)] = &[
         include_str!("../../../../examples/configs/hybrid-laya.toml"),
     ),
     (
+        "hybrid-laya-native",
+        include_str!("../../../../examples/configs/hybrid-laya-native.toml"),
+    ),
+    (
         "claude",
         include_str!("../../../../examples/configs/claude.toml"),
     ),

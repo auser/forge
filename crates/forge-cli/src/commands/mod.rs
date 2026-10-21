@@ -139,7 +139,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             prompt,
             max_turns,
             skills,
-        }) => run_cmd::run(&ctx, prompt, max_turns, skills).await,
+            plan,
+        }) => run_cmd::run(&ctx, prompt, max_turns, skills, plan).await,
         Some(Command::Resume { id }) => session_cmd::resume(&ctx, &id).await,
         Some(Command::Cancel { id }) => session_cmd::cancel(&ctx, &id),
         Some(Command::Session { command }) => match command.unwrap_or(SessionCommand::List) {

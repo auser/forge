@@ -194,6 +194,22 @@ impl JsonlSessionStore {
         Ok(out)
     }
 
+    /// Session ids without reading transcript contents.
+    ///
+    /// Completion pickers only need names. Routing them through
+    /// [`list_sessions`](Self::list_sessions) made each prompt submission
+    /// count every line in every transcript, so refresh time grew with the
+    /// complete project history even after run listing itself was bounded.
+    pub fn list_session_ids(&self) -> Result<Vec<String>, ForgeError> {
+        let mut ids: Vec<String> = self
+            .session_files_by_recency()?
+            .into_iter()
+            .map(|(session_id, _, _)| session_id)
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
     /// Session transcript files under the root — session id, path and
     /// modification time, **newest-modified first** — without reading any
     /// of them. This is the enumeration for callers (like
@@ -395,6 +411,23 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "sess-a");
         assert_eq!(sessions[1].event_count, 2);
+    }
+
+    #[test]
+    fn session_ids_do_not_parse_transcripts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = JsonlSessionStore::new(tmp.path());
+        std::fs::write(tmp.path().join("sess-b.jsonl"), [0xff]).expect("write");
+        std::fs::write(tmp.path().join("sess-a.jsonl"), [0xfe]).expect("write");
+
+        assert_eq!(
+            store.list_session_ids().expect("list ids"),
+            ["sess-a", "sess-b"]
+        );
+        assert!(
+            store.list_sessions().is_err(),
+            "the control call proves reading transcript contents would fail"
+        );
     }
 
     /// The decision log lives beside the transcripts as

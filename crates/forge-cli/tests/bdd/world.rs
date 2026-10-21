@@ -318,17 +318,37 @@ impl BddWorld {
             if i > 0 {
                 wait_for_quiescence(&stdout_buf, Duration::from_millis(200)).await;
             }
-            if i > 0 && *line == "/fork" && !lines[i - 1].starts_with('/') {
+            if i > 0 && matches!(*line, "y" | "n") {
+                // A fast static route can go quiet before its tool call reaches
+                // the approval gate. Wait for the visible prompt so the answer
+                // cannot be consumed as a queued chat message instead.
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while !stdout_buf
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains("approval needed:")
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("approval prompt did not appear before scripted answer");
+            }
+            if i > 0
+                && matches!(*line, "/fork" | "/show" | "/quit")
+                && !lines[i - 1].starts_with('/')
+            {
                 // Silence during startup/provider work is not turn completion.
-                // The idle-only /fork scenario must wait for the rendered
-                // footer, not race the controller with a fixed quiet interval.
+                // Commands that inspect or move completed work must wait for
+                // the rendered footer, not race the controller with a fixed
+                // quiet interval.
                 tokio::time::timeout(Duration::from_secs(15), async {
                     while completed_turns() <= completed_before_previous_input {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 })
                 .await
-                .expect("chat turn did not finish before /fork");
+                .expect("chat turn did not finish before completion-dependent command");
             }
             completed_before_previous_input = completed_turns();
             stdin
@@ -704,6 +724,15 @@ impl BddWorld {
     /// Set/replace a config key line (TOML `key = value`); flushed to
     /// `.forge/config.toml` by `flush_config`.
     pub fn set_config(&mut self, key: &str, value: &str) {
+        if key == "model"
+            && matches!(value.trim_matches('"'), "mock-local" | "scripted-mock")
+            && !self
+                .config_lines
+                .iter()
+                .any(|line| line.starts_with("router ="))
+        {
+            self.config_lines.push("router = \"static\"".to_string());
+        }
         let prefix = format!("{key} =");
         self.config_lines.retain(|l| !l.starts_with(&prefix));
         self.config_lines.push(format!("{prefix} {value}"));

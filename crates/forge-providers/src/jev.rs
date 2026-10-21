@@ -43,7 +43,9 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use forge_core::{DecisionRouter, ForgeError, ModelCapabilities, RoutingDecision, RoutingRequest};
+use forge_core::{
+    DecisionRouter, ForgeError, ModelCapabilities, RoutingDecision, RoutingPhase, RoutingRequest,
+};
 
 use crate::local_only::EgressPolicy;
 use crate::router::{filter_candidates, optimistic_caps};
@@ -249,13 +251,23 @@ impl DecisionRouter for JevRouter {
                 )
             })
             .collect();
+        let state = match task.phase {
+            RoutingPhase::General => task.task.clone(),
+            RoutingPhase::Plan => format!("[phase: plan] {}", task.task),
+            RoutingPhase::Execute => format!("[phase: execute] {}", task.task),
+            RoutingPhase::Review => format!("[phase: review] {}", task.task),
+        };
         let body = serde_json::json!({
-            "state": task.task,
+            "state": state,
             "model": self.model_id,
             "questions": {
                 "model": {
                     "type": "choice",
-                    "instructions": "Which model should handle this software task?",
+                    "instructions": match task.phase {
+                        RoutingPhase::Plan => "Which model should design the implementation plan? Prefer the strongest reasoning model available.",
+                        RoutingPhase::Review => "Which model should independently review this change? Prefer strong reasoning for subtle defects.",
+                        RoutingPhase::General | RoutingPhase::Execute => "Which model should handle this software task? Prefer the least expensive capable model.",
+                    },
                     "criteria": criteria,
                 }
             }
@@ -379,6 +391,7 @@ mod tests {
 
         let request = RoutingRequest {
             task: "fix the failing test".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string(), "pricey-b".to_string()],
         };
@@ -429,6 +442,7 @@ mod tests {
 
         let request = RoutingRequest {
             task: "route me".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string()],
         };
@@ -462,6 +476,7 @@ mod tests {
         .expect("construct");
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string()],
         };
@@ -495,6 +510,7 @@ mod tests {
         .expect("construct");
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string()],
         };
@@ -534,6 +550,7 @@ mod tests {
         .expect("construct");
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string()],
         };
@@ -569,6 +586,7 @@ mod tests {
         .expect("construct");
         let request = RoutingRequest {
             task: "use tools".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![Capability::Tools],
             candidates: vec!["weak".to_string(), "strong".to_string()],
         };
@@ -604,6 +622,7 @@ mod tests {
         .expect("construct");
         let request = RoutingRequest {
             task: "use tools".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![Capability::Tools],
             candidates: vec!["weak".to_string()],
         };

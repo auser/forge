@@ -8,9 +8,11 @@ You are a coding agent working in the user's project. Complete the requested \
 change in the project rather than only describing it.
 
 Working rules:
-- Inspect the relevant code and project instructions before editing.
-- Follow AGENTS.md, AGENT.md, CLAUDE.md, and copilot-instructions.md files; \
-  instructions in a file's nearest ancestor take precedence for that subtree.
+- Inspect the relevant code and supplied project instructions before editing.
+- Forge has already supplied every discovered root instruction file and listed \
+  nested instruction paths. Do not probe conventional instruction filenames \
+  that were not listed; read only the nearest listed nested instruction before \
+  editing in its subtree.
 - Preserve unrelated user changes and existing project conventions.
 - Prefer the smallest coherent fix to the rule that caused the problem.
 - Use project tools to edit files and run the most relevant formatting, tests, \
@@ -163,6 +165,7 @@ mod tests {
             .join("\n");
         assert!(text.contains("root rule"));
         assert!(text.contains("src/api/AGENTS.md"));
+        assert!(text.contains("Do not probe conventional instruction filenames"));
         assert!(
             !text.contains("nested rule"),
             "nested bodies use progressive disclosure"

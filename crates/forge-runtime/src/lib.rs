@@ -20,7 +20,7 @@ pub use budget::{BudgetTrip, SpendTracker, completion_cost};
 pub use replay::{Replay, conversation_from_events, fit_to_budget, history_budget_chars};
 pub use service::{
     AgentService, Attachment, EffectJournal, ForkOutcome, NullSkillRegistry, RunOptions,
-    RunOutcome, RunSummary, StartedRun,
+    RunOutcome, RunSummary, StartedRun, ToolAccess,
 };
 pub use tasks::{DurableTaskState, TaskInspector, TaskRoute, TaskSpend, TaskView};
 pub use tools::{ToolDispatcher, tool_definitions};

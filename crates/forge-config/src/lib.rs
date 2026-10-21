@@ -285,6 +285,59 @@ impl Default for NeedleConfig {
     }
 }
 
+/// `[embedding]`: provider used for the semantic project index. Needle keeps
+/// the zero-config default; EmbeddingGemma 2 is an opt-in local HTTP service.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// `needle` or `embeddinggemma2`.
+    pub provider: String,
+    /// OpenAI-compatible base URL used by `embeddinggemma2`.
+    pub base_url: String,
+    /// Model name sent to the embeddings endpoint and used to version indexes.
+    pub model: String,
+    /// Matryoshka output width: 128, 256, 512, or 768.
+    pub dimensions: usize,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: "needle".to_string(),
+            base_url: "http://127.0.0.1:8081/v1".to_string(),
+            model: "embeddinggemma-2".to_string(),
+            dimensions: 256,
+        }
+    }
+}
+
+const EMBEDDING_PROVIDERS: &[&str] = &["needle", "embeddinggemma2"];
+const EMBEDDING_DIMENSIONS: &[usize] = &[128, 256, 512, 768];
+
+/// `[laya]`: checkpoint lifecycle for the native Rust Laya router.
+///
+/// When `autofetch` is enabled (the default), Forge downloads the pinned
+/// `typed-decisions` checkpoint on first use. An empty `weights_path` uses
+/// the Forge model cache; set `autofetch = false` for offline deployments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayaConfig {
+    /// Directory containing `model.safetensors`, `encoder/`, `tokenizer/`,
+    /// and `rl_agent_config.json` for a Laya checkpoint.
+    pub weights_path: String,
+    /// Whether the pinned Laya checkpoint may be downloaded on first use.
+    pub autofetch: bool,
+}
+
+impl Default for LayaConfig {
+    fn default() -> Self {
+        Self {
+            weights_path: String::new(),
+            autofetch: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -335,7 +388,11 @@ pub struct Config {
     pub server_port: u16,
     /// Agent-loop turn budget.
     pub max_turns: u32,
-    /// Reject http/laya/needle/jev routing decisions below this confidence.
+    /// Turn budget for the read-only planning phase of a planned workflow.
+    pub plan_max_turns: u32,
+    /// Turn budget for the read-only review phase of a development workflow.
+    pub review_max_turns: u32,
+    /// Reject http/laya/laya-native/needle/jev routing decisions below this confidence.
     pub router_confidence_threshold: f64,
     /// Fallback router when the primary fails or is below threshold
     /// ("static" or "cheapest").
@@ -346,10 +403,16 @@ pub struct Config {
     /// Named models with cost/capability metadata. Deep-merged by name
     /// across config files; not settable via env/CLI flags.
     pub models: BTreeMap<String, ModelEntry>,
-    /// The embedded on-device Needle brain: config for the default
-    /// `router = "needle"`. When the weights are missing, routing built on
-    /// it degrades to `router_fallback`.
+    /// The embedded on-device Needle brain. It remains an explicit router
+    /// option; when its weights are missing it degrades to `router_fallback`.
     pub needle: NeedleConfig,
+    /// Provider used for graph indexing and semantic code search. Independent
+    /// of the decision router so Needle may keep routing while another model
+    /// embeds code.
+    pub embedding: EmbeddingConfig,
+    /// Optional native Rust Laya checkpoint configuration. Used only by
+    /// `router = "laya-native"`.
+    pub laya: LayaConfig,
     /// Spend ceilings enforced by the agent loop (`[budget]`); all ceilings
     /// absent means no budget.
     pub budget: BudgetConfig,
@@ -616,7 +679,7 @@ impl Default for Config {
             model_base_url: Some("http://127.0.0.1:8080/v1".to_string()),
             model_key_env: None,
             mock_script: None,
-            router: "needle".to_string(),
+            router: "laya-native".to_string(),
             router_url: None,
             router_key_env: None,
             router_escalate: "auto".to_string(),
@@ -630,8 +693,10 @@ impl Default for Config {
             server_host: "127.0.0.1".to_string(),
             server_port: 7_341,
             max_turns: 25,
+            plan_max_turns: 4,
+            review_max_turns: 4,
             router_confidence_threshold: 0.7,
-            router_fallback: "static".to_string(),
+            router_fallback: "cheapest".to_string(),
             router_autostart: true,
             models: [
                 ("qwen3-coder".to_string(), models[0].clone()),
@@ -646,6 +711,8 @@ impl Default for Config {
             .into_iter()
             .collect(),
             needle: NeedleConfig::default(),
+            embedding: EmbeddingConfig::default(),
+            laya: LayaConfig::default(),
             budget: BudgetConfig::default(),
             tool_limits: BTreeMap::new(),
             context_artifacts: ContextArtifactsConfig::default(),
@@ -739,6 +806,8 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_SERVER_HOST", "server_host"),
     ("FORGE_SERVER_PORT", "server_port"),
     ("FORGE_MAX_TURNS", "max_turns"),
+    ("FORGE_PLAN_MAX_TURNS", "plan_max_turns"),
+    ("FORGE_REVIEW_MAX_TURNS", "review_max_turns"),
     (
         "FORGE_ROUTER_CONFIDENCE_THRESHOLD",
         "router_confidence_threshold",
@@ -748,6 +817,8 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_NEEDLE_VARIANT", "needle.variant"),
     ("FORGE_NEEDLE_AUTOFETCH", "needle.autofetch"),
     ("FORGE_NEEDLE_WEIGHTS_SHA256", "needle.weights_sha256"),
+    ("FORGE_LAYA_WEIGHTS_PATH", "laya.weights_path"),
+    ("FORGE_LAYA_AUTOFETCH", "laya.autofetch"),
     ("FORGE_BUDGET_SESSION_TOKENS", "budget.session_tokens"),
     ("FORGE_BUDGET_SESSION_USD", "budget.session_usd"),
     ("FORGE_BUDGET_DAILY_USD", "budget.daily_usd"),
@@ -822,6 +893,26 @@ impl Config {
                 NEEDLE_VARIANTS.join(", "),
                 self.needle.variant
             )));
+        }
+        if !EMBEDDING_PROVIDERS.contains(&self.embedding.provider.as_str()) {
+            return Err(ForgeError::config(format!(
+                "embedding.provider must be one of {} (got {:?})",
+                EMBEDDING_PROVIDERS.join(", "),
+                self.embedding.provider
+            )));
+        }
+        if self.embedding.provider == "embeddinggemma2" {
+            if self.embedding.base_url.trim().is_empty() || self.embedding.model.trim().is_empty() {
+                return Err(ForgeError::config(
+                    "embeddinggemma2 requires non-empty embedding.base_url and embedding.model",
+                ));
+            }
+            if !EMBEDDING_DIMENSIONS.contains(&self.embedding.dimensions) {
+                return Err(ForgeError::config(format!(
+                    "embedding.dimensions must be one of 128, 256, 512, 768 (got {})",
+                    self.embedding.dimensions
+                )));
+            }
         }
         if !BUDGET_ON_EXCEEDED_VALUES.contains(&self.budget.on_exceeded.as_str()) {
             return Err(ForgeError::config(format!(
@@ -1066,11 +1157,13 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
             "server_port" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
                 ForgeError::config(format!("{env_name} must be a valid port, got {raw:?}"))
             })?),
-            "max_turns" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
-                ForgeError::config(format!(
-                    "{env_name} must be a positive integer, got {raw:?}"
-                ))
-            })?),
+            "max_turns" | "plan_max_turns" | "review_max_turns" => {
+                toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
+                    ForgeError::config(format!(
+                        "{env_name} must be a positive integer, got {raw:?}"
+                    ))
+                })?)
+            }
             "budget.session_tokens" | "catalogue_ttl_days" => {
                 toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
                     ForgeError::config(format!(

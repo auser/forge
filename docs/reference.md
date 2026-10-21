@@ -20,32 +20,24 @@ expensive, and unaccountable about its own uncertainty; a decision model
 returns a typed choice with a confidence score in milliseconds, for free,
 without leaving the machine.
 
-## The decision plane: Needle 3, then Jev, then rules
+## The decision plane: Laya routes; Needle dispatches safe tools
 
-Every routing and guardrail question forge asks is a System One decision — a
-choice from a fixed set, with a confidence, never generated prose. Three tiers
-answer, cheapest first:
+Forge separates model selection from safe local execution. Laya chooses a
+least-expensive capable generation model; Needle remains an independent,
+on-device fast path for deterministic, read-only tool work and its guardrail.
+The user does not need to choose between them.
 
-1. **Needle 3, on-device.** The default (`router = "needle"`): an embedded
-   decision model from [Cactus Compute](https://huggingface.co/Cactus-Compute/needle3)
-   (Apache-2.0, ~35 MB of weights) running inside the forge process, with no
-   network calls once its weights are on disk. Free, and fast enough to be
-   invisible — the end-to-end suite's reference for a warm route round-trip is
-   ~47 ms in a release build on an idle macos-arm64 machine. Needle is also
-   what *fills* tool calls: name and arguments, against the same tool schemas
-   the language model would have been handed.
-2. **Jev**, when the on-device brain is unsure. TypeSafe's hosted System One
-   API, or a self-hosted [OpenJev](https://github.com/razorback16/openjev)
-   speaking the same wire protocol. It is consulted only when needle declines,
-   errors, or lands below `router_confidence_threshold` **and** a Jev
-   credential (`TYPESAFE_API_KEY`, or `jev_key_env`) is actually present and
-   `--local-only` is off. With no credential, `router_escalate = "auto"` — the
-   default — is a no-op and nothing leaves the machine.
-3. **Deterministic static rules**, as the floor that cannot fail. They need no
-   model, no weights, and no network. So an absent, unloaded, unreachable or
-   unconfident brain degrades to rules (`fallback_used: true` in the event log)
-   and the run continues. Laya and any other System One-compatible HTTP router
-   remain available as alternates.
+1. **Native Laya, on-device.** The default (`router = "laya-native"`) loads a
+   pinned checkpoint in Forge and selects the least-expensive candidate that
+   meets the task's requirements. Its first use downloads the checkpoint to
+   Forge's shared model cache; a missing/unavailable router falls back to
+   `cheapest` deterministically.
+2. **Needle 3, on-device.** It fills an exact safe tool call and applies a
+   separate destructive-operation guardrail before the model loop. It does not
+   replace Laya's model selection.
+3. **Optional remote decision routers** (Jev or the legacy Laya adapter), then
+   deterministic `cheapest` routing. These are compatibility/configuration
+   paths, never needed for the default workflow.
 
 What this buys is two things you can point at:
 
@@ -415,8 +407,9 @@ hardware), `decider` (hosted routing from meraGPT's Decider 1) and `jev`
 (hosted TypeSafe Jev as needle's escalation tier — nothing to configure;
 `export TYPESAFE_API_KEY=...` is the one step that arms it), plus
 `local-first` (the default stack, made explicit), `hybrid-needle` (local
-first, hosted escalation), `budget-hosted`, and `hybrid-laya` (the
-Laya-adapter example), and an [`env.example`](examples/env.example)
+first, hosted escalation), `budget-hosted`, `hybrid-laya` (the Laya-adapter
+example), and `hybrid-laya-native` (in-process Rust Laya), and an
+[`env.example`](examples/env.example)
 template for provider keys. An existing config is never overwritten —
 `--preset` says so instead. Unit tests parse every preset (on disk and
 embedded) against the current config schema, so a preset never drifts out
@@ -465,6 +458,7 @@ Run the agent loop (multi-turn, tool-using when the model supports it):
 ```bash
 forge run "add a hello function to main.rs"   # edits files via tools
 forge run --max-turns 10 "refactor the parser"
+forge run --plan "refactor authentication"    # plan, execute, independent review
 forge run --json "summarize this repo" | jq .text
 ```
 
@@ -477,6 +471,22 @@ pushing, publishing, or deploying anything. Human output includes the plan,
 review, and diff when the run produced a diff. JSON output adds `task_id`,
 `plan`, `changed_paths`, `checks`, `review`, and `diff` alongside the ordinary
 run and session fields.
+
+`--plan` adds explicit design and independent-review phases around execution.
+Plan and review use their own bounded turn budgets (`plan_max_turns` and
+`review_max_turns`), while `--max-turns` continues to control implementation.
+To compare the ordinary and phase-aware workflows on the same disposable Rust
+task, build Forge and run `scripts/benchmark-phase-routing.sh`. Set
+`FORGE_BENCH_MODEL` or `FORGE_BENCH_ROUTER` to pin a candidate. The script
+retains a JSON summary and raw session events with phase, selected model,
+tokens, latency, completion, and resolved cost; it never copies project source
+into the synthetic fixture.
+Both use only `read_file`, `graph_context`, and `graph_grep`. Their routes are
+tagged `plan` and `review`; implementation uses a separately recorded `execute`
+route. The independent review runs only when execution records an implementation
+change, and is advisory if its provider is unavailable. The generated plan and
+review are persisted in the task checkpoint and shown by `forge task show`.
+Explicit model pins remain binding for every phase.
 
 The task checkpoint is written to `.forge/tasks/<task-id>.jsonl`. This first
 workflow integration records completed and interrupted runs. `forge resume`
@@ -749,24 +759,12 @@ says so once.
 `--json` promises stdout is one machine-readable value, which a
 conversation cannot honour. Use `forge run --json` instead.
 
-### Known chat-specific limitations
+### Terminal behavior
 
-One is a real gap, not yet fixed, and worth knowing before you rely on the
-behaviour it touches:
-
-- **A background notice can land mid-line.** `notify()` no longer
-  coordinates with an in-progress prompt: an out-of-band line (a
-  `/bg` job finishing, an approval another job needs) prints wherever
-  the cursor happens to be rather than being drawn cleanly above the
-  prompt. This is a deliberate trade, not an oversight: `rustyline`
-  18.0.1's `select()` is missing a buffer-check its sibling `poll()` has,
-  so keeping the `ExternalPrinter` that would coordinate the two meant
-  *any* multi-byte burst arriving at once — a paste, fast type-ahead, a
-  line typed right after Ctrl-C — permanently wedged the editor thread.
-  Interleaved output was judged the smaller cost. The fix already exists
-  upstream (rustyline commit `f2bbcc5`, verified against forge's own pty
-  reproduction); when a release after 18.0.1 ships, the dependency bump
-  restores the `ExternalPrinter` and notices draw above the prompt again.
+Background notices coordinate with the active line editor: a `/bg` job
+finishing or asking for approval is drawn above the prompt, then the prompt
+and any partially typed input are restored. This relies on rustyline 19's
+buffered-input fix and is covered through Forge's real pseudo-terminal tests.
 
 Note that `/graph` in the chat *does* blend semantically when the build
 has a working needle engine and a semantic index (`forge graph build`
@@ -775,15 +773,15 @@ maintains one whenever the engine is available): the same
 now-async `ChatHost::graph_context`. Without an engine or index it is the
 plain lexical ranking — the same degradation as outside the chat.
 
-Beyond those three, see [Known limitations](#known-limitations-v03) for the
-ones shared with the rest of forge (background runs not surviving the
-process, lexical-only skill discovery).
+See [Known limitations](#known-limitations-v03) for constraints shared with
+the rest of forge (background runs not surviving the process, lexical-only
+skill discovery).
 
 ## Command line
 
 ```text
 forge init                          Initialize a project (idempotent)
-forge run [--max-turns N] [--skill NAME]... <prompt>
+forge run [--plan] [--max-turns N] [--skill NAME]... <prompt>
                                     Run the multi-turn agent loop
 forge task [list]                   List durable development tasks
 forge task show <task-id>           Inspect one durable task
@@ -796,7 +794,8 @@ forge resume <task-run-or-session-id>  Continue a parked task or completed run
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
 forge session fork <id> [--at X]    Branch a session into a new one
-forge learn propose|list|show|apply|reject|metrics
+forge learn add <guidance> [--kind decision|preference|guardrail|runbook] [--touch <path>]
+forge learn check|propose|list|show|apply|reject|metrics
                                     Review redacted recurring evidence locally
 forge graph build|check|map|grep|callers|blast|context
 forge skill list|show|test
@@ -816,7 +815,7 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
---router <r>          override the router (needle|jev|laya|http|static|cheapest)
+--router <r>          override the router (needle|jev|laya|laya-native|http|static|cheapest)
 --execution <p>       override the execution provider (native)
 --local-only          refuse any provider or router endpoint that is not on
                       this machine (see "What --local-only restricts")
@@ -854,15 +853,15 @@ Key settings (all optional):
 | `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.). **Setting this overrides *every* model's endpoint**, including hosted `[models]` entries like `claude-sonnet` and `gpt-5` — setting it to the default value still counts as setting it. Per-model endpoints belong in `[models.<name>] base_url`. Combinations that cannot work are refused at startup, naming both settings: an `anthropic`-family model whose endpoint ends in `/v1` (the client appends `/v1/messages`, so it would 404), or an entry whose `provider` contradicts the endpoint (`provider = "anthropic"` pointed at `api.openai.com`) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
+| `router` | `laya-native` | `FORGE_ROUTER` | Cost-aware native default; also `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key. Same primary-only fallback rule as `router_url` — the escalation tier never uses it (see `jev_key_env`) |
 | `router_escalate` | `auto` | `FORGE_ROUTER_ESCALATE` | `auto` \| `off` — when `router = "needle"`, escalate to the Jev tier before the static fallback once a Jev credential is present (`auto`, the default) or never (`off`); no-op unless a credential exists and `--local-only` is off |
 | `jev_url` | — | `FORGE_JEV_URL` | Jev/OpenJev endpoint, default `https://api.typesafe.ai/v1/systemone` (or a self-hosted OpenJev server's `/v1/systemone`). Scoped separately from `router_url` so a leftover http/laya `router_url` can never be hijacked into carrying the Jev credential to the wrong host — the escalation tier resolves **only** `jev_url` (or the default); `router = "jev"` as primary also accepts `router_url` as a secondary fallback |
 | `jev_key_env` | — | `FORGE_JEV_KEY_ENV` | Name of the env var holding the Jev credential, default `TYPESAFE_API_KEY`. Same scoping as `jev_url`: the escalation tier never falls back to `router_key_env` |
-| `router_timeout_ms` | `5000` | — | HTTP/needle/jev router timeout |
-| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/needle/jev decisions escalate to the fallback |
-| `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
+| `router_timeout_ms` | `5000` | — | HTTP/native-Laya/needle/jev router timeout |
+| `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/laya-native/needle/jev decisions escalate to the fallback |
+| `router_fallback` | `cheapest` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` |
 | `approval` | `prompt-dangerous` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny`; the default lets ordinary project edits and validation run while still asking before destructive operations |
@@ -870,11 +869,19 @@ Key settings (all optional):
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
 | `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
+| `plan_max_turns` | `4` | `FORGE_PLAN_MAX_TURNS` | Read-only planning-phase turn budget |
+| `review_max_turns` | `4` | `FORGE_REVIEW_MAX_TURNS` | Read-only review-phase turn budget |
 | `tool_limits.<name>.per_run` | — | — | Maximum attempted calls to the exact tool name in one run |
 | `needle.variant` | `full` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small \| medium \| full); **only `full` has a downloadable artifact today** — Cactus-Compute publishes one 20-layer file, `needle build --layers N` slices smaller ones locally, so `small`/`medium` currently report "no pinned weights artifact" and fall back to static routing. `full` is the default precisely because it's the one that actually fetches; revisit once a smaller rung is hosted |
 | `needle.weights_path` | — | — | Weights override; empty → ~/.cache/forge/models/ |
+| `laya.weights_path` | — | `FORGE_LAYA_WEIGHTS_PATH` | Native Laya checkpoint directory; empty → `~/.cache/forge/models/laya/typed-decisions` |
+| `laya.autofetch` | `true` | `FORGE_LAYA_AUTOFETCH` | Download the pinned ~847 MB native Laya checkpoint on first use; disabled automatically under `local_only` |
 | `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~35 MB for `full`) |
 | `needle.weights_sha256` | — | `FORGE_NEEDLE_WEIGHTS_SHA256` | Operator override for the expected weights checksum (64 hex chars); empty → use the compiled-in pin. Pairs with `weights_path`/a custom base URL to run your own weights without recompiling |
+| `embedding.provider` | `needle` | — | Semantic-index embedder: `needle` or `embeddinggemma2`; independent from `router` |
+| `embedding.base_url` | `http://127.0.0.1:8081/v1` | — | OpenAI-compatible embeddings endpoint used by `embeddinggemma2` |
+| `embedding.model` | `embeddinggemma-2` | — | Model name sent to the endpoint and included in index versioning; include a checkpoint/quantization suffix when changing either |
+| `embedding.dimensions` | `256` | — | EmbeddingGemma 2 MRL width: `128`, `256`, `512`, or `768` |
 
 Unknown keys are tolerated, with one deliberate exception: inside a
 `[models.<name>]` entry, `model_base_url`/`model_key_env` are rejected by
@@ -1120,13 +1127,15 @@ Seven modes:
   to static when unreachable or uncredentialed),
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
+- `laya-native` (the same typed-decision model in-process through the Rust
+  `laya` crate; the default, with a shared-cache download on first use),
 - `static` (deterministic rules),
 - `cheapest` (lowest-cost candidate from the `[models]` cost table;
   tie-breaks by output cost then name),
 - `http` (System One-compatible: POST `{task, candidates, required_capabilities}`
   to `router_url`, bearer token from `router_key_env`).
 
-`http`/`laya`/`needle`/`jev` decisions below `router_confidence_threshold`
+`http`/`laya`/`laya-native`/`needle`/`jev` decisions below `router_confidence_threshold`
 (default 0.7) are rejected and escalate through the fallback chain: any
 router is wrapped in a fallback (`router_fallback`, default `static`, may be
 `cheapest`), so an unreachable, timing-out, unconfident, or (for `needle`)
@@ -1232,6 +1241,32 @@ Without Forge, the same adapter ships as a plain script:
 `{"answers": {"model": {"choice", "confidence"}}}`. The adapter is optional;
 Forge never requires Python.
 
+### Native Rust Laya
+
+`router = "laya-native"` loads the Laya checkpoint in Forge's process through
+the Rust `laya` crate, so it needs neither Python nor the HTTP adapter. Keep
+the legacy `laya` setting when you intentionally use a compatible external
+endpoint. On its first routing decision, native Laya streams the pinned
+~847 MB `typed-decisions` checkpoint into Forge's cache and verifies the
+model file's SHA-256. Set `autofetch = false` to require an already present
+checkpoint. Keep `router_fallback = "cheapest"` so a download failure, a
+timeout, or low confidence selects the least expensive capable model instead
+of blocking a run.
+
+```toml
+router = "laya-native"
+router_fallback = "cheapest"
+
+[laya]
+# Empty uses ~/.cache/forge/models/laya/typed-decisions.
+# weights_path = "/absolute/path/to/laya/typed-decisions"
+autofetch = true
+```
+
+The directory contains `model.safetensors`, `encoder/`, `tokenizer/`, and
+`rl_agent_config.json`. `local_only = true` disables the automatic download;
+provide the directory first in that case.
+
 ### ExecutionProvider
 
 All command/script execution AND file reads/writes/edits/deletes go through
@@ -1305,11 +1340,11 @@ forge graph context <query>    # ranked files/symbols for agent context
 
 ### Semantic index
 
-`forge graph build --semantic` embeds every symbol locally and stores the
-vectors at `.forge/graph/embeddings.bin`. It requires a genuinely available
-Needle engine (weights loaded and answering, not just constructible — see
-`forge_needle::engine_if_available`); ordinary `forge graph build` remains a
-fast, model-free structural operation. Embedding text is
+`forge graph build --semantic` embeds every symbol and stores the vectors at
+`.forge/graph/embeddings.bin`. It uses the configured `[embedding]` provider;
+`needle` remains the zero-config default, while `embeddinggemma2` talks to a
+local OpenAI-compatible embeddings endpoint. Ordinary `forge graph build`
+remains a fast, model-free structural operation. Embedding text is
 `"<kind> <name> in <path>"`;
 the index key is `"<path>::<name>"`, so two symbols with the same name in
 different files are both independently searchable. Rebuilds are incremental
@@ -1317,10 +1352,30 @@ and content-hash keyed: only symbols whose embedded text actually changed are
 re-embedded, in batches of 32. Each completed batch is checkpointed with a
 temporary-file replacement, so an interrupted first build resumes instead of
 starting over; symbols removed from the graph are dropped from the index too.
-An index built with a different model or embedding
+An index built with a different model, prompt format, or embedding
 dimensionality is discarded and rebuilt wholesale rather than mixed with new
-vectors. Without a working Needle engine, `--semantic` fails with an actionable
-error while the ordinary structural build still succeeds.
+vectors. Without a working embedding provider, `--semantic` fails with an
+actionable error while the ordinary structural build still succeeds.
+
+To opt into EmbeddingGemma 2, run its text-only GGUF server on the configured
+port, then add this to `.forge/config.toml`:
+
+```bash
+llama serve -hf ggml-org/embeddinggemma-2-GGUF:BF16 --embeddings --port 8081
+```
+
+```toml
+[embedding]
+provider = "embeddinggemma2"
+base_url = "http://127.0.0.1:8081/v1"
+model = "embeddinggemma-2-bf16"
+dimensions = 256
+```
+
+Forge applies EmbeddingGemma 2's asymmetric code-retrieval prefixes, truncates
+the returned 768-value vectors to the configured MRL width, and L2-normalizes
+them before storage. Changing `model`, dimensions, or the built-in prompt
+format invalidates the old index cleanly.
 
 `embeddings.bin` is a single `serde_json` blob today (an 8-byte `FRGEMB01`
 magic prefix + one JSON object), parsed in full on every load. That is fine
@@ -1334,17 +1389,17 @@ the spec's §8 amendment for the follow-up.
 
 `forge graph grep --semantic <query>` embeds the query and returns the top 20
 matches by cosine similarity (`score  path::symbol` lines); without a working
-engine it fails with `semantic search needs needle weights (run forge init)`
+provider it fails with `semantic search needs an available embedding provider`
 (exit 1) rather than silently falling back to literal search. `forge graph
-context <query>` blends the two signals when both an engine and a matching
+context <query>` blends the two signals when both an embedder and a matching
 index exist: `final = 0.5 * (1 / (1 + lexical_rank)) + 0.5 * cosine`; otherwise
 its output is exactly the lexical ranking as before. Both the CLI (`--steer
 "prefer tests"`), the chat (`/graph <query> -- <steering>`) and the MCP
 `forge_graph_context` tool (`steer`) accept steering text: it is embedded
 alongside the query in one batch, and each candidate's cosine is the best of
 the two vectors — steering is additive preference, symmetric with the blend's
-union semantics, and a no-op without an engine. For `--json` consumers:
-`score` is always a float — a blended 0-1 value when a needle engine and
+union semantics, and a no-op without an embedder. For `--json` consumers:
+`score` is always a float — a blended 0-1 value when an embedder and
 matching index both exist, otherwise the raw lexical rank count — whereas the
 `POST /v1/project/context` server endpoint always returns the raw lexical
 count as an integer today (see [Server](#server); it has not been wired to
@@ -1809,6 +1864,8 @@ forge memory sources --session <id> --offset 0 --json
 forge memory consolidate --session <id> --json
 forge memory search --session <id> --query <text> --json
 forge memory promote --session <id> --topic decisions --yes --json
+forge learn add <guidance> [--kind decision|preference|guardrail|runbook] [--touch <path>]
+forge learn check
 forge learn propose [--session <id>] [--since <rfc3339>] [--until <rfc3339>]
 forge learn list
 forge learn show <proposal-id>
@@ -1917,7 +1974,25 @@ silently delete its consolidated or promoted provenance; removing derived
 context storage is an explicit filesystem lifecycle operation, and promoted
 claims remain source-labeled rather than becoming repository guidance.
 
-### Reviewable learning proposals
+### Project learnings and reviewable proposals
+
+`forge learn add "..."` creates a small, reviewable Markdown record under
+`.forge/learnings/`. It is repository-owned and deliberately not ignored.
+When `--touch` is omitted Forge links the record to the files currently changed
+in git. The default kind is `decision`; use `guardrail` for a rule that must be
+seen before an affected change. Every run uses the project graph to inject only
+records linked to relevant files. `forge learn check` shows the decisions and
+guardrails linked to the current diff before commit.
+
+After a successful `forge run`, Forge refreshes the separate local proposal
+queue from repeated, redacted evidence. This only creates pending candidates;
+it never accepts guidance or writes repository-owned learning files. The
+non-JSON completion receipt names the model/router, resolved cost, graph
+freshness, relevant-learning count, and pending-candidate count.
+
+The existing proposal flow remains separate and private: it mines repeated,
+redacted session evidence into ignored local guidance, which has no effect
+until explicitly accepted.
 
 `forge learn propose` deterministically mines the redacted event log for exact
 recurrence of failures, developer corrections, developer instructions, and

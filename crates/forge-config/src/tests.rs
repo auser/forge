@@ -210,14 +210,14 @@ fn defaults_when_nothing_set() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
 
-    // Default stack: local oMLX model + embedded Needle router (mocks are
-    // opt-in).
+    // Default stack: local oMLX model + cost-aware native Laya router (mocks
+    // are opt-in).
     assert_eq!(resolved.config.model, "qwen3-coder");
     assert_eq!(
         resolved.config.model_base_url.as_deref(),
         Some("http://127.0.0.1:8080/v1")
     );
-    assert_eq!(resolved.config.router, "needle");
+    assert_eq!(resolved.config.router, "laya-native");
     assert_eq!(resolved.config.router_timeout_ms, 5_000);
     assert_eq!(resolved.config.execution, "native");
     assert_eq!(resolved.config.approval, "prompt-dangerous");
@@ -303,7 +303,7 @@ fn project_file_overrides_user_file_and_defaults() {
     // Untouched key stays default.
     assert_eq!(
         resolved.explain("router"),
-        Some(("\"needle\"".to_string(), Origin::Default))
+        Some(("\"laya-native\"".to_string(), Origin::Default))
     );
 }
 
@@ -501,6 +501,8 @@ fn max_turns_default_env_and_invalid() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
     assert_eq!(resolved.config.max_turns, 25);
+    assert_eq!(resolved.config.plan_max_turns, 4);
+    assert_eq!(resolved.config.review_max_turns, 4);
     assert_eq!(
         resolved.explain("max_turns"),
         Some(("25".to_string(), Origin::Default))
@@ -513,6 +515,14 @@ fn max_turns_default_env_and_invalid() {
         resolved.explain("max_turns"),
         Some(("7".to_string(), Origin::Environment))
     );
+
+    unsafe {
+        std::env::set_var("FORGE_PLAN_MAX_TURNS", "3");
+        std::env::set_var("FORGE_REVIEW_MAX_TURNS", "2");
+    }
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.plan_max_turns, 3);
+    assert_eq!(resolved.config.review_max_turns, 2);
 
     unsafe { std::env::set_var("FORGE_MAX_TURNS", "lots") };
     let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
@@ -632,6 +642,37 @@ fn needle_defaults() {
 }
 
 #[test]
+fn embeddinggemma2_is_opt_in_and_validates_its_mrl_width() {
+    let defaults = Config::default();
+    assert_eq!(defaults.embedding.provider, "needle");
+    assert_eq!(defaults.embedding.dimensions, 256);
+
+    let configured: Config = toml::from_str(
+        "[embedding]\nprovider = \"embeddinggemma2\"\nbase_url = \"http://127.0.0.1:8081/v1\"\nmodel = \"embeddinggemma-2-q8\"\ndimensions = 512",
+    )
+    .expect("parses");
+    assert!(configured.validate().is_ok());
+
+    let invalid: Config =
+        toml::from_str("[embedding]\nprovider = \"embeddinggemma2\"\ndimensions = 384")
+            .expect("parses");
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn laya_defaults_and_autofetch_override() {
+    let c = Config::default();
+    assert_eq!(c.laya.weights_path, "");
+    assert!(c.laya.autofetch);
+
+    let configured: Config =
+        toml::from_str("[laya]\nweights_path = \"/models/laya\"\nautofetch = false")
+            .expect("parses");
+    assert_eq!(configured.laya.weights_path, "/models/laya");
+    assert!(!configured.laya.autofetch);
+}
+
+#[test]
 fn needle_section_parses_and_validates() {
     let c: Config =
         toml::from_str("[needle]\nvariant = \"small\"\nautofetch = false").expect("parses");
@@ -734,7 +775,7 @@ fn router_confidence_threshold_and_fallback_defaults_and_env() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
     assert_eq!(resolved.config.router_confidence_threshold, 0.7);
-    assert_eq!(resolved.config.router_fallback, "static");
+    assert_eq!(resolved.config.router_fallback, "cheapest");
     assert!(resolved.config.router_autostart);
     unsafe { std::env::set_var("FORGE_ROUTER_AUTOSTART", "false") };
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");

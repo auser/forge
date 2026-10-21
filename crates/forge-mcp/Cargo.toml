@@ -9,7 +9,7 @@ license.workspace = true
 forge-config.workspace = true
 forge-core.workspace = true
 forge-graph.workspace = true
-forge-needle.workspace = true
+forge-providers.workspace = true
 forge-runtime.workspace = true
 forge-session.workspace = true
 async-trait.workspace = true
@@ -21,7 +21,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 forge-execution.workspace = true
-forge-providers.workspace = true
 forge-skills.workspace = true
 forge-task.workspace = true
 tempfile.workspace = true

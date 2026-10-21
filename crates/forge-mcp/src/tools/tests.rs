@@ -578,7 +578,7 @@ async fn graph_grep_matches_symbols() {
 }
 
 #[tokio::test]
-async fn semantic_grep_without_an_engine_is_a_tool_error_naming_the_fix() {
+async fn semantic_grep_without_an_embedder_is_a_tool_error_naming_the_fix() {
     let tmp = tempfile::tempdir().expect("tempdir");
     project(tmp.path());
     build_graph(tmp.path());
@@ -606,7 +606,7 @@ async fn semantic_grep_without_an_engine_is_a_tool_error_naming_the_fix() {
     assert_eq!(outcome.value["code"], "semantic_unavailable");
     let message = outcome.value["error"].as_str().unwrap_or_default();
     assert!(
-        message.contains("weights") && message.contains("forge init"),
+        message.contains("embedding provider"),
         "unhelpful message: {message}"
     );
 }

@@ -21,7 +21,7 @@ Feature: Cost-aware and Laya routing
     Given a local Laya router answering "mock-local" with confidence 0.3
     And the confidence threshold is 0.7
     When Forge routes a coding task
-    Then the routing decision fell back to static routing
+    Then the routing decision fell back to cheapest routing
 
   Scenario: Cheapest routing prices unpriced config entries from the cached catalogue
     Given a seeded OpenRouter catalogue pricing "cat-cheap" at 0.05 and "cat-pricey" at 9.0

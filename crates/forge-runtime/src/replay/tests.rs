@@ -89,6 +89,7 @@ fn tool_calls_and_results_replay_in_order_with_their_ids() {
             EventKind::RoutingDecisionMade {
                 router: "static".into(),
                 selected_model: "scripted-mock".into(),
+                phase: forge_core::RoutingPhase::General,
                 confidence: 1.0,
                 fallback_used: false,
                 reason: String::new(),

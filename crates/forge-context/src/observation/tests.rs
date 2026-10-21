@@ -158,6 +158,7 @@ fn source_bounds_and_unsupported_values_fail_without_content() {
     source[0].kind = EventKind::RoutingDecisionMade {
         router: "r".into(),
         selected_model: "m".into(),
+        phase: forge_core::RoutingPhase::General,
         confidence: f64::NAN,
         fallback_used: false,
         reason: String::new(),

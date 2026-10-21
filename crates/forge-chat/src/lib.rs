@@ -5,16 +5,15 @@
 //! **What this crate does *not* claim.** It is not free of I/O. Everything
 //! outside [`app`] is a pure function, but `app` drives a real
 //! `AgentService` handed to it by [`ChatHost::service`], and several of
-//! that service's methods are synchronous filesystem reads taken straight
-//! on the executor: [`app`]'s `refresh_completions` (`list_runs()` —
-//! which re-reads and re-parses every session's whole JSONL log — plus
-//! `list_sessions()`), `events_for` (session resume, `/session`, and
-//! `/show`), and `fork_session`. `refresh_completions` also takes the
+//! that service's methods include synchronous filesystem reads. Completion
+//! refresh moves its bounded run/session lookup onto Tokio's blocking pool;
+//! `events_for` (session resume, `/session`, and `/show`) and `fork_session`
+//! still run on the executor. `refresh_completions` also takes the
 //! project file list for `@`-completion through [`ChatHost::project_files`]
 //! — a graph-state read the shell performs and bounds, arriving here as
 //! plain data like everything else behind the host seam. The multi-thread
 //! runtime `forge-cli` builds keeps that off the critical path, so it is
-//! latency rather than a stall, and §14 has the bounded-listing follow-up.
+//! latency rather than a stall.
 //! Stated plainly here because the earlier "no I/O syscalls" wording was
 //! not true and would mislead whoever next adds a `ChatHost` method: the
 //! rule this crate actually keeps is **no terminal**, and filesystem

@@ -52,6 +52,9 @@ fn print_human(task: &TaskView) {
     println!("task: {}", task.task_id);
     println!("state: {}", task.state.as_str());
     println!("request: {}", task.request);
+    if let Some(plan) = &task.generated_plan {
+        println!("plan:\n{plan}");
+    }
     println!("node: {}", task.current_node.as_deref().unwrap_or("-"));
     if let Some(route) = &task.route {
         println!(
@@ -98,5 +101,8 @@ fn print_human(task: &TaskView) {
     }
     if let Some(result) = &task.terminal_result {
         println!("result: {result}");
+    }
+    if let Some(review) = &task.review {
+        println!("review:\n{review}");
     }
 }

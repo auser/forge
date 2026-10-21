@@ -272,6 +272,7 @@ fn a_routing_decision_becomes_one_thought_chunk() {
         vec![EventKind::RoutingDecisionMade {
             router: "needle".into(),
             selected_model: "mock-local".into(),
+            phase: forge_core::RoutingPhase::General,
             confidence: 0.94,
             fallback_used: false,
             reason: "local is enough".into(),

@@ -23,11 +23,12 @@ fn format_event(event: &Event) -> String {
         EventKind::RoutingDecisionMade {
             router,
             selected_model,
+            phase,
             confidence,
             fallback_used,
             ..
         } => format!(
-            "routing_decision router={router} model={selected_model} confidence={confidence:.2} fallback={fallback_used}"
+            "routing_decision phase={phase:?} router={router} model={selected_model} confidence={confidence:.2} fallback={fallback_used}"
         ),
         EventKind::UsageRecorded {
             model,

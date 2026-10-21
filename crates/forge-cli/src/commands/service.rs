@@ -114,7 +114,7 @@ pub(crate) fn overrides_for(ctx: &Context, options: &ServiceOptions) -> CliOverr
 fn is_zero_config_model_selection(config: &forge_config::Config) -> bool {
     !config.explicit.contains("model")
         && !config.explicit.iter().any(|key| key.starts_with("models."))
-        && (!config.explicit.contains("router") || config.router == "needle")
+        && (!config.explicit.contains("router") || config.router == "laya-native")
 }
 
 /// Build the transport-neutral agent runtime from the resolved
@@ -235,6 +235,7 @@ pub fn build_service_with(
         AgentService::new(model, router, execution, skills, sessions, config)
             .with_task_store(Arc::new(forge_task::JsonlTaskStore::for_project(&root)))
             .with_graph(graph)
+            .with_project_learnings(forge_context::load_project_learnings(&root))
             .with_context_store(Some(context_store))
             .with_artifact_store(Some(artifact_store))
             .with_compression_enabled(compression_enabled)
@@ -337,7 +338,7 @@ mod tests {
         std::fs::create_dir_all(project.path().join(".forge")).expect("forge dir");
         std::fs::write(
             project.path().join(".forge/config.toml"),
-            "router = \"needle\"\nexecution = \"native\"\napproval = \"prompt-dangerous\"\n",
+            "router = \"laya-native\"\nrouter_fallback = \"cheapest\"\nexecution = \"native\"\napproval = \"prompt-dangerous\"\n",
         )
         .expect("starter config");
         let resolved = forge_config::Config::load(

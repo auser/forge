@@ -33,6 +33,7 @@ impl DurableTaskState {
 pub struct TaskRoute {
     pub router: String,
     pub model: String,
+    pub phase: forge_core::RoutingPhase,
     pub confidence: f64,
     pub fallback_used: bool,
     pub reason: String,
@@ -54,6 +55,8 @@ pub struct TaskSpend {
 pub struct TaskView {
     pub task_id: String,
     pub request: String,
+    pub generated_plan: Option<String>,
+    pub review: Option<String>,
     pub state: DurableTaskState,
     pub current_node: Option<String>,
     pub run_id: Option<String>,
@@ -156,12 +159,15 @@ fn project(task: LoadedTask, events: &[Event]) -> TaskView {
             EventKind::RoutingDecisionMade {
                 router,
                 selected_model,
+                phase,
                 confidence,
                 fallback_used,
                 reason,
+                ..
             } => Some(TaskRoute {
                 router: router.clone(),
                 model: selected_model.clone(),
+                phase: *phase,
                 confidence: *confidence,
                 fallback_used: *fallback_used,
                 reason: reason.clone(),
@@ -175,6 +181,7 @@ fn project(task: LoadedTask, events: &[Event]) -> TaskView {
                 } => Some(TaskRoute {
                     router: "direct".into(),
                     model: model.clone(),
+                    phase: forge_core::RoutingPhase::General,
                     confidence: 1.0,
                     fallback_used: false,
                     reason: format!("direct dispatch through {provider}"),
@@ -230,6 +237,8 @@ fn project(task: LoadedTask, events: &[Event]) -> TaskView {
     TaskView {
         task_id: task.plan.task_id,
         request: task.plan.request,
+        generated_plan: task.checkpoint.generated_plan,
+        review: task.checkpoint.review,
         state,
         current_node,
         run_id: task.checkpoint.run_id,
@@ -268,6 +277,12 @@ mod tests {
             .expect("plan");
         tasks.create(plan).expect("create");
         tasks
+            .record_plan("task-view", "1. Inspect\n2. Edit")
+            .expect("record plan");
+        tasks
+            .record_review("task-view", "No findings.")
+            .expect("record review");
+        tasks
             .transition(
                 "task-view",
                 TransitionRequest::new("inspect", TaskState::Running),
@@ -302,6 +317,7 @@ mod tests {
             EventKind::RoutingDecisionMade {
                 router: "jev".into(),
                 selected_model: "model-a".into(),
+                phase: forge_core::RoutingPhase::Execute,
                 confidence: 0.9,
                 fallback_used: false,
                 reason: "capability fit".into(),
@@ -335,6 +351,8 @@ mod tests {
             .show("task-view")
             .expect("view");
         assert_eq!(view.state, DurableTaskState::Succeeded);
+        assert_eq!(view.generated_plan.as_deref(), Some("1. Inspect\n2. Edit"));
+        assert_eq!(view.review.as_deref(), Some("No findings."));
         assert_eq!(
             view.route.as_ref().map(|route| route.router.as_str()),
             Some("jev")
