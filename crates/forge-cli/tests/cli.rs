@@ -1183,7 +1183,7 @@ fn run_works_offline_with_mock_model() {
     // Mock is opt-in: request it explicitly.
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"mock-local\"\n",
+        "model = \"mock-local\"\nrouter = \"static\"\n",
     )
     .expect("write config");
 
@@ -1251,7 +1251,7 @@ fn project_with_demo_skill(tmp: &Path) -> PathBuf {
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"mock-local\"\n",
+        "model = \"mock-local\"\nrouter = \"static\"\n",
     )
     .expect("write config");
     let skill = project.join(".forge").join("skills").join("demo");
@@ -1337,7 +1337,7 @@ fn run_json_mode_is_pure_json_and_session_list_shows_it() {
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir");
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"mock-local\"\n",
+        "model = \"mock-local\"\nrouter = \"static\"\n",
     )
     .expect("write config");
 
@@ -1839,7 +1839,7 @@ fn scripted_mock_loop_edits_file_and_emits_tool_events() {
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"scripted-mock\"\nmock_script = \"script.json\"\napproval = \"auto\"\n",
+        "model = \"scripted-mock\"\nmock_script = \"script.json\"\nrouter = \"static\"\napproval = \"auto\"\n",
     )
     .expect("write config");
 
@@ -1908,7 +1908,7 @@ fn max_turns_flag_bounds_the_loop() {
     std::fs::create_dir_all(project.join(".forge")).expect("mkdir .forge");
     std::fs::write(
         project.join(".forge/config.toml"),
-        "model = \"scripted-mock\"\nmock_script = \"script.json\"\n",
+        "model = \"scripted-mock\"\nmock_script = \"script.json\"\nrouter = \"static\"\n",
     )
     .expect("write config");
 
