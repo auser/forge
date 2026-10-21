@@ -400,7 +400,7 @@ pub enum GraphCommand {
         #[arg(value_name = "PATTERN")]
         pattern: String,
         /// Search the local semantic embedding index instead of literal
-        /// text/regex matching (requires needle weights; see `forge init`).
+        /// text/regex matching (requires a configured embedding provider).
         #[arg(long)]
         semantic: bool,
     },

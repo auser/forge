@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use forge_core::ProjectGraph;
 use forge_core::{Event, EventKind, ForgeError, RunState, SessionStore};
 use forge_graph::LocalGraph;
-use forge_needle::EngineEmbedder;
 use forge_runtime::{AgentService, RunOptions};
 use forge_session::new_run_id;
 use serde_json::{Value, json};
@@ -138,7 +137,7 @@ fn graph_context_schema() -> Value {
             },
             "steer": {
                 "type": "string",
-                "description": "Optional free text that steers the semantic half of the ranking (e.g. \"prefer tests over implementation\"). No effect without a needle engine and a built semantic index."
+                "description": "Optional free text that steers the semantic half of the ranking (e.g. \"prefer tests over implementation\"). No effect without an embedding provider and a built semantic index."
             }
         },
         "required": ["query"],
@@ -157,7 +156,7 @@ fn graph_grep_schema() -> Value {
             "semantic": {
                 "type": "boolean",
                 "default": false,
-                "description": "Search the local embedding index by meaning instead of by regex. Requires needle weights and a built semantic index."
+                "description": "Search the local embedding index by meaning instead of by regex. Requires an embedding provider and a built semantic index."
             }
         },
         "required": ["pattern"],
@@ -424,15 +423,14 @@ impl ForgeTools {
         Ok(graph)
     }
 
-    /// The on-device embedder, when one is genuinely usable. `None` is
-    /// normal (no weights fetched, or an engine-less build) and never an
+    /// The configured embedder, when one is genuinely usable. `None` is
+    /// normal (for example, no Needle weights) and never an
     /// error on its own — `forge_graph_context` simply stays lexical.
-    async fn embedder(&self) -> Option<EngineEmbedder> {
-        let engine = forge_needle::engine_if_available(self.service.config()).await?;
-        match EngineEmbedder::new(engine).await {
-            Ok(embedder) => Some(embedder),
+    async fn embedder(&self) -> Option<Arc<dyn forge_core::embed::Embedder>> {
+        match forge_providers::embedder_from_config(self.service.config()).await {
+            Ok(embedder) => embedder,
             Err(e) => {
-                tracing::debug!(error = %e, "needle engine present but not usable as an embedder");
+                tracing::debug!(error = %e, "configured embedding provider is not usable");
                 None
             }
         }
@@ -454,20 +452,13 @@ impl ForgeTools {
         };
 
         let embedder = self.embedder().await;
-        let hits = match forge_graph::blended_context(
-            &graph,
-            embedder
-                .as_ref()
-                .map(|e| e as &dyn forge_core::embed::Embedder),
-            query,
-            steer,
-            limit,
-        )
-        .await
-        {
-            Ok(hits) => hits,
-            Err(e) => return ToolOutcome::error("graph_error", e.to_string()),
-        };
+        let hits =
+            match forge_graph::blended_context(&graph, embedder.as_deref(), query, steer, limit)
+                .await
+            {
+                Ok(hits) => hits,
+                Err(e) => return ToolOutcome::error("graph_error", e.to_string()),
+            };
 
         ToolOutcome::ok(json!({
             "query": query,
@@ -508,16 +499,7 @@ impl ForgeTools {
         // the fix in it, never a protocol error: the client should be able
         // to retry with semantic=false.
         let embedder = self.embedder().await;
-        match forge_graph::semantic_grep(
-            &graph,
-            embedder
-                .as_ref()
-                .map(|e| e as &dyn forge_core::embed::Embedder),
-            pattern,
-            20,
-        )
-        .await
-        {
+        match forge_graph::semantic_grep(&graph, embedder.as_deref(), pattern, 20).await {
             Ok(matches) => ToolOutcome::ok(json!({
                 "pattern": pattern,
                 "semantic": true,

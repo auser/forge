@@ -666,8 +666,8 @@ fn graph_and_skill_tools_answer_from_the_real_project() {
             .is_empty()
     );
 
-    // Semantic search has no weights in a hermetic run: a tool error that
-    // names the fix, never a protocol error.
+    // Semantic search has no embedding provider in a hermetic run: a useful
+    // tool error, never a protocol error.
     let semantic = client.call_tool(
         "forge_graph_grep",
         serde_json::json!({ "pattern": "http", "semantic": true }),
@@ -677,7 +677,10 @@ fn graph_and_skill_tools_answer_from_the_real_project() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    assert!(message.contains("forge init"), "unhelpful: {message}");
+    assert!(
+        message.contains("embedding provider"),
+        "unhelpful: {message}"
+    );
 
     let skills = client.call_tool("forge_skill_list", serde_json::json!({}));
     let listed = McpClient::tool_json(&skills);

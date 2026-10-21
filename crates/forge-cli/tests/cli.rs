@@ -1541,7 +1541,7 @@ fn graph_build_check_map_and_stale_detection() {
 }
 
 #[test]
-fn graph_semantic_grep_needs_needle_weights_without_an_engine() {
+fn graph_semantic_grep_needs_an_available_embedding_provider() {
     // No engine available to this run (engine-less build, or engine-linked
     // but the hermetic HOME has no weights, and no FORGE_NEEDLE_BACKEND hook):
     // `engine_if_available` must report unavailable, and `graph grep
@@ -1568,9 +1568,74 @@ fn graph_semantic_grep_needs_needle_weights_without_an_engine() {
     assert!(!grep.status.success());
     let stderr = String::from_utf8_lossy(&grep.stderr);
     assert!(
-        stderr.contains("semantic search needs needle weights (run forge init)"),
+        stderr.contains("semantic search needs an available embedding provider"),
         "stderr: {stderr}"
     );
+}
+
+#[tokio::test]
+async fn graph_semantic_build_and_search_use_embeddinggemma2() {
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let mut vector = vec![0.0; 128];
+    vector[0] = 1.0;
+    for input in [
+        "title: none | text: function main in src/main.rs",
+        "task: code retrieval | query: find entry point",
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(serde_json::json!({
+                "model": "embeddinggemma-2-test",
+                "input": [input]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"index": 0, "embedding": vector.clone()}]
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join("src")).expect("mkdir");
+    std::fs::create_dir_all(project.join(".forge")).expect("mkdir config");
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write source");
+    std::fs::write(
+        project.join(".forge/config.toml"),
+        format!(
+            "[embedding]\nprovider = \"embeddinggemma2\"\nbase_url = \"{}/v1\"\nmodel = \"embeddinggemma-2-test\"\ndimensions = 128\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+
+    let build = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "build", "--semantic"])
+        .output()
+        .expect("build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let search = forge(tmp.path())
+        .args(["--project"])
+        .arg(&project)
+        .args(["graph", "grep", "--semantic", "find entry point"])
+        .output()
+        .expect("search");
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    assert!(String::from_utf8_lossy(&search.stdout).contains("src/main.rs::main"));
 }
 
 #[test]

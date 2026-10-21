@@ -642,6 +642,24 @@ fn needle_defaults() {
 }
 
 #[test]
+fn embeddinggemma2_is_opt_in_and_validates_its_mrl_width() {
+    let defaults = Config::default();
+    assert_eq!(defaults.embedding.provider, "needle");
+    assert_eq!(defaults.embedding.dimensions, 256);
+
+    let configured: Config = toml::from_str(
+        "[embedding]\nprovider = \"embeddinggemma2\"\nbase_url = \"http://127.0.0.1:8081/v1\"\nmodel = \"embeddinggemma-2-q8\"\ndimensions = 512",
+    )
+    .expect("parses");
+    assert!(configured.validate().is_ok());
+
+    let invalid: Config =
+        toml::from_str("[embedding]\nprovider = \"embeddinggemma2\"\ndimensions = 384")
+            .expect("parses");
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
 fn laya_defaults_and_autofetch_override() {
     let c = Config::default();
     assert_eq!(c.laya.weights_path, "");

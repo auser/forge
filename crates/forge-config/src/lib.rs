@@ -285,6 +285,35 @@ impl Default for NeedleConfig {
     }
 }
 
+/// `[embedding]`: provider used for the semantic project index. Needle keeps
+/// the zero-config default; EmbeddingGemma 2 is an opt-in local HTTP service.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// `needle` or `embeddinggemma2`.
+    pub provider: String,
+    /// OpenAI-compatible base URL used by `embeddinggemma2`.
+    pub base_url: String,
+    /// Model name sent to the embeddings endpoint and used to version indexes.
+    pub model: String,
+    /// Matryoshka output width: 128, 256, 512, or 768.
+    pub dimensions: usize,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: "needle".to_string(),
+            base_url: "http://127.0.0.1:8081/v1".to_string(),
+            model: "embeddinggemma-2".to_string(),
+            dimensions: 256,
+        }
+    }
+}
+
+const EMBEDDING_PROVIDERS: &[&str] = &["needle", "embeddinggemma2"];
+const EMBEDDING_DIMENSIONS: &[usize] = &[128, 256, 512, 768];
+
 /// `[laya]`: checkpoint lifecycle for the native Rust Laya router.
 ///
 /// When `autofetch` is enabled (the default), Forge downloads the pinned
@@ -377,6 +406,10 @@ pub struct Config {
     /// The embedded on-device Needle brain. It remains an explicit router
     /// option; when its weights are missing it degrades to `router_fallback`.
     pub needle: NeedleConfig,
+    /// Provider used for graph indexing and semantic code search. Independent
+    /// of the decision router so Needle may keep routing while another model
+    /// embeds code.
+    pub embedding: EmbeddingConfig,
     /// Optional native Rust Laya checkpoint configuration. Used only by
     /// `router = "laya-native"`.
     pub laya: LayaConfig,
@@ -678,6 +711,7 @@ impl Default for Config {
             .into_iter()
             .collect(),
             needle: NeedleConfig::default(),
+            embedding: EmbeddingConfig::default(),
             laya: LayaConfig::default(),
             budget: BudgetConfig::default(),
             tool_limits: BTreeMap::new(),
@@ -859,6 +893,26 @@ impl Config {
                 NEEDLE_VARIANTS.join(", "),
                 self.needle.variant
             )));
+        }
+        if !EMBEDDING_PROVIDERS.contains(&self.embedding.provider.as_str()) {
+            return Err(ForgeError::config(format!(
+                "embedding.provider must be one of {} (got {:?})",
+                EMBEDDING_PROVIDERS.join(", "),
+                self.embedding.provider
+            )));
+        }
+        if self.embedding.provider == "embeddinggemma2" {
+            if self.embedding.base_url.trim().is_empty() || self.embedding.model.trim().is_empty() {
+                return Err(ForgeError::config(
+                    "embeddinggemma2 requires non-empty embedding.base_url and embedding.model",
+                ));
+            }
+            if !EMBEDDING_DIMENSIONS.contains(&self.embedding.dimensions) {
+                return Err(ForgeError::config(format!(
+                    "embedding.dimensions must be one of 128, 256, 512, 768 (got {})",
+                    self.embedding.dimensions
+                )));
+            }
         }
         if !BUDGET_ON_EXCEEDED_VALUES.contains(&self.budget.on_exceeded.as_str()) {
             return Err(ForgeError::config(format!(

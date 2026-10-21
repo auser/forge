@@ -14,6 +14,7 @@
 mod anthropic;
 mod codex;
 mod credentials;
+mod embedding;
 mod jev;
 mod laya_weights;
 mod local_only;
@@ -31,6 +32,7 @@ pub use credentials::{
     AuthProbe, CredentialKind, CredentialSource, ResolvedCredential, codex_auth, probe_auth,
     resolve_credential,
 };
+pub use embedding::embedder_from_config;
 pub use jev::JevRouter;
 pub use local_only::{EgressPolicy, endpoint_is_local};
 pub use model::{

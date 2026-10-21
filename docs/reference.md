@@ -877,6 +877,10 @@ Key settings (all optional):
 | `laya.autofetch` | `true` | `FORGE_LAYA_AUTOFETCH` | Download the pinned ~847 MB native Laya checkpoint on first use; disabled automatically under `local_only` |
 | `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~35 MB for `full`) |
 | `needle.weights_sha256` | — | `FORGE_NEEDLE_WEIGHTS_SHA256` | Operator override for the expected weights checksum (64 hex chars); empty → use the compiled-in pin. Pairs with `weights_path`/a custom base URL to run your own weights without recompiling |
+| `embedding.provider` | `needle` | — | Semantic-index embedder: `needle` or `embeddinggemma2`; independent from `router` |
+| `embedding.base_url` | `http://127.0.0.1:8081/v1` | — | OpenAI-compatible embeddings endpoint used by `embeddinggemma2` |
+| `embedding.model` | `embeddinggemma-2` | — | Model name sent to the endpoint and included in index versioning; include a checkpoint/quantization suffix when changing either |
+| `embedding.dimensions` | `256` | — | EmbeddingGemma 2 MRL width: `128`, `256`, `512`, or `768` |
 
 Unknown keys are tolerated, with one deliberate exception: inside a
 `[models.<name>]` entry, `model_base_url`/`model_key_env` are rejected by
@@ -1335,11 +1339,11 @@ forge graph context <query>    # ranked files/symbols for agent context
 
 ### Semantic index
 
-`forge graph build --semantic` embeds every symbol locally and stores the
-vectors at `.forge/graph/embeddings.bin`. It requires a genuinely available
-Needle engine (weights loaded and answering, not just constructible — see
-`forge_needle::engine_if_available`); ordinary `forge graph build` remains a
-fast, model-free structural operation. Embedding text is
+`forge graph build --semantic` embeds every symbol and stores the vectors at
+`.forge/graph/embeddings.bin`. It uses the configured `[embedding]` provider;
+`needle` remains the zero-config default, while `embeddinggemma2` talks to a
+local OpenAI-compatible embeddings endpoint. Ordinary `forge graph build`
+remains a fast, model-free structural operation. Embedding text is
 `"<kind> <name> in <path>"`;
 the index key is `"<path>::<name>"`, so two symbols with the same name in
 different files are both independently searchable. Rebuilds are incremental
@@ -1347,10 +1351,30 @@ and content-hash keyed: only symbols whose embedded text actually changed are
 re-embedded, in batches of 32. Each completed batch is checkpointed with a
 temporary-file replacement, so an interrupted first build resumes instead of
 starting over; symbols removed from the graph are dropped from the index too.
-An index built with a different model or embedding
+An index built with a different model, prompt format, or embedding
 dimensionality is discarded and rebuilt wholesale rather than mixed with new
-vectors. Without a working Needle engine, `--semantic` fails with an actionable
-error while the ordinary structural build still succeeds.
+vectors. Without a working embedding provider, `--semantic` fails with an
+actionable error while the ordinary structural build still succeeds.
+
+To opt into EmbeddingGemma 2, run its text-only GGUF server on the configured
+port, then add this to `.forge/config.toml`:
+
+```bash
+llama serve -hf ggml-org/embeddinggemma-2-GGUF:BF16 --embeddings --port 8081
+```
+
+```toml
+[embedding]
+provider = "embeddinggemma2"
+base_url = "http://127.0.0.1:8081/v1"
+model = "embeddinggemma-2-bf16"
+dimensions = 256
+```
+
+Forge applies EmbeddingGemma 2's asymmetric code-retrieval prefixes, truncates
+the returned 768-value vectors to the configured MRL width, and L2-normalizes
+them before storage. Changing `model`, dimensions, or the built-in prompt
+format invalidates the old index cleanly.
 
 `embeddings.bin` is a single `serde_json` blob today (an 8-byte `FRGEMB01`
 magic prefix + one JSON object), parsed in full on every load. That is fine
@@ -1364,17 +1388,17 @@ the spec's §8 amendment for the follow-up.
 
 `forge graph grep --semantic <query>` embeds the query and returns the top 20
 matches by cosine similarity (`score  path::symbol` lines); without a working
-engine it fails with `semantic search needs needle weights (run forge init)`
+provider it fails with `semantic search needs an available embedding provider`
 (exit 1) rather than silently falling back to literal search. `forge graph
-context <query>` blends the two signals when both an engine and a matching
+context <query>` blends the two signals when both an embedder and a matching
 index exist: `final = 0.5 * (1 / (1 + lexical_rank)) + 0.5 * cosine`; otherwise
 its output is exactly the lexical ranking as before. Both the CLI (`--steer
 "prefer tests"`), the chat (`/graph <query> -- <steering>`) and the MCP
 `forge_graph_context` tool (`steer`) accept steering text: it is embedded
 alongside the query in one batch, and each candidate's cosine is the best of
 the two vectors — steering is additive preference, symmetric with the blend's
-union semantics, and a no-op without an engine. For `--json` consumers:
-`score` is always a float — a blended 0-1 value when a needle engine and
+union semantics, and a no-op without an embedder. For `--json` consumers:
+`score` is always a float — a blended 0-1 value when an embedder and
 matching index both exist, otherwise the raw lexical rank count — whereas the
 `POST /v1/project/context` server endpoint always returns the raw lexical
 count as an integer today (see [Server](#server); it has not been wired to
