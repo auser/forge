@@ -1,12 +1,12 @@
 # forge
 
-A one-command, local-first AI coding harness that combines Needle 3,
-a semantic project graph, optional Jev escalation, and your choice of local
-or hosted generation models. It is built around two planes:
+A one-command, local-first AI coding harness that combines native Laya,
+Needle 3, a semantic project graph, and your choice of local or hosted
+generation models. It is built around two planes:
 
-- a **decision plane** — a small on-device model (needle) that answers
-  "which tool, which model, if any" in milliseconds, locally, before any
-  big model is called. Every decision is written to a local log
+- a **decision plane** — Laya selects the least-expensive capable generation
+  model; Needle remains an on-device safe-tool and guardrail fast path. Every
+  decision is written to a local log
   (`forge session decisions`).
 - a **generation plane** — your model: local first, cloud when you
   choose. The same agent loop runs either way.
@@ -38,7 +38,7 @@ forge                                # auto-bootstraps this project and opens th
 ```
 
 On the first run Forge creates its local state, builds the project graph,
-prepares Needle 3 when the embedded engine is available, and prints the
+prepares the native Laya checkpoint when it is first needed, and prints the
 generation model it selected. Selection is deterministic: a reachable local
 model wins, followed by an authenticated CLI subscription, then an API-key
 hosted provider. Models without working endpoints or credentials are never
@@ -65,6 +65,7 @@ Or the explicit steps:
 cd your-project
 forge init                            # starter config, project graph, brain weights
 forge run "Explain this project"      # the agent loop (non-interactive)
+forge run --plan "Refactor auth"      # route planning separately from execution
 forge chat                            # the same loop, interactive
 ```
 
@@ -149,11 +150,15 @@ and tradeoffs.
 
 - `forge run` — a bounded inspect/edit/check/review workflow over the
   multi-turn agent loop, with durable task evidence and a reviewable diff.
+- `forge run --plan` — routes a read-only design pass, economical execution,
+  and—when implementation changes something—a read-only independent review.
+  The generated plan and review are durable task evidence.
 - `forge resume <task-id>` — validates the working tree and effect journal,
   then continues a safely parked task in its existing session.
-- `forge task [list]` / `forge task show <task-id>` — inspect the current
-  node, route, spend, checks, changed files, parked reason, and terminal result;
-  add `--json` for the shared machine-readable projection.
+- `forge task [list]` / `forge task show <task-id>` — inspect the generated
+  plan, current node, route, spend, checks, changed files, review, parked
+  reason, and terminal result; add `--json` for the shared machine-readable
+  projection.
 - `forge chat` — the same tool-using runtime interactively, with approvals
   (`y`/`n` inline; safe reads never ask).
 - `forge graph` — a deterministic project graph plus an on-device
@@ -172,7 +177,8 @@ everything. The three keys you'll actually touch:
 
 ```toml
 model = "..."            # from `forge model list`
-router = "needle"        # default; also static, cheapest, jev, laya, laya-native
+router = "laya-native"   # default; chooses the least-expensive capable model
+router_fallback = "cheapest"
 approval = "prompt-dangerous" # ordinary edits run; destructive operations ask
 ```
 

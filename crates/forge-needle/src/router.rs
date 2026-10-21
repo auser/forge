@@ -72,12 +72,16 @@ impl DecisionRouter for NeedleRouter {
                 reason: "only eligible model".to_string(),
             });
         }
-        let decision = tokio::time::timeout(
-            self.timeout,
-            self.engine.decide(task.task.clone(), eligible),
-        )
-        .await
-        .map_err(|_| ForgeError::router("needle: decision timed out"))??;
+        let routing_text = match task.phase {
+            forge_core::RoutingPhase::General => task.task.clone(),
+            forge_core::RoutingPhase::Plan => format!("[phase: plan] {}", task.task),
+            forge_core::RoutingPhase::Execute => format!("[phase: execute] {}", task.task),
+            forge_core::RoutingPhase::Review => format!("[phase: review] {}", task.task),
+        };
+        let decision =
+            tokio::time::timeout(self.timeout, self.engine.decide(routing_text, eligible))
+                .await
+                .map_err(|_| ForgeError::router("needle: decision timed out"))??;
         Ok(RoutingDecision {
             selected_model: decision.choice,
             confidence: decision.confidence,

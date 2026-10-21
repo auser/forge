@@ -103,6 +103,7 @@ impl TranscriptState {
                 confidence,
                 fallback_used,
                 reason,
+                ..
             } => vec![Line::meta(routing_text(
                 router,
                 selected_model,
@@ -493,6 +494,7 @@ mod tests {
             EventKind::RoutingDecisionMade {
                 router: "needle".into(),
                 selected_model: "qwen3-coder".into(),
+                phase: forge_core::RoutingPhase::General,
                 confidence: 0.913,
                 fallback_used: false,
                 reason: String::new(),
@@ -509,6 +511,7 @@ mod tests {
             EventKind::RoutingDecisionMade {
                 router: "static".into(),
                 selected_model: "qwen3-coder".into(),
+                phase: forge_core::RoutingPhase::General,
                 confidence: 0.5,
                 fallback_used: true,
                 reason: "needle declined".into(),
@@ -529,6 +532,7 @@ mod tests {
             EventKind::RoutingDecisionMade {
                 router: "needle-dispatch".into(),
                 selected_model: "none".into(),
+                phase: forge_core::RoutingPhase::General,
                 confidence: 0.94,
                 fallback_used: false,
                 reason: "needle filled and dispatched `read_file` on device; no model call".into(),
@@ -551,6 +555,7 @@ mod tests {
             EventKind::RoutingDecisionMade {
                 router: "needle-dispatch".into(),
                 selected_model: "none".into(),
+                phase: forge_core::RoutingPhase::General,
                 confidence: 0.94,
                 fallback_used: false,
                 reason: String::new(),

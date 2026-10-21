@@ -359,7 +359,11 @@ pub struct Config {
     pub server_port: u16,
     /// Agent-loop turn budget.
     pub max_turns: u32,
-    /// Reject http/laya/needle/jev routing decisions below this confidence.
+    /// Turn budget for the read-only planning phase of a planned workflow.
+    pub plan_max_turns: u32,
+    /// Turn budget for the read-only review phase of a development workflow.
+    pub review_max_turns: u32,
+    /// Reject http/laya/laya-native/needle/jev routing decisions below this confidence.
     pub router_confidence_threshold: f64,
     /// Fallback router when the primary fails or is below threshold
     /// ("static" or "cheapest").
@@ -370,9 +374,8 @@ pub struct Config {
     /// Named models with cost/capability metadata. Deep-merged by name
     /// across config files; not settable via env/CLI flags.
     pub models: BTreeMap<String, ModelEntry>,
-    /// The embedded on-device Needle brain: config for the default
-    /// `router = "needle"`. When the weights are missing, routing built on
-    /// it degrades to `router_fallback`.
+    /// The embedded on-device Needle brain. It remains an explicit router
+    /// option; when its weights are missing it degrades to `router_fallback`.
     pub needle: NeedleConfig,
     /// Optional native Rust Laya checkpoint configuration. Used only by
     /// `router = "laya-native"`.
@@ -643,7 +646,7 @@ impl Default for Config {
             model_base_url: Some("http://127.0.0.1:8080/v1".to_string()),
             model_key_env: None,
             mock_script: None,
-            router: "needle".to_string(),
+            router: "laya-native".to_string(),
             router_url: None,
             router_key_env: None,
             router_escalate: "auto".to_string(),
@@ -657,8 +660,10 @@ impl Default for Config {
             server_host: "127.0.0.1".to_string(),
             server_port: 7_341,
             max_turns: 25,
+            plan_max_turns: 4,
+            review_max_turns: 4,
             router_confidence_threshold: 0.7,
-            router_fallback: "static".to_string(),
+            router_fallback: "cheapest".to_string(),
             router_autostart: true,
             models: [
                 ("qwen3-coder".to_string(), models[0].clone()),
@@ -767,6 +772,8 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_SERVER_HOST", "server_host"),
     ("FORGE_SERVER_PORT", "server_port"),
     ("FORGE_MAX_TURNS", "max_turns"),
+    ("FORGE_PLAN_MAX_TURNS", "plan_max_turns"),
+    ("FORGE_REVIEW_MAX_TURNS", "review_max_turns"),
     (
         "FORGE_ROUTER_CONFIDENCE_THRESHOLD",
         "router_confidence_threshold",
@@ -1096,11 +1103,13 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
             "server_port" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
                 ForgeError::config(format!("{env_name} must be a valid port, got {raw:?}"))
             })?),
-            "max_turns" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
-                ForgeError::config(format!(
-                    "{env_name} must be a positive integer, got {raw:?}"
-                ))
-            })?),
+            "max_turns" | "plan_max_turns" | "review_max_turns" => {
+                toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
+                    ForgeError::config(format!(
+                        "{env_name} must be a positive integer, got {raw:?}"
+                    ))
+                })?)
+            }
             "budget.session_tokens" | "catalogue_ttl_days" => {
                 toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
                     ForgeError::config(format!(

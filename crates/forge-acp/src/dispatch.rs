@@ -313,6 +313,7 @@ impl TurnState {
                 confidence,
                 fallback_used,
                 reason,
+                ..
             } => {
                 let mut text =
                     format!("Routing via {router}: {selected_model} (confidence {confidence:.2})");

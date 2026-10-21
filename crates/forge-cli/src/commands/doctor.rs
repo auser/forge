@@ -565,6 +565,7 @@ async fn live_checks(ctx: &Context) -> Vec<Check> {
                 activate_skills: Vec::new(),
                 development_workflow: false,
                 effect_journal: None,
+                ..forge_runtime::RunOptions::default()
             },
         ),
     )
@@ -1410,6 +1411,14 @@ mod tests {
             .join("\n")
     }
 
+    fn needle_config() -> forge_config::Config {
+        forge_config::Config {
+            router: "needle".to_string(),
+            router_fallback: "static".to_string(),
+            ..forge_config::Config::default()
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn needle_checks_when_router_is_not_needle_is_ok_and_informational() {
@@ -1429,7 +1438,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn the_needle_report_is_always_a_line_pair_covering_backend_and_weights() {
-        let mut config = forge_config::Config::default();
+        let mut config = needle_config();
         config.needle.weights_path = "/nonexistent/needle.cact".to_string();
 
         let checks = needle_checks(&config).await;
@@ -1464,7 +1473,7 @@ mod tests {
         if forge_needle::HAS_EMBEDDED_BACKEND {
             return; // this binary *has* a backend; nothing to assert
         }
-        let mut config = forge_config::Config::default();
+        let mut config = needle_config();
         config.needle.weights_path = "/nonexistent/needle.cact".to_string();
 
         let checks = needle_checks(&config).await;
@@ -1509,7 +1518,7 @@ mod tests {
         if !forge_needle::HAS_EMBEDDED_BACKEND {
             return;
         }
-        let mut config = forge_config::Config::default();
+        let mut config = needle_config();
         config.needle.weights_path = "/nonexistent/needle.cact".to_string();
 
         let checks = needle_checks(&config).await;
@@ -1551,7 +1560,7 @@ mod tests {
                 // verify cleanly.
                 weights_sha256: format!("{:x}", Sha256::digest(bytes)),
             },
-            ..forge_config::Config::default()
+            ..needle_config()
         };
 
         let checks = needle_checks(&config).await;
@@ -1579,7 +1588,7 @@ mod tests {
         // "medium" is config-valid but has no pinned artifact yet (see
         // forge-needle's weights module doc) — must degrade to Warn, never
         // panic or Fail.
-        let mut config = forge_config::Config::default();
+        let mut config = needle_config();
         config.needle.variant = "medium".to_string();
         let checks = needle_checks(&config).await;
         let text = pair_text(&checks);
@@ -1598,7 +1607,7 @@ mod tests {
         unsafe {
             std::env::set_var("FORGE_NEEDLE_BACKEND", "hash");
         }
-        let checks = needle_checks(&forge_config::Config::default()).await;
+        let checks = needle_checks(&needle_config()).await;
         unsafe {
             std::env::remove_var("FORGE_NEEDLE_BACKEND");
         }
@@ -1628,7 +1637,7 @@ mod tests {
     #[serial]
     fn jev_check_reports_credential_detected_for_escalation() {
         unsafe { std::env::set_var("TYPESAFE_API_KEY", "dummy-value-for-test") };
-        let config = forge_config::Config::default(); // router = "needle", escalate = "auto"
+        let config = needle_config();
         let check = jev_check(&config);
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
         assert_eq!(check.level, Level::Ok);
@@ -1646,7 +1655,7 @@ mod tests {
     #[serial]
     fn jev_check_reports_informational_message_when_escalation_has_no_credential() {
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
-        let config = forge_config::Config::default(); // router = "needle", escalate = "auto"
+        let config = needle_config();
         let check = jev_check(&config);
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
@@ -1661,6 +1670,7 @@ mod tests {
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
         let config = forge_config::Config {
             router: "jev".to_string(),
+            router_fallback: "static".to_string(),
             ..forge_config::Config::default()
         };
         let check = jev_check(&config);
@@ -1676,7 +1686,7 @@ mod tests {
 
         let escalation = forge_config::Config {
             local_only: true,
-            ..forge_config::Config::default() // router = "needle", escalate = "auto"
+            ..needle_config()
         };
         let check = jev_check(&escalation);
         assert_eq!(check.level, Level::Ok);
@@ -2445,6 +2455,7 @@ mod tests {
                 forge_core::EventKind::RoutingDecisionMade {
                     router: router.into(),
                     selected_model: selected.into(),
+                    phase: forge_core::RoutingPhase::General,
                     confidence,
                     fallback_used: fallback,
                     reason: "test".into(),
@@ -2473,11 +2484,7 @@ mod tests {
     #[test]
     fn live_success_checks_report_model_router_fallback_latency_and_session() {
         let outcome = fake_live_outcome("needle", "qwen3-coder", 0.91, false);
-        let checks = live_success_checks(
-            &outcome,
-            Duration::from_millis(812),
-            &forge_config::Config::default(),
-        );
+        let checks = live_success_checks(&outcome, Duration::from_millis(812), &needle_config());
 
         assert_eq!(
             labels(&checks),
@@ -2505,11 +2512,7 @@ mod tests {
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
         let outcome = fake_live_outcome("jev", "gpt-5", 0.88, false);
         // router = "needle" (the default): a jev decision IS the escalation.
-        let checks = live_success_checks(
-            &outcome,
-            Duration::from_millis(100),
-            &forge_config::Config::default(),
-        );
+        let checks = live_success_checks(&outcome, Duration::from_millis(100), &needle_config());
         assert!(
             find(&checks, "live jev")
                 .detail
@@ -2533,11 +2536,7 @@ mod tests {
     fn live_jev_reports_armed_but_not_needed() {
         unsafe { std::env::set_var("TYPESAFE_API_KEY", "dummy-value-for-test") };
         let outcome = fake_live_outcome("needle", "qwen3-coder", 0.91, false);
-        let checks = live_success_checks(
-            &outcome,
-            Duration::from_millis(100),
-            &forge_config::Config::default(),
-        );
+        let checks = live_success_checks(&outcome, Duration::from_millis(100), &needle_config());
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
         assert_eq!(
             find(&checks, "live jev").detail,
@@ -2550,11 +2549,7 @@ mod tests {
     fn live_jev_reports_not_armed_without_a_credential() {
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
         let outcome = fake_live_outcome("static", "mock-local", 1.0, true);
-        let checks = live_success_checks(
-            &outcome,
-            Duration::from_millis(100),
-            &forge_config::Config::default(),
-        );
+        let checks = live_success_checks(&outcome, Duration::from_millis(100), &needle_config());
         assert_eq!(
             find(&checks, "live jev").detail,
             "did not fire — not armed (no TYPESAFE_API_KEY credential)"

@@ -22,6 +22,7 @@ pub async fn run(
     prompt: Vec<String>,
     max_turns: Option<u32>,
     skills: Vec<String>,
+    plan: bool,
 ) -> Result<(), ForgeError> {
     let prompt = prompt.join(" ");
     let service = Arc::new(build_run_service(ctx).await?);
@@ -40,6 +41,7 @@ pub async fn run(
             run_id: Some(run_id),
             max_turns,
             activate_skills: skills,
+            plan_before_execute: plan,
             ..RunOptions::default()
         },
     )

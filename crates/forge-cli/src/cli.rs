@@ -104,6 +104,9 @@ pub enum Command {
         /// the prompt matches. An unknown name is an error.
         #[arg(long = "skill", value_name = "NAME")]
         skills: Vec<String>,
+        /// Route a read-only planning pass before the implementation run.
+        #[arg(long)]
+        plan: bool,
     },
 
     /// Serve the Model Context Protocol over stdio (for editors and agent

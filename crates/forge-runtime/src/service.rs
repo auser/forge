@@ -14,8 +14,8 @@ use forge_context::{
 };
 use forge_core::{
     CompletionRequest, DecisionRouter, Event, EventKind, ExecutionProvider, ForgeError, Message,
-    ModelProvider, ProjectGraph, RiskLevel, RoutingRequest, RunState, SessionStore, Skill,
-    SkillMeta, SkillRegistry, TOOL_POLICY_SCHEMA_VERSION, ToolCall, ToolResult,
+    ModelProvider, ProjectGraph, RiskLevel, RoutingPhase, RoutingRequest, RunState, SessionStore,
+    Skill, SkillMeta, SkillRegistry, TOOL_POLICY_SCHEMA_VERSION, ToolCall, ToolResult,
 };
 use forge_needle::NeedleEngine;
 use forge_session::{
@@ -224,7 +224,26 @@ fn has_external_effect(call: &ToolCall) -> bool {
 }
 
 /// Optional parameters for a run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAccess {
+    #[default]
+    All,
+    ReadOnly,
+    None,
+}
+
+impl ToolAccess {
+    fn allows(self, tool: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::ReadOnly => matches!(tool, "read_file" | "graph_context" | "graph_grep"),
+            Self::None => false,
+        }
+    }
+}
+
+/// Optional parameters for a run.
+#[derive(Debug, Default, Clone)]
 pub struct RunOptions {
     /// Pre-generated run id (defaults to a fresh ULID).
     pub run_id: Option<String>,
@@ -239,6 +258,16 @@ pub struct RunOptions {
     /// Add the deterministic inspect/edit/check/review contract as hidden
     /// system context while preserving the user's prompt verbatim.
     pub development_workflow: bool,
+    /// Development phase exposed to model routing and durable route events.
+    pub routing_phase: RoutingPhase,
+    /// Override the text used for routing while preserving `prompt` as the
+    /// actual conversation turn.
+    pub routing_task: Option<String>,
+    /// Restrict the model-visible tool surface for this run.
+    pub tool_access: ToolAccess,
+    /// Ask a read-only planning model to produce the implementation plan
+    /// before the ordinary development workflow executes it.
+    pub plan_before_execute: bool,
     /// Optional durable boundary invoked synchronously around externally
     /// visible tool effects.
     pub effect_journal: Option<Arc<dyn EffectJournal>>,
@@ -265,28 +294,26 @@ struct RunPlan {
     /// options and re-runs discovery on the original task.
     activate_skills: Vec<String>,
     development_workflow: bool,
+    routing_phase: RoutingPhase,
+    tool_access: ToolAccess,
     effect_journal: Option<Arc<dyn EffectJournal>>,
 }
 
 impl RunPlan {
     /// A new instruction: the prompt is the task, and `history` is whatever
     /// the session it lands in already contains (empty for a fresh session).
-    fn new_prompt(
-        prompt: impl Into<String>,
-        history: Vec<Message>,
-        activate_skills: Vec<String>,
-        development_workflow: bool,
-        effect_journal: Option<Arc<dyn EffectJournal>>,
-    ) -> Self {
+    fn new_prompt(prompt: impl Into<String>, history: Vec<Message>, options: RunOptions) -> Self {
         let prompt = prompt.into();
         Self {
-            task: prompt.clone(),
+            task: options.routing_task.unwrap_or_else(|| prompt.clone()),
             prompt,
             history,
             resumed_from: None,
-            activate_skills,
-            development_workflow,
-            effect_journal,
+            activate_skills: options.activate_skills,
+            development_workflow: options.development_workflow,
+            routing_phase: options.routing_phase,
+            tool_access: options.tool_access,
+            effect_journal: options.effect_journal,
         }
     }
 }
@@ -1907,21 +1934,16 @@ impl AgentService {
         options: RunOptions,
     ) -> Result<RunOutcome, ForgeError> {
         self.validate_activate_skills(&options.activate_skills)?;
-        let run_id = options.run_id.unwrap_or_else(new_run_id);
-        let session_id = options.session_id.unwrap_or_else(new_session_id);
+        let run_id = options.run_id.clone().unwrap_or_else(new_run_id);
+        let session_id = options.session_id.clone().unwrap_or_else(new_session_id);
+        let max_turns = options.max_turns;
         let claim = self.claim_session(&session_id, &run_id)?;
         let history = self.session_history(&session_id);
         self.run_tracked(
-            RunPlan::new_prompt(
-                prompt,
-                history,
-                options.activate_skills,
-                options.development_workflow,
-                options.effect_journal,
-            ),
+            RunPlan::new_prompt(prompt, history, options),
             &run_id,
             &session_id,
-            options.max_turns,
+            max_turns,
             claim,
         )
         .await
@@ -1992,8 +2014,8 @@ impl AgentService {
         options: RunOptions,
     ) -> Result<StartedRun, ForgeError> {
         self.validate_activate_skills(&options.activate_skills)?;
-        let run_id = options.run_id.unwrap_or_else(new_run_id);
-        let session_id = options.session_id.unwrap_or_else(new_session_id);
+        let run_id = options.run_id.clone().unwrap_or_else(new_run_id);
+        let session_id = options.session_id.clone().unwrap_or_else(new_session_id);
         let claim = self.claim_session(&session_id, &run_id)?;
         // Create the broadcast channel now so subscribers connecting right
         // after the ids are handed out miss nothing.
@@ -2002,20 +2024,11 @@ impl AgentService {
         let prompt = prompt.into();
         let (rid, sid) = (run_id.clone(), session_id.clone());
         let max_turns = options.max_turns;
-        let activate_skills = options.activate_skills;
-        let development_workflow = options.development_workflow;
-        let effect_journal = options.effect_journal;
         let handle = tokio::spawn(async move {
             let history = service.session_history(&sid);
             service
                 .run_tracked(
-                    RunPlan::new_prompt(
-                        prompt,
-                        history,
-                        activate_skills,
-                        development_workflow,
-                        effect_journal,
-                    ),
+                    RunPlan::new_prompt(prompt, history, options),
                     &rid,
                     &sid,
                     max_turns,
@@ -2263,6 +2276,8 @@ impl AgentService {
             resumed_from,
             activate_skills,
             development_workflow,
+            routing_phase,
+            tool_access,
             effect_journal,
         } = plan;
         let prompt = prompt.as_str();
@@ -2362,7 +2377,10 @@ impl AgentService {
         let decide_tools = tool_definitions();
         // `tool_definitions()` is a fixed surface, so it is always
         // non-empty and does not gate the fast path.
-        let fast = if resumed_from.is_none() && activate_skills.is_empty() {
+        let fast = if resumed_from.is_none()
+            && activate_skills.is_empty()
+            && tool_access == ToolAccess::All
+        {
             let started = std::time::Instant::now();
             let outcome = self.needle_fast_path(prompt, &run_id, &decide_tools).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -2413,6 +2431,7 @@ impl AgentService {
                     EventKind::RoutingDecisionMade {
                         router: NEEDLE_DISPATCH.to_string(),
                         selected_model: "none".to_string(),
+                        phase: routing_phase,
                         confidence: fast.confidence,
                         fallback_used: false,
                         reason: format!(
@@ -2616,6 +2635,7 @@ impl AgentService {
         }
         let routing_request = RoutingRequest {
             task: task.to_string(),
+            phase: routing_phase,
             required_capabilities: Vec::new(),
             candidates,
         };
@@ -2674,6 +2694,7 @@ impl AgentService {
                 EventKind::RoutingDecisionMade {
                     router: decision.router_name.clone(),
                     selected_model: decision.selected_model.clone(),
+                    phase: routing_phase,
                     confidence: decision.confidence,
                     fallback_used: decision.fallback_used,
                     reason: decision.reason.clone(),
@@ -2686,15 +2707,34 @@ impl AgentService {
         // System first is what providers expect, and the history is a real
         // user/assistant/tool transcript that must arrive in its own order.
         let mut messages = self.system_context.clone();
+        if routing_phase == RoutingPhase::Plan {
+            messages.push(Message::system(
+                "Plan this coding request without changing the working tree. Inspect relevant \n\
+                 repository context with the available read-only tools, identify affected files \n\
+                 and invariants, and finish with a concise ordered implementation plan and its \n\
+                 verification steps. Do not claim that edits or checks have already happened."
+                    .to_string(),
+            ));
+        }
+        if routing_phase == RoutingPhase::Review {
+            messages.push(Message::system(
+                "Independently review the completed implementation without changing the working \
+                 tree. Use the available read-only tools only when needed. Prioritize correctness, \
+                 security, regressions, and missing verification. Report actionable findings first \
+                 and say clearly when there are none."
+                    .to_string(),
+            ));
+        }
         if development_workflow {
             messages.push(Message::system(
                 "Complete this coding request as one bounded workflow: inspect the relevant \n\
                  repository context before changing files; make only the requested edits; run \n\
                  focused checks defined by repository instructions or the affected project; then \n\
-                 review the working-tree changes. During review, use run_command with `git diff \n\
-                 --no-ext-diff --` so Forge can return the reviewable diff. Do not commit, push, \n\
-                 publish, deploy, or contact external services. Keep the final review concise and \n\
-                 state which checks ran."
+                 capture the working-tree changes once with run_command using `git diff \n\
+                 --no-ext-diff --` so Forge can return the reviewable diff. Do not reread files \n\
+                 merely to confirm successful edits. Once the requested change and focused checks \n\
+                 are complete, stop using tools and summarize; Forge performs an independent \n\
+                 review next. Do not commit, push, publish, deploy, or contact external services."
                     .to_string(),
             ));
         }
@@ -2779,11 +2819,21 @@ impl AgentService {
         // offered the full surface above regardless of this — a chat-only
         // model receives zero tools, exactly as before the reorder.
         let mut tools = if model.capabilities().tools {
-            decide_tools
+            match tool_access {
+                ToolAccess::All => decide_tools,
+                ToolAccess::ReadOnly => decide_tools
+                    .into_iter()
+                    .filter(|tool| tool_access.allows(&tool.name))
+                    .collect(),
+                ToolAccess::None => Vec::new(),
+            }
         } else {
             Vec::new()
         };
-        if model.capabilities().tools && self.artifact_store.is_some() {
+        if tool_access == ToolAccess::All
+            && model.capabilities().tools
+            && self.artifact_store.is_some()
+        {
             tools.push(crate::tools::artifact_tool_definition());
         }
 
@@ -3028,7 +3078,14 @@ impl AgentService {
                     call_id: call.id.clone(),
                     event_seq: collected.last().expect("persisted tool request").seq,
                 };
-                let reservation = tool_quotas.reserve(&call.name);
+                let reservation = if tool_access.allows(&call.name) {
+                    tool_quotas.reserve(&call.name)
+                } else {
+                    Err(format!(
+                        "tool `{}` is unavailable during the {:?} phase",
+                        call.name, routing_phase
+                    ))
+                };
                 let mut effect_may_execute = false;
                 if let Some(mut policy) = dispatcher.evaluate_policy(call) {
                     if reservation.is_err() {
@@ -3494,6 +3551,8 @@ impl AgentService {
                 // original task, exactly as the run being continued did.
                 activate_skills: Vec::new(),
                 development_workflow: options.development_workflow,
+                routing_phase: options.routing_phase,
+                tool_access: options.tool_access,
                 effect_journal: options.effect_journal,
             },
             &resumed_run,

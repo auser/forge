@@ -3,6 +3,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ForgeError;
 
+/// The development phase whose work is being routed.
+///
+/// Routers may spend more on planning or review while preferring an
+/// economical capable model for execution. `General` preserves the behavior
+/// of callers that do not run Forge's development workflow.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingPhase {
+    #[default]
+    General,
+    Plan,
+    Execute,
+    Review,
+}
+
 /// A capability a task requires from the selected model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +45,8 @@ impl Capability {
 pub struct RoutingRequest {
     pub task: String,
     #[serde(default)]
+    pub phase: RoutingPhase,
+    #[serde(default)]
     pub required_capabilities: Vec<Capability>,
     #[serde(default)]
     pub candidates: Vec<String>,
@@ -39,8 +56,16 @@ impl RoutingRequest {
     pub fn new(task: impl Into<String>) -> Self {
         Self {
             task: task.into(),
+            phase: RoutingPhase::General,
             required_capabilities: Vec::new(),
             candidates: Vec::new(),
+        }
+    }
+
+    pub fn for_phase(task: impl Into<String>, phase: RoutingPhase) -> Self {
+        Self {
+            phase,
+            ..Self::new(task)
         }
     }
 }

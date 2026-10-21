@@ -151,6 +151,9 @@ pub enum EventKind {
     RoutingDecisionMade {
         router: String,
         selected_model: String,
+        /// Development phase this decision served (`general` for older logs).
+        #[serde(default)]
+        phase: crate::RoutingPhase,
         confidence: f64,
         fallback_used: bool,
         /// Why this model was selected ("" for older logs).
@@ -578,6 +581,7 @@ mod tests {
             EventKind::RoutingDecisionMade {
                 router: "static".into(),
                 selected_model: "mock-local".into(),
+                phase: crate::RoutingPhase::General,
                 confidence: 1.0,
                 fallback_used: false,
                 reason: "test".into(),
@@ -589,6 +593,7 @@ mod tests {
         assert_eq!(value["run_id"], "run-1");
         assert_eq!(value["session_id"], "session-1");
         assert_eq!(value["router"], "static");
+        assert_eq!(value["phase"], "general");
         assert_eq!(value["fallback_used"], false);
         assert_eq!(value["confidence"], 1.0);
     }
@@ -602,8 +607,11 @@ mod tests {
         assert_eq!(event.seq, 0);
         assert_eq!(event.seq_or_index(7), 7);
         match &event.kind {
-            EventKind::RoutingDecisionMade { confidence, .. } => {
+            EventKind::RoutingDecisionMade {
+                confidence, phase, ..
+            } => {
                 assert!((confidence - 0.9).abs() < 0.001);
+                assert_eq!(*phase, crate::RoutingPhase::General);
             }
             other => panic!("unexpected kind: {other:?}"),
         }

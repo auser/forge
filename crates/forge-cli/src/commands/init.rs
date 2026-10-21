@@ -10,15 +10,17 @@ const STARTER_CONFIG: &str = "\
 # Forge project configuration.
 # Forge auto-selects a reachable local model or an authenticated hosted model.
 # Set `model = \"...\"` here only when you want to pin one.
-# The embedded Needle 3 decision router is the default.
+# Native Laya picks the least-expensive capable model and downloads its
+# checkpoint to Forge's shared cache automatically on first use.
 # Precedence: user config -> this file -> FORGE_* env -> CLI flags.
 # See `forge config explain <key>`.
-router = \"needle\"            # on-device decisions; falls back to static when unavailable
+router = \"laya-native\"
+router_fallback = \"cheapest\"
 execution = \"native\"
 approval = \"prompt-dangerous\" # ordinary project edits run; destructive operations ask
 ";
 
-const GITIGNORE_ENTRY: &str = ".forge/";
+const GITIGNORE_ENTRY: &str = ".forge/*\n!.forge/learnings/\n!.forge/learnings/*.md";
 
 /// Known provider API keys and the built-in model entry they unlock
 /// (None = no built-in entry; still worth reporting).
@@ -57,7 +59,8 @@ struct InitItem {
 }
 
 /// Idempotent project initialization: `.forge/` directories, starter config
-/// (only when absent), and a single `.forge/` line in `.gitignore`.
+/// (only when absent), and ignored Forge runtime state. Reviewed project
+/// learnings are the one `.forge` subtree deliberately left trackable.
 pub fn run(ctx: &Context, preset: Option<&str>) -> Result<(), ForgeError> {
     run_inner(ctx, preset, true)
 }
@@ -113,6 +116,7 @@ fn run_inner(ctx: &Context, preset: Option<&str>, print_report: bool) -> Result<
         &forge_dir,
         &forge_dir.join("graph"),
         &forge_dir.join("sessions"),
+        &forge_dir.join("learnings"),
     ] {
         let status = if dir.is_dir() {
             ItemStatus::Unchanged
@@ -178,9 +182,8 @@ fn legacy_config_item(root: &Path, config: &forge_config::Config) -> Option<Init
         status: ItemStatus::Detected,
         path: forge_config::Config::project_config_path(root),
         note: Some(
-            "note: router = \"laya\" is set; the built-in default is now the embedded \
-             needle brain — delete the router line to use it (or keep laya and run \
-             `forge router serve`)"
+            "note: router = \"laya\" is set; the built-in default is now native Laya — \
+             delete the router line to use it (or keep laya and run `forge router serve`)"
                 .to_string(),
         ),
     })
@@ -438,14 +441,21 @@ fn update_gitignore(root: &Path) -> Result<InitItem, ForgeError> {
     let path = root.join(".gitignore");
     if path.exists() {
         let existing = std::fs::read_to_string(&path).map_err(ForgeError::Io)?;
-        if existing.lines().any(|line| line.trim() == GITIGNORE_ENTRY) {
+        if existing.contains(GITIGNORE_ENTRY) {
             return Ok(InitItem {
                 status: ItemStatus::Unchanged,
                 path,
                 note: Some(format!("already contains {GITIGNORE_ENTRY}")),
             });
         }
-        let mut updated = existing;
+        // Migrate the old blanket directory ignore. A negated child cannot
+        // revive a path below an ignored directory, so retaining `.forge/`
+        // would make repository learnings untrackable.
+        let mut updated = existing
+            .lines()
+            .filter(|line| line.trim() != ".forge/")
+            .collect::<Vec<_>>()
+            .join("\n");
         if !updated.is_empty() && !updated.ends_with('\n') {
             updated.push('\n');
         }
@@ -519,7 +529,7 @@ mod tests {
         assert_eq!(item.status, ItemStatus::Detected);
         let note = item.note.expect("note");
         assert!(note.contains("router = \"laya\" is set"), "note: {note}");
-        assert!(note.contains("embedded needle brain"), "note: {note}");
+        assert!(note.contains("native Laya"), "note: {note}");
         assert!(note.contains("delete the router line"), "note: {note}");
         // The note points at the file that has to be edited.
         assert!(item.path.ends_with(".forge/config.toml"), "{:?}", item.path);
@@ -528,7 +538,7 @@ mod tests {
     #[test]
     fn legacy_config_item_is_silent_for_the_default_router() {
         let config = forge_config::Config::default();
-        assert_eq!(config.router, "needle");
+        assert_eq!(config.router, "laya-native");
         assert!(legacy_config_item(Path::new("/proj"), &config).is_none());
     }
 

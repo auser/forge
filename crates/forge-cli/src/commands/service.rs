@@ -114,7 +114,7 @@ pub(crate) fn overrides_for(ctx: &Context, options: &ServiceOptions) -> CliOverr
 fn is_zero_config_model_selection(config: &forge_config::Config) -> bool {
     !config.explicit.contains("model")
         && !config.explicit.iter().any(|key| key.starts_with("models."))
-        && (!config.explicit.contains("router") || config.router == "needle")
+        && (!config.explicit.contains("router") || config.router == "laya-native")
 }
 
 /// Build the transport-neutral agent runtime from the resolved
@@ -337,7 +337,7 @@ mod tests {
         std::fs::create_dir_all(project.path().join(".forge")).expect("forge dir");
         std::fs::write(
             project.path().join(".forge/config.toml"),
-            "router = \"needle\"\nexecution = \"native\"\napproval = \"prompt-dangerous\"\n",
+            "router = \"laya-native\"\nrouter_fallback = \"cheapest\"\nexecution = \"native\"\napproval = \"prompt-dangerous\"\n",
         )
         .expect("starter config");
         let resolved = forge_config::Config::load(

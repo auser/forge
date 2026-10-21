@@ -20,32 +20,24 @@ expensive, and unaccountable about its own uncertainty; a decision model
 returns a typed choice with a confidence score in milliseconds, for free,
 without leaving the machine.
 
-## The decision plane: Needle 3, then Jev, then rules
+## The decision plane: Laya routes; Needle dispatches safe tools
 
-Every routing and guardrail question forge asks is a System One decision — a
-choice from a fixed set, with a confidence, never generated prose. Three tiers
-answer, cheapest first:
+Forge separates model selection from safe local execution. Laya chooses a
+least-expensive capable generation model; Needle remains an independent,
+on-device fast path for deterministic, read-only tool work and its guardrail.
+The user does not need to choose between them.
 
-1. **Needle 3, on-device.** The default (`router = "needle"`): an embedded
-   decision model from [Cactus Compute](https://huggingface.co/Cactus-Compute/needle3)
-   (Apache-2.0, ~35 MB of weights) running inside the forge process, with no
-   network calls once its weights are on disk. Free, and fast enough to be
-   invisible — the end-to-end suite's reference for a warm route round-trip is
-   ~47 ms in a release build on an idle macos-arm64 machine. Needle is also
-   what *fills* tool calls: name and arguments, against the same tool schemas
-   the language model would have been handed.
-2. **Jev**, when the on-device brain is unsure. TypeSafe's hosted System One
-   API, or a self-hosted [OpenJev](https://github.com/razorback16/openjev)
-   speaking the same wire protocol. It is consulted only when needle declines,
-   errors, or lands below `router_confidence_threshold` **and** a Jev
-   credential (`TYPESAFE_API_KEY`, or `jev_key_env`) is actually present and
-   `--local-only` is off. With no credential, `router_escalate = "auto"` — the
-   default — is a no-op and nothing leaves the machine.
-3. **Deterministic static rules**, as the floor that cannot fail. They need no
-   model, no weights, and no network. So an absent, unloaded, unreachable or
-   unconfident brain degrades to rules (`fallback_used: true` in the event log)
-   and the run continues. Laya and any other System One-compatible HTTP router
-   remain available as alternates.
+1. **Native Laya, on-device.** The default (`router = "laya-native"`) loads a
+   pinned checkpoint in Forge and selects the least-expensive candidate that
+   meets the task's requirements. Its first use downloads the checkpoint to
+   Forge's shared model cache; a missing/unavailable router falls back to
+   `cheapest` deterministically.
+2. **Needle 3, on-device.** It fills an exact safe tool call and applies a
+   separate destructive-operation guardrail before the model loop. It does not
+   replace Laya's model selection.
+3. **Optional remote decision routers** (Jev or the legacy Laya adapter), then
+   deterministic `cheapest` routing. These are compatibility/configuration
+   paths, never needed for the default workflow.
 
 What this buys is two things you can point at:
 
@@ -466,6 +458,7 @@ Run the agent loop (multi-turn, tool-using when the model supports it):
 ```bash
 forge run "add a hello function to main.rs"   # edits files via tools
 forge run --max-turns 10 "refactor the parser"
+forge run --plan "refactor authentication"    # plan, execute, independent review
 forge run --json "summarize this repo" | jq .text
 ```
 
@@ -478,6 +471,22 @@ pushing, publishing, or deploying anything. Human output includes the plan,
 review, and diff when the run produced a diff. JSON output adds `task_id`,
 `plan`, `changed_paths`, `checks`, `review`, and `diff` alongside the ordinary
 run and session fields.
+
+`--plan` adds explicit design and independent-review phases around execution.
+Plan and review use their own bounded turn budgets (`plan_max_turns` and
+`review_max_turns`), while `--max-turns` continues to control implementation.
+To compare the ordinary and phase-aware workflows on the same disposable Rust
+task, build Forge and run `scripts/benchmark-phase-routing.sh`. Set
+`FORGE_BENCH_MODEL` or `FORGE_BENCH_ROUTER` to pin a candidate. The script
+retains a JSON summary and raw session events with phase, selected model,
+tokens, latency, completion, and resolved cost; it never copies project source
+into the synthetic fixture.
+Both use only `read_file`, `graph_context`, and `graph_grep`. Their routes are
+tagged `plan` and `review`; implementation uses a separately recorded `execute`
+route. The independent review runs only when execution records an implementation
+change, and is advisory if its provider is unavailable. The generated plan and
+review are persisted in the task checkpoint and shown by `forge task show`.
+Explicit model pins remain binding for every phase.
 
 The task checkpoint is written to `.forge/tasks/<task-id>.jsonl`. This first
 workflow integration records completed and interrupted runs. `forge resume`
@@ -772,7 +781,7 @@ skill discovery).
 
 ```text
 forge init                          Initialize a project (idempotent)
-forge run [--max-turns N] [--skill NAME]... <prompt>
+forge run [--plan] [--max-turns N] [--skill NAME]... <prompt>
                                     Run the multi-turn agent loop
 forge task [list]                   List durable development tasks
 forge task show <task-id>           Inspect one durable task
@@ -843,7 +852,7 @@ Key settings (all optional):
 | `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.). **Setting this overrides *every* model's endpoint**, including hosted `[models]` entries like `claude-sonnet` and `gpt-5` — setting it to the default value still counts as setting it. Per-model endpoints belong in `[models.<name>] base_url`. Combinations that cannot work are refused at startup, naming both settings: an `anthropic`-family model whose endpoint ends in `/v1` (the client appends `/v1/messages`, so it would 404), or an entry whose `provider` contradicts the endpoint (`provider = "anthropic"` pointed at `api.openai.com`) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
-| `router` | `needle` | `FORGE_ROUTER` | `needle` \| `jev` \| `laya` \| `laya-native` \| `http` \| `static` \| `cheapest` |
+| `router` | `laya-native` | `FORGE_ROUTER` | Cost-aware native default; also `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key. Same primary-only fallback rule as `router_url` — the escalation tier never uses it (see `jev_key_env`) |
 | `router_escalate` | `auto` | `FORGE_ROUTER_ESCALATE` | `auto` \| `off` — when `router = "needle"`, escalate to the Jev tier before the static fallback once a Jev credential is present (`auto`, the default) or never (`off`); no-op unless a credential exists and `--local-only` is off |
@@ -851,7 +860,7 @@ Key settings (all optional):
 | `jev_key_env` | — | `FORGE_JEV_KEY_ENV` | Name of the env var holding the Jev credential, default `TYPESAFE_API_KEY`. Same scoping as `jev_url`: the escalation tier never falls back to `router_key_env` |
 | `router_timeout_ms` | `5000` | — | HTTP/native-Laya/needle/jev router timeout |
 | `router_confidence_threshold` | `0.7` | `FORGE_ROUTER_CONFIDENCE_THRESHOLD` | Below this, http/laya/laya-native/needle/jev decisions escalate to the fallback |
-| `router_fallback` | `static` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
+| `router_fallback` | `cheapest` | `FORGE_ROUTER_FALLBACK` | Fallback router (`static` \| `cheapest`) |
 | `router_autostart` | `true` | `FORGE_ROUTER_AUTOSTART` | `forge serve` auto-starts the Laya adapter when `router = "laya"` |
 | `execution` | `native` | `FORGE_EXECUTION` | `native` |
 | `approval` | `prompt-dangerous` | `FORGE_APPROVAL` | `auto` \| `prompt` \| `prompt-dangerous` \| `deny`; the default lets ordinary project edits and validation run while still asking before destructive operations |
@@ -859,6 +868,8 @@ Key settings (all optional):
 | `server_host` | `127.0.0.1` | `FORGE_SERVER_HOST` | Server bind address (loopback default) |
 | `server_port` | `7341` | `FORGE_SERVER_PORT` | Server port |
 | `max_turns` | `25` | `FORGE_MAX_TURNS` | Agent-loop turn budget |
+| `plan_max_turns` | `4` | `FORGE_PLAN_MAX_TURNS` | Read-only planning-phase turn budget |
+| `review_max_turns` | `4` | `FORGE_REVIEW_MAX_TURNS` | Read-only review-phase turn budget |
 | `tool_limits.<name>.per_run` | — | — | Maximum attempted calls to the exact tool name in one run |
 | `needle.variant` | `full` | `FORGE_NEEDLE_VARIANT` | Needle 3 weights ladder (small \| medium \| full); **only `full` has a downloadable artifact today** — Cactus-Compute publishes one 20-layer file, `needle build --layers N` slices smaller ones locally, so `small`/`medium` currently report "no pinned weights artifact" and fall back to static routing. `full` is the default precisely because it's the one that actually fetches; revisit once a smaller rung is hosted |
 | `needle.weights_path` | — | — | Weights override; empty → ~/.cache/forge/models/ |
@@ -1112,7 +1123,7 @@ Seven modes:
 - `laya` (open-source System One decision model via the reference adapter;
   falls back to static when the adapter is down),
 - `laya-native` (the same typed-decision model in-process through the Rust
-  `laya` crate; requires a locally provisioned checkpoint),
+  `laya` crate; the default, with a shared-cache download on first use),
 - `static` (deterministic rules),
 - `cheapest` (lowest-cost candidate from the `[models]` cost table;
   tie-breaks by output cost then name),

@@ -12,7 +12,7 @@ use crate::{
     TaskState, TransitionRequest, Verification, WorkspaceCheckpoint,
 };
 
-pub const TASK_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const TASK_EVENT_SCHEMA_VERSION: u32 = 3;
 
 pub fn new_task_id() -> String {
     ulid::Ulid::new().to_string()
@@ -58,6 +58,12 @@ enum TaskEventKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum TaskCheckpointUpdate {
+    PlanRecorded {
+        text: String,
+    },
+    ReviewRecorded {
+        text: String,
+    },
     RunBound {
         run_id: String,
         session_id: String,
@@ -289,6 +295,28 @@ impl JsonlTaskStore {
         )
     }
 
+    pub fn record_plan(
+        &self,
+        task_id: &str,
+        text: impl Into<String>,
+    ) -> Result<LoadedTask, ForgeError> {
+        self.update(
+            task_id,
+            TaskCheckpointUpdate::PlanRecorded { text: text.into() },
+        )
+    }
+
+    pub fn record_review(
+        &self,
+        task_id: &str,
+        text: impl Into<String>,
+    ) -> Result<LoadedTask, ForgeError> {
+        self.update(
+            task_id,
+            TaskCheckpointUpdate::ReviewRecorded { text: text.into() },
+        )
+    }
+
     pub fn register_effect(
         &self,
         task_id: &str,
@@ -409,6 +437,18 @@ fn apply_update(
     let mut next = checkpoint.clone();
     next.sequence = next.sequence.saturating_add(1);
     match update {
+        TaskCheckpointUpdate::PlanRecorded { text } => {
+            if text.trim().is_empty() {
+                return Err(ForgeError::task("generated task plan cannot be empty"));
+            }
+            next.generated_plan = Some(text.clone());
+        }
+        TaskCheckpointUpdate::ReviewRecorded { text } => {
+            if text.trim().is_empty() {
+                return Err(ForgeError::task("task review cannot be empty"));
+            }
+            next.review = Some(text.clone());
+        }
         TaskCheckpointUpdate::RunBound {
             run_id,
             session_id,
@@ -545,7 +585,7 @@ fn load_file(path: &Path, task_id: &str) -> Result<Replay, ForgeError> {
                 )));
             }
         };
-        if !matches!(event.v, 1 | TASK_EVENT_SCHEMA_VERSION) {
+        if !matches!(event.v, 1 | 2 | TASK_EVENT_SCHEMA_VERSION) {
             return Err(ForgeError::task(format!(
                 "unsupported task event version {} at {}:{line_number}",
                 event.v,
@@ -781,6 +821,45 @@ mod tests {
         assert_eq!(value["type"], "plan_created");
         assert_eq!(value["checkpoint"]["nodes"]["inspect"]["state"], "ready");
         assert_eq!(value["checkpoint"]["nodes"]["edit"]["state"], "pending");
+    }
+
+    #[test]
+    fn generated_plan_and_review_are_durable_checkpoint_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlTaskStore::new(tmp.path());
+        store.create(plan()).unwrap();
+        store.record_plan("task-1", "1. Inspect\n2. Edit").unwrap();
+        let loaded = store
+            .record_review("task-1", "No correctness findings.")
+            .unwrap();
+
+        assert_eq!(
+            loaded.checkpoint.generated_plan.as_deref(),
+            Some("1. Inspect\n2. Edit")
+        );
+        assert_eq!(
+            loaded.checkpoint.review.as_deref(),
+            Some("No correctness findings.")
+        );
+        assert_eq!(store.load("task-1").unwrap(), loaded);
+    }
+
+    #[test]
+    fn version_two_task_journals_remain_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlTaskStore::new(tmp.path());
+        store.create(plan()).unwrap();
+        let path = tmp.path().join("task-1.jsonl");
+        let journal = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            journal.replacen(&format!("\"v\":{TASK_EVENT_SCHEMA_VERSION}"), "\"v\":2", 1),
+        )
+        .unwrap();
+        assert_eq!(
+            store.load("task-1").unwrap().checkpoint.state("inspect"),
+            Some(TaskState::Ready)
+        );
     }
 
     #[test]

@@ -11,8 +11,10 @@ use forge_task::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::{AgentService, EffectJournal, RunOptions, RunOutcome};
+use crate::{AgentService, EffectJournal, RunOptions, RunOutcome, ToolAccess};
+use forge_core::RoutingPhase;
 
+const PLAN_LIMIT: usize = 16 * 1024;
 const REVIEW_LIMIT: usize = 16 * 1024;
 const DIFF_LIMIT: usize = 64 * 1024;
 
@@ -37,7 +39,7 @@ pub async fn run_development_workflow(
 ) -> Result<DevelopmentWorkflowOutcome, ForgeError> {
     let task_id = new_task_id();
     let plan = workflow_plan(&task_id, request)?;
-    let human_plan = render_plan(&plan);
+    let fallback_plan = render_plan(&plan);
     task_store.create(plan)?;
     task_store.transition(
         &task_id,
@@ -51,6 +53,35 @@ pub async fn run_development_workflow(
         .session_id
         .take()
         .unwrap_or_else(forge_session::new_session_id);
+    let plan_max_turns = Some(service.config().plan_max_turns);
+    let review_max_turns = Some(service.config().review_max_turns);
+    let planned = options.plan_before_execute;
+    let human_plan = if planned {
+        let plan_run = service
+            .run_with_options(
+                request,
+                RunOptions {
+                    run_id: Some(forge_session::new_run_id()),
+                    session_id: Some(session_id.clone()),
+                    max_turns: plan_max_turns,
+                    activate_skills: options.activate_skills.clone(),
+                    routing_phase: RoutingPhase::Plan,
+                    routing_task: Some(request.to_string()),
+                    tool_access: ToolAccess::ReadOnly,
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .inspect_err(|error| {
+                let _ = record_failure(task_store.as_ref(), &task_id, error);
+            })?;
+        bounded(&plan_run.text, PLAN_LIMIT)
+    } else {
+        fallback_plan
+    };
+    if planned {
+        task_store.record_plan(&task_id, human_plan.clone())?;
+    }
     task_store.bind_run(
         &task_id,
         run_id.clone(),
@@ -58,15 +89,24 @@ pub async fn run_development_workflow(
         capture_workspace(project_root)?,
     )?;
     options.run_id = Some(run_id);
-    options.session_id = Some(session_id);
+    options.session_id = Some(session_id.clone());
     options.development_workflow = true;
+    options.routing_phase = RoutingPhase::Execute;
+    options.routing_task = Some(request.to_string());
+    options.tool_access = ToolAccess::All;
+    options.plan_before_execute = false;
     options.effect_journal = Some(Arc::new(WorkflowEffectJournal::new(
         Arc::clone(&task_store),
         task_id.clone(),
         project_root.to_path_buf(),
     )));
 
-    let run = match service.run_with_options(request, options).await {
+    let execution_prompt = if planned {
+        "Execute the implementation plan from the conversation above. Make the requested changes, run focused checks, capture one reviewable git diff, then stop and summarize. Do not reread a file merely to confirm a successful edit; Forge performs an independent review next."
+    } else {
+        request
+    };
+    let run = match service.run_with_options(execution_prompt, options).await {
         Ok(run) => run,
         Err(error) => {
             record_failure(task_store.as_ref(), &task_id, &error)?;
@@ -74,14 +114,31 @@ pub async fn run_development_workflow(
         }
     };
     let evidence = WorkflowEvidence::from_run(&run);
-    complete_plan(task_store.as_ref(), &task_id, &evidence)?;
+    begin_review(task_store.as_ref(), &task_id, &evidence)?;
+    let (review, review_verification) = review_implementation(
+        service,
+        request,
+        &session_id,
+        review_max_turns,
+        planned,
+        &evidence,
+        &run.text,
+    )
+    .await;
+    task_store.record_review(&task_id, review.clone())?;
+    complete_review(
+        task_store.as_ref(),
+        &task_id,
+        &evidence,
+        review_verification,
+    )?;
 
     Ok(DevelopmentWorkflowOutcome {
         task_id,
         plan: human_plan,
         changed_paths: evidence.changed_paths.into_iter().collect(),
         checks: evidence.checks,
-        review: bounded(&run.text, REVIEW_LIMIT),
+        review,
         diff: bounded(&evidence.diff.unwrap_or_default(), DIFF_LIMIT),
         run,
     })
@@ -95,6 +152,7 @@ pub async fn resume_development_workflow(
     mut options: RunOptions,
 ) -> Result<DevelopmentWorkflowOutcome, ForgeError> {
     let loaded = task_store.load(task_id)?;
+    let generated_plan = loaded.checkpoint.generated_plan.clone();
     let prior_run = loaded
         .checkpoint
         .run_id
@@ -140,10 +198,15 @@ pub async fn resume_development_workflow(
         .run_id
         .take()
         .unwrap_or_else(forge_session::new_run_id);
+    let review_max_turns = Some(service.config().review_max_turns);
     task_store.bind_run(task_id, run_id.clone(), session_id.clone(), actual)?;
     options.run_id = Some(run_id);
-    options.session_id = Some(session_id);
+    options.session_id = Some(session_id.clone());
     options.development_workflow = true;
+    options.routing_phase = RoutingPhase::Execute;
+    options.routing_task = Some(loaded.plan.request.clone());
+    options.tool_access = ToolAccess::All;
+    options.plan_before_execute = false;
     options.effect_journal = Some(Arc::new(WorkflowEffectJournal::new(
         Arc::clone(&task_store),
         task_id.to_string(),
@@ -158,13 +221,25 @@ pub async fn resume_development_workflow(
         }
     };
     let evidence = WorkflowEvidence::from_run(&run);
-    complete_plan(task_store.as_ref(), task_id, &evidence)?;
+    begin_review(task_store.as_ref(), task_id, &evidence)?;
+    let (review, review_verification) = review_implementation(
+        service,
+        &loaded.plan.request,
+        &session_id,
+        review_max_turns,
+        generated_plan.is_some(),
+        &evidence,
+        &run.text,
+    )
+    .await;
+    task_store.record_review(task_id, review.clone())?;
+    complete_review(task_store.as_ref(), task_id, &evidence, review_verification)?;
     Ok(DevelopmentWorkflowOutcome {
         task_id: task_id.to_string(),
-        plan: render_plan(&loaded.plan),
+        plan: generated_plan.unwrap_or_else(|| render_plan(&loaded.plan)),
         changed_paths: evidence.changed_paths.into_iter().collect(),
         checks: evidence.checks,
-        review: bounded(&run.text, REVIEW_LIMIT),
+        review,
         diff: bounded(&evidence.diff.unwrap_or_default(), DIFF_LIMIT),
         run,
     })
@@ -579,7 +654,7 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn complete_plan(
+fn begin_review(
     store: &JsonlTaskStore,
     task_id: &str,
     evidence: &WorkflowEvidence,
@@ -605,6 +680,15 @@ fn complete_plan(
     }
 
     advance_to_node(store, task_id, "review")?;
+    Ok(())
+}
+
+fn complete_review(
+    store: &JsonlTaskStore,
+    task_id: &str,
+    evidence: &WorkflowEvidence,
+    independent_review: Option<Verification>,
+) -> Result<(), ForgeError> {
     let loaded = store.load(task_id)?;
     if loaded.checkpoint.state("review") == Some(TaskState::Running) {
         let mut review =
@@ -622,9 +706,71 @@ fn complete_plan(
                     .with_detail("provider completed without invoking a focused check"),
             );
         }
+        if let Some(independent_review) = independent_review {
+            review = review.with_verification(independent_review);
+        }
         store.transition(task_id, review)?;
     }
     Ok(())
+}
+
+async fn review_implementation(
+    service: &AgentService,
+    request: &str,
+    session_id: &str,
+    max_turns: Option<u32>,
+    planned: bool,
+    evidence: &WorkflowEvidence,
+    executor_summary: &str,
+) -> (String, Option<Verification>) {
+    if !planned {
+        return (bounded(executor_summary, REVIEW_LIMIT), None);
+    }
+    if !evidence.has_changes() {
+        return (
+            bounded(executor_summary, REVIEW_LIMIT),
+            Some(
+                Verification::new("independent model review", VerificationStatus::Skipped)
+                    .with_detail("execution recorded no implementation changes"),
+            ),
+        );
+    }
+
+    let prompt = evidence.review_prompt();
+    match service
+        .run_with_options(
+            &prompt,
+            RunOptions {
+                session_id: Some(session_id.to_string()),
+                max_turns,
+                routing_phase: RoutingPhase::Review,
+                routing_task: Some(request.to_string()),
+                tool_access: ToolAccess::ReadOnly,
+                ..RunOptions::default()
+            },
+        )
+        .await
+    {
+        Ok(outcome) => (
+            bounded(&outcome.text, REVIEW_LIMIT),
+            Some(Verification::new(
+                "independent model review",
+                VerificationStatus::Passed,
+            )),
+        ),
+        Err(error) => (
+            bounded(
+                &format!(
+                    "Independent review was unavailable ({error}).\n\nExecutor summary:\n{executor_summary}"
+                ),
+                REVIEW_LIMIT,
+            ),
+            Some(
+                Verification::new("independent model review", VerificationStatus::Skipped)
+                    .with_detail(error.to_string()),
+            ),
+        ),
+    }
 }
 
 fn record_failure(
@@ -729,6 +875,44 @@ impl WorkflowEvidence {
             checks,
             diff,
         }
+    }
+
+    fn has_changes(&self) -> bool {
+        !self.changed_paths.is_empty()
+            || self
+                .diff
+                .as_deref()
+                .is_some_and(|diff| !diff.trim().is_empty())
+    }
+
+    fn review_prompt(&self) -> String {
+        let paths = self
+            .changed_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let checks = self
+            .checks
+            .iter()
+            .map(|check| format!("{}: {:?}", check.name, check.status))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let diff = self.diff.as_deref().unwrap_or("not captured");
+        format!(
+            "Review the implementation from the conversation above. Do not modify files. Look for correctness, security, regression, and missing-test risks. State actionable findings first; if there are none, say so clearly.\n\nChanged paths:\n{}\n\nChecks:\n{}\n\nCaptured diff:\n{}",
+            if paths.is_empty() {
+                "not recorded"
+            } else {
+                &paths
+            },
+            if checks.is_empty() {
+                "none recorded"
+            } else {
+                &checks
+            },
+            bounded(diff, DIFF_LIMIT),
+        )
     }
 }
 
@@ -837,6 +1021,184 @@ mod tests {
             Arc::new(JsonlSessionStore::new(root.join(".forge/sessions"))),
             Config::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn planned_workflow_routes_read_only_plan_then_execution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = Arc::new(ScriptedMockModel::new(vec![
+            ScriptedReply {
+                text: None,
+                tool_calls: vec![ToolCall::new(
+                    "forbidden-write",
+                    "write_file",
+                    serde_json::json!({"path":"plan-leak.txt", "content":"must not exist"}),
+                )],
+            },
+            ScriptedReply {
+                text: Some(
+                    "1. Inspect src/lib.rs\n2. Make the focused change\n3. Run tests".into(),
+                ),
+                tool_calls: Vec::new(),
+            },
+            ScriptedReply {
+                text: None,
+                tool_calls: vec![ToolCall::new(
+                    "implementation-write",
+                    "write_file",
+                    serde_json::json!({"path":"implemented.txt", "content":"done\n"}),
+                )],
+            },
+            ScriptedReply {
+                text: Some("implementation complete".into()),
+                tool_calls: Vec::new(),
+            },
+            ScriptedReply {
+                text: Some("No findings. The focused change is correct.".into()),
+                tool_calls: Vec::new(),
+            },
+        ]));
+        let router = Arc::new(MockRouter::selecting("scripted-mock"));
+        let service = AgentService::new(
+            model.clone(),
+            router.clone(),
+            Arc::new(MockExecution::new(tmp.path())),
+            Arc::new(crate::NullSkillRegistry),
+            Arc::new(JsonlSessionStore::new(tmp.path().join(".forge/sessions"))),
+            Config::default(),
+        );
+        let store = Arc::new(JsonlTaskStore::for_project(tmp.path()));
+
+        let outcome = run_development_workflow(
+            &service,
+            store.clone(),
+            tmp.path(),
+            "make the focused change",
+            RunOptions {
+                plan_before_execute: true,
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.plan.contains("Inspect src/lib.rs"));
+        assert_eq!(
+            outcome.review,
+            "No findings. The focused change is correct."
+        );
+        assert!(!tmp.path().join("plan-leak.txt").exists());
+        assert_eq!(outcome.changed_paths, vec!["implemented.txt"]);
+        assert_eq!(
+            router
+                .recorded()
+                .into_iter()
+                .map(|request| request.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                RoutingPhase::Plan,
+                RoutingPhase::Execute,
+                RoutingPhase::Review
+            ]
+        );
+        let requests = model.recorded();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "graph_context", "graph_grep"]
+        );
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == forge_core::Role::Tool
+                && message
+                    .content
+                    .contains("unavailable during the Plan phase")
+        }));
+        assert!(
+            requests[2]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "edit_file")
+        );
+        assert!(requests[2].messages.iter().any(|message| {
+            message.role == forge_core::Role::Assistant
+                && message.content.contains("Inspect src/lib.rs")
+        }));
+        assert_eq!(
+            requests[4]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "graph_context", "graph_grep"]
+        );
+        let task = store.load(&outcome.task_id).unwrap();
+        assert_eq!(
+            task.checkpoint.generated_plan.as_deref(),
+            Some("1. Inspect src/lib.rs\n2. Make the focused change\n3. Run tests")
+        );
+        assert_eq!(
+            task.checkpoint.review.as_deref(),
+            Some("No findings. The focused change is correct.")
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_review_is_conditional_and_advisory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = Arc::new(OnceLimitedModel {
+            calls: AtomicUsize::new(0),
+        });
+        let router = Arc::new(MockRouter::selecting("once-limited"));
+        let service = AgentService::new(
+            model,
+            router.clone(),
+            Arc::new(MockExecution::new(tmp.path())),
+            Arc::new(crate::NullSkillRegistry),
+            Arc::new(JsonlSessionStore::new(tmp.path().join(".forge/sessions"))),
+            Config::default(),
+        );
+        let unchanged = WorkflowEvidence {
+            changed_paths: BTreeSet::new(),
+            checks: Vec::new(),
+            diff: None,
+        };
+        let (summary, verification) = review_implementation(
+            &service,
+            "request",
+            "session",
+            None,
+            true,
+            &unchanged,
+            "executor summary",
+        )
+        .await;
+        assert_eq!(summary, "executor summary");
+        assert_eq!(verification.unwrap().status, VerificationStatus::Skipped);
+        assert!(router.recorded().is_empty());
+
+        let changed = WorkflowEvidence {
+            changed_paths: BTreeSet::from(["src/lib.rs".to_string()]),
+            checks: Vec::new(),
+            diff: None,
+        };
+        let (fallback, verification) = review_implementation(
+            &service,
+            "request",
+            "session",
+            None,
+            true,
+            &changed,
+            "executor summary",
+        )
+        .await;
+        assert!(fallback.contains("Independent review was unavailable"));
+        assert!(fallback.contains("executor summary"));
+        assert_eq!(verification.unwrap().status, VerificationStatus::Skipped);
+        assert_eq!(router.recorded()[0].phase, RoutingPhase::Review);
     }
 
     #[tokio::test]

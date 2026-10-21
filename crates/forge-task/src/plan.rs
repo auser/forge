@@ -267,6 +267,8 @@ impl TaskPlan {
             nodes,
             run_id: None,
             session_id: None,
+            generated_plan: None,
+            review: None,
             workspace: None,
             effects: BTreeMap::new(),
         }
@@ -332,6 +334,10 @@ pub struct Checkpoint {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceCheckpoint>,
     #[serde(default)]

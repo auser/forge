@@ -210,14 +210,14 @@ fn defaults_when_nothing_set() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
 
-    // Default stack: local oMLX model + embedded Needle router (mocks are
-    // opt-in).
+    // Default stack: local oMLX model + cost-aware native Laya router (mocks
+    // are opt-in).
     assert_eq!(resolved.config.model, "qwen3-coder");
     assert_eq!(
         resolved.config.model_base_url.as_deref(),
         Some("http://127.0.0.1:8080/v1")
     );
-    assert_eq!(resolved.config.router, "needle");
+    assert_eq!(resolved.config.router, "laya-native");
     assert_eq!(resolved.config.router_timeout_ms, 5_000);
     assert_eq!(resolved.config.execution, "native");
     assert_eq!(resolved.config.approval, "prompt-dangerous");
@@ -303,7 +303,7 @@ fn project_file_overrides_user_file_and_defaults() {
     // Untouched key stays default.
     assert_eq!(
         resolved.explain("router"),
-        Some(("\"needle\"".to_string(), Origin::Default))
+        Some(("\"laya-native\"".to_string(), Origin::Default))
     );
 }
 
@@ -501,6 +501,8 @@ fn max_turns_default_env_and_invalid() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
     assert_eq!(resolved.config.max_turns, 25);
+    assert_eq!(resolved.config.plan_max_turns, 4);
+    assert_eq!(resolved.config.review_max_turns, 4);
     assert_eq!(
         resolved.explain("max_turns"),
         Some(("25".to_string(), Origin::Default))
@@ -513,6 +515,14 @@ fn max_turns_default_env_and_invalid() {
         resolved.explain("max_turns"),
         Some(("7".to_string(), Origin::Environment))
     );
+
+    unsafe {
+        std::env::set_var("FORGE_PLAN_MAX_TURNS", "3");
+        std::env::set_var("FORGE_REVIEW_MAX_TURNS", "2");
+    }
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.plan_max_turns, 3);
+    assert_eq!(resolved.config.review_max_turns, 2);
 
     unsafe { std::env::set_var("FORGE_MAX_TURNS", "lots") };
     let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
@@ -747,7 +757,7 @@ fn router_confidence_threshold_and_fallback_defaults_and_env() {
 
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
     assert_eq!(resolved.config.router_confidence_threshold, 0.7);
-    assert_eq!(resolved.config.router_fallback, "static");
+    assert_eq!(resolved.config.router_fallback, "cheapest");
     assert!(resolved.config.router_autostart);
     unsafe { std::env::set_var("FORGE_ROUTER_AUTOSTART", "false") };
     let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use forge_config::Config;
 use forge_core::{
     Capability, DecisionRouter, ForgeError, ModelCapabilities, ModelProvider, RoutingDecision,
-    RoutingRequest,
+    RoutingPhase, RoutingRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -206,6 +206,7 @@ pub struct HttpRouter {
 #[derive(Serialize)]
 struct RouteRequest<'a> {
     task: &'a str,
+    phase: RoutingPhase,
     candidates: &'a [String],
     required_capabilities: &'a [Capability],
 }
@@ -244,6 +245,7 @@ impl DecisionRouter for HttpRouter {
     async fn route(&self, task: &RoutingRequest) -> Result<RoutingDecision, ForgeError> {
         let body = RouteRequest {
             task: &task.task,
+            phase: task.phase,
             candidates: &task.candidates,
             required_capabilities: &task.required_capabilities,
         };
@@ -445,7 +447,8 @@ const LAYA_LEGACY_HINT: &str = "hint: laya is no longer the default — delete t
 /// Native, in-process Laya router. This keeps Laya's checkpoint and inference
 /// out of the async runtime: one blocking worker owns the loaded Candle model,
 /// and a timeout releases no second inference while the first is still using
-/// the model.
+/// the model. The deadline covers checkpoint provisioning as well as inference
+/// so a first-run download cannot hold routing open indefinitely.
 ///
 /// This is intentionally a distinct mode from [`LayaRouter`]. `laya` has
 /// always meant "dial a System One-compatible HTTP endpoint"; changing it to
@@ -482,12 +485,21 @@ impl NativeLayaRouter {
         task: &RoutingRequest,
         candidates: Vec<String>,
     ) -> Result<(String, f64), ForgeError> {
-        let timeout = self.timeout;
-        let permit = tokio::time::timeout(timeout, self.inference_permit.clone().acquire_owned())
+        tokio::time::timeout(self.timeout, self.decide_within_deadline(task, candidates))
             .await
-            .map_err(|_| {
-                ForgeError::router("native laya: decision timed out waiting for inference")
-            })?
+            .map_err(|_| ForgeError::router("native laya: decision timed out"))?
+    }
+
+    async fn decide_within_deadline(
+        &self,
+        task: &RoutingRequest,
+        candidates: Vec<String>,
+    ) -> Result<(String, f64), ForgeError> {
+        let permit = self
+            .inference_permit
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| ForgeError::router("native laya: inference worker is unavailable"))?;
         // Once the agent is loaded its checkpoint has already been validated.
         // Avoid rehashing the 847 MB safetensors file for every decision.
@@ -497,9 +509,8 @@ impl NativeLayaRouter {
             .map_err(|_| ForgeError::router("native laya model lock was poisoned"))?
             .is_none();
         let path = if needs_checkpoint {
-            // Initial provisioning can move 847 MB, so it has its own
-            // deliberately generous transfer timeout. `router_timeout_ms`
-            // applies to normal routing, not to a one-time installation.
+            // The weight store has its own transport timeout, while the outer
+            // routing deadline bounds how long callers wait before fallback.
             laya_weights::ensure_weights(&self.laya).await?
         } else {
             laya_weights::weights_path(&self.laya)
@@ -507,6 +518,7 @@ impl NativeLayaRouter {
         let criteria = self.criteria.clone();
         let state = serde_json::json!({
             "task": task.task.clone(),
+            "phase": task.phase,
             "required_capabilities": task.required_capabilities.clone(),
         });
         let agent = Arc::clone(&self.agent);
@@ -571,9 +583,7 @@ impl NativeLayaRouter {
             Ok((choice, confidence))
         });
 
-        tokio::time::timeout(timeout, work)
-            .await
-            .map_err(|_| ForgeError::router("native laya: decision timed out"))?
+        work.await
             .map_err(|e| ForgeError::router(format!("native laya worker failed: {e}")))?
             .map_err(ForgeError::router)
     }
@@ -729,12 +739,17 @@ impl DecisionRouter for LayaRouter {
         let body = serde_json::json!({
             "state": {
                 "task": task.task,
+                "phase": task.phase,
                 "required_capabilities": task.required_capabilities,
             },
             "questions": {
                 "model": {
                     "type": "choice",
-                    "instructions": "Which model should handle this software task? Prefer the least expensive model that can correctly complete it.",
+                    "instructions": match task.phase {
+                        RoutingPhase::Plan => "Which model should design the implementation plan? Prefer the strongest reasoning model available.",
+                        RoutingPhase::Review => "Which model should independently review this change? Prefer strong reasoning for subtle defects.",
+                        RoutingPhase::General | RoutingPhase::Execute => "Which model should handle this software task? Prefer the least expensive model that can correctly complete it.",
+                    },
                     "criteria": criteria,
                 }
             }
@@ -1352,6 +1367,7 @@ mod tests {
         ]);
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![Capability::Streaming],
             candidates: vec!["silent".to_string(), "live".to_string()],
         };
@@ -1363,6 +1379,7 @@ mod tests {
         // `errors_when_nothing_is_capable` shape).
         let only_silent = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![Capability::Streaming],
             candidates: vec!["silent".to_string()],
         };
@@ -1388,6 +1405,7 @@ mod tests {
         let decision = router
             .route(&RoutingRequest {
                 task: "x".to_string(),
+                phase: RoutingPhase::General,
                 required_capabilities: vec![Capability::Streaming],
                 candidates: vec!["silent".to_string(), "live".to_string()],
             })
@@ -1443,6 +1461,7 @@ mod tests {
         ]);
         let request = RoutingRequest {
             task: "use tools".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![Capability::Tools],
             candidates: vec!["weak".to_string(), "strong".to_string()],
         };
@@ -1457,6 +1476,7 @@ mod tests {
             StaticRouter::new("weak").with_registry(vec![("weak".to_string(), caps(false))]);
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![Capability::Tools],
             candidates: vec!["weak".to_string()],
         };
@@ -1595,11 +1615,11 @@ mod tests {
     }
 
     #[test]
-    fn router_from_config_builds_needle_chain_by_default() {
-        // Default router is needle (threshold-gated, static fallback).
+    fn router_from_config_builds_native_laya_chain_by_default() {
+        // Default router is native Laya (threshold-gated, cheapest fallback).
         let config = Config::default();
-        assert_eq!(config.router, "needle");
-        assert_eq!(config.router_fallback, "static");
+        assert_eq!(config.router, "laya-native");
+        assert_eq!(config.router_fallback, "cheapest");
         let router = router_from_config(&config, &[]).expect("default chain builds");
         drop(router);
     }
@@ -1997,6 +2017,7 @@ mod tests {
         let router = router_from_config(&config, &[]).expect("builds");
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["mock-local".to_string()],
         };
@@ -2191,6 +2212,7 @@ mod tests {
         let router = router_from_config(&config, &[]).expect("builds");
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string(), "mock-local".to_string()],
         };
@@ -2393,6 +2415,7 @@ mod tests {
         let router = cheapest(&[("pricey-b", 5.0, 10.0), ("cheap-a", 0.1, 0.2)]);
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["pricey-b".to_string(), "cheap-a".to_string()],
         };
@@ -2415,6 +2438,7 @@ mod tests {
         let router = cheapest(&[("b", 1.0, 3.0), ("a", 1.0, 2.0), ("c", 1.0, 2.0)]);
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["b".to_string(), "a".to_string(), "c".to_string()],
         };
@@ -2447,6 +2471,7 @@ mod tests {
         );
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![Capability::Tools],
             candidates: vec!["cheap".to_string(), "strong".to_string()],
         };
@@ -2462,6 +2487,7 @@ mod tests {
         );
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![Capability::Tools],
             candidates: vec!["cheap".to_string()],
         };
@@ -2480,6 +2506,7 @@ mod tests {
         let router = cheapest(&[("priced", 1.0, 1.0)]);
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["mystery-unpriced".to_string(), "priced".to_string()],
         };
@@ -2500,6 +2527,7 @@ mod tests {
         let router = cheapest(&[]);
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["zeta".to_string(), "alpha".to_string()],
         };
@@ -2581,6 +2609,7 @@ mod tests {
 
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["other-unpriced".to_string(), "cat-model".to_string()],
         };
@@ -2622,6 +2651,7 @@ mod tests {
 
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cfg-model".to_string(), "cat-model".to_string()],
         };
@@ -2656,6 +2686,7 @@ mod tests {
 
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cat-model".to_string(), "cfg-model".to_string()],
         };
@@ -2709,7 +2740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn laya_router_maps_typed_answer() {
+    async fn laya_router_maps_typed_answer_and_planning_phase() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/decide"))
@@ -2734,6 +2765,7 @@ mod tests {
 
         let request = RoutingRequest {
             task: "fix the bug".to_string(),
+            phase: RoutingPhase::Plan,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string(), "pricey-b".to_string()],
         };
@@ -2747,7 +2779,13 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&received[0].body).expect("request json");
         assert_eq!(body["state"]["task"], "fix the bug");
+        assert_eq!(body["state"]["phase"], "plan");
         assert_eq!(body["questions"]["model"]["type"], "choice");
+        assert!(
+            body["questions"]["model"]["instructions"]
+                .as_str()
+                .is_some_and(|text| text.contains("strongest reasoning"))
+        );
         assert_eq!(
             body["questions"]["model"]["criteria"]["cheap-a"],
             "cheap general model"
@@ -2772,6 +2810,7 @@ mod tests {
         .expect("construct");
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string()],
         };
@@ -2894,6 +2933,7 @@ mod tests {
         let decision = router
             .route(&RoutingRequest {
                 task: "simple rename".to_string(),
+                phase: RoutingPhase::General,
                 required_capabilities: vec![],
                 candidates: vec!["strong".to_string(), "cheap".to_string()],
             })
@@ -2908,6 +2948,32 @@ mod tests {
             "{}",
             decision.reason
         );
+    }
+
+    #[tokio::test]
+    async fn native_laya_deadline_bounds_the_whole_decision() {
+        let router = NativeLayaRouter::new(
+            forge_config::LayaConfig::default(),
+            [("candidate".to_string(), "test candidate".to_string())]
+                .into_iter()
+                .collect(),
+            Duration::from_millis(20),
+        );
+        let _held_permit = router
+            .inference_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("permit is available");
+        let started = tokio::time::Instant::now();
+
+        let error = router
+            .route(&RoutingRequest::new("bounded routing"))
+            .await
+            .expect_err("the whole decision should time out");
+
+        assert!(error.to_string().contains("decision timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -2929,6 +2995,7 @@ mod tests {
         let router = router_from_config(&config, &[]).expect("builds");
         let request = RoutingRequest {
             task: "x".to_string(),
+            phase: RoutingPhase::General,
             required_capabilities: vec![],
             candidates: vec!["cheap-a".to_string(), "mock-local".to_string()],
         };

@@ -10,7 +10,7 @@ use crate::world::BddWorld;
 
 #[given(expr = "a project config sets the model to {string}")]
 fn project_config_sets_model(world: &mut BddWorld, model: String) {
-    world.write_file(".forge/config.toml", &format!("model = \"{model}\"\n"));
+    world.set_config("model", &format!("\"{model}\""));
 }
 
 #[given(expr = "the environment sets the model to {string}")]
@@ -178,7 +178,8 @@ fn forge_dirs_and_graph_exist(world: &mut BddWorld) {
 fn generated_paths_ignored(world: &mut BddWorld) {
     let gitignore = std::fs::read_to_string(world.project().join(".gitignore")).expect("gitignore");
     assert!(
-        gitignore.lines().any(|l| l == ".forge/"),
+        gitignore.lines().any(|l| l == ".forge/*")
+            && gitignore.lines().any(|l| l == "!.forge/learnings/"),
         "gitignore: {gitignore}"
     );
 }
@@ -187,7 +188,7 @@ fn generated_paths_ignored(world: &mut BddWorld) {
 fn no_duplicate_ignore_entries(world: &mut BddWorld) {
     let gitignore = std::fs::read_to_string(world.project().join(".gitignore")).expect("gitignore");
     assert_eq!(
-        gitignore.lines().filter(|l| *l == ".forge/").count(),
+        gitignore.lines().filter(|l| *l == ".forge/*").count(),
         1,
         "gitignore: {gitignore}"
     );
@@ -1581,7 +1582,7 @@ fn confidence_threshold(world: &mut BddWorld, threshold: f64) {
     world.set_config("router_confidence_threshold", &threshold.to_string());
 }
 
-#[then("the routing decision fell back to static routing")]
+#[then("the routing decision fell back to cheapest routing")]
 fn routing_decision_fell_back(world: &mut BddWorld) {
     let log = world.session_log();
     let decision = log
@@ -1590,7 +1591,7 @@ fn routing_decision_fell_back(world: &mut BddWorld) {
         .find(|e| e["type"] == "routing_decision_made")
         .unwrap_or_else(|| panic!("no routing decision in: {log}"));
     assert_eq!(decision["fallback_used"], true);
-    assert_eq!(decision["router"], "static");
+    assert_eq!(decision["router"], "cheapest");
     // Expected fallback is part of the structured decision, not a noisy
     // default-level diagnostic in an interactive terminal.
     assert!(
@@ -1701,6 +1702,9 @@ async fn initialized_project_no_needle_weights(world: &mut BddWorld) {
     // build may not even have an engine linked).
     world.run_forge(&["init"]).await;
     assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    world.set_config("router", "\"needle\"");
+    world.set_config("router_fallback", "\"static\"");
+    world.flush_config();
 }
 
 #[given("an initialized project with the hash needle backend")]
@@ -1710,6 +1714,9 @@ async fn initialized_project_hash_needle_backend(world: &mut BddWorld) {
         .insert("FORGE_NEEDLE_BACKEND".to_string(), "hash".to_string());
     world.run_forge(&["init"]).await;
     assert_eq!(world.last_code, Some(0), "stderr: {}", world.last_stderr);
+    world.set_config("router", "\"needle\"");
+    world.set_config("router_fallback", "\"static\"");
+    world.flush_config();
 }
 
 #[when(expr = "I run forge with prompt {string} and model {string}")]
