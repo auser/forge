@@ -235,6 +235,7 @@ pub fn build_service_with(
         AgentService::new(model, router, execution, skills, sessions, config)
             .with_task_store(Arc::new(forge_task::JsonlTaskStore::for_project(&root)))
             .with_graph(graph)
+            .with_project_learnings(forge_context::load_project_learnings(&root))
             .with_context_store(Some(context_store))
             .with_artifact_store(Some(artifact_store))
             .with_compression_enabled(compression_enabled)

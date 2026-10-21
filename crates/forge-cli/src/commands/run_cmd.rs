@@ -1,7 +1,7 @@
 use std::io::{BufRead, IsTerminal};
 use std::sync::Arc;
 
-use forge_core::ForgeError;
+use forge_core::{EventKind, ForgeError, ProjectGraph};
 use forge_runtime::RunOptions;
 
 use crate::commands::Context;
@@ -51,6 +51,7 @@ pub async fn run(
         handle.abort();
     }
     let outcome = result?;
+    let learning_candidates = super::learn_cmd::refresh_after_success(&project_root)?;
 
     if ctx.global.json {
         println!(
@@ -67,8 +68,71 @@ pub async fn run(
                 outcome.plan, outcome.review, outcome.diff
             );
         }
+        print_status(
+            &project_root,
+            &prompt,
+            &outcome.run.events,
+            learning_candidates,
+        );
     }
     Ok(())
+}
+
+/// One compact post-run receipt makes the default workflow inspectable without
+/// asking people to learn several status commands. The underlying event log
+/// remains the source of truth for full telemetry.
+fn print_status(
+    root: &std::path::Path,
+    task: &str,
+    events: &[forge_core::Event],
+    learning_candidates: usize,
+) {
+    let route = events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::RoutingDecisionMade {
+            router,
+            selected_model,
+            phase,
+            fallback_used,
+            ..
+        } => Some(format!(
+            "{selected_model} via {router} for {phase:?}{}",
+            if *fallback_used { " (fallback)" } else { "" }
+        )),
+        _ => None,
+    });
+    let cost = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::UsageRecorded { cost_usd, .. } => *cost_usd,
+            _ => None,
+        })
+        .sum::<f64>();
+    let graph = forge_graph::LocalGraph::open(root)
+        .ok()
+        .filter(|graph| graph.graph_file().is_file())
+        .map(|graph| if graph.is_fresh() { "fresh" } else { "stale" })
+        .unwrap_or("unavailable");
+    let graph_paths = forge_graph::LocalGraph::open(root)
+        .ok()
+        .filter(|graph| graph.graph_file().is_file())
+        .map(|graph| {
+            graph
+                .context(task, 5)
+                .into_iter()
+                .map(|hit| hit.path)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let relevant = forge_context::relevant_project_learnings(
+        &forge_context::load_project_learnings(root),
+        task,
+        &graph_paths,
+    )
+    .len();
+    let route = route.unwrap_or_else(|| "Needle safe-tool fast path".to_string());
+    eprintln!(
+        "forge: {route} · cost ${cost:.4} · graph {graph} · {relevant} relevant learnings · {learning_candidates} learning candidates"
+    );
 }
 
 /// Forward stdin lines to the run's input channel. Only spawned when

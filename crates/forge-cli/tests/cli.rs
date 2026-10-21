@@ -542,10 +542,12 @@ fn init_is_idempotent() {
 
     let gitignore = std::fs::read_to_string(project.join(".gitignore")).expect("gitignore");
     assert_eq!(
-        gitignore.lines().filter(|l| *l == ".forge/").count(),
+        gitignore.lines().filter(|l| *l == ".forge/*").count(),
         1,
-        "gitignore must contain exactly one .forge/ line"
+        "gitignore must contain exactly one .forge/* line"
     );
+    assert!(gitignore.lines().any(|l| l == "!.forge/learnings/"));
+    assert!(gitignore.lines().any(|l| l == "!.forge/learnings/*.md"));
     assert!(project.join(".forge/graph").is_dir());
     assert!(project.join(".forge/sessions").is_dir());
     assert!(project.join(".forge/config.toml").is_file());
@@ -3247,6 +3249,7 @@ fn learning_proposals_are_local_reviewable_explicit_and_measured() {
     assert_eq!(metrics["recurrence_after_acceptance"], 1);
 
     let gitignore = std::fs::read_to_string(project.join(".gitignore")).unwrap();
-    assert!(gitignore.lines().any(|line| line.trim() == ".forge/"));
+    assert!(gitignore.contains(".forge/*"), "{gitignore}");
+    assert!(gitignore.contains("!.forge/learnings/*.md"), "{gitignore}");
     assert!(project.join(".forge/context/learning/index.json").is_file());
 }

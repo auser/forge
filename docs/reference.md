@@ -794,7 +794,8 @@ forge resume <task-run-or-session-id>  Continue a parked task or completed run
 forge cancel <run-or-session-id>    Cancel a run (in-flight or recorded)
 forge session [list|show <id>]      Inspect sessions (JSONL event logs)
 forge session fork <id> [--at X]    Branch a session into a new one
-forge learn propose|list|show|apply|reject|metrics
+forge learn add <guidance> [--kind decision|preference|guardrail|runbook] [--touch <path>]
+forge learn check|propose|list|show|apply|reject|metrics
                                     Review redacted recurring evidence locally
 forge graph build|check|map|grep|callers|blast|context
 forge skill list|show|test
@@ -1863,6 +1864,8 @@ forge memory sources --session <id> --offset 0 --json
 forge memory consolidate --session <id> --json
 forge memory search --session <id> --query <text> --json
 forge memory promote --session <id> --topic decisions --yes --json
+forge learn add <guidance> [--kind decision|preference|guardrail|runbook] [--touch <path>]
+forge learn check
 forge learn propose [--session <id>] [--since <rfc3339>] [--until <rfc3339>]
 forge learn list
 forge learn show <proposal-id>
@@ -1971,7 +1974,25 @@ silently delete its consolidated or promoted provenance; removing derived
 context storage is an explicit filesystem lifecycle operation, and promoted
 claims remain source-labeled rather than becoming repository guidance.
 
-### Reviewable learning proposals
+### Project learnings and reviewable proposals
+
+`forge learn add "..."` creates a small, reviewable Markdown record under
+`.forge/learnings/`. It is repository-owned and deliberately not ignored.
+When `--touch` is omitted Forge links the record to the files currently changed
+in git. The default kind is `decision`; use `guardrail` for a rule that must be
+seen before an affected change. Every run uses the project graph to inject only
+records linked to relevant files. `forge learn check` shows the decisions and
+guardrails linked to the current diff before commit.
+
+After a successful `forge run`, Forge refreshes the separate local proposal
+queue from repeated, redacted evidence. This only creates pending candidates;
+it never accepts guidance or writes repository-owned learning files. The
+non-JSON completion receipt names the model/router, resolved cost, graph
+freshness, relevant-learning count, and pending-candidate count.
+
+The existing proposal flow remains separate and private: it mines repeated,
+redacted session evidence into ignored local guidance, which has no effect
+until explicitly accepted.
 
 `forge learn propose` deterministically mines the redacted event log for exact
 recurrence of failures, developer corrections, developer instructions, and

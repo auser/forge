@@ -2685,6 +2685,53 @@ async fn run_seeds_graph_context_when_available() {
 }
 
 #[tokio::test]
+async fn run_injects_only_project_learnings_linked_by_the_graph() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("src")).expect("mkdir");
+    std::fs::write(tmp.path().join("src/payments.rs"), "fn charge() {}\n").expect("write");
+    std::fs::write(tmp.path().join("src/other.rs"), "fn unrelated() {}\n").expect("write");
+    let mut graph = forge_graph::LocalGraph::open(tmp.path()).expect("open");
+    forge_core::ProjectGraph::build(&mut graph).expect("build");
+    let learnings = vec![
+        forge_context::ProjectLearning {
+            path: ".forge/learnings/payment.md".into(),
+            kind: forge_context::ProjectLearningKind::Guardrail,
+            touches: vec!["src/payments.rs".into()],
+            guidance: "Never log card tokens.".into(),
+        },
+        forge_context::ProjectLearning {
+            path: ".forge/learnings/other.md".into(),
+            kind: forge_context::ProjectLearningKind::Decision,
+            touches: vec!["src/other.rs".into()],
+            guidance: "This must stay out of the request.".into(),
+        },
+    ];
+    let model = Arc::new(ScriptedMockModel::new(vec![text_reply("done")]));
+    let recorded = model.clone();
+    let service = AgentService::new(
+        model,
+        Arc::new(MockRouter::selecting("scripted-mock")),
+        Arc::new(MockExecution::new(tmp.path())),
+        Arc::new(NullSkillRegistry),
+        Arc::new(JsonlSessionStore::new(tmp.path().join(".forge/sessions"))),
+        Config::default(),
+    )
+    .with_graph(Some(Arc::new(graph)))
+    .with_project_learnings(learnings);
+
+    service.run("fix charge").await.expect("run");
+    let system = recorded.recorded()[0]
+        .messages
+        .iter()
+        .filter(|message| message.role == forge_core::Role::System)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(system.contains("Never log card tokens."), "{system}");
+    assert!(!system.contains("stay out of the request"), "{system}");
+}
+
+#[tokio::test]
 async fn graph_tools_work_and_report_unavailable() {
     // With a graph.
     let tmp = tempfile::tempdir().expect("tempdir");

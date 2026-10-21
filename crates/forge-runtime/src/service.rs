@@ -551,6 +551,9 @@ pub struct AgentService {
     tasks: Option<Arc<forge_task::JsonlTaskStore>>,
     config: Config,
     graph: Option<Arc<dyn ProjectGraph>>,
+    /// Reviewed repository knowledge linked to paths in the project graph.
+    /// Unlike `system_context`, this is selected per task.
+    project_learnings: Vec<forge_context::ProjectLearning>,
     context_store: Option<Arc<dyn ContextStore>>,
     artifact_store: Option<Arc<dyn forge_context::ArtifactStore>>,
     observer: Option<Arc<crate::observer::ObserverSupervisor>>,
@@ -628,6 +631,7 @@ impl AgentService {
             tasks: None,
             config,
             graph: None,
+            project_learnings: Vec::new(),
             context_store: None,
             artifact_store: None,
             observer: None,
@@ -651,6 +655,16 @@ impl AgentService {
     /// Attach a project graph for context seeding and graph tools.
     pub fn with_graph(mut self, graph: Option<Arc<dyn ProjectGraph>>) -> Self {
         self.graph = graph;
+        self
+    }
+
+    /// Attach repository-owned learnings. They remain data until a task and
+    /// graph slice identify them as relevant.
+    pub fn with_project_learnings(
+        mut self,
+        learnings: Vec<forge_context::ProjectLearning>,
+    ) -> Self {
+        self.project_learnings = learnings;
         self
     }
 
@@ -2776,7 +2790,7 @@ impl AgentService {
             }
         }
         let skills_end = messages.len();
-        if let Some(graph) = &self.graph {
+        let graph_paths = if let Some(graph) = &self.graph {
             let hits = graph.context(task, 5);
             if !hits.is_empty() {
                 let listing = hits
@@ -2788,6 +2802,28 @@ impl AgentService {
                     "Relevant project files (from the project graph):\n{listing}"
                 )));
             }
+            hits.into_iter().map(|hit| hit.path).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let learnings =
+            forge_context::relevant_project_learnings(&self.project_learnings, task, &graph_paths);
+        if !learnings.is_empty() {
+            let listing = learnings
+                .iter()
+                .map(|learning| {
+                    format!(
+                        "- {:?} ({}): {}",
+                        learning.kind,
+                        learning.path.display(),
+                        learning.guidance
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            messages.push(Message::system(format!(
+                "Relevant reviewed project learnings. Follow guardrails and use decisions as context:\n{listing}"
+            )));
         }
         let graph_end = messages.len();
         messages.extend(history);

@@ -13,6 +13,7 @@ mod observation;
 mod observation_render;
 pub mod observer;
 mod plan;
+mod project_learning;
 mod store;
 
 pub use artifact::{
@@ -49,5 +50,9 @@ pub use observer::*;
 pub use plan::{
     CONTEXT_PLAN_VERSION, ContextComponents, ContextPlan, ContextPlanDraft, ContextPlanSummary,
     ContextSize, StablePrefix, stable_prefix,
+};
+pub use project_learning::{
+    ProjectLearning, ProjectLearningKind, changed_project_files, load_project_learnings,
+    relevant_project_learnings, write_project_learning,
 };
 pub use store::{ContextStore, FsContextStore, MemoryContextStore};

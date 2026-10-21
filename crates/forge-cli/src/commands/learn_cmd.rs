@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
-use forge_context::{FsLearningStore, LearningScope, LearningSession, ProposalStatus};
+use forge_context::{
+    FsLearningStore, LearningScope, LearningSession, ProjectLearningKind, ProposalStatus,
+    changed_project_files, load_project_learnings, write_project_learning,
+};
 use forge_core::ForgeError;
+use forge_graph::LocalGraph;
 use forge_session::JsonlSessionStore;
 
 use crate::{
@@ -13,6 +17,62 @@ pub fn run(ctx: &Context, command: LearnCommand) -> Result<(), ForgeError> {
     let sessions = JsonlSessionStore::new(root.join(".forge/sessions"));
     let store = FsLearningStore::new(root.join(".forge/context"));
     match command {
+        LearnCommand::Add {
+            guidance,
+            touch,
+            kind,
+        } => {
+            let kind = ProjectLearningKind::parse(&kind).ok_or_else(|| {
+                ForgeError::session(
+                    "learning kind must be decision, preference, guardrail, or runbook",
+                )
+            })?;
+            let touches = if touch.is_empty() {
+                changed_project_files(&root).map_err(ForgeError::Io)?
+            } else {
+                touch
+            };
+            if touches.is_empty() {
+                return Err(ForgeError::session(
+                    "learning needs --touch PATH, or create it while relevant files are changed",
+                ));
+            }
+            output(
+                &write_project_learning(&root, kind, &touches, &guidance)
+                    .map_err(ForgeError::Io)?,
+            )
+        }
+        LearnCommand::Check => {
+            let changed = changed_project_files(&root).map_err(ForgeError::Io)?;
+            // A decision linked to an importer matters just as much as one
+            // linked to the edited leaf. The stored graph makes that useful
+            // without an LLM or an embedding query; absent/stale graphs fail
+            // open to the exact diff paths.
+            let mut related = changed.clone();
+            if let Ok(graph) = LocalGraph::open(&root) {
+                for path in &changed {
+                    related.extend(graph.blast(path));
+                }
+                related.sort();
+                related.dedup();
+            }
+            let records = load_project_learnings(&root);
+            let affected = records
+                .into_iter()
+                .filter(|record| {
+                    record
+                        .touches
+                        .iter()
+                        .any(|touch| related.iter().any(|path| path == touch))
+                })
+                .collect::<Vec<_>>();
+            output(&serde_json::json!({
+                "changed": changed,
+                "related": related,
+                "affected": affected,
+                "message": if affected.is_empty() { "no reviewed project learnings are linked to this diff" } else { "review the linked decisions and guardrails before committing" },
+            }))
+        }
         LearnCommand::Propose { scope } => {
             let scope = scope_from(&scope)?;
             let evidence = evidence_for_scope(&sessions, scope.session_id())?;
@@ -53,6 +113,18 @@ pub fn run(ctx: &Context, command: LearnCommand) -> Result<(), ForgeError> {
             )
         }
     }
+}
+
+/// Refresh local, reviewable candidates after verified work. This is
+/// deliberately private and deterministic: it can add a pending candidate,
+/// but it never accepts guidance or writes repository-owned learnings.
+pub(crate) fn refresh_after_success(root: &std::path::Path) -> Result<usize, ForgeError> {
+    let sessions = JsonlSessionStore::new(root.join(".forge/sessions"));
+    let evidence = evidence_for_scope(&sessions, None)?;
+    let records = FsLearningStore::new(root.join(".forge/context"))
+        .propose(&evidence, &LearningScope::new(), sessions.redactor())
+        .map_err(learning_error)?;
+    Ok(records.len())
 }
 
 fn scope_from(args: &LearnScopeArgs) -> Result<LearningScope, ForgeError> {

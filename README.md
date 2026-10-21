@@ -69,6 +69,21 @@ forge run --plan "Refactor auth"      # route planning separately from execution
 forge chat                            # the same loop, interactive
 ```
 
+Forge also keeps durable project knowledge alongside the graph. Add a concise,
+reviewable decision linked to the files you changed, then inspect it before a
+commit:
+
+```bash
+forge learn add "Keep payment tokens out of logs" --kind guardrail
+forge learn check
+```
+
+These Markdown records live in `.forge/learnings/`, are intentionally
+trackable, and are injected only when the project graph finds related files.
+After a verified `forge run`, Forge also refreshes its separate private queue
+of redacted learning candidates; review it with `forge learn list` before any
+guidance affects later prompts.
+
 When Forge auto-bootstraps it chooses a reachable local model or a
 credentialed hosted model for you; use `forge model list` to inspect
 what it detected and `forge model add` / `.forge/config.toml` to pin one.

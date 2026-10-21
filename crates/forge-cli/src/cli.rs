@@ -248,6 +248,20 @@ pub struct LearnScopeArgs {
 
 #[derive(Subcommand)]
 pub enum LearnCommand {
+    /// Add a reviewed repository learning. With no `--touch`, Forge links it
+    /// to the files currently changed in git.
+    Add {
+        #[arg(value_name = "GUIDANCE")]
+        guidance: String,
+        /// One repository-relative file affected by this learning (repeatable).
+        #[arg(long, value_name = "PATH")]
+        touch: Vec<String>,
+        /// decision, preference, guardrail, or runbook (defaults to decision).
+        #[arg(long, default_value = "decision", value_name = "KIND")]
+        kind: String,
+    },
+    /// Show reviewed learnings affected by the current working-tree diff.
+    Check,
     /// Analyze recurrence and persist reviewable pending proposals.
     Propose {
         #[command(flatten)]
