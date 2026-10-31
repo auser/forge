@@ -1153,6 +1153,14 @@ default (`claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5`; `opus`,
 of the same name keep their own description and capability keys; only
 `provider`, `base_url` and `key_env` are set.
 
+`local_only = true` and `router_escalate = "off"` are written into the *user*
+config, so they apply to every ordinary run as well as to proxied ones: after
+one `init`, a plain `forge run` cannot reach a hosted provider and the
+needle→jev escalation tier is off. That is a defensible way to run, but it is
+a global change, so `forge doctor` says so on its `proxy scope` line — and the
+line names where `local_only` came from. Delete the two lines from the user
+config to put ordinary runs back online.
+
 **Settings precedence:** flags (`--url`, `--key-env`) > environment
 (`FORGE_PROXY_URL`; the key from the `key_env` variable, then
 `FORGE_PROXY_API_KEY`, default `dummy`) > `[proxy]` > `http://127.0.0.1:8001`.

@@ -206,6 +206,24 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
         });
     }
 
+    // `forge proxy init` writes `local_only` and `router_escalate` into the
+    // *user* config, so they outlive the proxy and apply to every ordinary
+    // run too — a normal `forge run` afterwards cannot reach a hosted
+    // provider, and the needle→jev escalation is dead. That is a defensible
+    // way to run, but it is a global change, and it is invisible unless
+    // something says so.
+    if let Ok(resolved) = &resolved
+        && !forge_config::proxy_mode()
+    {
+        let origin = resolved
+            .explain("local_only")
+            .map(|(_, origin)| origin.to_string())
+            .unwrap_or_else(|| "an unknown origin".to_string());
+        if let Some(check) = proxy_scope_check(&resolved.config, &origin) {
+            checks.push(check);
+        }
+    }
+
     // Skill discovery.
     {
         use forge_core::SkillRegistry;
@@ -1260,6 +1278,32 @@ fn profile_check(config: &forge_config::Config, eligible: &[&str]) -> Check {
     }
 }
 
+/// The scope a proxy setup left behind: `forge proxy init` writes
+/// `local_only` and `router_escalate` into the *user* config, so they
+/// outlive the proxy and apply to every ordinary run too — a normal
+/// `forge run` afterwards cannot reach a hosted provider, and the
+/// needle→jev escalation is dead.
+///
+/// That is a defensible way to run, but it is a global change, and
+/// nothing else says so. This is the line that says it.
+fn proxy_scope_check(config: &forge_config::Config, origin: &str) -> Option<Check> {
+    // The `[proxy]` section is what `forge proxy init` writes, so it is
+    // the signal that a proxy setup is in the config at all.
+    if config.proxy.url.is_none() || !config.local_only {
+        return None;
+    }
+    Some(Check {
+        level: Level::Warn,
+        label: "proxy scope".into(),
+        detail: format!(
+            "local_only is on (from {origin}) for every run, not only for proxied ones: \
+             an ordinary `forge run` cannot reach a hosted provider, and the jev \
+             escalation tier is off. `forge proxy init` writes this into the user \
+             config; remove the line if you want ordinary runs to stay online"
+        ),
+    })
+}
+
 /// Probe the Jev escalation tier: credential + endpoint only, no network
 /// probe (consistent with `needle_check` — this stays fast and offline).
 /// Meaningful whenever jev could actually be contacted: as the primary
@@ -2029,6 +2073,31 @@ mod tests {
         let check = profile_check(&forge_config::Config::default(), &["sonnet"]);
         assert_eq!(check.level, Level::Ok);
         assert!(check.detail.contains("no profile active"), "{}", check.detail);
+    }
+
+    /// The proxy scope line exists so that a global `local_only` left
+    /// behind by `forge proxy init` is visible rather than surprising. It
+    /// must not fire when no proxy is configured.
+    #[test]
+    fn the_proxy_scope_check_only_fires_for_a_configured_proxy() {
+        let mut config = forge_config::Config::default();
+        config.local_only = true;
+        assert!(
+            proxy_scope_check(&config, "user-file").is_none(),
+            "no [proxy] section: nothing to be out of scope for"
+        );
+        config.proxy.url = Some("http://127.0.0.1:8001".to_string());
+        let check = proxy_scope_check(&config, "user-file").expect("a check");
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("user-file"), "{}", check.detail);
+    }
+
+    /// `local_only` off: nothing is out of scope, whatever the proxy says.
+    #[test]
+    fn the_proxy_scope_check_is_absent_without_local_only() {
+        let mut config = forge_config::Config::default();
+        config.proxy.url = Some("http://127.0.0.1:8001".to_string());
+        assert!(proxy_scope_check(&config, "user-file").is_none());
     }
 
     /// `local_only` off: no check at all, so the report doesn't grow a line
