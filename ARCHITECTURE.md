@@ -68,8 +68,20 @@ generate text — which is exactly why it is safe to run on every request.
   `rustc`'s `static=` lookup needs, so a release asset keeps the same runtime
   dependencies as a brain-less build. `NEEDLE_CXX_RUNTIME` overrides it.
   Choosing by OS instead is what broke the first brain-enabled Linux build.
-  Linkability is per *architecture*, not per OS: the x86_64 archives need a
-  libc++ symbol no distribution ships, so only the arm64 engines are pinned.
+  Linkability is per *architecture*, not per OS: the x86_64 archives
+  reference `std::__1::__hash_memory`, which only libc++ 21+ defines, so the
+  build reads the engine's libc++ needs from the artifact, picks a libc++
+  whose symbol index defines them, and goes engine-less with one warning
+  (never a link error) when none does. arm64 (macOS, Linux) and x86_64 Linux
+  are pinned. Every build also records *which* path it took
+  (`needle_sys::ENGINE_PROVENANCE` / `ENGINE_RESOLUTION`: pinned download,
+  local engine verified against the pin, local unverified, or none and why).
+- **Runtime CPU check** (`forge_needle::cpu`): a linked engine is only handed
+  work if the host meets its measured instruction-set floor (x86_64: SSE2;
+  aarch64: NEON). The engine dispatches its own AVX2/AVX-512/VNNI or dotprod
+  kernels; forge reports which family applies, and below the floor it spawns
+  `UnsupportedCpuBackend`, whose `CpuUnsupported` error degrades routing to
+  the fallback with the reason.
 - `forge-needle` — the safe layer. `NeedleEngine` owns the model on one
   dedicated OS thread (mpsc jobs, oneshot replies): lazy load, panic
   containment (`catch_unwind`), abandoned-job skip (a caller that timed out

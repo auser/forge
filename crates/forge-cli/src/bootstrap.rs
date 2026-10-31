@@ -26,6 +26,10 @@ pub fn load_dotenv(global: &GlobalOpts) {
 }
 
 fn load_from_root(root: &Path) {
+    // Inside `forge proxy`, a project `.env` must not put back what the
+    // re-exec cleared (a provider key or base URL would reopen a path around
+    // the proxy).
+    let proxied = forge_config::proxy_mode();
     for name in [".env.local", ".env"] {
         let path = root.join(name);
         if !path.is_file() {
@@ -37,6 +41,10 @@ fn load_from_root(root: &Path) {
                 for item in iter {
                     match item {
                         Ok((key, value)) => {
+                            if proxied && forge_config::proxy::is_sanitized_env(&key) {
+                                tracing::debug!(%key, "forge proxy: not loading a cleared variable from an env file");
+                                continue;
+                            }
                             // Shell env always wins.
                             if std::env::var_os(&key).is_none() {
                                 // Single-threaded bootstrap before any

@@ -151,7 +151,15 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
     }
 
     // Credential detection summary (sources only, never values).
-    {
+    if forge_config::proxy_mode() {
+        checks.push(Check {
+            level: Level::Ok,
+            label: "credentials".into(),
+            detail: "subscription and provider-key discovery disabled by `forge proxy`; \
+                     models authenticate with the proxy key only"
+                .into(),
+        });
+    } else {
         let probes = forge_providers::probe_auth();
         let detected: Vec<String> = probes
             .iter()
@@ -183,6 +191,17 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
         checks.push(Check {
             level,
             label: "credentials".into(),
+            detail,
+        });
+    }
+
+    // `forge proxy`: URL, reachability, dialects, and (inside it) isolation.
+    for (level, label, detail) in
+        crate::commands::proxy_cmd::doctor_rows(resolved.as_ref().ok().map(|r| &r.config)).await
+    {
+        checks.push(Check {
+            level,
+            label: label.into(),
             detail,
         });
     }
@@ -816,7 +835,7 @@ async fn needle_checks(config: &forge_config::Config) -> Vec<Check> {
     // points two ways at once. Backend first: without it, nothing about the
     // weights is actionable.
     let blocked_remedy = if !backend.usable {
-        Some(forge_needle::ENGINE_REMEDY.to_string())
+        Some(backend.remedy.clone())
     } else {
         weights.remedy.clone()
     };
@@ -839,10 +858,13 @@ async fn needle_checks(config: &forge_config::Config) -> Vec<Check> {
     vec![engine, brain]
 }
 
-/// Is there an inference engine in this binary at all?
+/// Is there an inference engine in this binary at all — and can this CPU
+/// run it?
 struct BackendState {
     usable: bool,
     detail: String,
+    /// What fixes it when `usable` is false.
+    remedy: String,
 }
 
 /// Where the weights stand, and — if they are the thing blocking the brain —
@@ -857,6 +879,12 @@ struct WeightsState {
 /// run inference": it is true only when `needle-sys`'s build script resolved
 /// a real engine and linked it, and false whenever it continued engine-less —
 /// a build-time fact about what resolved, not a feature someone asked for.
+///
+/// The detail always says *which* resolution path the build took and why
+/// (`forge_needle::ENGINE_RESOLUTION`: target, origin, checksum, C++ runtime
+/// — or the reason there is no engine), and, for a linked engine, what this
+/// CPU means for it (`forge_needle::cpu`): accelerated kernels, portable
+/// kernels, or a refusal.
 fn backend_state(using_hash_backend: bool) -> BackendState {
     if using_hash_backend {
         return BackendState {
@@ -864,17 +892,31 @@ fn backend_state(using_hash_backend: bool) -> BackendState {
             detail: "backend overridden to the deterministic hash backend \
                      (FORGE_NEEDLE_BACKEND=hash)"
                 .to_string(),
+            remedy: String::new(),
         };
     }
     if forge_needle::HAS_EMBEDDED_BACKEND {
+        let cpu = forge_needle::cpu::host();
         BackendState {
-            usable: true,
-            detail: "backend built in (libneedle linked)".to_string(),
+            usable: cpu.runnable(),
+            detail: format!(
+                "backend built in (libneedle linked, {}: {}); {}",
+                forge_needle::ENGINE_PROVENANCE,
+                forge_needle::ENGINE_RESOLUTION,
+                cpu.describe()
+            ),
+            remedy: "this machine's CPU is below the engine's floor; nothing to fetch or \
+                     rebuild here"
+                .to_string(),
         }
     } else {
         BackendState {
             usable: false,
-            detail: "backend not in this build (no engine linked)".to_string(),
+            detail: format!(
+                "backend not in this build (no engine linked: {})",
+                forge_needle::ENGINE_RESOLUTION
+            ),
+            remedy: forge_needle::ENGINE_REMEDY.to_string(),
         }
     }
 }

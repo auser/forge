@@ -91,6 +91,11 @@ tokio = { version = "1", features = [
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 toml = "0.9"
+# Format-preserving TOML edits for `forge proxy init`, which must update a
+# user's config.toml in place (keys, comments and layout kept) and be
+# idempotent. Shares toml 0.9's parser/writer/datetime crates, so it adds one
+# package to the tree.
+toml_edit = "0.23"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

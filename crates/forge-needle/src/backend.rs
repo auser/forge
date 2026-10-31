@@ -48,6 +48,11 @@ pub enum BackendError {
          {ENGINE_REMEDY}"
     )]
     EngineMissing,
+    /// The engine is linked, but this CPU is below its measured floor (see
+    /// `crate::cpu`). Neither a rebuild nor `forge init` fixes that on this
+    /// machine, so the message says so and the router falls back.
+    #[error("this CPU cannot run the linked needle engine ({0}); routing with static rules")]
+    CpuUnsupported(String),
     #[error("needle weights missing at {0} (run `forge init` to fetch)")]
     WeightsMissing(PathBuf),
     #[error("needle inference failed: {0}")]
@@ -142,9 +147,68 @@ impl NeedleBackend for UnavailableBackend {
     }
 }
 
+/// The backend `engine_from_config` picks when this build *has* an engine
+/// but `crate::cpu::host()` says this CPU cannot run it. Like
+/// [`UnavailableBackend`], `load()` always fails, so routing degrades to the
+/// configured fallback — with a reason that names the CPU, not the build.
+#[derive(Debug, Clone)]
+pub struct UnsupportedCpuBackend {
+    pub reason: String,
+}
+
+impl NeedleBackend for UnsupportedCpuBackend {
+    fn load(&mut self) -> Result<(), BackendError> {
+        Err(BackendError::CpuUnsupported(self.reason.clone()))
+    }
+
+    fn model_id(&self) -> String {
+        "unavailable".to_string()
+    }
+
+    fn dimensions(&self) -> usize {
+        0
+    }
+
+    fn decide(&mut self, _task: &str, _options: &[String]) -> Result<Decision, BackendError> {
+        Err(BackendError::NotLoaded)
+    }
+
+    fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, BackendError> {
+        Err(BackendError::NotLoaded)
+    }
+
+    fn extract(&mut self, _text: &str, _schema_json: &str) -> Result<String, BackendError> {
+        Err(BackendError::NotLoaded)
+    }
+
+    fn tool_call(
+        &mut self,
+        _prompt: &str,
+        _tools_json: &str,
+    ) -> Result<Option<NeedleToolCall>, BackendError> {
+        Err(BackendError::NotLoaded)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CPU refusal is its own error: it names the CPU and the fallback, and
+    /// it must not send anyone to reinstall or refetch — neither would help.
+    #[test]
+    fn a_cpu_refusal_names_the_cpu_and_the_fallback_not_a_rebuild() {
+        let mut backend = UnsupportedCpuBackend {
+            reason: "cpu x86_64 cannot run the linked needle engine (missing sse2)".into(),
+        };
+        let err = backend.load().expect_err("refused");
+        assert!(matches!(err, BackendError::CpuUnsupported(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("missing sse2"), "{message}");
+        assert!(message.contains("static rules"), "{message}");
+        assert!(!message.contains("cargo install"), "{message}");
+        assert!(!message.contains("forge init"), "{message}");
+    }
 
     /// The bug this exists to prevent: a binary with no inference backend
     /// reported `WeightsMissing`, whose message says "run `forge init` to

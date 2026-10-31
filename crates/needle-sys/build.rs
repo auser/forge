@@ -60,6 +60,21 @@
 //!   binary can never go out labelled brain-enabled.
 //! * `NEEDLE_LIB_DIR` set but wrong → `cargo:warning` *and* a failure.
 //!   Operator error, deserves to be impossible to miss.
+//! * Engine resolved but provably unlinkable here (it references a libc++
+//!   symbol no installed libc++ defines — the x86_64 archive's
+//!   `__hash_memory`, libc++ 21+) → treated exactly like "unresolvable": one
+//!   warning naming the packages, engine-less build, fatal only under
+//!   `NEEDLE_REQUIRE_ENGINE`. Never a link error.
+//!
+//! **What resolved is reported, not just whether.** Every build emits
+//! `NEEDLE_ENGINE_PROVENANCE` (`pinned` | `local-verified` |
+//! `local-unverified` | `none`) and `NEEDLE_ENGINE_RESOLUTION` (one line:
+//! target, origin, checksum, C++ runtime — or why there is no engine) as
+//! compile-time env for `src/lib.rs`, which `forge doctor` prints. A
+//! `NEEDLE_LIB_DIR`/`vendor/` engine is hashed and compared with the pin for
+//! its target: identical bytes are `local-verified`, anything else (a
+//! self-built or newer upstream engine) is linked as asked but labelled
+//! `local-unverified`.
 
 // `build_support.rs` is pulled in rather than `mod`-declared so that
 // `tests/engine_resolution.rs` can include the very same source and unit-test
@@ -115,6 +130,11 @@ fn main() {
     // Step 1 and 2. Step 1 is the only path that fails on absence: the
     // operator named a specific directory, so an empty one is a mistake
     // worth stopping for.
+    let source_label = if configured.is_some() {
+        LIB_DIR_ENV
+    } else {
+        "vendor/"
+    };
     let mut lib_dir: Option<PathBuf> = match configured {
         Some(dir) => {
             let dir = PathBuf::from(dir);
@@ -139,6 +159,19 @@ fn main() {
         None => static_lib(&vendor, &target).map(|_| vendor.clone()),
     };
 
+    // What resolved, from where, and whether its bytes are the pinned ones —
+    // the build-time half of what `forge doctor` reports. A local engine is
+    // linked as asked either way, but labelled honestly.
+    let mut provenance: Option<(Provenance, String)> = lib_dir.as_ref().map(|dir| {
+        let sha = static_lib(dir, &target)
+            .and_then(|lib| sha256_file(&lib).ok())
+            .unwrap_or_default();
+        let kind = local_provenance(&target, &sha);
+        (kind, format!("{source_label} {}", dir.display()))
+    });
+    // Engine-less builds still say why, for `forge doctor`.
+    let mut engine_less_reason = String::new();
+
     // Step 3: the engine is always wanted, so the fetch attempt always runs
     // when steps 1 and 2 found nothing.
     if lib_dir.is_none() {
@@ -148,6 +181,7 @@ fn main() {
                     "cargo:rerun-if-changed={}",
                     dir.join(lib_file_name(&target)).display()
                 );
+                provenance = Some((Provenance::Pinned, "pinned download".to_string()));
                 lib_dir = Some(dir);
             }
             Err(e) => {
@@ -156,6 +190,7 @@ fn main() {
                 // own stderr is easy to lose in a parallel build's output.
                 let message = e.message(&target);
                 println!("cargo:warning=needle-sys: {}", one_line(&message));
+                engine_less_reason = one_line(&message);
                 if env_flag(REQUIRE_ENV) {
                     fail(&format!(
                         "{message}\n\n({REQUIRE_ENV} is set, so this is fatal.)"
@@ -172,9 +207,40 @@ fn main() {
 
     // The fetch attempt above already warned when nothing resolved; nothing
     // more to say on that path.
-    if let Some(dir) = &lib_dir {
-        emit_link_flags(dir, &target, &host);
-    }
+    let resolution = match (&lib_dir, provenance) {
+        (Some(dir), Some((kind, origin))) => match emit_link_flags(dir, &target, &host) {
+            Ok(cxx) => {
+                let sha = static_lib(dir, &target)
+                    .and_then(|lib| sha256_file(&lib).ok())
+                    .unwrap_or_default();
+                println!("cargo:rustc-env=NEEDLE_ENGINE_PROVENANCE={}", kind.as_str());
+                format!(
+                    "{target} engine from {origin}, sha256 {}…, {}; C++ runtime: {cxx}",
+                    sha.get(..12).unwrap_or(&sha),
+                    match kind {
+                        Provenance::Pinned => "verified against the pin",
+                        Provenance::LocalVerified => "local copy, matches the pin",
+                        Provenance::LocalUnverified => "local, NOT a pinned artifact",
+                    }
+                )
+            }
+            Err(blocker) => {
+                println!("cargo:warning=needle-sys: {}", one_line(&blocker));
+                if env_flag(REQUIRE_ENV) {
+                    fail(&format!(
+                        "{blocker}\n\n({REQUIRE_ENV} is set, so this is fatal.)"
+                    ));
+                }
+                println!("cargo:rustc-env=NEEDLE_ENGINE_PROVENANCE=none");
+                one_line(&blocker)
+            }
+        },
+        _ => {
+            println!("cargo:rustc-env=NEEDLE_ENGINE_PROVENANCE=none");
+            engine_less_reason
+        }
+    };
+    println!("cargo:rustc-env=NEEDLE_ENGINE_RESOLUTION={resolution}");
 }
 
 /// Stop the build with a message and no backtrace noise.
@@ -202,15 +268,32 @@ fn env(key: &str) -> String {
 /// The C++ half is only probed here, once an engine actually exists — there is
 /// no point telling someone to install libc++ for a build that was never going
 /// to link anything.
-fn emit_link_flags(dir: &Path, target: &str, host: &str) {
+///
+/// Returns a one-line summary of the C++ runtime choice, or — when the
+/// engine provably cannot link here (it needs a newer libc++ than the machine
+/// has) — the blocker, having emitted **nothing**, so the build continues
+/// engine-less instead of failing at link time.
+fn emit_link_flags(dir: &Path, target: &str, host: &str) -> Result<String, String> {
+    let needs = static_lib(dir, target)
+        .and_then(|lib| std::fs::read(lib).ok())
+        .map(|bytes| engine_libcxx_needs(&bytes))
+        .unwrap_or_default();
+    let requested = requested_cxx_runtime();
+    let plan = cxx_plan(
+        target,
+        requested.as_deref(),
+        &probe_cxx_for(target, host, &needs),
+    );
+    if let Some(blocker) = plan.blocker {
+        return Err(blocker);
+    }
+
     // The fact that makes this build's `ENGINE_LINKED` true — emitted only
     // alongside real link flags, never for an engine-less build.
     println!("cargo:rustc-cfg=needle_engine");
     println!("cargo:rustc-link-search=native={}", dir.display());
     println!("cargo:rustc-link-lib=static=needle");
 
-    let requested = requested_cxx_runtime();
-    let plan = cxx_plan(target, requested.as_deref(), &probe_cxx(target, host));
     for dir in &plan.search_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
@@ -220,4 +303,19 @@ fn emit_link_flags(dir: &Path, target: &str, host: &str) {
     if let Some(warning) = &plan.warning {
         println!("cargo:warning=needle-sys: {}", one_line(warning));
     }
+    let summary = if plan.flags.is_empty() {
+        "none added".to_string()
+    } else {
+        plan.flags.join(" ")
+    };
+    // Name the libc++ actually chosen, symlinks resolved, so a report reads
+    // `/usr/lib/llvm-21/lib/libc++.a` rather than a gcc-relative path.
+    Ok(match plan.search_dirs.first() {
+        Some(dir) => {
+            let lib = dir.join("libc++.a");
+            let shown = lib.canonicalize().unwrap_or(lib);
+            format!("{summary} ({})", shown.display())
+        }
+        None => summary,
+    })
 }

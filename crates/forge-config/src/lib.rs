@@ -3,8 +3,9 @@
 //! Precedence, lowest to highest: built-in defaults →
 //! `~/.config/forge/config.toml` (honoring `XDG_CONFIG_HOME`) →
 //! `<project>/.forge/config.toml` → `FORGE_*` environment variables →
-//! CLI flag overrides. Every key records its winning value and origin so
-//! `forge config explain <key>` can report provenance.
+//! CLI flag overrides → (inside `forge proxy` only) the proxy pin. Every key
+//! records its winning value and origin so `forge config explain <key>` can
+//! report provenance.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -15,10 +16,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod catalogue;
 pub mod costs;
+pub mod proxy;
 pub mod test_mocks;
 
 pub use costs::{CostBook, PriceSource};
 pub use forge_core::ProfileConfig;
+pub use proxy::{ProxyConfig, ProxyPin, proxy_mode};
 pub use test_mocks::{TEST_MOCKS_ENV, ensure_test_mocks_allowed, test_mocks_allowed};
 
 /// A `[models.<name>]` entry: cost metadata, optional endpoint, and
@@ -446,6 +449,9 @@ pub struct Config {
     pub context_compression: ContextCompressionConfig,
     /// Opt-in background observer model and dedicated spend ceilings.
     pub observer: ObserverConfig,
+    /// `[proxy]`: where `forge proxy` sends model traffic (see
+    /// [`crate::proxy`]).
+    pub proxy: ProxyConfig,
     /// Days a cached OpenRouter model catalogue counts as fresh (see
     /// [`crate::catalogue`]). A stale cache is still used — with a warning
     /// naming its age — because stale prices beat no prices; must be >= 1.
@@ -747,6 +753,7 @@ impl Default for Config {
             context_artifacts: ContextArtifactsConfig::default(),
             context_compression: ContextCompressionConfig::default(),
             observer: ObserverConfig::default(),
+            proxy: ProxyConfig::default(),
             catalogue_ttl_days: 7,
             // Nothing here was explicitly configured — this *is* the
             // defaults layer.
@@ -766,6 +773,8 @@ pub enum Origin {
     ProjectFile,
     Environment,
     CliFlag,
+    /// Pinned by `forge proxy` on top of every other layer.
+    Proxy,
 }
 
 impl fmt::Display for Origin {
@@ -776,6 +785,7 @@ impl fmt::Display for Origin {
             Self::ProjectFile => "project-file",
             Self::Environment => "environment",
             Self::CliFlag => "cli-flag",
+            Self::Proxy => "proxy",
         };
         f.write_str(s)
     }
@@ -1100,6 +1110,12 @@ impl Config {
         config.model_pinned = sources
             .get("model")
             .is_some_and(|s| matches!(s.origin, Origin::CliFlag | Origin::Environment));
+        // `forge proxy`'s pin goes on last, over CLI flags too: inside the
+        // proxied process nothing may turn `local_only` off or point a proxy
+        // entry elsewhere.
+        if let Some(pin) = ProxyPin::from_env() {
+            pin.apply(&mut config, &mut sources);
+        }
         config.validate()?;
 
         Ok(ResolvedConfig { config, sources })
