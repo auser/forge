@@ -257,6 +257,12 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
             label: "model eligibility".into(),
             detail,
         });
+        // The routing profile, if one is active. It is worth a line of its
+        // own because a tier names models, and a tier naming a model that
+        // is not eligible degrades to the ordinary pool *silently* — the
+        // run succeeds and the policy simply does not apply. This is where
+        // that shows up.
+        checks.push(profile_check(config, &eligible));
         // Model provider: a test-only mock is reported as whatever it
         // actually is right now — usable under the gate, broken without it
         // (every run would fail at provider construction, and "why does
@@ -1150,6 +1156,110 @@ fn local_only_check(config: &forge_config::Config) -> Option<Check> {
     })
 }
 
+/// The active routing profile and what it actually constrains.
+///
+/// A tier is a list of *model names*, so a tier naming a model that is not
+/// eligible cannot be honoured — the request degrades to the ordinary pool
+/// and the run still succeeds. That is the right failure (a working model
+/// beats no model), but it is silent, and a user who believes their tier
+/// policy is in force is wrong. So the check names the tiers *and* marks
+/// the models that cannot serve them.
+fn profile_check(config: &forge_config::Config, eligible: &[&str]) -> Check {
+    const LABEL: &str = "routing profile";
+    let Some(name) = config.profile.as_deref() else {
+        return Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: "no profile active — every phase uses the ordinary candidate pool".into(),
+        };
+    };
+    let Some(profile) = config.profiles.get(name) else {
+        // Config::load refuses this, so it cannot happen at runtime; the
+        // check says so rather than reporting a profile that is not there.
+        return Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!("profile {name:?} is selected but not defined"),
+        };
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut unusable = 0usize;
+    for (phase, own) in [
+        (forge_core::RoutingPhase::Plan, &profile.plan),
+        (forge_core::RoutingPhase::Execute, &profile.execute),
+        (forge_core::RoutingPhase::Review, &profile.review),
+        (forge_core::RoutingPhase::General, &profile.general),
+    ] {
+        if own.is_empty() {
+            continue;
+        }
+        let rendered = own
+            .iter()
+            .map(|model| {
+                if eligible.contains(&model.as_str()) {
+                    model.clone()
+                } else {
+                    unusable += 1;
+                    format!("{model} (not eligible)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("{}: {rendered}", phase.as_str()));
+    }
+    // A phase the profile does not name inherits the `general` tier, so the
+    // report says which tiers are inherited rather than letting it look as
+    // though the profile named them.
+    let general = &profile.general;
+    if !general.is_empty() {
+        for phase in [
+            forge_core::RoutingPhase::Plan,
+            forge_core::RoutingPhase::Execute,
+            forge_core::RoutingPhase::Review,
+        ] {
+            let own = match phase {
+                forge_core::RoutingPhase::Plan => &profile.plan,
+                forge_core::RoutingPhase::Execute => &profile.execute,
+                forge_core::RoutingPhase::Review => &profile.review,
+                forge_core::RoutingPhase::General => unreachable!(),
+            };
+            if !own.is_empty() {
+                continue;
+            }
+            let rendered = general
+                .iter()
+                .map(|model| {
+                    if eligible.contains(&model.as_str()) {
+                        model.clone()
+                    } else {
+                        unusable += 1;
+                        format!("{model} (not eligible)")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("{}: {rendered} (from general)", phase.as_str()));
+        }
+    }
+
+    let level = if unusable == 0 {
+        Level::Ok
+    } else {
+        Level::Warn
+    };
+    let detail = if parts.is_empty() {
+        format!("profile {name:?} is active but names no model for any phase")
+    } else {
+        format!("profile {name:?} — {}", parts.join("; "))
+    };
+    Check {
+        level,
+        label: LABEL.into(),
+        detail,
+    }
+}
+
 /// Probe the Jev escalation tier: credential + endpoint only, no network
 /// probe (consistent with `needle_check` — this stays fast and offline).
 /// Meaningful whenever jev could actually be contacted: as the primary
@@ -1850,6 +1960,75 @@ mod tests {
              router_fallback: {}",
             check.detail
         );
+    }
+
+    /// A profile that names an eligible model for every phase is fine.
+    #[test]
+    fn the_profile_check_reports_each_tier() {
+        let mut config = forge_config::Config::default();
+        config.profile = Some("opusplan".to_string());
+        config.profiles.insert(
+            "opusplan".to_string(),
+            forge_config::ProfileConfig {
+                plan: vec!["opus".to_string()],
+                execute: vec!["sonnet".to_string()],
+                ..forge_config::ProfileConfig::default()
+            },
+        );
+        let check = profile_check(&config, &["opus", "sonnet"]);
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("plan: opus"), "{}", check.detail);
+        assert!(check.detail.contains("execute: sonnet"), "{}", check.detail);
+    }
+
+    /// A tier naming a model that cannot be served degrades to the ordinary
+    /// pool — silently, at run time. The check is where that shows up
+    /// instead.
+    #[test]
+    fn the_profile_check_marks_a_model_that_cannot_be_served() {
+        let mut config = forge_config::Config::default();
+        config.profile = Some("opusplan".to_string());
+        config.profiles.insert(
+            "opusplan".to_string(),
+            forge_config::ProfileConfig {
+                plan: vec!["opus".to_string()],
+                ..forge_config::ProfileConfig::default()
+            },
+        );
+        let check = profile_check(&config, &["sonnet"]);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("opus (not eligible)"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A phase the profile does not name inherits the general tier, and the
+    /// report says so rather than making it look named.
+    #[test]
+    fn the_profile_check_marks_an_inherited_tier() {
+        let mut config = forge_config::Config::default();
+        config.profile = Some("opusplan".to_string());
+        config.profiles.insert(
+            "opusplan".to_string(),
+            forge_config::ProfileConfig {
+                plan: vec!["opus".to_string()],
+                general: vec!["sonnet".to_string()],
+                ..forge_config::ProfileConfig::default()
+            },
+        );
+        let check = profile_check(&config, &["opus", "sonnet"]);
+        assert!(check.detail.contains("(from general)"), "{}", check.detail);
+    }
+
+    /// No profile: one line, saying routing is unconstrained — the report
+    /// should not grow a section about a policy nobody set.
+    #[test]
+    fn the_profile_check_says_so_when_no_profile_is_active() {
+        let check = profile_check(&forge_config::Config::default(), &["sonnet"]);
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("no profile active"), "{}", check.detail);
     }
 
     /// `local_only` off: no check at all, so the report doesn't grow a line

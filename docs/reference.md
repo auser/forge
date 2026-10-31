@@ -410,7 +410,9 @@ hardware), `decider` (hosted routing from meraGPT's Decider 1) and `jev`
 `export TYPESAFE_API_KEY=...` is the one step that arms it), plus
 `local-first` (the default stack, made explicit), `hybrid-needle` (local
 first, hosted escalation), `budget-hosted`, `hybrid-laya` (the Laya-adapter
-example), and `hybrid-laya-native` (in-process Rust Laya), and an
+example), `hybrid-laya-native` (in-process Rust Laya), `opusplan` (the
+phase-tier policy: a strong model for the plan, a cheaper one for the
+build), and an
 [`env.example`](examples/env.example)
 template for provider keys. An existing config is never overwritten —
 `--preset` says so instead. Unit tests parse every preset (on disk and
@@ -963,11 +965,18 @@ profile works across Anthropic, OpenRouter, or a local model.
 
 ```toml
 [profiles.opusplan]
-plan    = "claude-opus"              # one model  -> a decision
-execute = ["claude-sonnet", "gpt-5"] # several    -> a menu
-review  = "claude-opus"
-general = "claude-sonnet"            # the default for phases the profile does not name
+plan    = "claude-sonnet"              # one model  -> a decision
+execute = ["deepseek-chat", "gpt-5"]   # several    -> a menu
+review  = "claude-sonnet"
+general = "deepseek-chat"              # the default for phases the profile does not name
 ```
+
+`forge init --preset opusplan` writes that shape, with the models forge
+declares. A tier names models, so a name that is not a declared model cannot
+be served — the tier degrades to the ordinary pool at run time, silently.
+`forge doctor` reports the active profile and marks every tier model that
+cannot be served, so a name that is not wired up shows up before a run
+quietly ignores it.
 
 Four keys, four phases: `plan`, `execute`, `review`, `general`. A phase takes
 either a single string or a list of strings — the two spellings mean the same

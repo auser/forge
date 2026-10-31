@@ -227,7 +227,7 @@ approval = "prompt-dangerous" # ordinary edits run; destructive operations ask
 
 Presets live in [`examples/configs/`](examples/configs/) — or let init
 write one: `forge init --preset claude` (also `codex`, `kimi`, `kev`,
-`decider`, `jev`, `local-first`, `hybrid-needle`, `budget-hosted`,
+`decider`, `jev`, `opusplan`, `local-first`, `hybrid-needle`, `budget-hosted`,
 `hybrid-laya`, `hybrid-laya-native`).
 
 A **routing profile** says which models may serve which phase — the
@@ -239,9 +239,14 @@ from:
 profile = "opusplan"           # or FORGE_PROFILE=opusplan, or --profile opusplan
 
 [profiles.opusplan]
-plan    = "claude-opus"              # one model: a decision
-execute = ["claude-sonnet", "gpt-5"] # several: a menu
+plan    = "claude-sonnet"           # one model: a decision
+execute = ["deepseek-chat", "gpt-5"] # several: a menu
 ```
+
+`forge init --preset opusplan` writes that shape with the models forge
+already declares. `forge doctor` reports the active profile and marks any
+tier model that cannot be served — a name that is not wired up would
+otherwise be ignored at run time, silently.
 
 ## Where to read more
 

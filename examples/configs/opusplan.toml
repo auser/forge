@@ -1,0 +1,53 @@
+# Opusplan: plan with the strong model, build with the cheap one.
+#
+# The idea Claude Code calls `opusplan`, expressed per phase rather than per
+# vendor. A profile says which models may serve which phase, so the plan
+# gets a model that can afford to think and the implementation gets one
+# that cannot.
+#
+#     forge init --preset opusplan
+#
+# Then every phase of the development workflow — plan, execute, review —
+# routes to that phase's tier. The plan and the build share one
+# conversation, so the cheap model still sees everything the strong model
+# produced.
+#
+# A tier with one model is a decision: the router returns it directly, so
+# no inference is spent choosing it. A tier with several is a menu the
+# configured router picks from, so cost-aware selection still applies
+# within the tier. Here the plan is a single model and the build is a
+# menu, so the build can fall to the cheaper of the two.
+
+profile = "opusplan"
+
+[profiles.opusplan]
+# The design pass. One model: no choice to make, no inference to pay.
+plan = "claude-sonnet"
+# The implementation. Several: the router picks, preferring the cheaper
+# model that can still do the job.
+execute = ["deepseek-chat", "qwen3-coder"]
+# The independent review is a reading task, not a writing one — a strong
+# model catches what a cheap one writes.
+review = "claude-sonnet"
+# Anything that is not one of the three phases above.
+general = "deepseek-chat"
+
+# The models above are the ones forge ships with. To widen the fidelity
+# gap — a real Opus for the plan — add the model yourself and name it in
+# the tier. This is the Anthropic shape; the wire id is what Anthropic
+# calls the model:
+#
+#     [models.claude-opus]
+#     provider = "anthropic"
+#     base_url = "https://api.anthropic.com"
+#     key_env = "ANTHROPIC_API_KEY"
+#     wire_model = "claude-opus-4-5"
+#     max_context = 200000
+#
+# then change `plan` above to "claude-opus". `forge doctor` reports the
+# active profile and marks any tier model that cannot be served, so a
+# name that is not wired up shows up before a run silently ignores it.
+
+model = "deepseek-chat"
+execution = "native"
+approval = "prompt"
