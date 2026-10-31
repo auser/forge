@@ -2144,12 +2144,26 @@ mod tests {
             .mount(&server)
             .await;
 
+        // Point the weights at a path that does not exist, so "the engine
+        // cannot answer" is a fact of this test rather than of the machine:
+        // the engine is linked by default now, and on a machine with real
+        // weights fetched, needle would genuinely decide and the escalation
+        // tier would never be consulted.
+        let tmp = tempfile::tempdir().expect("tempdir");
         let config = Config {
             router: "needle".to_string(),
             jev_url: Some(server.uri()),
             router_fallback: "static".to_string(),
             local_only: true,
             model: "mock-local".to_string(),
+            needle: forge_config::NeedleConfig {
+                weights_path: tmp
+                    .path()
+                    .join("no-weights.cact")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..forge_config::NeedleConfig::default()
+            },
             ..Config::default()
         };
         let router = router_from_config(
@@ -3465,7 +3479,9 @@ mod tests {
         let router = policy_router(
             inner.clone(),
             ProfileConfig {
-                plan: vec!["claude-opus".to_string()],
+                // A model the candidate pool does not carry — undeclared,
+                // or excluded as unavailable.
+                plan: vec!["gpt-5".to_string()],
                 ..ProfileConfig::default()
             },
         );
