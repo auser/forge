@@ -2152,8 +2152,21 @@ mod tests {
             model: "mock-local".to_string(),
             ..Config::default()
         };
-        let router =
-            router_from_config(&config, &[("mock-local".to_string(), caps(true))]).expect("builds");
+        let router = router_from_config(
+            &config,
+            &[
+                ("mock-local".to_string(), caps(true)),
+                // A second eligible model, so needle actually has to
+                // decide. With exactly one eligible model the router takes
+                // the "only eligible model" shortcut and answers it without
+                // consulting the engine — so needle would never decline,
+                // and the escalation tier this test is about would never be
+                // reached. The escalation path is the one that needs a
+                // choice to refuse.
+                ("mock-other".to_string(), caps(true)),
+            ],
+        )
+        .expect("builds");
         let decision = router
             .route(&RoutingRequest::new("offline task"))
             .await
