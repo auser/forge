@@ -195,6 +195,17 @@ fn forge_args_pass_through_unchanged() {
         proxied(&["forge", "-v", "--json", "proxy", "doctor"]).0,
         os(&["-v", "--json", "doctor"])
     );
+    // The routing profile crosses the re-exec boundary too: a flag that
+    // is not re-emitted would leave the child reading the config's own
+    // profile, so the tier policy would be inert without any error.
+    assert_eq!(
+        proxied(&["forge", "proxy", "--profile", "opusplan", "run", "x"]).0,
+        os(&["--profile", "opusplan", "run", "x"])
+    );
+    assert_eq!(
+        proxied(&["forge", "--profile", "opusplan", "proxy", "doctor"]).0,
+        os(&["--profile", "opusplan", "doctor"])
+    );
     // Flags after the forge subcommand stay where they were.
     assert_eq!(
         proxied(&["forge", "proxy", "run", "--model", "sonnet", "x"]).0,

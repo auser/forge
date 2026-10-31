@@ -310,6 +310,14 @@ pub fn child_args(global: &GlobalOpts, forge_args: &[OsString]) -> Vec<OsString>
     if let Some(v) = &global.model {
         flag("--model", Some(OsStr::new(v)));
     }
+    // The routing profile has to cross the re-exec boundary too. A flag
+    // that is not re-emitted is not merely dropped: the child's config
+    // layers would still answer, and the profile would silently not apply
+    // — the tier policy the user asked for would be inert, with nothing
+    // to say so.
+    if let Some(v) = &global.profile {
+        flag("--profile", Some(OsStr::new(v)));
+    }
     if let Some(v) = &global.router {
         flag("--router", Some(OsStr::new(v)));
     }
