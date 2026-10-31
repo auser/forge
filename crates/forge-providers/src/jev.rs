@@ -39,6 +39,25 @@
 //!
 //! Endpoint note: the brief suggested checking `console.typesafe.ai`; the
 //! verified hosted API host is actually `api.typesafe.ai`.
+//!
+//! ## The self-hosted family
+//!
+//! The same contract is served by servers **you** run, which changes two
+//! things for this router:
+//!
+//! - **The credential becomes optional.** lev
+//!   (<https://github.com/franckverrot/lev>), OpenJev and Kev either ignore
+//!   the bearer token or are fronted by something that does, so a loopback
+//!   endpoint is contacted without one. A *remote* endpoint still needs it:
+//!   TypeSafe rejects unauthenticated requests, and that stays a typed
+//!   error naming the env var rather than a request that fails at the far
+//!   end.
+//! - **One extension becomes available.** lev and Kev expose
+//!   `POST /v1/systemone/permute`, which re-asks one choice question under
+//!   several option orders and reports whether the winner survives
+//!   re-ordering. That is a check TypeSafe's published contract does not
+//!   offer, and it is off by default (`jev_order_check`) because it is an
+//!   extra forward pass per order — see [`JevRouterBuilder::order_check`].
 
 use std::time::Duration;
 
@@ -58,15 +77,21 @@ pub struct JevRouter {
     client: reqwest::Client,
     url: String,
     /// Always resolved to a concrete name by `new()` (default
-    /// `TYPESAFE_API_KEY`) — unlike `LayaRouter`/`HttpRouter`, a missing
-    /// credential is a routing error here, not a silently-unauthenticated
-    /// request (see the brief: "missing key" is a named error case).
+    /// `TYPESAFE_API_KEY`). Unlike `LayaRouter`/`HttpRouter`, a missing
+    /// credential is a routing error here — for a **remote** endpoint. A
+    /// local one (lev, OpenJev, Kev on loopback) needs no credential at all,
+    /// so it is contacted unauthenticated rather than refused.
     key_env: String,
     /// The top-level `model` id sent on every request. Defaults to
     /// [`JevRouter::MODEL_ALIAS`]; a backend that wants its own id
     /// (meraGPT's `sd-1`, a self-hosted Kev/CLM server's) gets it via the
     /// `jev_model` config key.
     model_id: String,
+    /// Whether to re-ask the routing question under several option orders
+    /// and refuse a choice whose winner does not survive re-ordering. Off
+    /// by default: it is an extension of the self-hosted family, not of
+    /// TypeSafe's contract, and it costs one forward pass per order.
+    order_check: bool,
     registry: Vec<(String, ModelCapabilities)>,
 }
 
@@ -108,6 +133,23 @@ impl JevRouter {
         registry: Vec<(String, ModelCapabilities)>,
         egress: EgressPolicy,
     ) -> Result<Self, ForgeError> {
+        Self::with_options(url, key_env, model_id, timeout, registry, egress, false)
+    }
+
+    /// Everything [`JevRouter::with_model_id`] takes, plus the option-order
+    /// check. Private because the builder is the public way to set it (and
+    /// because the positional-argument list is already at the limit where
+    /// another one stops being readable).
+    #[allow(clippy::too_many_arguments)]
+    fn with_options(
+        url: Option<String>,
+        key_env: Option<String>,
+        model_id: Option<String>,
+        timeout: Duration,
+        registry: Vec<(String, ModelCapabilities)>,
+        egress: EgressPolicy,
+        order_check: bool,
+    ) -> Result<Self, ForgeError> {
         let client = egress
             .client(timeout)
             .map_err(|e| ForgeError::router(format!("building HTTP client: {e}")))?;
@@ -116,6 +158,7 @@ impl JevRouter {
             url: url.unwrap_or_else(|| Self::DEFAULT_URL.to_string()),
             key_env: key_env.unwrap_or_else(|| Self::DEFAULT_KEY_ENV.to_string()),
             model_id: model_id.unwrap_or_else(|| Self::MODEL_ALIAS.to_string()),
+            order_check,
             registry,
         })
     }
@@ -141,6 +184,7 @@ pub struct JevRouterBuilder {
     timeout: Duration,
     registry: Vec<(String, ModelCapabilities)>,
     egress: Option<EgressPolicy>,
+    order_check: bool,
 }
 
 impl JevRouterBuilder {
@@ -169,6 +213,22 @@ impl JevRouterBuilder {
         self
     }
 
+    /// Re-ask the routing question under several option orders and refuse a
+    /// choice whose winner does not survive re-ordering.
+    ///
+    /// A classifier that lists its options in a different order and picks a
+    /// different one has not made a decision — it has reported the order.
+    /// The self-hosted System One servers (lev, Kev) expose an endpoint for
+    /// exactly this (`POST /v1/systemone/permute`); TypeSafe's published
+    /// contract does not, so against a hosted endpoint this check reports
+    /// itself unavailable and the decision stands.
+    ///
+    /// Off by default: each order costs one forward pass at the far end.
+    pub fn order_check(mut self, order_check: bool) -> Self {
+        self.order_check = order_check;
+        self
+    }
+
     /// **Required** (see [`EgressPolicy`]). `EgressPolicy::default()` is the
     /// permissive variant, so a builder that silently defaulted would make
     /// *forgetting* the confidentiality-relevant choice the unrestricted one.
@@ -187,13 +247,14 @@ impl JevRouterBuilder {
                  default to unrestricted",
             )
         })?;
-        JevRouter::with_model_id(
+        JevRouter::with_options(
             self.url,
             self.key_env,
             self.model_id,
             self.timeout,
             self.registry,
             egress,
+            self.order_check,
         )
     }
 }
@@ -201,18 +262,21 @@ impl JevRouterBuilder {
 #[async_trait]
 impl DecisionRouter for JevRouter {
     async fn route(&self, task: &RoutingRequest) -> Result<RoutingDecision, ForgeError> {
-        // The credential is read at request time (never logged) and its
-        // absence is a typed error naming the env var, not a silent
-        // unauthenticated request — Jev/OpenJev both require auth.
-        let key = std::env::var(&self.key_env)
-            .ok()
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| {
-                ForgeError::router(format!(
-                    "jev router requires a credential in ${} (not set)",
-                    self.key_env
-                ))
-            })?;
+        // The credential is read at request time (never logged). A **local**
+        // endpoint needs none: the self-hosted System One servers this
+        // crate speaks to (lev, OpenJev, Kev) ignore the bearer token, so
+        // refusing the request would refuse a setup that works. A **remote**
+        // endpoint does need one — TypeSafe rejects unauthenticated
+        // requests — and its absence stays a typed error naming the env
+        // var, not a silently-unauthenticated request that fails at the far
+        // end.
+        let key = std::env::var(&self.key_env).ok().filter(|k| !k.is_empty());
+        if key.is_none() && !crate::endpoint_is_local(&self.url) {
+            return Err(ForgeError::router(format!(
+                "jev router requires a credential in ${} (not set)",
+                self.key_env
+            )));
+        }
 
         // Candidate pool: requested candidates (capability-checked against
         // the registry) or, when the request names none, the whole
@@ -257,43 +321,43 @@ impl DecisionRouter for JevRouter {
             RoutingPhase::Execute => format!("[phase: execute] {}", task.task),
             RoutingPhase::Review => format!("[phase: review] {}", task.task),
         };
+        let mut questions = serde_json::Map::new();
+        questions.insert(
+            MODEL_QUESTION_ID.to_string(),
+            serde_json::json!({
+                "type": "choice",
+                "instructions": match task.phase {
+                    RoutingPhase::Plan => "Which model should design the implementation plan? Prefer the strongest reasoning model available.",
+                    RoutingPhase::Review => "Which model should independently review this change? Prefer strong reasoning for subtle defects.",
+                    RoutingPhase::General | RoutingPhase::Execute => "Which model should handle this software task? Prefer the least expensive capable model.",
+                },
+                "criteria": criteria,
+            }),
+        );
         let body = serde_json::json!({
             "state": state,
             "model": self.model_id,
-            "questions": {
-                "model": {
-                    "type": "choice",
-                    "instructions": match task.phase {
-                        RoutingPhase::Plan => "Which model should design the implementation plan? Prefer the strongest reasoning model available.",
-                        RoutingPhase::Review => "Which model should independently review this change? Prefer strong reasoning for subtle defects.",
-                        RoutingPhase::General | RoutingPhase::Execute => "Which model should handle this software task? Prefer the least expensive capable model.",
-                    },
-                    "criteria": criteria,
-                }
-            }
+            "questions": questions,
         });
 
-        let response = self
-            .client
-            .post(&self.url)
-            .bearer_auth(key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ForgeError::router(format!("jev router request to {} timed out", self.url))
-                } else {
-                    // Source chain included so a `local_only` redirect
-                    // refusal explains itself (see
-                    // `local_only::error_detail`).
-                    ForgeError::router(format!(
-                        "jev router request to {} failed: {}",
-                        self.url,
-                        crate::local_only::error_detail(&e)
-                    ))
-                }
-            })?;
+        let mut request = self.client.post(&self.url);
+        if let Some(key) = key.as_deref() {
+            request = request.bearer_auth(key);
+        }
+        let response = request.json(&body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ForgeError::router(format!("jev router request to {} timed out", self.url))
+            } else {
+                // Source chain included so a `local_only` redirect
+                // refusal explains itself (see
+                // `local_only::error_detail`).
+                ForgeError::router(format!(
+                    "jev router request to {} failed: {}",
+                    self.url,
+                    crate::local_only::error_detail(&e)
+                ))
+            }
+        })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -320,13 +384,160 @@ impl DecisionRouter for JevRouter {
             .pointer("/answers/model/confidence")
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0);
+
+        // The order check runs on the *request* that produced this choice, so
+        // the far end re-asks exactly the same question — only with the
+        // candidate order shuffled.
+        let mut reason = format!("jev choice (confidence {confidence:.2})");
+        if self.order_check {
+            match self.check_order_stability(&body, key.as_deref()).await {
+                OrderCheck::Stable => {
+                    reason.push_str(&format!(
+                        "; order-stable across {ORDER_CHECK_PERMUTATIONS} option orders"
+                    ));
+                }
+                OrderCheck::Unavailable(why) => {
+                    // A missing extension is not a failed decision: TypeSafe's
+                    // contract has no permute endpoint at all. The reason
+                    // string carries the caveat so the routing event does
+                    // too — a decision nobody can verify must not read as one
+                    // that was verified.
+                    tracing::warn!(why = %why, "jev order check unavailable; keeping the choice");
+                    reason.push_str(&format!("; order check unavailable ({why})"));
+                }
+                OrderCheck::Unstable { choices } => {
+                    // Not a decision — a report of the order the candidates
+                    // happened to be listed in. Refusing it sends the run
+                    // down the fallback chain, which is the honest outcome:
+                    // a wrong-but-confident model is worse than the
+                    // configured fallback.
+                    return Err(ForgeError::router(format!(
+                        "jev choice is order-sensitive: the top candidate changed across \
+                         {ORDER_CHECK_PERMUTATIONS} option orders (saw {choices:?}); \
+                         refusing to route on it"
+                    )));
+                }
+            }
+        }
+
         Ok(RoutingDecision {
             selected_model: choice.to_string(),
             confidence,
             router_name: "jev".to_string(),
             fallback_used: false,
-            reason: format!("jev choice (confidence {confidence:.2})"),
+            reason,
         })
+    }
+}
+
+impl JevRouter {
+    /// Re-ask the routing question under several option orders and report
+    /// whether the winner survives re-ordering.
+    ///
+    /// Never fails the routing decision on its own: a backend without the
+    /// endpoint, an unreachable one, or an unreadable answer all resolve to
+    /// [`OrderCheck::Unavailable`], which keeps the choice and says so. Only
+    /// a *positive* finding — the winner actually changing — refuses it.
+    async fn check_order_stability(
+        &self,
+        body: &serde_json::Value,
+        key: Option<&str>,
+    ) -> OrderCheck {
+        let url = permute_url(&self.url);
+        let mut request = self.client.post(&url);
+        if let Some(key) = key {
+            request = request.bearer_auth(key);
+        }
+        let payload = serde_json::json!({
+            "request": body,
+            "question": MODEL_QUESTION_ID,
+            "n_perm": ORDER_CHECK_PERMUTATIONS,
+            "seed": 0,
+        });
+        let response = match request.json(&payload).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                return OrderCheck::Unavailable(format!(
+                    "request to {url} failed: {}",
+                    crate::local_only::error_detail(&e)
+                ));
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            return OrderCheck::Unavailable(format!("{url} returned {status}"));
+        }
+        let parsed: serde_json::Value = match response.json().await {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return OrderCheck::Unavailable(format!("invalid response from {url}: {e}"));
+            }
+        };
+        match parsed
+            .pointer("/argmax_stable")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => OrderCheck::Stable,
+            Some(false) => OrderCheck::Unstable {
+                choices: distinct_choices(&parsed),
+            },
+            None => OrderCheck::Unavailable(format!("{url} did not report argmax stability")),
+        }
+    }
+}
+
+/// The question id forge asks its routing question under — and the id the
+/// order check re-asks.
+const MODEL_QUESTION_ID: &str = "model";
+
+/// How many option orders the order check tries. lev's own default; each
+/// order is one forward pass at the far end.
+const ORDER_CHECK_PERMUTATIONS: usize = 6;
+
+/// The outcome of the option-order check.
+enum OrderCheck {
+    /// The same candidate won under every order.
+    Stable,
+    /// Different candidates won under different orders: the choice reflects
+    /// the order the candidates were listed in, not the task.
+    Unstable { choices: Vec<String> },
+    /// The check could not run. No evidence of instability — the decision
+    /// stands, and says that the check did not run.
+    Unavailable(String),
+}
+
+/// The distinct winners across the permute runs, in the order they appear.
+fn distinct_choices(parsed: &serde_json::Value) -> Vec<String> {
+    let mut choices: Vec<String> = Vec::new();
+    for run in parsed
+        .pointer("/runs")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(choice) = run.pointer("/choice").and_then(serde_json::Value::as_str) {
+            let choice = choice.to_string();
+            if !choices.contains(&choice) {
+                choices.push(choice);
+            }
+        }
+    }
+    choices
+}
+
+/// The option-order endpoint for a System One URL.
+///
+/// lev and Kev expose `POST /v1/systemone/permute` next to
+/// `POST /v1/systemone`; deriving it from the configured URL keeps the two
+/// in step without a second config key. A URL that does not end in
+/// `/systemone` gets `/permute` appended — the honest guess for other
+/// layouts, and a backend without such an endpoint answers 404, which the
+/// caller reads as "check unavailable" rather than as a failure.
+fn permute_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    match trimmed.strip_suffix("/systemone") {
+        Some(base) => format!("{base}/systemone/permute"),
+        None => format!("{trimmed}/permute"),
     }
 }
 
@@ -488,15 +699,48 @@ mod tests {
         }
     }
 
+    /// A **remote** endpoint still needs a credential: TypeSafe rejects
+    /// unauthenticated requests, so a missing key is a typed error naming
+    /// the env var rather than a request that fails at the far end. The
+    /// error names the credential rather than the transport — which is the
+    /// proof that nothing was sent.
     #[tokio::test]
     #[serial]
     async fn jev_router_missing_credential_is_typed_error_with_no_network_call() {
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
 
+        let router = JevRouter::new(
+            Some("http://router.example.com/systemone".to_string()),
+            None,
+            Duration::from_millis(200),
+            vec![("cheap-a".to_string(), caps(true))],
+            EgressPolicy::default(),
+        )
+        .expect("construct");
+        let request = RoutingRequest::new("x");
+        let err = router
+            .route(&request)
+            .await
+            .expect_err("must fail without a credential");
+        match err {
+            ForgeError::Router(msg) => assert!(msg.contains("TYPESAFE_API_KEY"), "got: {msg}"),
+            other => panic!("expected router error, got {other:?}"),
+        }
+    }
+
+    /// A **local** endpoint needs no credential at all: the self-hosted
+    /// System One servers (lev, OpenJev, Kev) ignore the bearer token, and
+    /// demanding one would refuse a setup that works. The request goes out
+    /// without an `Authorization` header — not with an empty one.
+    #[tokio::test]
+    #[serial]
+    async fn a_local_endpoint_is_consulted_without_a_credential() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.9)))
-            .expect(0)
+            .and(path("/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.82)))
             .mount(&server)
             .await;
 
@@ -508,24 +752,20 @@ mod tests {
             EgressPolicy::default(),
         )
         .expect("construct");
-        let request = RoutingRequest {
-            task: "x".to_string(),
-            phase: RoutingPhase::General,
-            required_capabilities: vec![],
-            candidates: vec!["cheap-a".to_string()],
-        };
-        let err = router
-            .route(&request)
+
+        let decision = router
+            .route(&RoutingRequest::new("fix the failing test"))
             .await
-            .expect_err("must fail without a credential");
-        match err {
-            ForgeError::Router(msg) => assert!(msg.contains("TYPESAFE_API_KEY"), "got: {msg}"),
-            other => panic!("expected router error, got {other:?}"),
-        }
-        assert_eq!(
-            server.received_requests().await.expect("requests").len(),
-            0,
-            "no network call should be attempted without a credential"
+            .expect("routes without a credential");
+
+        assert_eq!(decision.selected_model, "cheap-a");
+        assert_eq!(decision.router_name, "jev");
+
+        let received = server.received_requests().await.expect("requests");
+        assert_eq!(received.len(), 1);
+        assert!(
+            received[0].headers.get("authorization").is_none(),
+            "no credential means no Authorization header at all"
         );
     }
 
@@ -681,5 +921,165 @@ mod tests {
             .expect("omitting .egress() must fail");
         assert!(matches!(err, ForgeError::Router(_)), "{err}");
         assert!(err.to_string().contains("requires .egress("), "{err}");
+    }
+
+    /// A router with the order check on, pointing at a mock that answers
+    /// both endpoints the way lev does.
+    fn order_check_router(url: &str) -> Result<JevRouter, ForgeError> {
+        JevRouter::builder()
+            .url(Some(format!("{url}/systemone")))
+            .timeout(Duration::from_secs(5))
+            .registry(vec![
+                ("cheap-a".to_string(), caps(true)),
+                ("pricey-b".to_string(), caps(true)),
+            ])
+            .order_check(true)
+            .egress(EgressPolicy::default())
+            .build()
+    }
+
+    /// lev's permute response, shaped exactly as it answers.
+    fn permute_body(stable: bool) -> serde_json::Value {
+        let (first, second) = if stable {
+            ("cheap-a", "cheap-a")
+        } else {
+            ("cheap-a", "pricey-b")
+        };
+        serde_json::json!({
+            "runs": [
+                {"order": ["cheap-a", "pricey-b"], "choice": first,
+                 "probabilities": {"cheap-a": 0.7, "pricey-b": 0.3}},
+                {"order": ["pricey-b", "cheap-a"], "choice": second,
+                 "probabilities": {"cheap-a": 0.66, "pricey-b": 0.34}},
+            ],
+            "argmax_stable": stable,
+            "spread": {"cheap-a": 0.04, "pricey-b": 0.04},
+        })
+    }
+
+    /// A choice that wins under every option order is a decision. The
+    /// check runs, finds the winner unchanged, and the decision says so.
+    #[tokio::test]
+    #[serial]
+    async fn the_order_check_keeps_a_choice_that_survives_re_ordering() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-jev-key") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.82)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/systemone/permute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(permute_body(true)))
+            .mount(&server)
+            .await;
+
+        let router = order_check_router(&server.uri()).expect("construct");
+        let decision = router
+            .route(&RoutingRequest::new("route me"))
+            .await
+            .expect("routes");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        assert_eq!(decision.selected_model, "cheap-a");
+        assert!(
+            decision.reason.contains("order-stable"),
+            "the reason must record that the check ran: {}",
+            decision.reason
+        );
+    }
+
+    /// A choice whose winner changes with the option order is not a
+    /// decision — it is the order talking. The router refuses it, so the
+    /// fallback chain takes over instead of routing on an artefact.
+    #[tokio::test]
+    #[serial]
+    async fn the_order_check_refuses_an_order_sensitive_choice() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-jev-key") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.82)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/systemone/permute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(permute_body(false)))
+            .mount(&server)
+            .await;
+
+        let router = order_check_router(&server.uri()).expect("construct");
+        let err = router
+            .route(&RoutingRequest::new("route me"))
+            .await
+            .expect_err("an order-sensitive choice must be refused");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        match err {
+            ForgeError::Router(msg) => {
+                assert!(msg.contains("order-sensitive"), "got: {msg}");
+                // Both winners are named: the message says what it saw.
+                assert!(msg.contains("cheap-a"), "got: {msg}");
+                assert!(msg.contains("pricey-b"), "got: {msg}");
+            }
+            other => panic!("expected router error, got {other:?}"),
+        }
+    }
+
+    /// A backend without the permute endpoint (TypeSafe's published
+    /// contract has none) must not break routing: the check reports itself
+    /// unavailable, the decision stands, and the reason carries the caveat
+    /// — a decision nobody could verify must not read as one that was.
+    #[tokio::test]
+    #[serial]
+    async fn the_order_check_is_skipped_when_the_backend_has_no_such_endpoint() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-jev-key") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("cheap-a", 0.82)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/systemone/permute"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let router = order_check_router(&server.uri()).expect("construct");
+        let decision = router
+            .route(&RoutingRequest::new("route me"))
+            .await
+            .expect("a missing extension must not break routing");
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+
+        assert_eq!(decision.selected_model, "cheap-a");
+        assert!(
+            decision.reason.contains("order check unavailable"),
+            "the reason must record that the check did not run: {}",
+            decision.reason
+        );
+    }
+
+    /// The permute endpoint is derived from the configured URL, so the two
+    /// cannot drift into different halves of one server.
+    #[test]
+    fn the_permute_endpoint_is_derived_from_the_configured_url() {
+        assert_eq!(
+            permute_url("http://127.0.0.1:8009/v1/systemone"),
+            "http://127.0.0.1:8009/v1/systemone/permute"
+        );
+        assert_eq!(
+            permute_url("http://127.0.0.1:8009/v1/systemone/"),
+            "http://127.0.0.1:8009/v1/systemone/permute"
+        );
+        assert_eq!(
+            permute_url("http://127.0.0.1:8009/v1"),
+            "http://127.0.0.1:8009/v1/permute"
+        );
     }
 }

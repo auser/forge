@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use forge_core::ForgeError;
+use forge_core::{ForgeError, PhasePolicy, RoutingPhase};
 use serde::{Deserialize, Serialize};
 
 pub mod catalogue;
@@ -18,6 +18,7 @@ pub mod costs;
 pub mod test_mocks;
 
 pub use costs::{CostBook, PriceSource};
+pub use forge_core::ProfileConfig;
 pub use test_mocks::{TEST_MOCKS_ENV, ensure_test_mocks_allowed, test_mocks_allowed};
 
 /// A `[models.<name>]` entry: cost metadata, optional endpoint, and
@@ -380,6 +381,19 @@ pub struct Config {
     /// Decider 1 takes `sd-1`; a self-hosted Kev/CLM server may take its
     /// own).
     pub jev_model: Option<String>,
+    /// Re-check the jev tier's choice for **option-order sensitivity**
+    /// before accepting it: the same question is asked again under several
+    /// option orders, and a choice whose top candidate changes is refused
+    /// (it is not a decision — it is an artefact of the order the
+    /// candidates happened to be listed in).
+    ///
+    /// Off by default. The check is an extension of the self-hosted
+    /// System One family (lev and Kev expose `POST /v1/systemone/permute`),
+    /// not part of TypeSafe's published contract, and it costs one extra
+    /// forward pass per order — a real price against a hosted endpoint.
+    /// Backends without the endpoint are detected and skipped, not
+    /// failed, so enabling this never breaks routing on its own.
+    pub jev_order_check: bool,
     pub router_timeout_ms: u64,
     pub execution: String,
     pub approval: String,
@@ -403,6 +417,13 @@ pub struct Config {
     /// Named models with cost/capability metadata. Deep-merged by name
     /// across config files; not settable via env/CLI flags.
     pub models: BTreeMap<String, ModelEntry>,
+    /// Named phase→model policies (`[profiles.<name>]`). Deep-merged by
+    /// profile name across config files.
+    pub profiles: BTreeMap<String, ProfileConfig>,
+    /// The active profile, if any. When set, routing constrains each phase
+    /// to that profile's tier for it. `None` (the default) leaves routing
+    /// unconstrained.
+    pub profile: Option<String>,
     /// The embedded on-device Needle brain. It remains an explicit router
     /// option; when its weights are missing it degrades to `router_fallback`.
     pub needle: NeedleConfig,
@@ -507,6 +528,11 @@ pub mod keys {
     /// Source-map key for one `[models.<name>]` entry.
     pub fn model_entry(name: &str) -> String {
         format!("models.{name}")
+    }
+
+    /// Source-map key for one `[profiles.<name>]` entry.
+    pub fn profile_entry(name: &str) -> String {
+        format!("profiles.{name}")
     }
 }
 
@@ -686,6 +712,7 @@ impl Default for Config {
             jev_url: None,
             jev_key_env: None,
             jev_model: None,
+            jev_order_check: false,
             router_timeout_ms: 5_000,
             execution: "native".to_string(),
             approval: "prompt-dangerous".to_string(),
@@ -710,6 +737,8 @@ impl Default for Config {
             ]
             .into_iter()
             .collect(),
+            profiles: BTreeMap::new(),
+            profile: None,
             needle: NeedleConfig::default(),
             embedding: EmbeddingConfig::default(),
             laya: LayaConfig::default(),
@@ -764,6 +793,9 @@ pub struct ConfigSource {
 pub struct CliOverrides {
     pub config_path: Option<PathBuf>,
     pub model: Option<String>,
+    /// The active routing profile (`--profile`). Overrides the config file's
+    /// `profile` and the `FORGE_PROFILE` environment variable.
+    pub profile: Option<String>,
     pub router: Option<String>,
     pub router_url: Option<String>,
     pub router_key_env: Option<String>,
@@ -792,6 +824,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_MODEL", "model"),
     ("FORGE_MODEL_BASE_URL", "model_base_url"),
     ("FORGE_MODEL_KEY_ENV", "model_key_env"),
+    ("FORGE_PROFILE", "profile"),
     ("FORGE_MOCK_SCRIPT", "mock_script"),
     ("FORGE_ROUTER", "router"),
     ("FORGE_ROUTER_URL", "router_url"),
@@ -800,6 +833,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("FORGE_JEV_URL", "jev_url"),
     ("FORGE_JEV_KEY_ENV", "jev_key_env"),
     ("FORGE_JEV_MODEL", "jev_model"),
+    ("FORGE_JEV_ORDER_CHECK", "jev_order_check"),
     ("FORGE_EXECUTION", "execution"),
     ("FORGE_APPROVAL", "approval"),
     ("FORGE_LOCAL_ONLY", "local_only"),
@@ -855,6 +889,22 @@ impl Config {
     /// Cross-field and enum-like validation that TOML deserialization alone
     /// can't express. Called at the end of [`Config::load`] so every caller
     /// gets it for free.
+    /// The active profile as a routing policy, if one is selected.
+    ///
+    /// `None` means routing is unconstrained — the ordinary candidate pool
+    /// applies to every phase.
+    pub fn phase_policy(&self) -> Option<PhasePolicy> {
+        let name = self.profile.as_ref()?;
+        let profile = self.profiles.get(name)?;
+        Some(PhasePolicy::new(name.clone(), profile.clone()))
+    }
+
+    /// Whether any profile is defined. Used by `forge doctor` and the chat
+    /// banner to tell the user that profiles exist but none is active.
+    pub fn has_profiles(&self) -> bool {
+        !self.profiles.is_empty()
+    }
+
     pub fn validate(&self) -> Result<(), ForgeError> {
         if self.observer.enabled
             && self
@@ -959,6 +1009,33 @@ impl Config {
                     )));
                 }
             }
+        }
+        for (name, profile) in &self.profiles {
+            for phase in [
+                RoutingPhase::Plan,
+                RoutingPhase::Execute,
+                RoutingPhase::Review,
+                RoutingPhase::General,
+            ] {
+                for model in profile.tier_for(phase) {
+                    if model.trim().is_empty() {
+                        return Err(ForgeError::config(format!(
+                            "[profiles.{name}] names an empty model for the {} phase",
+                            phase.as_str()
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(active) = &self.profile
+            && !self.profiles.contains_key(active)
+        {
+            // A profile that does not exist would otherwise fail silently:
+            // routing would fall back to the unconstrained pool and the user
+            // would believe their tier policy was in force.
+            return Err(ForgeError::config(format!(
+                "profile {active:?} is not defined; add a [profiles.{active}] section"
+            )));
         }
         Ok(())
     }
@@ -1094,6 +1171,49 @@ fn apply_layer(
             merged.insert(key, toml::Value::Table(combined));
             continue;
         }
+        // The profiles table merges the same way the models table does — by
+        // profile name — but a profile's phases merge individually, because
+        // each tier is an independent decision. A project layer that names
+        // one tier must not erase the user's other tiers for the same
+        // profile: a project that overrides the plan model should not
+        // silently un-constrain the execute model too.
+        if key == "profiles"
+            && let toml::Value::Table(new_entries) = &value
+        {
+            let mut combined = match merged.get("profiles") {
+                Some(toml::Value::Table(existing)) => existing.clone(),
+                _ => toml::Table::new(),
+            };
+            for (name, entry) in new_entries {
+                let merged_entry = match (combined.get(name), entry) {
+                    (Some(toml::Value::Table(existing)), toml::Value::Table(new)) => {
+                        let mut phases = existing.clone();
+                        for (phase, tier) in new {
+                            phases.insert(phase.clone(), tier.clone());
+                        }
+                        toml::Value::Table(phases)
+                    }
+                    _ => entry.clone(),
+                };
+                combined.insert(name.clone(), merged_entry);
+                sources.insert(
+                    keys::profile_entry(name),
+                    ConfigSource {
+                        value: entry.to_string(),
+                        origin,
+                    },
+                );
+            }
+            sources.insert(
+                key.clone(),
+                ConfigSource {
+                    value: format!("{} profile(s)", combined.len()),
+                    origin,
+                },
+            );
+            merged.insert(key, toml::Value::Table(combined));
+            continue;
+        }
         // Generic one-level nested config sections (e.g. `[needle]`): merge
         // field-by-field so a layer that sets only some fields doesn't wipe
         // out the others, and record a dotted source per field this layer
@@ -1151,7 +1271,7 @@ fn env_layer() -> Result<toml::Table, ForgeError> {
             continue;
         };
         let value = match *key {
-            "local_only" | "router_autostart" | "needle.autofetch" => {
+            "local_only" | "router_autostart" | "needle.autofetch" | "jev_order_check" => {
                 toml::Value::Boolean(parse_env_bool(env_name, &raw)?)
             }
             "server_port" => toml::Value::Integer(raw.parse::<i64>().map_err(|_| {
@@ -1225,6 +1345,10 @@ fn cli_layer(overrides: &CliOverrides) -> toml::Table {
         }
     };
     insert("model", overrides.model.clone().map(toml::Value::String));
+    insert(
+        "profile",
+        overrides.profile.clone().map(toml::Value::String),
+    );
     insert("router", overrides.router.clone().map(toml::Value::String));
     insert(
         "router_url",

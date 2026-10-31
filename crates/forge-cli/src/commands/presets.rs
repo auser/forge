@@ -38,6 +38,7 @@ pub const PRESETS: &[(&str, &str)] = &[
         include_str!("../../../../examples/configs/kimi.toml"),
     ),
     ("kev", include_str!("../../../../examples/configs/kev.toml")),
+    ("lev", include_str!("../../../../examples/configs/lev.toml")),
     (
         "decider",
         include_str!("../../../../examples/configs/decider.toml"),
@@ -90,5 +91,23 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("claude"), "{message}");
         assert!(message.contains("local-first"), "{message}");
+    }
+
+    /// The lev preset is the local System One setup: a loopback endpoint,
+    /// no credential to configure, and the option-order check on.
+    #[test]
+    fn the_lev_preset_points_at_a_local_system_one_endpoint() {
+        let contents = get("lev").expect("preset lev");
+        let config: forge_config::Config = toml::from_str(contents).expect("parses");
+        assert_eq!(config.router, "jev");
+        let url = config.jev_url.expect("lev sets its own endpoint");
+        assert!(
+            url.starts_with("http://127.0.0.1"),
+            "the lev endpoint must be local: {url}"
+        );
+        assert!(
+            config.jev_order_check,
+            "the preset turns the option-order check on"
+        );
     }
 }

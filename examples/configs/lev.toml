@@ -1,0 +1,38 @@
+# Local decisions with lev: a Jev-style decision model you run yourself.
+#
+# lev (Apache-2.0, https://github.com/franckverrot/lev) serves the same
+# System One contract forge's jev router already speaks — `POST
+# /v1/systemone` — out of a local model (LFM2.5-350M). No account, no key,
+# no per-call cost, and the task text never leaves the machine: the server
+# binds 127.0.0.1.
+#
+# Start it:
+#
+#     uv run --extra serve python -m lev.serve --run franckverrot/lev-350m --port 8009
+#
+# then `forge doctor` reports the endpoint and says "no credential needed",
+# because the self-hosted servers ignore the bearer token. A hosted
+# TYPESAFE_API_KEY is never handed to this server: `jev_key_env` names an
+# env var that is normally unset, so nothing else has to be.
+#
+# To use lev as the escalation tier under the on-device Needle brain
+# instead of as the primary router, set `router = "needle"` (the default
+# stack's primary) and leave everything else here as it is: the tier
+# resolves `jev_url` on its own.
+
+router = "jev"
+jev_url = "http://127.0.0.1:8009/v1/systemone"
+jev_key_env = "LEV_API_KEY"    # normally unset: keeps a hosted key off the local server
+jev_model = "lev-latest"
+
+# Ask the routing question again under several option orders and refuse a
+# choice whose winner does not survive re-ordering — lev's
+# /v1/systemone/permute. A classifier that picks a different model when
+# the candidates are listed in a different order has not decided anything.
+# One extra forward pass per order, which is why it is opt-in; backends
+# without the endpoint are detected and skipped, never failed.
+jev_order_check = true
+
+model = "qwen3-coder"        # generation stays local too (oMLX)
+execution = "native"
+approval = "prompt"

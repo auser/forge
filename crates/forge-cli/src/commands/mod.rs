@@ -40,6 +40,7 @@ impl Context {
         CliOverrides {
             config_path: self.global.config.clone(),
             model: self.global.model.clone(),
+            profile: self.global.profile.clone(),
             router: self.global.router.clone(),
             execution: self.global.execution.clone(),
             approval: self.global.approval.clone(),

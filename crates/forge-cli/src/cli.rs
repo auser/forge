@@ -37,6 +37,15 @@ pub struct GlobalOpts {
     #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
 
+    /// Activate a routing profile: which models may serve which phase.
+    ///
+    /// A profile is Forge's `opusplan` — a plan gets the high-fidelity
+    /// model, the build gets the cheap one — expressed per phase rather
+    /// than per vendor. Define it under `[profiles.<name>]` in the config
+    /// file. Without this flag, routing is unconstrained.
+    #[arg(long, global = true, value_name = "PROFILE")]
+    pub profile: Option<String>,
+
     /// Override the configured router (needle|jev|laya|laya-native|http|static|cheapest).
     // `mock` is deliberately absent from that list: it is a test-only
     // router that `router_from_config` refuses unless FORGE_TEST_MOCKS=1

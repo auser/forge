@@ -584,6 +584,13 @@ pub struct AgentService {
     finished: Mutex<FinishedRuns>,
     /// One live run per session (see [`AgentService::claim_session`]).
     live_sessions: Arc<LiveSessions>,
+    /// The active phase→model policy, shared with the router.
+    ///
+    /// Kept as a handle rather than a value so a session can change the
+    /// policy mid-run (the chat's `/profile` command) without rebuilding
+    /// the router stack — rebuilding would reload Laya's weights for what
+    /// is a table of model names.
+    phase_policy: forge_core::PhasePolicyHandle,
     /// What forge decided, appended beside the transcripts as
     /// `<session-id>.decisions.jsonl` — decision shape only, never prompt
     /// text or tool arguments (see `forge_session::decisions`).
@@ -608,6 +615,21 @@ impl AgentService {
         if let Some(observer) = &self.observer {
             observer.notify();
         }
+    }
+
+    /// The active phase→model policy handle.
+    ///
+    /// The handle is shared with the router, so a policy set through it
+    /// takes effect on the next routing decision — no rebuild, no reloading
+    /// of router weights.
+    pub fn phase_policy(&self) -> forge_core::PhasePolicyHandle {
+        self.phase_policy.clone()
+    }
+
+    /// Set the active phase→model policy. `None` clears it, returning
+    /// routing to the unconstrained behaviour.
+    pub fn set_phase_policy(&self, policy: Option<forge_core::PhasePolicy>) {
+        self.phase_policy.set(policy);
     }
 
     pub fn new(
@@ -646,6 +668,7 @@ impl AgentService {
             cancel_tokens: Mutex::new(HashMap::new()),
             finished: Mutex::new(FinishedRuns::default()),
             live_sessions: Arc::new(LiveSessions::default()),
+            phase_policy: forge_core::PhasePolicyHandle::default(),
             decision_log,
             session_turns: Mutex::new(HashMap::new()),
             run_listing: Mutex::new(HashMap::new()),
@@ -673,6 +696,15 @@ impl AgentService {
     /// lifecycle logic.
     pub fn with_task_store(mut self, tasks: Arc<forge_task::JsonlTaskStore>) -> Self {
         self.tasks = Some(tasks);
+        self
+    }
+
+    /// Attach the shared phase→model policy handle.
+    ///
+    /// The handle must be the same one the router was built with, or the
+    /// router will never see a policy set through it.
+    pub fn with_phase_policy(mut self, policy: forge_core::PhasePolicyHandle) -> Self {
+        self.phase_policy = policy;
         self
     }
 
@@ -2687,6 +2719,10 @@ impl AgentService {
                 decider: match decision.router_name.as_str() {
                     "needle" | "needle-dispatch" => Decider::Needle,
                     "static" | "cheapest" | "mock" => Decider::Static,
+                    // A profile's single-model tier is a decision the policy
+                    // made, not one an LLM made: recording it as `Llm` would
+                    // inflate the decline rate this log exists to measure.
+                    name if name.starts_with("phase-policy:") => Decider::Static,
                     _ => Decider::Llm,
                 },
                 question: "model".to_string(),

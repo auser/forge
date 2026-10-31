@@ -1082,8 +1082,8 @@ fn local_only_refuses(config: &forge_config::Config, url: &str) -> bool {
 /// What `local_only` is actually doing, for the run this configuration
 /// describes — reported only when it is on, and only in terms of what the
 /// code enforces: providers refuse a non-local endpoint at construction
-/// (redirects included), network decision routers are pruned, `forge init`
-/// skips the weights fetch.
+/// (redirects included), decision routers with an off-device endpoint are
+/// pruned, `forge init` skips the weights fetch.
 ///
 /// Deliberately `Ok` even when the configured model contradicts the setting:
 /// the `model provider` check below owns that verdict, and two `Fail` lines
@@ -1099,8 +1099,9 @@ fn local_only_check(config: &forge_config::Config) -> Option<Check> {
         level: Level::Ok,
         label: "local only".into(),
         detail: "enforced at provider construction (endpoint and every redirect must be \
-                 loopback, localhost or a socket path); jev and off-device decision routers \
-                 are pruned. Not a sandbox: tools and hooks you run are unrestricted, and a \
+                 loopback, localhost or a socket path); decision routers with an off-device \
+                 endpoint — a hosted jev included — are pruned, while a loopback one is kept. \
+                 Not a sandbox: tools and hooks you run are unrestricted, and a \
                  router that selects a hosted [models] entry fails that run rather than \
                  silently picking another."
             .into(),
@@ -1127,13 +1128,26 @@ fn jev_check(config: &forge_config::Config) -> Check {
         };
     }
 
-    if config.local_only {
-        // `--local-only` prunes jev in both roles at construction time
+    // Role-scoped resolution, shared with `router_from_config` so this
+    // check can never drift from what the router actually does: escalation
+    // never falls back to the generic `router_url`/`router_key_env` (which
+    // could belong to an unrelated http/laya setup), but the primary role
+    // does, for backwards compatibility.
+    let escalation = !is_primary;
+    let key_env = forge_providers::resolved_jev_key_env(config, escalation);
+    let endpoint = forge_providers::jev_endpoint(config, escalation);
+    let endpoint_is_local = forge_providers::endpoint_is_local(&endpoint);
+    let key_present = forge_providers::jev_credential_present(config, escalation);
+
+    if config.local_only && !endpoint_is_local {
+        // `--local-only` prunes a jev tier whose endpoint is off-device
         // (see `router_from_config`); this mirrors why it never even gets
         // asked about a credential. Primary always degrades straight to
         // "static" (a literal, hardcoded target in `router_from_config`,
         // not `router_fallback` — name the actual behavior, not a
-        // plausible-looking but wrong guess).
+        // plausible-looking but wrong guess). A **local** endpoint is not
+        // pruned at all: it sends the task text to a process on this
+        // machine, so it falls through to the reporting below.
         let detail = if is_primary {
             "not active (--local-only forces static routing)".to_string()
         } else {
@@ -1146,38 +1160,49 @@ fn jev_check(config: &forge_config::Config) -> Check {
         };
     }
 
-    // Role-scoped resolution, shared with `router_from_config` so this
-    // check can never drift from what the router actually does: escalation
-    // never falls back to the generic `router_url`/`router_key_env` (which
-    // could belong to an unrelated http/laya setup), but the primary role
-    // does, for backwards compatibility.
-    let escalation = !is_primary;
-    let key_env = forge_providers::resolved_jev_key_env(config, escalation);
-    let endpoint = forge_providers::resolved_jev_url(config, escalation)
-        .unwrap_or_else(|| forge_providers::JevRouter::DEFAULT_URL.to_string());
-    let key_present = forge_providers::jev_credential_present(config, escalation);
-
-    if key_present {
-        Check {
-            level: Level::Ok,
-            label: LABEL.into(),
-            detail: format!("credential detected ({key_env}); endpoint {endpoint}"),
-        }
+    // A local endpoint needs no credential — the self-hosted System One
+    // servers (lev, OpenJev, Kev) ignore the bearer token — so an unset
+    // credential is not a warning there. It is still reported, because
+    // "which credential would be used" is the question this line answers.
+    let (level, mut detail) = if key_present {
+        (Level::Ok, format!("credential detected ({key_env})"))
+    } else if endpoint_is_local {
+        (
+            Level::Ok,
+            format!("no credential needed ({key_env} unset; the endpoint is local)"),
+        )
     } else if is_primary {
-        Check {
-            level: Level::Warn,
-            label: LABEL.into(),
-            detail: format!(
+        (
+            Level::Warn,
+            format!(
                 "no credential ({key_env}); requests to {endpoint} will fail (falls back to {})",
                 config.router_fallback
             ),
-        }
+        )
     } else {
-        Check {
-            level: Level::Ok,
-            label: LABEL.into(),
-            detail: format!("jev escalation: no credential ({key_env}) — on-device only"),
-        }
+        (
+            Level::Ok,
+            format!("jev escalation: no credential ({key_env}) — on-device only"),
+        )
+    };
+
+    // The endpoint is appended for every case except the two that already
+    // name it, so one report cannot give two different answers about where
+    // the tier would dial.
+    if !detail.contains(&endpoint) {
+        detail.push_str(&format!("; endpoint {endpoint}"));
+    }
+    if config.local_only {
+        detail.push_str("; kept under --local-only (loopback endpoint)");
+    }
+    if config.jev_order_check {
+        detail.push_str("; option-order check on");
+    }
+
+    Check {
+        level,
+        label: LABEL.into(),
+        detail,
     }
 }
 
@@ -1651,6 +1676,75 @@ mod tests {
         assert!(check.detail.contains("api.typesafe.ai"), "{}", check.detail);
     }
 
+    /// A local endpoint needs no credential, so an unset one is not a
+    /// warning there — it is the normal shape of a self-hosted setup.
+    #[test]
+    #[serial]
+    fn jev_check_reports_a_local_endpoint_as_needing_no_credential() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = forge_config::Config {
+            router: "jev".to_string(),
+            jev_url: Some("http://127.0.0.1:8009/v1/systemone".to_string()),
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("no credential needed"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("127.0.0.1:8009"), "{}", check.detail);
+    }
+
+    /// `--local-only` keeps a loopback jev — it sends nothing off the
+    /// machine — and the report says so, instead of claiming the tier is
+    /// pruned.
+    #[test]
+    #[serial]
+    fn jev_check_keeps_a_local_jev_under_local_only() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = forge_config::Config {
+            router: "jev".to_string(),
+            jev_url: Some("http://127.0.0.1:8009/v1/systemone".to_string()),
+            local_only: true,
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("kept under --local-only"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("forces static routing"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// The hosted jev is off-device, so `--local-only` still prunes it —
+    /// the promise is unchanged for anything that leaves the machine.
+    #[test]
+    #[serial]
+    fn jev_check_still_prunes_the_hosted_jev_under_local_only() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "dummy-value-for-test") };
+        let config = forge_config::Config {
+            router: "jev".to_string(),
+            local_only: true,
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("--local-only forces static routing"),
+            "{}",
+            check.detail
+        );
+    }
+
     #[test]
     #[serial]
     fn jev_check_reports_informational_message_when_escalation_has_no_credential() {
@@ -1660,7 +1754,8 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.detail,
-            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only"
+            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only; \
+             endpoint https://api.typesafe.ai/v1/systemone"
         );
     }
 
@@ -1864,7 +1959,8 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.detail,
-            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only"
+            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only; \
+             endpoint https://api.typesafe.ai/v1/systemone"
         );
         assert!(
             !check.detail.contains("poisoned.example.internal")

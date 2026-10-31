@@ -24,9 +24,9 @@ any single vendor, and every tier degrades gracefully to the one below it.
   ├───────────────────────────────┤        ├──────────────────────────────┤
   │ 2. Jev protocol — opt-in      │        │ 2. Cloud models (opt-in)     │
   │    TypeSafe hosted Jev, or    │        │    candidates exist only     │
-  │    self-hosted OpenJev        │        │    when a credential is      │
+  │    self-hosted OpenJev/lev    │        │    when a credential is      │
   │    (~70–500 ms, credential-   │        │    detected: API keys or     │
-  │    gated)                     │        │    CLI subscriptions (Claude │
+  │    gated when remote)         │        │    CLI subscriptions (Claude │
   ├───────────────────────────────┤        │    Code OAuth, Codex, Kimi)  │
   │ 3. Static rules — always      │        └──────────────────────────────┘
   │    succeeds, deterministic,   │
@@ -108,21 +108,26 @@ service speaking the Jev wire protocol:
 
 - **TypeSafe's hosted Jev** — the reference implementation
   (`https://api.typesafe.ai/v1/systemone`, bearer `TYPESAFE_API_KEY`).
-- **Self-hosted OpenJev** — wire-compatible open servers
+- **Self-hosted System One servers** — wire-compatible open servers
   ([razorback16/openjev](https://github.com/razorback16/openjev),
-  [GitHub30/OpenJev](https://github.com/GitHub30/OpenJev)); point `jev_url`
+  [GitHub30/OpenJev](https://github.com/GitHub30/OpenJev), **Kev**,
+  **CLM**, and [**lev**](https://github.com/franckverrot/lev), which serves
+  the contract from a local open-weights model); point `jev_url`
   (and, if needed, `jev_key_env`) at yours and escalation stays on your
   infrastructure. Deliberately **not** `router_url`/`router_key_env`: those
   belong to the `http`/`laya` routers, and the escalation tier never
   consults them — a leftover value from an unrelated router setup must
   never be able to receive the Jev credential or redirect it elsewhere.
 
-Escalation is **opt-in by credential**: `router_escalate = "auto"` (the
-default) does nothing until the key env var is set, and `--local-only`
-prunes the tier entirely (unconditionally, even for a loopback OpenJev;
-`http`/`laya` are pruned by endpoint instead — see the generation plane's
-`local_only` note). `JevRouter` never fabricates a decision — any
-error, timeout, or unknown choice is an `Err` that falls through.
+Escalation is **opt-in by reachability**: `router_escalate = "auto"` (the
+default) does nothing until the tier can actually be contacted — a remote
+endpoint needs its credential env var set, a local one needs nothing (the
+self-hosted servers ignore the bearer token). `--local-only` prunes the tier
+when its endpoint is off-device, and keeps it when the endpoint is on this
+machine; `http`/`laya` are judged by endpoint for the same reason — see the
+generation plane's `local_only` note. `JevRouter` never fabricates a
+decision — any error, timeout, unknown choice, or order-sensitive choice is
+an `Err` that falls through.
 
 ### Tier 3: static rules
 
@@ -450,8 +455,9 @@ adapters classify a run's ending by.
 | Missing / failing            | Behavior                                            |
 |------------------------------|-----------------------------------------------------|
 | Needle weights absent        | static routing, `fallback_used: true`, run proceeds |
-| Needle low confidence        | escalate to Jev (if credentialed) else static       |
+| Needle low confidence        | escalate to Jev (if the tier is reachable) else static |
 | Jev unreachable / no key     | static routing, recorded, run proceeds              |
+| Jev choice order-sensitive   | refused; the run falls back deterministically       |
 | Local model server down      | typed error with doctor-style hint                  |
 | Cloud credential absent      | cloud candidates simply don't exist                 |
 | `--local-only`               | off-device routers degrade, non-local providers refused |

@@ -585,6 +585,8 @@ session 01JCF3...  /help for commands
 /model      list models, or /model <name> to switch
 /auth       sign in: /auth <claude|codex|kimi>
 /approval   show the approval policy, or /approval <mode>
+/plan       toggle plan mode: /plan [on|off]
+/profile    list routing profiles, or /profile <name>|off
 /config     effective settings, or /config <key> for one
 /skills     discovered skills, name and description
 /graph      rank project files for a query, optionally /graph <query> -- <steering>
@@ -815,6 +817,7 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
+--profile <name>      activate a routing profile: which models may serve which phase
 --router <r>          override the router (needle|jev|laya|laya-native|http|static|cheapest)
 --execution <p>       override the execution provider (native)
 --local-only          refuse any provider or router endpoint that is not on
@@ -853,6 +856,7 @@ Key settings (all optional):
 | `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.). **Setting this overrides *every* model's endpoint**, including hosted `[models]` entries like `claude-sonnet` and `gpt-5` — setting it to the default value still counts as setting it. Per-model endpoints belong in `[models.<name>] base_url`. Combinations that cannot work are refused at startup, naming both settings: an `anthropic`-family model whose endpoint ends in `/v1` (the client appends `/v1/messages`, so it would 404), or an entry whose `provider` contradicts the endpoint (`provider = "anthropic"` pointed at `api.openai.com`) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
+| `profile` | — | `FORGE_PROFILE` | Name of the active routing profile (`[profiles.<name>]`); without one, routing is unconstrained. A profile that is not defined is a configuration error, not a silent fallback — see [Routing profiles](#routing-profiles) |
 | `router` | `laya-native` | `FORGE_ROUTER` | Cost-aware native default; also `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key. Same primary-only fallback rule as `router_url` — the escalation tier never uses it (see `jev_key_env`) |
@@ -939,6 +943,73 @@ forge config show            # merged effective config
 forge config path            # config file locations and which exist
 forge config explain model   # winning value + source, e.g. model = "cli-model" (source: cli-flag)
 ```
+
+### Routing profiles
+
+A profile is a named policy that says which models may serve which phase of
+the work. It is Claude Code's `opusplan` alias — the strong model plans, the
+cheap one builds — expressed per *phase* rather than per vendor, so one
+profile works across Anthropic, OpenRouter, or a local model.
+
+```toml
+[profiles.opusplan]
+plan    = "claude-opus"              # one model  -> a decision
+execute = ["claude-sonnet", "gpt-5"] # several    -> a menu
+review  = "claude-opus"
+general = "claude-sonnet"            # the default for phases the profile does not name
+```
+
+Four keys, four phases: `plan`, `execute`, `review`, `general`. A phase takes
+either a single string or a list of strings — the two spellings mean the same
+thing, a tier. `[profiles.<name>]` entries merge by profile name across
+config layers (user config, then project config), exactly like
+`[models.<name>]`: a project layer that sets one tier does not erase the
+user's other tiers for the same profile.
+
+Selecting one takes three forms, lowest precedence first: `profile =
+"opusplan"` in the config file, `FORGE_PROFILE=opusplan` in the environment,
+`--profile opusplan` on the command line. Naming a profile that is not
+defined is a configuration error and the run refuses to start: a policy that
+silently did not apply is worse than one that failed to apply, because the
+user would believe their tier was in force while routing stayed
+unconstrained. `forge config explain profile` reports the selected profile
+and where it came from, like any other key.
+
+**How a tier resolves.** Four rules:
+
+1. **One model in a tier is a decision.** The router returns it directly: no
+   inference, no cost, no run-to-run variance.
+2. **Several models in a tier are a menu.** The configured decision router —
+   whatever `router =` names — chooses among them, so cost-aware selection
+   still applies *within* the tier. The tier says how good the model has to
+   be, not which one it is.
+3. **A phase the profile does not name falls back to `general`.** If
+   `general` is empty too, that phase is unconstrained and uses the ordinary
+   candidate pool.
+4. **The tier is capability-filtered.** A model in the tier that cannot do
+   what the task needs — no tools, no streaming — is dropped from it, the
+   same way it would be dropped from the ordinary pool.
+
+And two more, so a policy cannot turn a working run into a failed one:
+
+- **An unavailable tier degrades; it does not fail.** The tier is intersected
+  with the ordinary candidate pool, so a model that is unavailable,
+  undeclared, or incapable is dropped from it. If that leaves nothing, the
+  request falls through to the unconstrained pool and the decision says so:
+  an unavailable Opus should degrade to a working model, not to no model.
+- **The tier wins over the inner router.** If the router answers with a model
+  outside the tier, the answer is corrected to a model inside it and the
+  decision is marked as a fallback.
+
+**Where it applies.** `forge run --plan` runs a plan phase (read-only), then
+an execute phase, then an optional review phase, and a profile sends the plan
+to its `plan` tier and the build to its `execute` tier. The plan and the
+build share one conversation, so the cheap model still sees everything the
+expensive model produced. In the chat, an ordinary turn is the `general`
+phase and takes the `general` tier; `/plan` puts subsequent turns in the plan
+phase and keeps them read-only, and `/profile` selects a profile for the
+session — both are session-scoped, so no config file is written, and neither
+disturbs the running turn. See [Slash commands](#slash-commands).
 
 ### What `--local-only` restricts
 
@@ -1173,6 +1244,23 @@ relaxed. An `http`/`laya` router, by contrast, is judged on its endpoint —
 see [What `--local-only` restricts](#what---local-only-restricts). Jev
 and Kev-family services also work through the plain `http` backend if
 you'd rather speak the flat contract yourself — nothing is hard-coded.
+
+#### A profile wraps the whole stack
+
+A routing profile is not a filter on the primary router's proposal: it wraps
+the finished stack — threshold gate, escalation tier and fallback chain
+included — so the tier constrains the *final answer*, not just the first
+proposal. A fallback that would have answered outside the tier is corrected
+to the tier and the decision is marked as a fallback.
+
+That is the whole point of wrapping the stack rather than the primary tier.
+The fallback chain exists to keep a run working when a router is unreachable,
+unconfident, or uncredentialed, so a profile that only constrained the
+primary would be routed around exactly when things went wrong — the policy
+would hold exactly when it was not needed and lapse exactly when it was.
+
+See [Routing profiles](#routing-profiles) for the tiers themselves and how
+they resolve.
 
 ### Model registry with costs
 

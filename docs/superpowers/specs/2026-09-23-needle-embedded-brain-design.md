@@ -902,6 +902,34 @@ adds `router_name: "needle"` and confidence — no schema change.
   a real credential into an otherwise-hermetic scenario and cause a live
   escalation attempt against `api.typesafe.ai`.
 
+  **Amendment (self-hosted System One servers, 2026-10-30).** The rule
+  above — "`jev` gets the stricter, brief-mandated behavior instead: pruned
+  in **both** roles it could play" — has been relaxed for one case, and the
+  reasoning matters more than the rule:
+
+  - **`local_only` now judges the jev tier by its endpoint**, exactly like
+    `http`/`laya` (the gap §3's finding named above was closed for them
+    long ago). A loopback System One server — lev, OpenJev, Kev — sends
+    the task text to a process on this machine and nowhere else, so
+    pruning it was over-blocking rather than enforcement. The hosted
+    default (`api.typesafe.ai`) is off-device and is still pruned, in both
+    roles. The promise `local_only` makes — "my code stays on my machine"
+    — is unchanged; only a rule that was stricter than the promise moved.
+  - **A local endpoint needs no credential.** The self-hosted servers
+    ignore the bearer token, so "missing key is a named error case" now
+    applies to *remote* endpoints only; a loopback endpoint is contacted
+    unauthenticated rather than refused, and `forge doctor` says "no
+    credential needed" instead of warning.
+  - **The escalation tier is wired in when the tier can be contacted** — a
+    remote endpoint with a credential, or a local endpoint with or without
+    one — rather than when a credential happens to be present.
+  - **`jev_order_check`** (new key, off by default) re-asks the routing
+    question under several option orders through the self-hosted family's
+    `POST /v1/systemone/permute` extension, and refuses a choice whose
+    winner does not survive re-ordering — a classifier that picks a
+    different model when the candidates are listed in a different order
+    has not decided anything.
+
   **Amendment (Task 10, `forge mcp` shipped 2026-09-24).** Two findings
   worth recording, because both contradicted assumptions the brief was
   written with:

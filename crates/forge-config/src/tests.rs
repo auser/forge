@@ -482,6 +482,38 @@ fn invalid_env_bool_is_a_config_error() {
     assert!(matches!(err, ForgeError::Config(_)));
 }
 
+/// The option-order check is off by default and settable from a file or
+/// the environment — a boolean like any other.
+#[test]
+#[serial]
+fn the_jev_order_check_is_off_by_default_and_configurable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert!(
+        !resolved.config.jev_order_check,
+        "the check costs a forward pass per order, so it is opt-in"
+    );
+
+    write_project_config(tmp.path(), "jev_order_check = true\n");
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert!(resolved.config.jev_order_check);
+    assert_eq!(
+        resolved.explain("jev_order_check"),
+        Some(("true".to_string(), Origin::ProjectFile))
+    );
+
+    unsafe { std::env::set_var("FORGE_JEV_ORDER_CHECK", "true") };
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    unsafe { std::env::remove_var("FORGE_JEV_ORDER_CHECK") };
+    assert!(resolved.config.jev_order_check);
+    assert_eq!(
+        resolved.explain("jev_order_check"),
+        Some(("true".to_string(), Origin::Environment))
+    );
+}
+
 #[test]
 #[serial]
 fn unparseable_project_file_is_a_config_error() {
@@ -1019,4 +1051,129 @@ fn budget_from_a_project_file_reports_provenance() {
         resolved.explain("budget.on_exceeded"),
         Some(("\"prompt\"".to_string(), Origin::Default))
     );
+}
+
+/// A profile may name one model or several; both are tier lists.
+#[test]
+#[serial]
+fn a_profile_accepts_one_model_or_several() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_project_config(
+        tmp.path(),
+        r#"
+[profiles.opusplan]
+plan = "claude-opus"
+execute = ["claude-sonnet", "gpt-5"]
+review = "claude-opus"
+"#,
+    );
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    let profile = resolved.config.profiles.get("opusplan").expect("profile");
+    assert_eq!(profile.plan, vec!["claude-opus".to_string()]);
+    assert_eq!(
+        profile.execute,
+        vec!["claude-sonnet".to_string(), "gpt-5".to_string()]
+    );
+    assert_eq!(profile.review, vec!["claude-opus".to_string()]);
+}
+
+/// The active profile is what routing reads.
+#[test]
+#[serial]
+fn the_active_profile_is_read_from_the_config_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_project_config(
+        tmp.path(),
+        "profile = \"opusplan\"\n\n[profiles.opusplan]\nplan = \"claude-opus\"\n",
+    );
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.profile.as_deref(), Some("opusplan"));
+    let policy = resolved.config.phase_policy().expect("a policy");
+    assert_eq!(policy.name, "opusplan");
+    assert_eq!(policy.profile.plan, vec!["claude-opus".to_string()]);
+}
+
+/// A profile that does not exist would fail silently — routing would fall
+/// back to the unconstrained pool and the user would believe their tier
+/// policy was in force — so it is a configuration error.
+#[test]
+#[serial]
+fn an_undefined_active_profile_is_a_configuration_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_project_config(tmp.path(), "profile = \"opusplan\"\n");
+
+    let err = Config::load(Some(tmp.path()), &CliOverrides::default()).expect_err("must fail");
+    assert!(matches!(err, ForgeError::Config(_)), "{err}");
+    assert!(err.to_string().contains("opusplan"), "{err}");
+}
+
+/// Profiles merge by name across layers, so a project layer that sets one
+/// tier does not erase the user layer's other tiers for the same profile.
+#[test]
+#[serial]
+fn profiles_merge_by_name_across_layers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_user_config(
+        tmp.path(),
+        "[profiles.opusplan]\nplan = \"claude-opus\"\nexecute = \"claude-sonnet\"\n",
+    );
+    write_project_config(tmp.path(), "[profiles.opusplan]\nexecute = \"gpt-5\"\n");
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    let profile = resolved.config.profiles.get("opusplan").expect("profile");
+    assert_eq!(profile.plan, vec!["claude-opus".to_string()]);
+    assert_eq!(profile.execute, vec!["gpt-5".to_string()]);
+}
+
+/// The environment variable selects a profile, the same way it selects a
+/// model.
+#[test]
+#[serial]
+fn the_profile_can_come_from_the_environment() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_project_config(tmp.path(), "[profiles.opusplan]\nplan = \"claude-opus\"\n");
+    unsafe { std::env::set_var("FORGE_PROFILE", "opusplan") };
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert_eq!(resolved.config.profile.as_deref(), Some("opusplan"));
+}
+
+/// And the flag wins over both.
+#[test]
+#[serial]
+fn the_profile_flag_wins_over_the_environment() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+    write_project_config(
+        tmp.path(),
+        "[profiles.opusplan]\nplan = \"claude-opus\"\n[profiles.cheap]\nplan = \"gpt-5\"\n",
+    );
+    unsafe { std::env::set_var("FORGE_PROFILE", "cheap") };
+
+    let overrides = CliOverrides {
+        profile: Some("opusplan".to_string()),
+        ..CliOverrides::default()
+    };
+    let resolved = Config::load(Some(tmp.path()), &overrides).expect("load");
+    assert_eq!(resolved.config.profile.as_deref(), Some("opusplan"));
+}
+
+/// Without a profile, routing is unconstrained — the behaviour a user has
+/// today must not change just because the feature exists.
+#[test]
+#[serial]
+fn no_profile_means_unconstrained_routing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = EnvGuard::isolated(tmp.path());
+
+    let resolved = Config::load(Some(tmp.path()), &CliOverrides::default()).expect("load");
+    assert!(resolved.config.profile.is_none());
+    assert!(resolved.config.phase_policy().is_none());
 }

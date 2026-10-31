@@ -4,8 +4,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use forge_config::Config;
 use forge_core::{
-    Capability, DecisionRouter, ForgeError, ModelCapabilities, ModelProvider, RoutingDecision,
-    RoutingPhase, RoutingRequest,
+    Capability, DecisionRouter, ForgeError, ModelCapabilities, ModelProvider, PhasePolicyHandle,
+    RoutingDecision, RoutingPhase, RoutingRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -23,6 +23,158 @@ pub fn filter_candidates(
         .filter(|(_, caps)| required.iter().all(|need| need.satisfied_by(caps)))
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// Constrains routing to the phase's tier under the active profile.
+///
+/// This is the `opusplan` behaviour — a plan is served by the high-fidelity
+/// model, the build by the cheap one — expressed as a *policy over phases*
+/// rather than a hard-coded pair of model names, so the same profile works
+/// across Anthropic, OpenRouter, or a local model.
+///
+/// Resolution is hybrid, and deliberately so:
+///
+/// - A tier with **one** model is a decision. The router returns it
+///   directly: no inference, no cost, no run-to-run variance.
+/// - A tier with **several** models is a menu. The inner router chooses
+///   among them, so cost-aware selection still applies *within* the tier —
+///   the tier says how good the model has to be, not which one it is.
+///
+/// The tier is enforced twice over, because an inner router is free to
+/// ignore its candidate list (an HTTP router answers with whatever the
+/// remote service chose): the candidate list is narrowed before delegating,
+/// and the answer is checked against the tier afterwards. A router that
+/// answers outside its tier has its answer replaced by the tier's first
+/// model and the decision is marked as a fallback.
+///
+/// When the tier cannot be honoured — the models it names are not in the
+/// ordinary candidate pool, or none of them can do what the task needs —
+/// the request falls through to the unconstrained pool rather than failing.
+/// An unavailable Opus should degrade to a working model, not to no model.
+pub struct PhasePolicyRouter {
+    inner: Arc<dyn DecisionRouter>,
+    policy: PhasePolicyHandle,
+    registry: Vec<(String, ModelCapabilities)>,
+}
+
+impl PhasePolicyRouter {
+    pub fn new(inner: Arc<dyn DecisionRouter>, policy: PhasePolicyHandle) -> Self {
+        Self {
+            inner,
+            policy,
+            registry: Vec::new(),
+        }
+    }
+
+    /// Known models and their capabilities, used for capability filtering
+    /// within the tier.
+    pub fn with_registry(mut self, registry: Vec<(String, ModelCapabilities)>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    fn capabilities_of(&self, name: &str) -> ModelCapabilities {
+        if let Some((_, caps)) = self.registry.iter().find(|(n, _)| n == name) {
+            return *caps;
+        }
+        optimistic_caps()
+    }
+
+    /// The models the profile allows for this request's phase, after the
+    /// ordinary candidate pool and the task's required capabilities have
+    /// had their say. Empty means the tier cannot be honoured.
+    fn tier_pool(&self, request: &RoutingRequest, tier: &[String]) -> Vec<String> {
+        // When the request names candidates, the tier is intersected with
+        // them: those are the models the caller says are actually
+        // available. When it names none, the tier stands on its own.
+        let pool: Vec<String> = if request.candidates.is_empty() {
+            tier.to_vec()
+        } else {
+            request
+                .candidates
+                .iter()
+                .filter(|candidate| tier.contains(candidate))
+                .cloned()
+                .collect()
+        };
+        let mut unique: Vec<String> = Vec::with_capacity(pool.len());
+        for name in pool {
+            if !unique.contains(&name) {
+                unique.push(name);
+            }
+        }
+        let caps: Vec<(String, ModelCapabilities)> = unique
+            .iter()
+            .map(|name| (name.clone(), self.capabilities_of(name)))
+            .collect();
+        filter_candidates(&caps, &request.required_capabilities)
+    }
+}
+
+#[async_trait]
+impl DecisionRouter for PhasePolicyRouter {
+    async fn route(&self, request: &RoutingRequest) -> Result<RoutingDecision, ForgeError> {
+        let Some(policy) = self.policy.get() else {
+            return self.inner.route(request).await;
+        };
+        let tier = policy.profile.tier_for(request.phase);
+        if tier.is_empty() {
+            // This phase is not constrained by the profile. The general
+            // pool applies, which is the behaviour a user gets with no
+            // profile at all.
+            return self.inner.route(request).await;
+        }
+
+        let pool = self.tier_pool(request, tier);
+        if pool.is_empty() {
+            let mut decision = self.inner.route(request).await?;
+            decision.reason = format!(
+                "{} (profile {} has no available model for the {} phase)",
+                decision.reason,
+                policy.name,
+                request.phase.as_str()
+            );
+            return Ok(decision);
+        }
+
+        if pool.len() == 1 {
+            // One model is a decision, not a choice: take it directly
+            // rather than paying for an inference that could only return
+            // the same answer.
+            return Ok(RoutingDecision {
+                selected_model: pool[0].clone(),
+                confidence: 1.0,
+                router_name: format!("phase-policy:{}", policy.name),
+                fallback_used: false,
+                reason: format!(
+                    "profile {} fixes the {} phase to {}",
+                    policy.name,
+                    request.phase.as_str(),
+                    pool[0]
+                ),
+            });
+        }
+
+        let narrowed = RoutingRequest {
+            candidates: pool.clone(),
+            ..request.clone()
+        };
+        let mut decision = self.inner.route(&narrowed).await?;
+        if !pool.contains(&decision.selected_model) {
+            // The inner router answered outside its tier. The tier is the
+            // policy; it wins.
+            decision.selected_model = pool[0].clone();
+            decision.fallback_used = true;
+        }
+        decision.reason = format!(
+            "{} (profile {} tier for the {} phase: {})",
+            decision.reason,
+            policy.name,
+            request.phase.as_str(),
+            pool.join(", ")
+        );
+        Ok(decision)
+    }
 }
 
 /// Deterministic rule-based router: optional keyword → model rules over a
@@ -1083,6 +1235,43 @@ pub fn jev_credential_present(config: &Config, escalation: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// The endpoint a jev role would actually dial — the role-scoped
+/// `resolved_jev_url` with the compiled-in hosted default as the last
+/// resort, so callers never have to repeat that fallback (and never have to
+/// guess which one applies).
+///
+/// Public so `forge doctor` reports the URL this crate will use instead of
+/// hardcoding a default that can drift.
+pub fn jev_endpoint(config: &Config, escalation: bool) -> String {
+    resolved_jev_url(config, escalation)
+        .unwrap_or_else(|| crate::JevRouter::DEFAULT_URL.to_string())
+}
+
+/// Whether the jev tier may run under the current `local_only` setting.
+///
+/// Judged on the **endpoint**, not on the router's name, exactly like
+/// `http`/`laya` (see [`local_only_block`]): a self-hosted System One server
+/// on loopback — lev, an OpenJev instance, Kev — sends the task text to a
+/// process on this machine and nowhere else, so refusing it would be
+/// over-blocking rather than enforcement. The hosted default
+/// (`api.typesafe.ai`) is remote and stays refused.
+pub fn jev_allowed_under_local_only(config: &Config, escalation: bool) -> bool {
+    !config.local_only || crate::endpoint_is_local(&jev_endpoint(config, escalation))
+}
+
+/// Whether the jev tier has what it needs to be contacted at all.
+///
+/// A **local** endpoint needs no credential: the self-hosted System One
+/// servers this crate speaks to (lev, OpenJev, Kev) either ignore the
+/// bearer token or are fronted by something that does. A **remote** one
+/// needs the credential to be present — TypeSafe's hosted Jev rejects
+/// unauthenticated requests, so that stays a hard requirement rather than
+/// a request that fails at the far end.
+fn jev_credential_sufficient(config: &Config, escalation: bool) -> bool {
+    crate::endpoint_is_local(&jev_endpoint(config, escalation))
+        || jev_credential_present(config, escalation)
+}
+
 /// Build a `JevRouter` for the given role (see [`resolved_jev_url`] /
 /// [`resolved_jev_key_env`] for why the role matters).
 fn build_jev(
@@ -1095,6 +1284,7 @@ fn build_jev(
             .url(resolved_jev_url(config, escalation))
             .key_env(Some(resolved_jev_key_env(config, escalation)))
             .model_id(config.jev_model.clone())
+            .order_check(config.jev_order_check)
             .timeout(Duration::from_millis(config.router_timeout_ms))
             .registry(registry.to_vec())
             .egress(EgressPolicy::from_config(config))
@@ -1118,17 +1308,28 @@ fn build_jev(
 /// Blanket-pruning them would break a setup that sends nothing off the
 /// machine, which is over-blocking, not enforcement.
 ///
-/// `jev` is pruned unconditionally, even when `jev_url` names a loopback
-/// self-hosted OpenJev. Its escalation-tier design shipped that promise
-/// ("`--local-only` prunes the tier entirely"), `forge doctor` reports it,
-/// and relaxing a shipped confidentiality promise is not this function's
-/// job. The asymmetry is deliberate and documented in the README.
+/// `jev` is judged the same way. It used to be pruned unconditionally, even
+/// when `jev_url` named a loopback self-hosted OpenJev — the escalation
+/// tier's design shipped that promise ("`--local-only` prunes the tier
+/// entirely"). That promise was about *the tier*, not about *the network*:
+/// the thing `local_only` protects is the task text leaving the machine,
+/// and a loopback System One server never lets it leave. Judging the tier
+/// on its endpoint is therefore strictly *more* faithful to the promise
+/// than pruning it by name — and it is the only way a self-hosted decision
+/// model (lev, OpenJev, Kev) can be used at all under `--local-only`.
+/// The hosted default (`api.typesafe.ai`) is remote and stays refused, so
+/// the confidentiality guarantee itself is unchanged.
 fn local_only_block(name: &str, config: &Config) -> Option<String> {
     if !config.local_only {
         return None;
     }
     match name {
-        "jev" => Some("requires network access".to_string()),
+        "jev" => {
+            let url = jev_endpoint(config, false);
+            (!crate::endpoint_is_local(&url)).then(|| {
+                format!("would send routing requests to {url}, which is not a local endpoint")
+            })
+        }
         "http" | "laya" => {
             let url = router_endpoint(name, config)?;
             (!crate::endpoint_is_local(&url)).then(|| {
@@ -1246,9 +1447,10 @@ impl<'a> RouterStackBuilder<'a> {
     }
 
     /// The needle -> jev escalation tier, if it applies: `None` when the
-    /// primary isn't `needle`, escalation is off, `--local-only` is set, or
-    /// no credential is present — in every one of those cases, today's
-    /// plain `Fallback(Threshold(needle), router_fallback)` behavior is
+    /// primary isn't `needle`, escalation is off, `--local-only` refuses the
+    /// tier's endpoint, or the tier could not be contacted at all — in every
+    /// one of those cases, today's plain
+    /// `Fallback(Threshold(needle), router_fallback)` behavior is
     /// unchanged. The escalation tier resolves its endpoint/credential from
     /// `jev_url`/`jev_key_env` (or the compiled-in defaults) only — see
     /// [`resolved_jev_url`] — deliberately never from the generic
@@ -1256,6 +1458,12 @@ impl<'a> RouterStackBuilder<'a> {
     /// router at all and, if left over from a previous `http`/`laya` setup,
     /// would otherwise silently receive the Jev credential or send an
     /// unrelated token to `api.typesafe.ai`.
+    ///
+    /// "Could be contacted" is endpoint-aware (see
+    /// [`jev_credential_sufficient`]): a local self-hosted System One server
+    /// needs no credential, a remote one does. `--local-only` is likewise
+    /// endpoint-aware (see [`jev_allowed_under_local_only`]): a loopback
+    /// tier stays, the hosted one is pruned.
     ///
     /// A `build_jev` construction failure (e.g. a bad `router_timeout_ms`
     /// producing an unbuildable HTTP client) skips the escalation tier with
@@ -1270,8 +1478,8 @@ impl<'a> RouterStackBuilder<'a> {
     ) -> Result<Option<Arc<dyn DecisionRouter>>, ForgeError> {
         let escalation_applies = primary_name == "needle"
             && self.config.router_escalate == "auto"
-            && !self.config.local_only
-            && jev_credential_present(self.config, true);
+            && jev_allowed_under_local_only(self.config, true)
+            && jev_credential_sufficient(self.config, true);
         if !escalation_applies {
             return Ok(None);
         }
@@ -1331,6 +1539,26 @@ pub fn router_from_config(
     RouterStackBuilder::new(config, registry).build()
 }
 
+/// Build the decision router with an active phase policy.
+///
+/// The policy wraps the *whole* stack — threshold gate, escalation tier, and
+/// fallback chain included — so the tier constrains the final answer rather
+/// than only the primary tier's proposal. A fallback that would have
+/// answered outside the tier is corrected by the policy wrapper.
+pub fn router_from_config_with_policy(
+    config: &Config,
+    registry: &[(String, ModelCapabilities)],
+    policy: PhasePolicyHandle,
+) -> Result<Arc<dyn DecisionRouter>, ForgeError> {
+    let stack = RouterStackBuilder::new(config, registry).build()?;
+    if !policy.is_active() {
+        return Ok(stack);
+    }
+    Ok(Arc::new(
+        PhasePolicyRouter::new(stack, policy).with_registry(registry.to_vec()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use serial_test::serial;
@@ -1338,6 +1566,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use forge_core::{PhasePolicy, ProfileConfig};
 
     fn caps(tools: bool) -> ModelCapabilities {
         ModelCapabilities {
@@ -1877,20 +2106,15 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn router_from_config_no_jev_credential_keeps_todays_static_fallback() {
-        // (b) no credential -> static fallback exactly as before jev
-        // existed; jev must never even be contacted.
+        // (b) no credential + a **remote** endpoint -> static fallback
+        // exactly as before jev existed; the tier is never even built, so
+        // it is never contacted. A local endpoint is the other case — it
+        // needs no credential — and has its own test below.
         unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("mock-local", 0.9)))
-            .expect(0)
-            .mount(&server)
-            .await;
 
         let config = Config {
             router: "needle".to_string(),
-            jev_url: Some(server.uri()),
+            jev_url: Some("https://jev.example.com/v1/systemone".to_string()),
             router_fallback: "static".to_string(),
             model: "mock-local".to_string(),
             ..Config::default()
@@ -1903,29 +2127,58 @@ mod tests {
 
         assert_eq!(decision.router_name, "static");
         assert!(decision.fallback_used);
-        assert_eq!(
-            server.received_requests().await.expect("requests").len(),
-            0,
-            "jev must never be contacted without a credential"
-        );
     }
 
+    /// The other half: a jev tier on **this machine** sends the task text
+    /// to a process here and nowhere else, so it is kept — and, needing no
+    /// credential, it is consulted even with no key present. This is the
+    /// lev case, and the reason the tier is judged by endpoint.
     #[tokio::test]
     #[serial]
-    async fn router_from_config_local_only_prunes_jev_escalation_even_with_credential() {
-        // (c) --local-only + credential present -> jev never contacted.
-        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+    async fn router_from_config_local_only_keeps_a_loopback_jev_escalation() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(jev_body("mock-local", 0.9)))
-            .expect(0)
             .mount(&server)
             .await;
 
         let config = Config {
             router: "needle".to_string(),
             jev_url: Some(server.uri()),
+            router_fallback: "static".to_string(),
+            local_only: true,
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let router =
+            router_from_config(&config, &[("mock-local".to_string(), caps(true))]).expect("builds");
+        let decision = router
+            .route(&RoutingRequest::new("offline task"))
+            .await
+            .expect("escalation routes");
+
+        assert_eq!(decision.router_name, "jev");
+        assert_eq!(decision.selected_model, "mock-local");
+        assert_eq!(
+            server.received_requests().await.expect("requests").len(),
+            1,
+            "a loopback tier under --local-only must be consulted, not pruned"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn router_from_config_local_only_prunes_a_remote_jev_escalation_even_with_credential() {
+        // (c) --local-only + credential present + an **off-device**
+        // endpoint -> the tier is never built, so it is never contacted.
+        // The loopback case above is the other half: that one is kept.
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+
+        let config = Config {
+            router: "needle".to_string(),
+            jev_url: Some("https://jev.example.com/v1/systemone".to_string()),
             router_fallback: "static".to_string(),
             local_only: true,
             model: "mock-local".to_string(),
@@ -1940,25 +2193,21 @@ mod tests {
 
         assert_eq!(decision.router_name, "static");
         assert!(decision.fallback_used);
-        assert_eq!(
-            server.received_requests().await.expect("requests").len(),
-            0,
-            "--local-only must prune jev from the escalation tier"
-        );
     }
 
     #[tokio::test]
     #[serial]
     async fn router_from_config_jev_primary_under_local_only_falls_back_to_static() {
-        // --local-only must also prune jev in the *primary* role: rather
-        // than erroring the whole build, it degrades straight to static
-        // (no FallbackRouter hop at all, since router_fallback is already
-        // "static" — matching needle's own no-weights-under-local-only
-        // philosophy of preferring a working router over refusing to run).
+        // --local-only must also prune a jev *primary* whose endpoint is
+        // off-device: rather than erroring the whole build, it degrades
+        // straight to static (no FallbackRouter hop at all, since
+        // router_fallback is already "static" — matching needle's own
+        // no-weights-under-local-only philosophy of preferring a working
+        // router over refusing to run).
         unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
         let config = Config {
             router: "jev".to_string(),
-            router_url: Some("http://127.0.0.1:9/systemone".to_string()),
+            jev_url: Some("https://jev.example.com/v1/systemone".to_string()),
             local_only: true,
             model: "mock-local".to_string(),
             ..Config::default()
@@ -1972,6 +2221,26 @@ mod tests {
 
         assert_eq!(decision.router_name, "static");
         assert!(!decision.fallback_used);
+    }
+
+    /// The other half of that rule: a jev primary on this machine is not
+    /// replaced at construction time. It is tried — and, being unreachable
+    /// here, falls back — but `--local-only` did not substitute static for
+    /// it.
+    #[tokio::test]
+    #[serial]
+    async fn router_from_config_loopback_jev_primary_survives_local_only() {
+        let config = Config {
+            router: "jev".to_string(),
+            jev_url: Some("http://127.0.0.1:8009/v1/systemone".to_string()),
+            local_only: true,
+            model: "mock-local".to_string(),
+            ..Config::default()
+        };
+        let stack = RouterStackBuilder::new(&config, &[]);
+        let (name, _router) = stack.resolve_primary().expect("resolves");
+        assert_eq!(name, "jev", "a loopback jev must not be degraded to static");
+        assert_eq!(effective_router_name("jev", &config), "jev");
     }
 
     /// `http` is the other half of the promise: a remote decision endpoint
@@ -2117,7 +2386,7 @@ mod tests {
 
     /// The predicate behind all of the above, exercised directly.
     #[test]
-    fn local_only_block_judges_http_and_laya_by_endpoint_and_jev_by_name() {
+    fn local_only_block_judges_every_network_router_by_endpoint() {
         let remote = Config {
             local_only: true,
             router_url: Some("https://router.example.com/route".to_string()),
@@ -2125,6 +2394,7 @@ mod tests {
         };
         assert!(local_only_block("http", &remote).is_some());
         assert!(local_only_block("laya", &remote).is_some());
+        // jev with no `jev_url` resolves to the hosted default — off-device.
         assert!(local_only_block("jev", &remote).is_some());
         for local in ["static", "cheapest", "needle", "laya-native", "mock"] {
             assert!(
@@ -2133,17 +2403,29 @@ mod tests {
             );
         }
 
-        // Loopback endpoints (and laya's loopback default) are allowed;
-        // `http` without a URL cannot be built at all, so it is not blocked
-        // here.
+        // Loopback endpoints are allowed — `jev` included, because a
+        // self-hosted System One server on this machine sends the task
+        // text nowhere else.
         let loopback = Config {
             local_only: true,
             router_url: Some("http://127.0.0.1:8788/decide".to_string()),
+            jev_url: Some("http://127.0.0.1:8009/v1/systemone".to_string()),
             ..Config::default()
         };
         assert!(local_only_block("http", &loopback).is_none());
         assert!(local_only_block("laya", &loopback).is_none());
-        assert!(local_only_block("jev", &loopback).is_some());
+        assert!(local_only_block("jev", &loopback).is_none());
+
+        // A jev pointed off-device is refused even when the generic
+        // `router_url` is local: the jev tier resolves its own endpoint,
+        // never the generic one.
+        let mixed = Config {
+            local_only: true,
+            router_url: Some("http://127.0.0.1:8788/decide".to_string()),
+            jev_url: Some("https://jev.example.com/v1/systemone".to_string()),
+            ..Config::default()
+        };
+        assert!(local_only_block("jev", &mixed).is_some());
 
         let laya_default = Config {
             local_only: true,
@@ -2151,6 +2433,7 @@ mod tests {
         };
         assert!(local_only_block("laya", &laya_default).is_none());
         assert!(local_only_block("http", &laya_default).is_none());
+        assert!(local_only_block("jev", &laya_default).is_some());
 
         // Nothing is blocked when the setting is off.
         let off = Config {
@@ -2160,6 +2443,31 @@ mod tests {
         for name in ["http", "laya", "jev"] {
             assert!(local_only_block(name, &off).is_none(), "{name}");
         }
+    }
+
+    /// Whether the tier can be contacted at all: a local endpoint needs no
+    /// credential, a remote one does.
+    #[test]
+    #[serial]
+    fn a_local_jev_endpoint_needs_no_credential_but_a_remote_one_does() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let local = Config {
+            jev_url: Some("http://127.0.0.1:8009/v1/systemone".to_string()),
+            ..Config::default()
+        };
+        assert!(jev_credential_sufficient(&local, true));
+        assert!(jev_credential_sufficient(&local, false));
+
+        let remote = Config {
+            jev_url: Some("https://jev.example.com/v1/systemone".to_string()),
+            ..Config::default()
+        };
+        assert!(!jev_credential_sufficient(&remote, true));
+        assert!(!jev_credential_sufficient(&remote, false));
+
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "test-escalation-key") };
+        assert!(jev_credential_sufficient(&remote, true));
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
     }
 
     #[tokio::test]
@@ -3049,5 +3357,255 @@ mod tests {
             .expect("omitting .egress() must fail");
         assert!(matches!(err, ForgeError::Router(_)), "{err}");
         assert!(err.to_string().contains("requires .egress("), "{err}");
+    }
+
+    /// A request in the plan phase, with both a strong and a cheap model
+    /// available.
+    fn plan_request() -> RoutingRequest {
+        RoutingRequest {
+            task: "design the implementation plan".to_string(),
+            phase: RoutingPhase::Plan,
+            required_capabilities: vec![],
+            candidates: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+        }
+    }
+
+    fn policy_router(inner: Arc<dyn DecisionRouter>, profile: ProfileConfig) -> PhasePolicyRouter {
+        PhasePolicyRouter::new(
+            inner,
+            PhasePolicyHandle::new(Some(PhasePolicy::new("opusplan", profile))),
+        )
+        .with_registry(vec![
+            ("claude-opus".to_string(), caps(true)),
+            ("claude-sonnet".to_string(), caps(true)),
+        ])
+    }
+
+    /// The `opusplan` shape: one model for the plan is a *decision*, so the
+    /// inner router is never consulted — no inference, no cost, no variance.
+    #[tokio::test]
+    async fn a_one_model_tier_is_decided_without_consulting_the_inner_router() {
+        let inner = Arc::new(MockRouter::selecting("inner-choice"));
+        let router = policy_router(
+            inner.clone(),
+            ProfileConfig {
+                plan: vec!["claude-opus".to_string()],
+                ..ProfileConfig::default()
+            },
+        );
+        let decision = router.route(&plan_request()).await.expect("routes");
+        assert_eq!(decision.selected_model, "claude-opus");
+        assert_eq!(decision.router_name, "phase-policy:opusplan");
+        assert!(
+            inner.recorded().is_empty(),
+            "one model is a decision, not a choice"
+        );
+    }
+
+    /// A tier of several is a *menu*: the inner router chooses, but only
+    /// from inside the tier, so cost-aware selection still applies within
+    /// the tier the policy defines.
+    #[tokio::test]
+    async fn a_several_model_tier_delegates_within_the_tier() {
+        let inner = Arc::new(MockRouter::selecting("claude-sonnet"));
+        let router = policy_router(
+            inner.clone(),
+            ProfileConfig {
+                plan: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+                ..ProfileConfig::default()
+            },
+        );
+        let decision = router.route(&plan_request()).await.expect("routes");
+        assert_eq!(decision.selected_model, "claude-sonnet");
+        let recorded = inner.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].candidates,
+            vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+            "the inner router must only ever see the tier"
+        );
+    }
+
+    /// The tier is the policy; a router that answers outside it is
+    /// corrected rather than obeyed.
+    #[tokio::test]
+    async fn an_answer_from_outside_the_tier_is_replaced() {
+        let inner = Arc::new(MockRouter::selecting("rogue-model"));
+        let router = policy_router(
+            inner.clone(),
+            ProfileConfig {
+                plan: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+                ..ProfileConfig::default()
+            },
+        );
+        let decision = router.route(&plan_request()).await.expect("routes");
+        assert_eq!(decision.selected_model, "claude-opus");
+        assert!(decision.fallback_used);
+    }
+
+    /// An unavailable Opus should degrade to a working model, not to no
+    /// model: when the tier names nothing the candidate pool carries, the
+    /// request falls through to the unconstrained pool.
+    #[tokio::test]
+    async fn an_unavailable_tier_falls_through_to_the_ordinary_pool() {
+        let inner = Arc::new(MockRouter::selecting("claude-sonnet"));
+        let router = policy_router(
+            inner.clone(),
+            ProfileConfig {
+                plan: vec!["claude-opus".to_string()],
+                ..ProfileConfig::default()
+            },
+        );
+        let decision = router.route(&plan_request()).await.expect("routes");
+        assert_eq!(decision.selected_model, "claude-sonnet");
+        assert!(
+            decision.reason.contains("no available model"),
+            "the fall-through must say why: {}",
+            decision.reason
+        );
+    }
+
+    /// A phase the policy does not name is unconstrained, so the ordinary
+    /// behaviour is untouched.
+    #[tokio::test]
+    async fn a_phase_the_policy_does_not_name_is_unconstrained() {
+        let inner = Arc::new(MockRouter::selecting("claude-sonnet"));
+        let router = policy_router(
+            inner.clone(),
+            ProfileConfig {
+                plan: vec!["claude-opus".to_string()],
+                ..ProfileConfig::default()
+            },
+        );
+        let decision = router
+            .route(&RoutingRequest {
+                task: "implement it".to_string(),
+                phase: RoutingPhase::Execute,
+                required_capabilities: vec![],
+                candidates: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+            })
+            .await
+            .expect("routes");
+        assert_eq!(decision.selected_model, "claude-sonnet");
+    }
+
+    /// The `general` tier covers the phases a policy does not name, so
+    /// "plan with the strong model, the rest with this one" needs two
+    /// lines rather than four.
+    #[tokio::test]
+    async fn the_general_tier_covers_the_phases_a_policy_does_not_name() {
+        let inner = Arc::new(MockRouter::selecting("claude-sonnet"));
+        let router = policy_router(
+            inner.clone(),
+            ProfileConfig {
+                plan: vec!["claude-opus".to_string()],
+                general: vec!["claude-sonnet".to_string()],
+                ..ProfileConfig::default()
+            },
+        );
+        let decision = router
+            .route(&RoutingRequest {
+                task: "implement it".to_string(),
+                phase: RoutingPhase::Execute,
+                required_capabilities: vec![],
+                candidates: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+            })
+            .await
+            .expect("routes");
+        assert_eq!(decision.selected_model, "claude-sonnet");
+    }
+
+    /// The wiring, end to end: a config that names a profile produces a
+    /// router that honours it. This is the seam between the config layer
+    /// and the router, and it is the one a config-only change could break
+    /// without any router test noticing.
+    #[tokio::test]
+    async fn a_configured_profile_constrains_the_router_it_builds() {
+        // `static` keeps the test hermetic: the profile decides, not the
+        // inner router.
+        let mut config = Config {
+            router: "static".to_string(),
+            profile: Some("opusplan".to_string()),
+            ..Config::default()
+        };
+        config.profiles.insert(
+            "opusplan".to_string(),
+            ProfileConfig {
+                plan: vec!["strong-model".to_string()],
+                execute: vec!["cheap-model".to_string()],
+                ..ProfileConfig::default()
+            },
+        );
+        let router = router_from_config_with_policy(
+            &config,
+            &[],
+            PhasePolicyHandle::new(config.phase_policy()),
+        )
+        .expect("builds");
+
+        let plan = router
+            .route(&RoutingRequest {
+                task: "design the approach".to_string(),
+                phase: RoutingPhase::Plan,
+                required_capabilities: vec![],
+                candidates: vec!["strong-model".to_string(), "cheap-model".to_string()],
+            })
+            .await
+            .expect("routes");
+        assert_eq!(plan.selected_model, "strong-model");
+
+        let execute = router
+            .route(&RoutingRequest {
+                task: "implement it".to_string(),
+                phase: RoutingPhase::Execute,
+                required_capabilities: vec![],
+                candidates: vec!["strong-model".to_string(), "cheap-model".to_string()],
+            })
+            .await
+            .expect("routes");
+        assert_eq!(execute.selected_model, "cheap-model");
+    }
+
+    /// A tier is still capability-filtered: a tier that cannot do the
+    /// task narrows rather than failing.
+    #[tokio::test]
+    async fn a_tier_is_filtered_by_the_required_capabilities() {
+        let inner = Arc::new(MockRouter::selecting("claude-opus"));
+        let router = PhasePolicyRouter::new(
+            inner,
+            PhasePolicyHandle::new(Some(PhasePolicy::new(
+                "opusplan",
+                ProfileConfig {
+                    plan: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+                    ..ProfileConfig::default()
+                },
+            ))),
+        )
+        .with_registry(vec![
+            (
+                "claude-opus".to_string(),
+                ModelCapabilities {
+                    streaming: true,
+                    tools: false,
+                    structured_output: false,
+                    vision: false,
+                    max_context: 8_192,
+                },
+            ),
+            ("claude-sonnet".to_string(), caps(true)),
+        ]);
+        let decision = router
+            .route(&RoutingRequest {
+                task: "design the implementation plan".to_string(),
+                phase: RoutingPhase::Plan,
+                required_capabilities: vec![Capability::Tools],
+                candidates: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+            })
+            .await
+            .expect("routes");
+        assert_eq!(
+            decision.selected_model, "claude-sonnet",
+            "the tier's other model cannot use tools"
+        );
     }
 }

@@ -31,6 +31,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "list models, or /model <name> to switch"),
     ("/auth", "sign in: /auth <claude|codex|kimi>"),
     ("/approval", "show the approval policy, or /approval <mode>"),
+    ("/plan", "toggle plan mode: /plan [on|off]"),
+    ("/profile", "list routing profiles, or /profile <name>|off"),
     ("/config", "effective settings, or /config <key> for one"),
     ("/context", "context estimates and storage: /context status"),
     (
@@ -61,6 +63,7 @@ const FORK_USAGE: &str = "/fork [--at <pos|run-id>]";
 const CONTEXT_USAGE: &str = "/context status";
 const MEMORY_USAGE: &str = "/memory status|on|off|show|sources (show/sources [--offset <n>])";
 const MEMORY_SUBCOMMANDS: &[&str] = &["status", "on", "off", "show", "sources"];
+const PLAN_USAGE: &str = "/plan [on|off]";
 
 /// At most this many path candidates per completion. The listing is
 /// `CompletionType::List`, which is unusable past a screenful; typing one
@@ -95,6 +98,10 @@ pub enum Parsed {
     Auth(Option<String>),
     /// `None` shows the policy; `Some` sets it.
     Approval(Option<String>),
+    /// `None` toggles plan mode; `Some(true|false)` sets it outright.
+    Plan(Option<bool>),
+    /// `None` lists the routing profiles; `Some` selects one (`off` clears).
+    Profile(Option<String>),
     /// `None` is `forge config show`; `Some` is `forge config explain`.
     Config(Option<String>),
     Skills,
@@ -199,6 +206,13 @@ impl Command {
             "model" => Parsed::Model(argument),
             "auth" => Parsed::Auth(argument),
             "approval" => Parsed::Approval(argument),
+            "plan" => match argument.as_deref() {
+                None => Parsed::Plan(None),
+                Some("on" | "true") => Parsed::Plan(Some(true)),
+                Some("off" | "false") => Parsed::Plan(Some(false)),
+                Some(_) => Parsed::Usage(PLAN_USAGE),
+            },
+            "profile" => Parsed::Profile(argument),
             "config" => Parsed::Config(argument),
             "context" => match rest.as_str() {
                 "status" => Parsed::Context(ContextCommand::Status),
@@ -570,6 +584,40 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// `/plan` toggles; `/plan on` and `/plan off` set it outright.
+    #[test]
+    fn plan_mode_parses_as_a_toggle_or_an_explicit_state() {
+        let snapshot = CompletionSnapshot::default();
+        assert_eq!(Command::parse("/plan", &snapshot), Parsed::Plan(None));
+        assert_eq!(
+            Command::parse("/plan on", &snapshot),
+            Parsed::Plan(Some(true))
+        );
+        assert_eq!(
+            Command::parse("/plan off", &snapshot),
+            Parsed::Plan(Some(false))
+        );
+        assert!(
+            matches!(Command::parse("/plan maybe", &snapshot), Parsed::Usage(_)),
+            "an unrecognised state is a usage error, not a silent toggle"
+        );
+    }
+
+    /// `/profile` lists; `/profile <name>` selects; `/profile off` clears.
+    #[test]
+    fn the_profile_command_parses_as_list_select_or_clear() {
+        let snapshot = CompletionSnapshot::default();
+        assert_eq!(Command::parse("/profile", &snapshot), Parsed::Profile(None));
+        assert_eq!(
+            Command::parse("/profile opusplan", &snapshot),
+            Parsed::Profile(Some("opusplan".to_string()))
+        );
+        assert_eq!(
+            Command::parse("/profile off", &snapshot),
+            Parsed::Profile(Some("off".to_string()))
+        );
     }
 
     #[test]

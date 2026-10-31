@@ -28,7 +28,10 @@ pub use model::{
     CompletionRequest, CompletionResponse, Message, ModelCapabilities, ModelProvider, Role, Usage,
 };
 pub use project::find_project_root;
-pub use router::{Capability, DecisionRouter, RoutingDecision, RoutingPhase, RoutingRequest};
+pub use router::{
+    Capability, DecisionRouter, PhasePolicy, PhasePolicyHandle, ProfileConfig, RoutingDecision,
+    RoutingPhase, RoutingRequest,
+};
 pub use run::RunState;
 pub use session::SessionStore;
 pub use skill::{Skill, SkillMeta, SkillRegistry};

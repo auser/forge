@@ -165,6 +165,8 @@ and tradeoffs.
 
 - `forge run` — a bounded inspect/edit/check/review workflow over the
   multi-turn agent loop, with durable task evidence and a reviewable diff.
+- Routing profiles — a named policy per phase: plan with the strong model,
+  build with the cheap one (`[profiles.<name>]`).
 - `forge run --plan` — routes a read-only design pass, economical execution,
   and—when implementation changes something—a read-only independent review.
   The generated plan and review are durable task evidence.
@@ -201,6 +203,19 @@ Presets live in [`examples/configs/`](examples/configs/) — or let init
 write one: `forge init --preset claude` (also `codex`, `kimi`, `kev`,
 `decider`, `jev`, `local-first`, `hybrid-needle`, `budget-hosted`,
 `hybrid-laya`, `hybrid-laya-native`).
+
+A **routing profile** says which models may serve which phase — the
+`opusplan` idea, per phase instead of per vendor. One model in a tier is a
+decision (no inference, no extra cost); several make a menu the router picks
+from:
+
+```toml
+profile = "opusplan"           # or FORGE_PROFILE=opusplan, or --profile opusplan
+
+[profiles.opusplan]
+plan    = "claude-opus"              # one model: a decision
+execute = ["claude-sonnet", "gpt-5"] # several: a menu
+```
 
 ## Where to read more
 
