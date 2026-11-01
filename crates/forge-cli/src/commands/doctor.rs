@@ -2072,7 +2072,11 @@ mod tests {
     fn the_profile_check_says_so_when_no_profile_is_active() {
         let check = profile_check(&forge_config::Config::default(), &["sonnet"]);
         assert_eq!(check.level, Level::Ok);
-        assert!(check.detail.contains("no profile active"), "{}", check.detail);
+        assert!(
+            check.detail.contains("no profile active"),
+            "{}",
+            check.detail
+        );
     }
 
     /// The proxy scope line exists so that a global `local_only` left

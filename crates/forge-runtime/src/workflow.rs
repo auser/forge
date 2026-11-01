@@ -1295,7 +1295,10 @@ mod tests {
                 })),
             "the build must see what the plan produced"
         );
-        assert_eq!(outcome.plan, "1. Inspect main.rs\n2. Make the change\n3. Run tests");
+        assert_eq!(
+            outcome.plan,
+            "1. Inspect main.rs\n2. Make the change\n3. Run tests"
+        );
     }
 
     #[tokio::test]
