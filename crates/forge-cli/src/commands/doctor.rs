@@ -2009,8 +2009,10 @@ mod tests {
     /// A profile that names an eligible model for every phase is fine.
     #[test]
     fn the_profile_check_reports_each_tier() {
-        let mut config = forge_config::Config::default();
-        config.profile = Some("opusplan".to_string());
+        let mut config = forge_config::Config {
+            profile: Some("opusplan".to_string()),
+            ..forge_config::Config::default()
+        };
         config.profiles.insert(
             "opusplan".to_string(),
             forge_config::ProfileConfig {
@@ -2030,8 +2032,10 @@ mod tests {
     /// instead.
     #[test]
     fn the_profile_check_marks_a_model_that_cannot_be_served() {
-        let mut config = forge_config::Config::default();
-        config.profile = Some("opusplan".to_string());
+        let mut config = forge_config::Config {
+            profile: Some("opusplan".to_string()),
+            ..forge_config::Config::default()
+        };
         config.profiles.insert(
             "opusplan".to_string(),
             forge_config::ProfileConfig {
@@ -2052,8 +2056,10 @@ mod tests {
     /// report says so rather than making it look named.
     #[test]
     fn the_profile_check_marks_an_inherited_tier() {
-        let mut config = forge_config::Config::default();
-        config.profile = Some("opusplan".to_string());
+        let mut config = forge_config::Config {
+            profile: Some("opusplan".to_string()),
+            ..forge_config::Config::default()
+        };
         config.profiles.insert(
             "opusplan".to_string(),
             forge_config::ProfileConfig {
@@ -2084,8 +2090,10 @@ mod tests {
     /// must not fire when no proxy is configured.
     #[test]
     fn the_proxy_scope_check_only_fires_for_a_configured_proxy() {
-        let mut config = forge_config::Config::default();
-        config.local_only = true;
+        let mut config = forge_config::Config {
+            local_only: true,
+            ..forge_config::Config::default()
+        };
         assert!(
             proxy_scope_check(&config, "user-file").is_none(),
             "no [proxy] section: nothing to be out of scope for"
