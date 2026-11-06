@@ -290,18 +290,28 @@ impl Default for NeedleConfig {
 }
 
 /// `[embedding]`: provider used for the semantic project index. Needle keeps
-/// the zero-config default; EmbeddingGemma 2 is an opt-in local HTTP service.
+/// the zero-config default; EmbeddingGemma 2 is an opt-in local HTTP service;
+/// `rten` runs a pinned encoder in-process with no daemon and no native
+/// dependency.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbeddingConfig {
-    /// `needle` or `embeddinggemma2`.
+    /// `needle`, `embeddinggemma2`, or `rten`.
     pub provider: String,
     /// OpenAI-compatible base URL used by `embeddinggemma2`.
     pub base_url: String,
     /// Model name sent to the embeddings endpoint and used to version indexes.
+    /// For `rten`, the id of a pinned local model (empty means the default).
     pub model: String,
-    /// Matryoshka output width: 128, 256, 512, or 768.
+    /// Matryoshka output width: 128, 256, 512, or 768. Used by
+    /// `embeddinggemma2`; a local model's width is fixed by the model.
     pub dimensions: usize,
+    /// Directory holding the local model's files. Used by `rten` only; empty
+    /// means the per-model directory under the forge model cache.
+    pub weights_dir: String,
+    /// Whether the pinned local model may be downloaded on first use. Used by
+    /// `rten` only; set to false for offline deployments.
+    pub autofetch: bool,
 }
 
 impl Default for EmbeddingConfig {
@@ -309,13 +319,20 @@ impl Default for EmbeddingConfig {
         Self {
             provider: "needle".to_string(),
             base_url: "http://127.0.0.1:8081/v1".to_string(),
-            model: "embeddinggemma-2".to_string(),
+            // Empty, not a provider's model name: `model` means different
+            // things to different providers, so each one supplies its own
+            // default when this is unset. A shared default would leak one
+            // provider's model name into another's configuration — asking
+            // the local runtime for a model called "embeddinggemma-2".
+            model: String::new(),
             dimensions: 256,
+            weights_dir: String::new(),
+            autofetch: true,
         }
     }
 }
 
-const EMBEDDING_PROVIDERS: &[&str] = &["needle", "embeddinggemma2"];
+const EMBEDDING_PROVIDERS: &[&str] = &["needle", "embeddinggemma2", "rten"];
 const EMBEDDING_DIMENSIONS: &[usize] = &[128, 256, 512, 768];
 
 /// `[laya]`: checkpoint lifecycle for the native Rust Laya router.
@@ -962,9 +979,9 @@ impl Config {
             )));
         }
         if self.embedding.provider == "embeddinggemma2" {
-            if self.embedding.base_url.trim().is_empty() || self.embedding.model.trim().is_empty() {
+            if self.embedding.base_url.trim().is_empty() {
                 return Err(ForgeError::config(
-                    "embeddinggemma2 requires non-empty embedding.base_url and embedding.model",
+                    "embeddinggemma2 requires a non-empty embedding.base_url",
                 ));
             }
             if !EMBEDDING_DIMENSIONS.contains(&self.embedding.dimensions) {

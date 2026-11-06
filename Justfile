@@ -35,6 +35,14 @@ lint-ffi:
     NEEDLE_NO_DOWNLOAD=1 \
     cargo clippy -p forge-needle --features needle-e2e --all-targets -- -D warnings
 
+# Type- and lint-check the rten e2e test target WITHOUT running it. It
+# needs a real encoder on disk (34 MB for the int8 default) to run, so it
+# is not part of `just verify` — the repo deliberately does not carry one.
+# Compiling it here is the same bargain `lint-ffi` makes for the Needle
+# e2e tests: the code is checked, the weights are not fetched.
+lint-rten:
+    cargo clippy -p forge-inference --features rten-e2e --all-targets -- -D warnings
+
 # unit + integration tests (see `lint` for why not --all-features)
 test:
     cargo test --workspace
@@ -45,7 +53,7 @@ bdd:
     cargo test -p forge-cli --test bdd
 
 # fmt --check + check + lint (incl. link-free e2e lint) + test + bdd
-verify: check lint lint-ffi test bdd
+verify: check lint lint-ffi lint-rten test bdd
     cargo fmt --all --check
 
 # Release gate for the drop-in coding harness. `verify` covers the complete

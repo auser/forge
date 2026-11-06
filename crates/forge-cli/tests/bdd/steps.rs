@@ -1771,6 +1771,22 @@ fn doctor_output_mentions(world: &mut BddWorld, needle: String) {
 }
 
 // ---------------------------------------------------------------------------
+// embedding.feature
+// ---------------------------------------------------------------------------
+
+/// Point the embedding provider at a model directory that cannot exist, so
+/// the scenario is deterministic whether or not the developer running it has
+/// the real model cached.
+#[given(expr = "a project config sets the embedding provider to {string}")]
+fn project_config_sets_embedding_provider(world: &mut BddWorld, provider: String) {
+    let absent = world.project().join("no-such-model-dir");
+    world.add_config_block(format!(
+        "[embedding]\nprovider = \"{provider}\"\nautofetch = false\nweights_dir = \"{}\"",
+        absent.display()
+    ));
+}
+
+// ---------------------------------------------------------------------------
 // first-run.feature
 // ---------------------------------------------------------------------------
 

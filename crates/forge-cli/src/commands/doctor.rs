@@ -415,6 +415,7 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
         ));
 
         checks.extend(needle_checks(config).await);
+        checks.extend(embedding_checks(config));
         checks.push(jev_check(config));
         checks.extend(credential_env_checks(config));
         if let Some(check) = legacy_router_check(config) {
@@ -880,6 +881,86 @@ async fn needle_checks(config: &forge_config::Config) -> Vec<Check> {
     // Both preconditions hold, so actually ask the brain something.
     let brain = probe_brain(config, using_hash_backend).await;
     vec![engine, brain]
+}
+
+/// Checks for the local embedding model behind `embedding.provider = "rten"`.
+///
+/// Filesystem/checksum only: this never fetches the model over the network
+/// (that's `forge init`'s job), so `forge doctor` stays fast and offline.
+/// The same rule the Needle checks follow.
+///
+/// The check answers one question: *would semantic search actually work?* A
+/// model that is absent, or present but not matching its pinned digest, is
+/// a warning — forge still runs, it just has no semantic index.
+fn embedding_checks(config: &forge_config::Config) -> Vec<Check> {
+    const LABEL: &str = "embedding model";
+    const KNOWN: &[&str] = &["needle", "embeddinggemma2", "rten"];
+
+    if !KNOWN.contains(&config.embedding.provider.as_str()) {
+        // `forge doctor` does not validate the whole config, so a typo in
+        // the provider name would otherwise sail past every other check
+        // and fail later, far from the setting that caused it.
+        return vec![Check {
+            level: Level::Fail,
+            label: LABEL.into(),
+            detail: format!(
+                "unknown embedding provider {:?}; expected one of {}",
+                config.embedding.provider,
+                KNOWN.join(", ")
+            ),
+        }];
+    }
+
+    if config.embedding.provider != "rten" {
+        return vec![Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: format!("provider: {}", config.embedding.provider),
+        }];
+    }
+
+    let spec = match forge_inference::spec_for_or_default(&config.embedding.model) {
+        Ok(spec) => spec,
+        Err(e) => {
+            return vec![Check {
+                level: Level::Fail,
+                label: LABEL.into(),
+                detail: e.to_string(),
+            }];
+        }
+    };
+    let dir = forge_inference::weights_dir(&config.embedding, spec);
+    let model_path = dir.join(spec.model.filename);
+    let tokenizer_path = dir.join(spec.tokenizer.filename);
+
+    let model_ok =
+        forge_inference::weights::verify(&model_path, spec.model.sha256).unwrap_or(false);
+    let tokenizer_ok =
+        forge_inference::weights::verify(&tokenizer_path, spec.tokenizer.sha256).unwrap_or(false);
+
+    if model_ok && tokenizer_ok {
+        vec![Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: format!(
+                "{} ready in {} ({} dimensions)",
+                spec.display_name,
+                dir.display(),
+                spec.dimensions
+            ),
+        }]
+    } else {
+        vec![Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!(
+                "{} not installed in {} — run `forge init` to fetch it; semantic search is off \
+                 until then",
+                spec.display_name,
+                dir.display()
+            ),
+        }]
+    }
 }
 
 /// Is there an inference engine in this binary at all — and can this CPU

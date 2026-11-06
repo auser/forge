@@ -9,6 +9,7 @@ members = [
     "crates/forge-core",
     "crates/forge-execution",
     "crates/forge-graph",
+    "crates/forge-inference",
     "crates/forge-mcp",
     "crates/forge-needle",
     "crates/forge-providers",
@@ -33,6 +34,7 @@ forge-core = { path = "crates/forge-core" }
 forge-config = { path = "crates/forge-config" }
 forge-execution = { path = "crates/forge-execution" }
 forge-graph = { path = "crates/forge-graph" }
+forge-inference = { path = "crates/forge-inference" }
 forge-mcp = { path = "crates/forge-mcp" }
 forge-needle = { path = "crates/forge-needle" }
 forge-providers = { path = "crates/forge-providers" }

@@ -157,6 +157,7 @@ fn run_inner(ctx: &Context, preset: Option<&str>, print_report: bool) -> Result<
     let resolved = ctx.resolve_config()?;
     items.extend(legacy_config_item(&root, &resolved.config));
     items.push(needle_weights_item(&root, &resolved.config));
+    items.push(local_model_item(&root, &resolved.config));
     items.push(catalogue_item(&resolved.config));
 
     items.extend(detect_environment(&root));
@@ -291,6 +292,125 @@ fn needle_weights_item(root: &Path, config: &forge_config::Config) -> InitItem {
                 note: Some(format!(
                     "needle weights: could not run fetch ({e}); static routing continues"
                 )),
+            }
+        }
+    }
+}
+
+/// `forge init`'s local-model step: fetch and verify the pinned encoder
+/// behind `embedding.provider = "rten"`.
+///
+/// This is the same shape as the Needle weights step, and for the same
+/// reason: a local model that is not on disk means semantic search is
+/// silently off, and the reader should learn that from `forge init` rather
+/// than discover it later as missing search results.
+///
+/// Skipped when the provider is not `rten` (the default provider is
+/// `needle`), when `--local-only` forbids the download, or when
+/// `embedding.autofetch = false`. Every failure degrades to an
+/// informational item — an offline `forge init` must not fail.
+fn local_model_item(root: &Path, config: &forge_config::Config) -> InitItem {
+    if config.embedding.provider != "rten" {
+        return InitItem {
+            status: ItemStatus::Detected,
+            path: root.to_path_buf(),
+            note: Some(format!(
+                "local model: not applicable (embedding.provider = {:?})",
+                config.embedding.provider
+            )),
+        };
+    }
+    let spec = match forge_inference::spec_for_or_default(&config.embedding.model) {
+        Ok(spec) => spec,
+        Err(e) => {
+            return InitItem {
+                status: ItemStatus::Detected,
+                path: root.to_path_buf(),
+                note: Some(format!("local model: {e}")),
+            };
+        }
+    };
+    let dir = forge_inference::weights_dir(&config.embedding, spec);
+
+    // A model that is already installed needs no network, so it is
+    // reported as present even when autofetch is off or `--local-only` is
+    // in force. Only a *missing* model turns on the download rules.
+    let installed =
+        forge_inference::weights::verify(&dir.join(spec.model.filename), spec.model.sha256)
+            .unwrap_or(false)
+            && forge_inference::weights::verify(
+                &dir.join(spec.tokenizer.filename),
+                spec.tokenizer.sha256,
+            )
+            .unwrap_or(false);
+    if installed {
+        return InitItem {
+            status: ItemStatus::Unchanged,
+            path: dir,
+            note: Some(format!(
+                "local model present (verified): {}",
+                spec.display_name
+            )),
+        };
+    }
+
+    if config.local_only {
+        return InitItem {
+            status: ItemStatus::Detected,
+            path: root.to_path_buf(),
+            note: Some(
+                "local model: skipped (--local-only); semantic search stays off until the model \
+                 is installed"
+                    .to_string(),
+            ),
+        };
+    }
+    if !config.embedding.autofetch {
+        return InitItem {
+            status: ItemStatus::Detected,
+            path: root.to_path_buf(),
+            note: Some("local model: autofetch disabled (embedding.autofetch = false)".to_string()),
+        };
+    }
+
+    match run_async(async move { forge_inference::ensure_weights(spec, &dir, true).await }) {
+        Ok(Ok(forge_inference::WeightsStatus::Present(path))) => InitItem {
+            status: ItemStatus::Unchanged,
+            path,
+            note: Some(format!(
+                "local model present (verified): {}",
+                spec.display_name
+            )),
+        },
+        Ok(Ok(forge_inference::WeightsStatus::Fetched(path))) => InitItem {
+            status: ItemStatus::Created,
+            path,
+            note: Some(format!("fetched local model: {}", spec.display_name)),
+        },
+        Ok(Ok(forge_inference::WeightsStatus::Missing { path, reason })) => {
+            warn!(reason = %reason, "local model unavailable; semantic search stays off");
+            InitItem {
+                status: ItemStatus::Detected,
+                path,
+                note: Some(format!(
+                    "local model unavailable: {reason} (semantic search stays off)"
+                )),
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "local model unavailable; semantic search stays off");
+            InitItem {
+                status: ItemStatus::Detected,
+                path: root.to_path_buf(),
+                note: Some(format!("local model unavailable: {e}")),
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "could not run the local model fetch");
+            InitItem {
+                status: ItemStatus::Detected,
+                path: root.to_path_buf(),
+                note: Some(format!("local model: could not run fetch ({e})")),
             }
         }
     }
@@ -577,6 +697,89 @@ mod tests {
             !weights_path.exists(),
             "no fetch should have happened, but a file exists at {}",
             weights_path.display()
+        );
+    }
+
+    /// The local-model step must not fetch anything when the provider is
+    /// not `rten`. The default provider is `needle`, so for most users this
+    /// step is a no-op — and it must not turn `forge init` into a 34 MB
+    /// download for someone who never asked for a local model.
+    #[test]
+    fn local_model_item_is_a_no_op_for_other_providers() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut config = forge_config::Config::default();
+        config.embedding.provider = "needle".to_string();
+        config.embedding.autofetch = true;
+
+        let item = local_model_item(dir.path(), &config);
+        let note = item.note.expect("note present");
+        assert!(note.contains("not applicable"), "note: {note}");
+        assert!(note.contains("needle"), "note: {note}");
+    }
+
+    /// `--local-only` forbids the download, so the step must skip rather
+    /// than reach for the network — and say that semantic search stays off.
+    #[test]
+    fn local_model_item_skips_the_fetch_under_local_only() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut config = forge_config::Config::default();
+        config.embedding.provider = "rten".to_string();
+        config.embedding.autofetch = true;
+        config.local_only = true;
+        // Point at a directory that cannot exist, so the step sees a
+        // *missing* model regardless of what the developer running this
+        // has cached.
+        config.embedding.weights_dir = dir.path().join("absent").display().to_string();
+
+        let item = local_model_item(dir.path(), &config);
+        let note = item.note.expect("note present");
+        assert!(note.contains("skipped"), "note: {note}");
+        assert!(note.contains("--local-only"), "note: {note}");
+    }
+
+    /// `embedding.autofetch = false` is the offline-deployment switch: the
+    /// step must not fetch, and must say so rather than reporting a model
+    /// it never installed.
+    #[test]
+    fn local_model_item_respects_autofetch_off() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut config = forge_config::Config::default();
+        config.embedding.provider = "rten".to_string();
+        config.embedding.autofetch = false;
+        config.local_only = false;
+        config.embedding.weights_dir = dir.path().join("absent").display().to_string();
+
+        let item = local_model_item(dir.path(), &config);
+        let note = item.note.expect("note present");
+        assert!(note.contains("autofetch disabled"), "note: {note}");
+    }
+
+    /// The "is it installed?" check is a real checksum, not a
+    /// file-existence check. A file whose bytes do not match the pin is
+    /// not an installed model, so init must treat it as absent and apply
+    /// the download rules.
+    ///
+    /// (The genuinely-installed path needs the real model, so it is
+    /// covered by the gated e2e test rather than here.)
+    #[test]
+    fn local_model_item_does_not_trust_a_file_that_fails_the_checksum() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let spec = forge_inference::spec_for_or_default("").expect("pinned");
+        for artifact in [spec.model, spec.tokenizer] {
+            let path = dir.path().join(artifact.filename);
+            std::fs::write(&path, b"not a real model").expect("write");
+        }
+        let mut config = forge_config::Config::default();
+        config.embedding.provider = "rten".to_string();
+        config.embedding.autofetch = false;
+        config.local_only = false;
+        config.embedding.weights_dir = dir.path().display().to_string();
+
+        let item = local_model_item(dir.path(), &config);
+        let note = item.note.expect("note present");
+        assert!(
+            note.contains("autofetch disabled"),
+            "a file whose bytes do not match the pin is not an installed model: {note}"
         );
     }
 

@@ -260,6 +260,9 @@ forge-providers   model providers (OpenAI-compatible, Anthropic, mocks) and
 forge-needle      NeedleEngine, backends (ffi/hash/unavailable), weights,
                   NeedleRouter, EngineEmbedder, engine cache
 needle-sys        raw FFI declarations + link configuration (feature ffi)
+forge-inference   pure-Rust local inference: InferenceSession seam, rten
+                  backend, pinned model catalog, weights, session cache,
+                  RtenEmbedder — no daemon, no native dependency
 forge-execution   native + mock execution; approval gating lives here
 forge-runtime     AgentService: the one runtime (agent loop, fast path,
                   tool dispatch) shared by CLI and server

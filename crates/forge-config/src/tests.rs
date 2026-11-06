@@ -692,6 +692,47 @@ fn embeddinggemma2_is_opt_in_and_validates_its_mrl_width() {
 }
 
 #[test]
+fn rten_is_a_valid_embedding_provider_and_ignores_the_mrl_width() {
+    // The rten provider's output width is fixed by the model, so
+    // `embedding.dimensions` — an EmbeddingGemma 2 concept — is not
+    // validated for it. The provider name itself is what config checks.
+    let configured: Config = toml::from_str(
+        "[embedding]\nprovider = \"rten\"\nmodel = \"bge-small-en-v1.5-int8\"\nautofetch = false",
+    )
+    .expect("parses");
+    assert!(configured.validate().is_ok());
+    assert_eq!(configured.embedding.provider, "rten");
+    assert_eq!(configured.embedding.model, "bge-small-en-v1.5-int8");
+    assert!(!configured.embedding.autofetch);
+}
+
+#[test]
+fn an_unknown_embedding_provider_is_rejected() {
+    let configured: Config = toml::from_str("[embedding]\nprovider = \"nope\"").expect("parses");
+    let error = configured.validate().expect_err("unknown provider");
+    let message = error.to_string();
+    assert!(message.contains("rten"), "message: {message}");
+}
+
+#[test]
+fn embedding_weights_dir_defaults_to_empty_and_autofetches() {
+    let defaults = Config::default();
+    assert_eq!(defaults.embedding.weights_dir, "");
+    assert!(defaults.embedding.autofetch);
+}
+
+#[test]
+fn embedding_model_defaults_to_empty_so_each_provider_supplies_its_own() {
+    // `embedding.model` means different things to different providers. A
+    // shared default would leak one provider's model name into another's
+    // configuration — asking the local runtime for a model called
+    // "embeddinggemma-2".
+    let defaults = Config::default();
+    assert_eq!(defaults.embedding.model, "");
+    assert!(defaults.validate().is_ok());
+}
+
+#[test]
 fn laya_defaults_and_autofetch_override() {
     let c = Config::default();
     assert_eq!(c.laya.weights_path, "");
