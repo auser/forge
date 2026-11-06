@@ -661,7 +661,7 @@ pub(super) fn record(path: &Path, draft: ContextPlanDraft) -> io::Result<Context
         &root.security,
     )?;
     // Persistent lock inode: deletion would split the transaction lock domain.
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + crate::store::LOCK_WAIT;
     loop {
         match lock.try_lock() {
             Ok(()) => break,

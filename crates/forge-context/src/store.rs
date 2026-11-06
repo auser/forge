@@ -6,6 +6,20 @@ use forge_core::ForgeError;
 
 use crate::{ContextPlan, ContextPlanDraft};
 
+/// How long a contender waits for a session or artifact lock before giving up
+/// with `WouldBlock`.
+///
+/// Shared by all three acquisition sites — the unix and windows `record`
+/// transactions and [`lock_artifacts`] — because they contend for the same
+/// kind of lock and had drifted apart: `record` waited one second while
+/// `lock_artifacts` waited five. One second is not enough under real
+/// contention. `independent_processes_serialize_compare_and_write` runs eight
+/// processes through one session lock, and each holds it across a directory
+/// open, a read, a hash compare and two writes; on a loaded machine the last
+/// contender in that queue exceeded a second and the whole suite failed, with
+/// nothing wrong in the code under test.
+pub(crate) const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) fn artifact_transaction<T>(
     path: &std::path::Path,
     operation: &mut dyn FnMut(&mut dyn crate::artifact::ArtifactFiles) -> std::io::Result<T>,
@@ -379,7 +393,7 @@ mod filesystem {
         fs::fchmod(&lock, Mode::from_raw_mode(0o600))?;
         // Kernel locks are released on crash. Never unlink lock files: doing so
         // could let contenders lock different inodes for the same session.
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + crate::store::LOCK_WAIT;
         loop {
             match lock.try_lock() {
                 Ok(()) => break,
@@ -479,7 +493,7 @@ fn read_bounded(input: std::fs::File, bound: usize) -> std::io::Result<Vec<u8>> 
 #[cfg(any(unix, windows))]
 fn lock_artifacts(lock: &std::fs::File) -> std::io::Result<()> {
     use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + LOCK_WAIT;
     loop {
         match lock.try_lock() {
             Ok(()) => return Ok(()),
@@ -854,7 +868,11 @@ mod tests {
                 .record(draft("run", "s", 2, "b"))
                 .is_err()
         );
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            start.elapsed() < crate::store::LOCK_WAIT + std::time::Duration::from_secs(2),
+            "waited well past the deadline: {:?}",
+            start.elapsed()
+        );
         assert!(store.plan("run", 2).unwrap().is_none());
         drop(lock);
         assert!(
@@ -910,8 +928,17 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(result.is_err());
-        assert!(elapsed >= std::time::Duration::from_secs(1));
-        assert!(elapsed < std::time::Duration::from_secs(2));
+        // Expressed against the constant, not a literal: these bounds are
+        // asserting "gives up after about one LOCK_WAIT", and hardcoding the
+        // number is what let `record` and `lock_artifacts` drift apart.
+        assert!(
+            elapsed >= crate::store::LOCK_WAIT,
+            "gave up early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < crate::store::LOCK_WAIT + std::time::Duration::from_secs(2),
+            "waited well past the deadline: {elapsed:?}"
+        );
         assert!(store.plan("run", 2).unwrap().is_none());
         assert!(
             store
