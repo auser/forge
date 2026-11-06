@@ -70,7 +70,10 @@ pub fn get(name: &str) -> Result<&'static str, forge_core::ForgeError> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
+    use crate::cli::Cli;
 
     /// Every preset parses against the current config schema — a preset
     /// can never drift out of date.
@@ -79,6 +82,24 @@ mod tests {
         for (name, contents) in PRESETS {
             let _: forge_config::Config = toml::from_str(contents)
                 .unwrap_or_else(|e| panic!("preset {name} does not parse: {e}"));
+        }
+    }
+
+    /// The registry is authoritative, so every accepted preset must remain
+    /// discoverable from the init command's help.
+    #[test]
+    fn every_preset_appears_in_init_help() {
+        let mut command = Cli::command();
+        let init = command
+            .find_subcommand_mut("init")
+            .expect("init subcommand exists");
+        let help = init.render_help().to_string();
+
+        for (name, _) in PRESETS {
+            assert!(
+                help.contains(name),
+                "preset {name:?} is accepted but missing from `forge init --help`"
+            );
         }
     }
 
