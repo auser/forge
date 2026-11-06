@@ -95,6 +95,24 @@ use std::os::raw::{c_char, c_int, c_uchar, c_ulonglong};
 /// runs — it just reports the engine as missing.
 pub const ENGINE_LINKED: bool = cfg!(needle_engine);
 
+/// Where the linked engine came from, as `build.rs` classified it:
+/// `"pinned"` (downloaded and checked against the pinned SHA-256),
+/// `"local-verified"` (`NEEDLE_LIB_DIR`/`vendor/`, byte-identical to the
+/// pin), `"local-unverified"` (supplied locally, not a pinned artifact), or
+/// `"none"` (engine-less build).
+pub const ENGINE_PROVENANCE: &str = match option_env!("NEEDLE_ENGINE_PROVENANCE") {
+    Some(value) => value,
+    None => "none",
+};
+
+/// One line saying which resolution path this build took and why: the
+/// target, origin, checksum and C++ runtime of a linked engine, or the reason
+/// an engine-less build has none. What `forge doctor` prints.
+pub const ENGINE_RESOLUTION: &str = match option_env!("NEEDLE_ENGINE_RESOLUTION") {
+    Some(value) => value,
+    None => "unknown (built without needle-sys's build script)",
+};
+
 #[cfg(needle_engine)]
 unsafe extern "C" {
     /// `int needle_init(const char*, const char*, const char*)` — installs the

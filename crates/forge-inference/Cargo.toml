@@ -1,0 +1,35 @@
+[package]
+name = "forge-inference"
+description = "Pure-Rust local inference runtime for Forge: rten-backed models with pinned, on-demand weights"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+forge-config.workspace = true
+forge-core.workspace = true
+# `rten` is a pure-Rust ONNX runtime: no C++ toolchain, no CMake, no NDK,
+# no per-platform static blobs. `onnx_format` reads the published ONNX
+# exports; `rten_format` additionally accepts `.rten` models, so an
+# operator can hand forge a pre-converted file.
+rten = { version = "0.27.0", features = ["onnx_format", "rten_format"] }
+rten-tensor = "0.27.0"
+rten-text = "0.27.0"
+reqwest.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+wiremock.workspace = true
+
+[features]
+# Opt-in tests that run a real encoder against real weights. They need the
+# model on disk (34 MB for the int8 default), so they are not part of
+# `just verify` — the repo deliberately does not carry one. `just lint-rten`
+# type-checks them without running them.
+rten-e2e = []

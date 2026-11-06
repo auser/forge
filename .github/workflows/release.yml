@@ -12,8 +12,10 @@
 # The other three ship engine-less on purpose (the build warns and continues):
 # Cactus publishes no engine for Intel macOS at all; the Windows artifact is a
 # COFF `libneedle.a` rather than the `needle.lib` MSVC resolves and needs a
-# libc++ MSVC has not got; and the x86_64 Linux archive leaves
-# `std::__1::__hash_memory` undefined, a symbol no distributed libc++ provides.
+# libc++ MSVC has not got; and the x86_64 Linux archive references
+# `std::__1::__hash_memory`, which only libc++ 21+ defines — the runner's distro
+# libc++ is older, so that asset stays engine-less until this workflow installs
+# LLVM's libc++-21-dev (a local `cargo build` with it links the brain).
 # Those binaries route statically and say so (`forge doctor`'s needle
 # line-pair). See the design spec's §8.
 #
@@ -47,10 +49,10 @@ jobs:
           - os: macos-14
             target: x86_64-apple-darwin
             brain: false
-          # x86_64 Linux ships engine-less: its `libneedle.a` leaves
-          # `std::__1::__hash_memory` undefined and no distributed libc++
-          # defines it, so the archive cannot be linked reproducibly. See
-          # PINNED_ENGINES in crates/needle-sys/build_support.rs.
+          # x86_64 Linux ships engine-less for now: its `libneedle.a` needs
+          # `std::__1::__hash_memory` (libc++ 21+), which the runner's distro
+          # libc++ lacks. See PINNED_ENGINES in
+          # crates/needle-sys/build_support.rs.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             brain: false

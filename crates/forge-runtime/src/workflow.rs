@@ -1146,6 +1146,161 @@ mod tests {
         );
     }
 
+    /// The `opusplan` promise, end to end: a profile serves the plan from
+    /// the strong model and the build from the cheap one.
+    ///
+    /// The two halves are proven apart elsewhere — that a phase reaches the
+    /// router, and that a profile's tier decides the model for a phase —
+    /// but the promise is one thing, and it is this: the plan and the
+    /// build are served by *different* models, in the same conversation.
+    /// The plan's output is still in the cheap model's context.
+    #[tokio::test]
+    async fn a_profile_serves_the_plan_and_the_build_from_different_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The strong model writes the plan; the cheap one builds it and
+        // reviews the result.
+        let strong = Arc::new(ScriptedMockModel::new(vec![
+            ScriptedReply {
+                text: None,
+                tool_calls: vec![ToolCall::new(
+                    "plan-inspect",
+                    "read_file",
+                    serde_json::json!({"path": "main.rs"}),
+                )],
+            },
+            ScriptedReply {
+                text: Some("1. Inspect main.rs\n2. Make the change\n3. Run tests".into()),
+                tool_calls: Vec::new(),
+            },
+        ]));
+        let cheap = Arc::new(ScriptedMockModel::new(vec![
+            ScriptedReply {
+                text: None,
+                tool_calls: vec![ToolCall::new(
+                    "implementation-write",
+                    "write_file",
+                    serde_json::json!({"path": "implemented.txt", "content": "done\n"}),
+                )],
+            },
+            ScriptedReply {
+                text: Some("implementation complete".into()),
+                tool_calls: Vec::new(),
+            },
+            ScriptedReply {
+                text: Some("No findings. The focused change is correct.".into()),
+                tool_calls: Vec::new(),
+            },
+        ]));
+
+        // The profile: one model for the plan, one for the build. A tier
+        // with a single model is a decision, so the strong model is not
+        // merely preferred — it is the only thing the plan phase can get.
+        let router = Arc::new(forge_providers::PhasePolicyRouter::new(
+            Arc::new(MockRouter::selecting("cheap-model")),
+            forge_core::PhasePolicyHandle::new(Some(forge_core::PhasePolicy::new(
+                "opusplan",
+                forge_core::ProfileConfig {
+                    plan: vec!["strong-model".to_string()],
+                    execute: vec!["cheap-model".to_string()],
+                    ..forge_core::ProfileConfig::default()
+                },
+            ))),
+        ));
+        let strong_for_factory = strong.clone();
+        let cheap_for_factory = cheap.clone();
+        // The candidate pool a router chooses from is the config's model
+        // table, so the profile's tiers must name models that are in it —
+        // a tier naming a model the pool does not carry cannot be served,
+        // and degrades to the ordinary pool instead.
+        let mut config = Config::default();
+        config.models.clear();
+        for name in ["strong-model", "cheap-model"] {
+            config.models.insert(
+                name.to_string(),
+                forge_config::ModelEntry {
+                    base_url: Some("https://models.invalid/v1".to_string()),
+                    ..forge_config::ModelEntry::default()
+                },
+            );
+        }
+        config.model = "cheap-model".to_string();
+        let service = AgentService::new(
+            strong.clone(),
+            router.clone(),
+            Arc::new(MockExecution::new(tmp.path())),
+            Arc::new(crate::NullSkillRegistry),
+            Arc::new(JsonlSessionStore::new(tmp.path().join(".forge/sessions"))),
+            config,
+        )
+        .with_model_factory(Arc::new(move |name: &str| {
+            Ok(match name {
+                "strong-model" => strong_for_factory.clone() as Arc<dyn ModelProvider>,
+                "cheap-model" => cheap_for_factory.clone() as Arc<dyn ModelProvider>,
+                other => {
+                    return Err(ForgeError::router(format!(
+                        "no provider for routed model {other:?}"
+                    )));
+                }
+            })
+        }));
+        let store = Arc::new(JsonlTaskStore::for_project(tmp.path()));
+
+        let outcome = run_development_workflow(
+            &service,
+            store,
+            tmp.path(),
+            "make the focused change",
+            RunOptions {
+                plan_before_execute: true,
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // The plan was served by the strong model...
+        let strong_models = strong
+            .recorded()
+            .iter()
+            .map(|request| request.model.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !strong_models.is_empty(),
+            "the plan phase must reach the strong model"
+        );
+        assert!(strong_models.iter().all(|model| model == "strong-model"));
+
+        // ...and the build by the cheap one.
+        let cheap_models = cheap
+            .recorded()
+            .iter()
+            .map(|request| request.model.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !cheap_models.is_empty(),
+            "the execute phase must reach the cheap model"
+        );
+        assert!(cheap_models.iter().all(|model| model == "cheap-model"));
+
+        // And the cheap model saw the plan, because they share a
+        // conversation — which is the whole point of switching models
+        // mid-task rather than starting a new one.
+        assert!(
+            cheap
+                .recorded()
+                .iter()
+                .any(|request| request.messages.iter().any(|message| {
+                    message.role == forge_core::Role::Assistant
+                        && message.content.contains("Inspect main.rs")
+                })),
+            "the build must see what the plan produced"
+        );
+        assert_eq!(
+            outcome.plan,
+            "1. Inspect main.rs\n2. Make the change\n3. Run tests"
+        );
+    }
+
     #[tokio::test]
     async fn independent_review_is_conditional_and_advisory() {
         let tmp = tempfile::tempdir().unwrap();

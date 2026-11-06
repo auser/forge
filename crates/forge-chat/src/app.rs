@@ -42,8 +42,8 @@
 use std::time::Duration;
 
 use crate::command::{ContextCommand, MemoryCommand};
-use forge_core::{Event, EventKind, ForgeError};
-use forge_runtime::{Attachment, RunOptions, RunOutcome};
+use forge_core::{Event, EventKind, ForgeError, RoutingPhase};
+use forge_runtime::{Attachment, RunOptions, RunOutcome, ToolAccess};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -662,6 +662,9 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                 Action::Authenticate(provider) => self.do_authenticate(&provider).await,
                 Action::ShowApproval => self.do_show_approval(),
                 Action::ShowConfig(key) => self.do_show_config(key),
+                Action::SetPlanMode(on) => self.do_set_plan_mode(on),
+                Action::SetProfile(name) => self.do_set_profile(name).await,
+                Action::ListProfiles => self.do_list_profiles().await,
                 Action::ListSkills => self.do_list_skills(),
                 Action::Graph(query, steering) => self.do_graph(query, steering).await,
                 Action::ShowSession => self.do_show_session(),
@@ -754,6 +757,15 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
                     run_id: Some(run_id.clone()),
                     session_id: Some(self.session_id.clone()),
                     activate_skills: turn.activate_skills,
+                    // Plan mode routes to the plan tier and keeps the model
+                    // read-only, so a planning turn cannot edit the tree.
+                    // The conversation is untouched either way — only the
+                    // model behind it changes.
+                    routing_phase: turn.routing_phase,
+                    tool_access: match turn.routing_phase {
+                        RoutingPhase::Plan => ToolAccess::ReadOnly,
+                        _ => ToolAccess::All,
+                    },
                     ..RunOptions::default()
                 },
             );
@@ -1057,6 +1069,47 @@ impl<Io: ChatIo, Host: ChatHost> App<Io, Host> {
     fn do_show_approval(&mut self) {
         let approval = self.host.environment().approval;
         self.emit(Line::meta(format!("approval {approval}")));
+    }
+
+    /// `/plan` — turn plan mode on or off.
+    ///
+    /// The conversation is not cleared and the running turn is not
+    /// disturbed: plan mode changes the phase of *subsequent* turns, which
+    /// is what lets the routing profile move the plan to a stronger model
+    /// while the build stays on the cheap one.
+    fn do_set_plan_mode(&mut self, on: bool) {
+        let message = if on {
+            "plan mode on - new turns route to the plan tier and are read-only"
+        } else {
+            "plan mode off - new turns route normally"
+        };
+        self.emit(Line::meta(message));
+    }
+
+    /// `/profile <name>|off` — select the routing profile for this session.
+    async fn do_set_profile(&mut self, name: Option<String>) {
+        let result = self.host.set_profile(name.clone()).await;
+        match result {
+            Ok(lines) => {
+                for line in lines {
+                    self.emit(line);
+                }
+            }
+            Err(e) => self.emit(Line::bad(format!("error: {e}"))),
+        }
+    }
+
+    /// `/profile` — list the routing profiles this host offers.
+    async fn do_list_profiles(&mut self) {
+        let result = self.host.list_profiles().await;
+        match result {
+            Ok(lines) => {
+                for line in lines {
+                    self.emit(line);
+                }
+            }
+            Err(e) => self.emit(Line::bad(format!("error: {e}"))),
+        }
     }
 
     fn do_show_config(&mut self, key: Option<String>) {

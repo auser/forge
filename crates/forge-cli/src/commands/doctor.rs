@@ -151,7 +151,15 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
     }
 
     // Credential detection summary (sources only, never values).
-    {
+    if forge_config::proxy_mode() {
+        checks.push(Check {
+            level: Level::Ok,
+            label: "credentials".into(),
+            detail: "subscription and provider-key discovery disabled by `forge proxy`; \
+                     models authenticate with the proxy key only"
+                .into(),
+        });
+    } else {
         let probes = forge_providers::probe_auth();
         let detected: Vec<String> = probes
             .iter()
@@ -185,6 +193,35 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
             label: "credentials".into(),
             detail,
         });
+    }
+
+    // `forge proxy`: URL, reachability, dialects, and (inside it) isolation.
+    for (level, label, detail) in
+        crate::commands::proxy_cmd::doctor_rows(resolved.as_ref().ok().map(|r| &r.config)).await
+    {
+        checks.push(Check {
+            level,
+            label: label.into(),
+            detail,
+        });
+    }
+
+    // `forge proxy init` writes `local_only` and `router_escalate` into the
+    // *user* config, so they outlive the proxy and apply to every ordinary
+    // run too — a normal `forge run` afterwards cannot reach a hosted
+    // provider, and the needle→jev escalation is dead. That is a defensible
+    // way to run, but it is a global change, and it is invisible unless
+    // something says so.
+    if let Ok(resolved) = &resolved
+        && !forge_config::proxy_mode()
+    {
+        let origin = resolved
+            .explain("local_only")
+            .map(|(_, origin)| origin.to_string())
+            .unwrap_or_else(|| "an unknown origin".to_string());
+        if let Some(check) = proxy_scope_check(&resolved.config, &origin) {
+            checks.push(check);
+        }
     }
 
     // Skill discovery.
@@ -238,6 +275,12 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
             label: "model eligibility".into(),
             detail,
         });
+        // The routing profile, if one is active. It is worth a line of its
+        // own because a tier names models, and a tier naming a model that
+        // is not eligible degrades to the ordinary pool *silently* — the
+        // run succeeds and the policy simply does not apply. This is where
+        // that shows up.
+        checks.push(profile_check(config, &eligible));
         // Model provider: a test-only mock is reported as whatever it
         // actually is right now — usable under the gate, broken without it
         // (every run would fail at provider construction, and "why does
@@ -372,6 +415,7 @@ pub async fn collect_checks(ctx: &Context) -> Result<Vec<Check>, ForgeError> {
         ));
 
         checks.extend(needle_checks(config).await);
+        checks.extend(embedding_checks(config));
         checks.push(jev_check(config));
         checks.extend(credential_env_checks(config));
         if let Some(check) = legacy_router_check(config) {
@@ -816,7 +860,7 @@ async fn needle_checks(config: &forge_config::Config) -> Vec<Check> {
     // points two ways at once. Backend first: without it, nothing about the
     // weights is actionable.
     let blocked_remedy = if !backend.usable {
-        Some(forge_needle::ENGINE_REMEDY.to_string())
+        Some(backend.remedy.clone())
     } else {
         weights.remedy.clone()
     };
@@ -839,10 +883,93 @@ async fn needle_checks(config: &forge_config::Config) -> Vec<Check> {
     vec![engine, brain]
 }
 
-/// Is there an inference engine in this binary at all?
+/// Checks for the local embedding model behind `embedding.provider = "rten"`.
+///
+/// Filesystem/checksum only: this never fetches the model over the network
+/// (that's `forge init`'s job), so `forge doctor` stays fast and offline.
+/// The same rule the Needle checks follow.
+///
+/// The check answers one question: *would semantic search actually work?* A
+/// model that is absent, or present but not matching its pinned digest, is
+/// a warning — forge still runs, it just has no semantic index.
+fn embedding_checks(config: &forge_config::Config) -> Vec<Check> {
+    const LABEL: &str = "embedding model";
+    const KNOWN: &[&str] = &["needle", "embeddinggemma2", "rten"];
+
+    if !KNOWN.contains(&config.embedding.provider.as_str()) {
+        // `forge doctor` does not validate the whole config, so a typo in
+        // the provider name would otherwise sail past every other check
+        // and fail later, far from the setting that caused it.
+        return vec![Check {
+            level: Level::Fail,
+            label: LABEL.into(),
+            detail: format!(
+                "unknown embedding provider {:?}; expected one of {}",
+                config.embedding.provider,
+                KNOWN.join(", ")
+            ),
+        }];
+    }
+
+    if config.embedding.provider != "rten" {
+        return vec![Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: format!("provider: {}", config.embedding.provider),
+        }];
+    }
+
+    let spec = match forge_inference::spec_for_or_default(&config.embedding.model) {
+        Ok(spec) => spec,
+        Err(e) => {
+            return vec![Check {
+                level: Level::Fail,
+                label: LABEL.into(),
+                detail: e.to_string(),
+            }];
+        }
+    };
+    let dir = forge_inference::weights_dir(&config.embedding, spec);
+    let model_path = dir.join(spec.model.filename);
+    let tokenizer_path = dir.join(spec.tokenizer.filename);
+
+    let model_ok =
+        forge_inference::weights::verify(&model_path, spec.model.sha256).unwrap_or(false);
+    let tokenizer_ok =
+        forge_inference::weights::verify(&tokenizer_path, spec.tokenizer.sha256).unwrap_or(false);
+
+    if model_ok && tokenizer_ok {
+        vec![Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: format!(
+                "{} ready in {} ({} dimensions)",
+                spec.display_name,
+                dir.display(),
+                spec.dimensions
+            ),
+        }]
+    } else {
+        vec![Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!(
+                "{} not installed in {} — run `forge init` to fetch it; semantic search is off \
+                 until then",
+                spec.display_name,
+                dir.display()
+            ),
+        }]
+    }
+}
+
+/// Is there an inference engine in this binary at all — and can this CPU
+/// run it?
 struct BackendState {
     usable: bool,
     detail: String,
+    /// What fixes it when `usable` is false.
+    remedy: String,
 }
 
 /// Where the weights stand, and — if they are the thing blocking the brain —
@@ -857,6 +984,12 @@ struct WeightsState {
 /// run inference": it is true only when `needle-sys`'s build script resolved
 /// a real engine and linked it, and false whenever it continued engine-less —
 /// a build-time fact about what resolved, not a feature someone asked for.
+///
+/// The detail always says *which* resolution path the build took and why
+/// (`forge_needle::ENGINE_RESOLUTION`: target, origin, checksum, C++ runtime
+/// — or the reason there is no engine), and, for a linked engine, what this
+/// CPU means for it (`forge_needle::cpu`): accelerated kernels, portable
+/// kernels, or a refusal.
 fn backend_state(using_hash_backend: bool) -> BackendState {
     if using_hash_backend {
         return BackendState {
@@ -864,17 +997,31 @@ fn backend_state(using_hash_backend: bool) -> BackendState {
             detail: "backend overridden to the deterministic hash backend \
                      (FORGE_NEEDLE_BACKEND=hash)"
                 .to_string(),
+            remedy: String::new(),
         };
     }
     if forge_needle::HAS_EMBEDDED_BACKEND {
+        let cpu = forge_needle::cpu::host();
         BackendState {
-            usable: true,
-            detail: "backend built in (libneedle linked)".to_string(),
+            usable: cpu.runnable(),
+            detail: format!(
+                "backend built in (libneedle linked, {}: {}); {}",
+                forge_needle::ENGINE_PROVENANCE,
+                forge_needle::ENGINE_RESOLUTION,
+                cpu.describe()
+            ),
+            remedy: "this machine's CPU is below the engine's floor; nothing to fetch or \
+                     rebuild here"
+                .to_string(),
         }
     } else {
         BackendState {
             usable: false,
-            detail: "backend not in this build (no engine linked)".to_string(),
+            detail: format!(
+                "backend not in this build (no engine linked: {})",
+                forge_needle::ENGINE_RESOLUTION
+            ),
+            remedy: forge_needle::ENGINE_REMEDY.to_string(),
         }
     }
 }
@@ -1082,8 +1229,8 @@ fn local_only_refuses(config: &forge_config::Config, url: &str) -> bool {
 /// What `local_only` is actually doing, for the run this configuration
 /// describes — reported only when it is on, and only in terms of what the
 /// code enforces: providers refuse a non-local endpoint at construction
-/// (redirects included), network decision routers are pruned, `forge init`
-/// skips the weights fetch.
+/// (redirects included), decision routers with an off-device endpoint are
+/// pruned, `forge init` skips the weights fetch.
 ///
 /// Deliberately `Ok` even when the configured model contradicts the setting:
 /// the `model provider` check below owns that verdict, and two `Fail` lines
@@ -1099,11 +1246,142 @@ fn local_only_check(config: &forge_config::Config) -> Option<Check> {
         level: Level::Ok,
         label: "local only".into(),
         detail: "enforced at provider construction (endpoint and every redirect must be \
-                 loopback, localhost or a socket path); jev and off-device decision routers \
-                 are pruned. Not a sandbox: tools and hooks you run are unrestricted, and a \
+                 loopback, localhost or a socket path); decision routers with an off-device \
+                 endpoint — a hosted jev included — are pruned, while a loopback one is kept. \
+                 Not a sandbox: tools and hooks you run are unrestricted, and a \
                  router that selects a hosted [models] entry fails that run rather than \
                  silently picking another."
             .into(),
+    })
+}
+
+/// The active routing profile and what it actually constrains.
+///
+/// A tier is a list of *model names*, so a tier naming a model that is not
+/// eligible cannot be honoured — the request degrades to the ordinary pool
+/// and the run still succeeds. That is the right failure (a working model
+/// beats no model), but it is silent, and a user who believes their tier
+/// policy is in force is wrong. So the check names the tiers *and* marks
+/// the models that cannot serve them.
+fn profile_check(config: &forge_config::Config, eligible: &[&str]) -> Check {
+    const LABEL: &str = "routing profile";
+    let Some(name) = config.profile.as_deref() else {
+        return Check {
+            level: Level::Ok,
+            label: LABEL.into(),
+            detail: "no profile active — every phase uses the ordinary candidate pool".into(),
+        };
+    };
+    let Some(profile) = config.profiles.get(name) else {
+        // Config::load refuses this, so it cannot happen at runtime; the
+        // check says so rather than reporting a profile that is not there.
+        return Check {
+            level: Level::Warn,
+            label: LABEL.into(),
+            detail: format!("profile {name:?} is selected but not defined"),
+        };
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut unusable = 0usize;
+    for (phase, own) in [
+        (forge_core::RoutingPhase::Plan, &profile.plan),
+        (forge_core::RoutingPhase::Execute, &profile.execute),
+        (forge_core::RoutingPhase::Review, &profile.review),
+        (forge_core::RoutingPhase::General, &profile.general),
+    ] {
+        if own.is_empty() {
+            continue;
+        }
+        let rendered = own
+            .iter()
+            .map(|model| {
+                if eligible.contains(&model.as_str()) {
+                    model.clone()
+                } else {
+                    unusable += 1;
+                    format!("{model} (not eligible)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("{}: {rendered}", phase.as_str()));
+    }
+    // A phase the profile does not name inherits the `general` tier, so the
+    // report says which tiers are inherited rather than letting it look as
+    // though the profile named them.
+    let general = &profile.general;
+    if !general.is_empty() {
+        for phase in [
+            forge_core::RoutingPhase::Plan,
+            forge_core::RoutingPhase::Execute,
+            forge_core::RoutingPhase::Review,
+        ] {
+            let own = match phase {
+                forge_core::RoutingPhase::Plan => &profile.plan,
+                forge_core::RoutingPhase::Execute => &profile.execute,
+                forge_core::RoutingPhase::Review => &profile.review,
+                forge_core::RoutingPhase::General => unreachable!(),
+            };
+            if !own.is_empty() {
+                continue;
+            }
+            let rendered = general
+                .iter()
+                .map(|model| {
+                    if eligible.contains(&model.as_str()) {
+                        model.clone()
+                    } else {
+                        unusable += 1;
+                        format!("{model} (not eligible)")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("{}: {rendered} (from general)", phase.as_str()));
+        }
+    }
+
+    let level = if unusable == 0 {
+        Level::Ok
+    } else {
+        Level::Warn
+    };
+    let detail = if parts.is_empty() {
+        format!("profile {name:?} is active but names no model for any phase")
+    } else {
+        format!("profile {name:?} — {}", parts.join("; "))
+    };
+    Check {
+        level,
+        label: LABEL.into(),
+        detail,
+    }
+}
+
+/// The scope a proxy setup left behind: `forge proxy init` writes
+/// `local_only` and `router_escalate` into the *user* config, so they
+/// outlive the proxy and apply to every ordinary run too — a normal
+/// `forge run` afterwards cannot reach a hosted provider, and the
+/// needle→jev escalation is dead.
+///
+/// That is a defensible way to run, but it is a global change, and
+/// nothing else says so. This is the line that says it.
+fn proxy_scope_check(config: &forge_config::Config, origin: &str) -> Option<Check> {
+    // The `[proxy]` section is what `forge proxy init` writes, so it is
+    // the signal that a proxy setup is in the config at all.
+    if config.proxy.url.is_none() || !config.local_only {
+        return None;
+    }
+    Some(Check {
+        level: Level::Warn,
+        label: "proxy scope".into(),
+        detail: format!(
+            "local_only is on (from {origin}) for every run, not only for proxied ones: \
+             an ordinary `forge run` cannot reach a hosted provider, and the jev \
+             escalation tier is off. `forge proxy init` writes this into the user \
+             config; remove the line if you want ordinary runs to stay online"
+        ),
     })
 }
 
@@ -1127,13 +1405,26 @@ fn jev_check(config: &forge_config::Config) -> Check {
         };
     }
 
-    if config.local_only {
-        // `--local-only` prunes jev in both roles at construction time
+    // Role-scoped resolution, shared with `router_from_config` so this
+    // check can never drift from what the router actually does: escalation
+    // never falls back to the generic `router_url`/`router_key_env` (which
+    // could belong to an unrelated http/laya setup), but the primary role
+    // does, for backwards compatibility.
+    let escalation = !is_primary;
+    let key_env = forge_providers::resolved_jev_key_env(config, escalation);
+    let endpoint = forge_providers::jev_endpoint(config, escalation);
+    let endpoint_is_local = forge_providers::endpoint_is_local(&endpoint);
+    let key_present = forge_providers::jev_credential_present(config, escalation);
+
+    if config.local_only && !endpoint_is_local {
+        // `--local-only` prunes a jev tier whose endpoint is off-device
         // (see `router_from_config`); this mirrors why it never even gets
         // asked about a credential. Primary always degrades straight to
         // "static" (a literal, hardcoded target in `router_from_config`,
         // not `router_fallback` — name the actual behavior, not a
-        // plausible-looking but wrong guess).
+        // plausible-looking but wrong guess). A **local** endpoint is not
+        // pruned at all: it sends the task text to a process on this
+        // machine, so it falls through to the reporting below.
         let detail = if is_primary {
             "not active (--local-only forces static routing)".to_string()
         } else {
@@ -1146,38 +1437,49 @@ fn jev_check(config: &forge_config::Config) -> Check {
         };
     }
 
-    // Role-scoped resolution, shared with `router_from_config` so this
-    // check can never drift from what the router actually does: escalation
-    // never falls back to the generic `router_url`/`router_key_env` (which
-    // could belong to an unrelated http/laya setup), but the primary role
-    // does, for backwards compatibility.
-    let escalation = !is_primary;
-    let key_env = forge_providers::resolved_jev_key_env(config, escalation);
-    let endpoint = forge_providers::resolved_jev_url(config, escalation)
-        .unwrap_or_else(|| forge_providers::JevRouter::DEFAULT_URL.to_string());
-    let key_present = forge_providers::jev_credential_present(config, escalation);
-
-    if key_present {
-        Check {
-            level: Level::Ok,
-            label: LABEL.into(),
-            detail: format!("credential detected ({key_env}); endpoint {endpoint}"),
-        }
+    // A local endpoint needs no credential — the self-hosted System One
+    // servers (lev, OpenJev, Kev) ignore the bearer token — so an unset
+    // credential is not a warning there. It is still reported, because
+    // "which credential would be used" is the question this line answers.
+    let (level, mut detail) = if key_present {
+        (Level::Ok, format!("credential detected ({key_env})"))
+    } else if endpoint_is_local {
+        (
+            Level::Ok,
+            format!("no credential needed ({key_env} unset; the endpoint is local)"),
+        )
     } else if is_primary {
-        Check {
-            level: Level::Warn,
-            label: LABEL.into(),
-            detail: format!(
+        (
+            Level::Warn,
+            format!(
                 "no credential ({key_env}); requests to {endpoint} will fail (falls back to {})",
                 config.router_fallback
             ),
-        }
+        )
     } else {
-        Check {
-            level: Level::Ok,
-            label: LABEL.into(),
-            detail: format!("jev escalation: no credential ({key_env}) — on-device only"),
-        }
+        (
+            Level::Ok,
+            format!("jev escalation: no credential ({key_env}) — on-device only"),
+        )
+    };
+
+    // The endpoint is appended for every case except the two that already
+    // name it, so one report cannot give two different answers about where
+    // the tier would dial.
+    if !detail.contains(&endpoint) {
+        detail.push_str(&format!("; endpoint {endpoint}"));
+    }
+    if config.local_only {
+        detail.push_str("; kept under --local-only (loopback endpoint)");
+    }
+    if config.jev_order_check {
+        detail.push_str("; option-order check on");
+    }
+
+    Check {
+        level,
+        label: LABEL.into(),
+        detail,
     }
 }
 
@@ -1651,6 +1953,75 @@ mod tests {
         assert!(check.detail.contains("api.typesafe.ai"), "{}", check.detail);
     }
 
+    /// A local endpoint needs no credential, so an unset one is not a
+    /// warning there — it is the normal shape of a self-hosted setup.
+    #[test]
+    #[serial]
+    fn jev_check_reports_a_local_endpoint_as_needing_no_credential() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = forge_config::Config {
+            router: "jev".to_string(),
+            jev_url: Some("http://127.0.0.1:8009/v1/systemone".to_string()),
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("no credential needed"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("127.0.0.1:8009"), "{}", check.detail);
+    }
+
+    /// `--local-only` keeps a loopback jev — it sends nothing off the
+    /// machine — and the report says so, instead of claiming the tier is
+    /// pruned.
+    #[test]
+    #[serial]
+    fn jev_check_keeps_a_local_jev_under_local_only() {
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        let config = forge_config::Config {
+            router: "jev".to_string(),
+            jev_url: Some("http://127.0.0.1:8009/v1/systemone".to_string()),
+            local_only: true,
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("kept under --local-only"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("forces static routing"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// The hosted jev is off-device, so `--local-only` still prunes it —
+    /// the promise is unchanged for anything that leaves the machine.
+    #[test]
+    #[serial]
+    fn jev_check_still_prunes_the_hosted_jev_under_local_only() {
+        unsafe { std::env::set_var("TYPESAFE_API_KEY", "dummy-value-for-test") };
+        let config = forge_config::Config {
+            router: "jev".to_string(),
+            local_only: true,
+            ..forge_config::Config::default()
+        };
+        let check = jev_check(&config);
+        unsafe { std::env::remove_var("TYPESAFE_API_KEY") };
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("--local-only forces static routing"),
+            "{}",
+            check.detail
+        );
+    }
+
     #[test]
     #[serial]
     fn jev_check_reports_informational_message_when_escalation_has_no_credential() {
@@ -1660,7 +2031,8 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.detail,
-            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only"
+            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only; \
+             endpoint https://api.typesafe.ai/v1/systemone"
         );
     }
 
@@ -1713,6 +2085,112 @@ mod tests {
              router_fallback: {}",
             check.detail
         );
+    }
+
+    /// A profile that names an eligible model for every phase is fine.
+    #[test]
+    fn the_profile_check_reports_each_tier() {
+        let mut config = forge_config::Config {
+            profile: Some("opusplan".to_string()),
+            ..forge_config::Config::default()
+        };
+        config.profiles.insert(
+            "opusplan".to_string(),
+            forge_config::ProfileConfig {
+                plan: vec!["opus".to_string()],
+                execute: vec!["sonnet".to_string()],
+                ..forge_config::ProfileConfig::default()
+            },
+        );
+        let check = profile_check(&config, &["opus", "sonnet"]);
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("plan: opus"), "{}", check.detail);
+        assert!(check.detail.contains("execute: sonnet"), "{}", check.detail);
+    }
+
+    /// A tier naming a model that cannot be served degrades to the ordinary
+    /// pool — silently, at run time. The check is where that shows up
+    /// instead.
+    #[test]
+    fn the_profile_check_marks_a_model_that_cannot_be_served() {
+        let mut config = forge_config::Config {
+            profile: Some("opusplan".to_string()),
+            ..forge_config::Config::default()
+        };
+        config.profiles.insert(
+            "opusplan".to_string(),
+            forge_config::ProfileConfig {
+                plan: vec!["opus".to_string()],
+                ..forge_config::ProfileConfig::default()
+            },
+        );
+        let check = profile_check(&config, &["sonnet"]);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("opus (not eligible)"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A phase the profile does not name inherits the general tier, and the
+    /// report says so rather than making it look named.
+    #[test]
+    fn the_profile_check_marks_an_inherited_tier() {
+        let mut config = forge_config::Config {
+            profile: Some("opusplan".to_string()),
+            ..forge_config::Config::default()
+        };
+        config.profiles.insert(
+            "opusplan".to_string(),
+            forge_config::ProfileConfig {
+                plan: vec!["opus".to_string()],
+                general: vec!["sonnet".to_string()],
+                ..forge_config::ProfileConfig::default()
+            },
+        );
+        let check = profile_check(&config, &["opus", "sonnet"]);
+        assert!(check.detail.contains("(from general)"), "{}", check.detail);
+    }
+
+    /// No profile: one line, saying routing is unconstrained — the report
+    /// should not grow a section about a policy nobody set.
+    #[test]
+    fn the_profile_check_says_so_when_no_profile_is_active() {
+        let check = profile_check(&forge_config::Config::default(), &["sonnet"]);
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("no profile active"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// The proxy scope line exists so that a global `local_only` left
+    /// behind by `forge proxy init` is visible rather than surprising. It
+    /// must not fire when no proxy is configured.
+    #[test]
+    fn the_proxy_scope_check_only_fires_for_a_configured_proxy() {
+        let mut config = forge_config::Config {
+            local_only: true,
+            ..forge_config::Config::default()
+        };
+        assert!(
+            proxy_scope_check(&config, "user-file").is_none(),
+            "no [proxy] section: nothing to be out of scope for"
+        );
+        config.proxy.url = Some("http://127.0.0.1:8001".to_string());
+        let check = proxy_scope_check(&config, "user-file").expect("a check");
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("user-file"), "{}", check.detail);
+    }
+
+    /// `local_only` off: nothing is out of scope, whatever the proxy says.
+    #[test]
+    fn the_proxy_scope_check_is_absent_without_local_only() {
+        let mut config = forge_config::Config::default();
+        config.proxy.url = Some("http://127.0.0.1:8001".to_string());
+        assert!(proxy_scope_check(&config, "user-file").is_none());
     }
 
     /// `local_only` off: no check at all, so the report doesn't grow a line
@@ -1864,7 +2342,8 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.detail,
-            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only"
+            "jev escalation: no credential (TYPESAFE_API_KEY) — on-device only; \
+             endpoint https://api.typesafe.ai/v1/systemone"
         );
         assert!(
             !check.detail.contains("poisoned.example.internal")

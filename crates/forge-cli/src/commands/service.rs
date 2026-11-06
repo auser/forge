@@ -185,7 +185,16 @@ pub fn build_service_with(
     if zero_config_selection {
         router_config.router = "static".to_string();
     }
-    let router = forge_providers::router_from_config(&router_config, &registry)?;
+    let router_config = router_config.clone();
+    // The phase policy is a handle, not a value: the router reads it on
+    // every decision, so the chat can switch profiles mid-session without
+    // rebuilding the router stack.
+    let phase_policy = forge_core::PhasePolicyHandle::new(router_config.phase_policy());
+    let router = forge_providers::router_from_config_with_policy(
+        &router_config,
+        &registry,
+        phase_policy.clone(),
+    )?;
 
     let execution = build_execution_with(&config, &root, options.approvals)?;
     let skills = Arc::new(FsSkillRegistry::new(&root, Some(execution.clone())));
@@ -241,7 +250,8 @@ pub fn build_service_with(
             .with_compression_enabled(compression_enabled)
             .with_observer(observer)
             .with_system_context(crate::commands::guidance::system_context(&root))
-            .with_model_factory(Arc::new(factory)),
+            .with_model_factory(Arc::new(factory))
+            .with_phase_policy(phase_policy),
     )
 }
 

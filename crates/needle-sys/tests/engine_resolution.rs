@@ -324,28 +324,174 @@ fn unsupported_targets_are_reported_as_unsupported_not_guessed() {
     }
 }
 
-/// x86_64 is deliberately absent, and this is the test that keeps it that way.
-///
-/// Both x86_64 archives (`linux-x86_64`, `windows-x86_64`) leave
-/// `std::__1::__hash_memory` undefined, and no Debian/Ubuntu libc++ package
-/// defines it at any version — the symbol lives only inside Cactus's own libc++
-/// build, which they ship pre-linked inside their `.so` and do not publish
-/// separately. Pinning `x86_64-unknown-linux-gnu` would therefore promise a
-/// download that cannot be linked, which is worse than admitting there is no
-/// engine: the user would get a link error instead of a working static-routing
-/// build plus an honest message.
+/// x86_64 Linux is pinned — at the immutable revision, like the arm64 pins —
+/// and the archive's one unusual need is a libc++ that defines
+/// `std::__1::__hash_memory` (libc++ 21+). That need is detected from the
+/// artifact, not hard-coded per target, so this checks both halves: the pin
+/// exists, and the symbol census recognises what the archive references.
 #[test]
-fn x86_64_linux_is_not_pinned_because_its_archive_cannot_be_linked() {
+fn x86_64_linux_is_pinned_and_its_libcxx_floor_is_detected_from_the_artifact() {
+    let pin = pinned_engine("x86_64-unknown-linux-gnu").expect("x86_64 Linux is pinned");
+    assert_eq!(pin.platform, "linux-x86_64");
     assert!(
-        pinned_engine("x86_64-unknown-linux-gnu").is_none(),
-        "see PINNED_ENGINES: the x86_64 archive needs a libc++ nobody distributes"
+        DEFAULT_BASE_URL.contains("/resolve/") && !DEFAULT_BASE_URL.ends_with("/main"),
+        "pins must resolve against an immutable revision, not main: {DEFAULT_BASE_URL}"
     );
-    let message = FetchError::UnsupportedTarget.message("x86_64-unknown-linux-gnu");
-    assert!(message.contains("static rules"), "{message}");
+
+    // An engine that references the symbol (as the x86_64 archive does) …
+    let mut engine = b"!<arch>\n...U _ZNSt3__16chrono12steady_clock3nowEv\0".to_vec();
+    engine.extend_from_slice(b"_ZNSt3__113__hash_memoryEPKvm\0...");
+    assert_eq!(
+        engine_libcxx_needs(&engine),
+        vec!["_ZNSt3__113__hash_memoryEPKvm"]
+    );
+    // … and one that does not (as the arm64 archives do not).
+    assert!(engine_libcxx_needs(b"!<arch>\n_ZNSt3__16chrono12steady_clock3nowEv").is_empty());
+
+    let message = FetchError::UnsupportedTarget.message("x86_64-apple-darwin");
     assert!(
-        message.contains("aarch64-unknown-linux-gnu"),
-        "must point at the Linux target that does work: {message}"
+        message.contains("x86_64-unknown-linux-gnu"),
+        "the unsupported-target message must now list x86_64 Linux: {message}"
     );
+}
+
+/// A GNU `ar` archive whose symbol index (member `/`) lists `defined`, and
+/// whose one member's bytes merely *mention* `mentioned`.
+fn gnu_archive(defined: &[&str], mentioned: &str) -> Vec<u8> {
+    let mut index = Vec::new();
+    index.extend_from_slice(&(defined.len() as u32).to_be_bytes());
+    for _ in defined {
+        index.extend_from_slice(&0u32.to_be_bytes());
+    }
+    for name in defined {
+        index.extend_from_slice(name.as_bytes());
+        index.push(0);
+    }
+    let header = |name: &str, size: usize| {
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644)
+    };
+    let mut out = b"!<arch>\n".to_vec();
+    out.extend_from_slice(header("/", index.len()).as_bytes());
+    out.extend_from_slice(&index);
+    if index.len() % 2 == 1 {
+        out.push(b'\n');
+    }
+    let member = format!("ELF... U {mentioned}");
+    out.extend_from_slice(header("member.o/", member.len()).as_bytes());
+    out.extend_from_slice(member.as_bytes());
+    out
+}
+
+/// The libc++ check reads the archive's symbol *index*, which lists defined
+/// symbols only — so a libc++ whose objects merely reference a symbol is not
+/// mistaken for one that provides it. Non-archives fall back to a byte search.
+#[test]
+fn a_libcxx_archive_counts_only_symbols_its_index_defines() {
+    let archive = gnu_archive(
+        &[
+            "_ZNSt3__16chrono12steady_clock3nowEv",
+            "_ZNSt3__113__hash_memoryEPKvm",
+        ],
+        "_ZNSt3__15mutex4lockEv",
+    );
+    let index = ar_symbol_index(&archive).expect("a GNU symbol index");
+    assert_eq!(index.len(), 2);
+    assert!(library_defines(&archive, "_ZNSt3__113__hash_memoryEPKvm"));
+    assert!(
+        !library_defines(&archive, "_ZNSt3__15mutex4lockEv"),
+        "referenced in a member, not defined: must not count"
+    );
+
+    let older = gnu_archive(&["_ZNSt3__16chrono12steady_clock3nowEv"], "x");
+    assert!(!library_defines(&older, "_ZNSt3__113__hash_memoryEPKvm"));
+
+    // A shared object: no `ar` index, so the dynamic string table decides.
+    assert!(ar_symbol_index(b"\x7fELF..._ZNSt3__113__hash_memoryEPKvm").is_none());
+    assert!(library_defines(
+        b"\x7fELF..._ZNSt3__113__hash_memoryEPKvm\0",
+        "_ZNSt3__113__hash_memoryEPKvm"
+    ));
+    // A Debian `libc++.so` linker script names no symbols, so it never counts.
+    assert!(!library_defines(
+        b"INPUT(libc++.so.1 -lc++abi)",
+        "_ZNSt3__113__hash_memoryEPKvm"
+    ));
+}
+
+/// The x86_64 failure this replaces was a *link error* on a machine with only
+/// libc++ 18. Now the plan refuses up front with the packages to install, and
+/// `build.rs` turns that into an engine-less build plus one warning.
+#[test]
+fn an_engine_needing_a_newer_libcxx_is_refused_up_front_not_at_link_time() {
+    let have = CxxAvailability {
+        unsatisfied: vec!["_ZNSt3__113__hash_memoryEPKvm".to_string()],
+        ..CxxAvailability::default()
+    };
+    let plan = cxx_plan("x86_64-unknown-linux-gnu", None, &have);
+    let blocker = plan.blocker.expect("must refuse");
+    assert!(
+        plan.flags.is_empty(),
+        "nothing may be linked: {:?}",
+        plan.flags
+    );
+    assert!(blocker.contains("libc++ 21"), "{blocker}");
+    assert!(
+        blocker.contains("libc++-21-dev"),
+        "names the package: {blocker}"
+    );
+    assert!(
+        blocker.contains("static rules"),
+        "says forge still works: {blocker}"
+    );
+
+    // An explicit runtime choice is the operator taking responsibility.
+    let overridden = cxx_plan("x86_64-unknown-linux-gnu", Some("none"), &have);
+    assert!(overridden.blocker.is_none());
+
+    // Satisfied needs (the default) never block.
+    assert!(
+        cxx_plan("x86_64-unknown-linux-gnu", None, &libcxx_installed())
+            .blocker
+            .is_none()
+    );
+}
+
+/// A symbol no libc++ anywhere defines must come back unsatisfied from the
+/// real probe — the end-to-end shape of the refusal on a machine without
+/// libc++ 21.
+#[test]
+fn the_probe_reports_a_symbol_no_installed_libcxx_defines() {
+    let host = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        _ => return, // the probe only runs for native ELF builds
+    };
+    let have = probe_cxx_for(host, host, &["_ZNSt3__1definitely_not_a_symbolEv"]);
+    assert_eq!(have.unsatisfied, vec!["_ZNSt3__1definitely_not_a_symbolEv"]);
+    assert_eq!(have.static_cxx, None);
+    assert!(probe_cxx_for(host, host, &[]).unsatisfied.is_empty());
+}
+
+/// `NEEDLE_LIB_DIR`/`vendor/` engines are linked as asked, but labelled: the
+/// pinned bytes are "local-verified", anything else "local-unverified" —
+/// never passed off as the verified artifact.
+#[test]
+fn a_local_engine_is_verified_against_the_pin_or_labelled_unverified() {
+    let pin = pinned_engine("x86_64-unknown-linux-gnu").expect("pinned");
+    assert_eq!(
+        local_provenance("x86_64-unknown-linux-gnu", pin.sha256),
+        Provenance::LocalVerified
+    );
+    assert_eq!(
+        local_provenance("x86_64-unknown-linux-gnu", &"0".repeat(64)),
+        Provenance::LocalUnverified
+    );
+    // A target with no pin can only ever be unverified.
+    assert_eq!(
+        local_provenance("x86_64-apple-darwin", pin.sha256),
+        Provenance::LocalUnverified
+    );
+    assert_eq!(Provenance::Pinned.as_str(), "pinned");
 }
 
 /// The linker's filename expectation differs from the published filename on
@@ -389,6 +535,7 @@ fn libcxx_installed() -> CxxAvailability {
         static_cxx: Some(PathBuf::from("/usr/lib/x86_64-linux-gnu")),
         static_cxxabi: Some(PathBuf::from("/usr/lib/x86_64-linux-gnu")),
         shared_cxx: true,
+        unsatisfied: Vec::new(),
     }
 }
 
@@ -534,6 +681,7 @@ fn a_machine_without_static_libcxx_links_dynamically_and_says_so() {
         static_cxx: None,
         static_cxxabi: None,
         shared_cxx: true,
+        unsatisfied: Vec::new(),
     };
     let plan = cxx_plan("x86_64-unknown-linux-gnu", None, &have);
 
@@ -596,6 +744,7 @@ fn a_static_plan_always_carries_the_search_dirs_rustc_needs() {
             static_cxx: Some(PathBuf::from("/usr/lib/llvm-18/lib")),
             static_cxxabi: Some(PathBuf::from("/usr/lib/x86_64-linux-gnu")),
             shared_cxx: true,
+            unsatisfied: Vec::new(),
         },
     );
     assert_eq!(

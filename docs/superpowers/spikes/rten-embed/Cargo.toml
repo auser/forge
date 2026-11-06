@@ -1,0 +1,16 @@
+[package]
+name = "rten-spike"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: this lives inside the forge repository tree but is deliberately
+# not a member of the forge workspace. An empty table detaches it.
+[workspace]
+
+[dependencies]
+rten = { version = "0.27.0", features = ["onnx_format", "rten_format", "mmap"] }
+rten-tensor = "0.27.0"
+rten-text = "0.27.0"
+
+[profile.release]
+opt-level = 3

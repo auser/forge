@@ -75,7 +75,13 @@ fn from_env(name: &str, kind: CredentialKind) -> Option<ResolvedCredential> {
     })
 }
 
+/// The one place a CLI credential store path is built. Inside `forge proxy`
+/// (see `forge_config::proxy`) there is no such path at all — whatever `HOME`
+/// points at, no subscription store is ever opened.
 fn home_file(rel: &str) -> Option<PathBuf> {
+    if forge_config::proxy_mode() {
+        return None;
+    }
     std::env::home_dir().map(|home| home.join(rel))
 }
 
@@ -125,7 +131,7 @@ fn claude_credential_from_json(text: &str, source: CredentialSource) -> Option<R
 fn claude_keychain_token() -> Option<ResolvedCredential> {
     // Hermetic integration suites deliberately unlock mock providers; never
     // let those processes read a developer's real login from Keychain.
-    if forge_config::test_mocks_allowed() {
+    if forge_config::test_mocks_allowed() || forge_config::proxy_mode() {
         return None;
     }
     let account = std::env::var("USER").ok()?;
@@ -236,6 +242,11 @@ pub fn resolve_credential(
     {
         return Some(cred);
     }
+    // Inside `forge proxy` the entry's own `key_env` is the only source:
+    // no conventional provider env var, no CLI subscription store.
+    if forge_config::proxy_mode() {
+        return None;
+    }
     match provider_hint {
         Some("anthropic") => from_env("ANTHROPIC_API_KEY", CredentialKind::ApiKey)
             .or_else(|| from_env("CLAUDE_CODE_OAUTH_TOKEN", CredentialKind::OAuthToken))
@@ -274,6 +285,8 @@ pub struct AuthProbe {
 /// Probe all known providers (for `forge auth status` and doctor).
 pub fn probe_auth() -> Vec<AuthProbe> {
     let mut out = Vec::new();
+    let hidden = forge_config::proxy_mode()
+        .then(|| "hidden by `forge proxy` (subscription stores are not read)".to_string());
     let probe = |provider: &str, models: &[&str]| {
         let credential = resolve_credential(None, Some(provider));
         AuthProbe {
@@ -282,7 +295,7 @@ pub fn probe_auth() -> Vec<AuthProbe> {
             detected: credential.is_some(),
             source: credential.as_ref().map(|c| c.source.clone()),
             kind: credential.as_ref().map(|c| c.kind),
-            note: None,
+            note: hidden.clone(),
         }
     };
     out.push(probe("anthropic", &["claude-sonnet"]));
@@ -298,7 +311,7 @@ pub fn probe_auth() -> Vec<AuthProbe> {
         detected: matches!(codex, CodexAuth::OAuth { .. }),
         source: matches!(codex, CodexAuth::OAuth { .. }).then_some(CredentialSource::CodexAuthJson),
         kind: matches!(codex, CodexAuth::OAuth { .. }).then_some(CredentialKind::OAuthToken),
-        note: None,
+        note: hidden,
     });
     out
 }
@@ -440,6 +453,65 @@ mod tests {
         assert!(resolve_credential(None, Some("kimi-code")).is_none());
         match prev_home {
             Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Inside `forge proxy`, a credential store that *is* on disk under
+    /// `HOME`, and conventional env vars that *are* set, are all ignored —
+    /// only the entry's own `key_env` resolves. The re-exec hides them too;
+    /// this is the in-process half of the guarantee.
+    #[test]
+    #[serial]
+    fn proxy_mode_reads_no_subscription_store_and_no_conventional_env() {
+        clear_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        for (dir, file, body) in [
+            (
+                ".claude",
+                ".credentials.json",
+                r#"{"claudeAiOauth": {"accessToken": "sk-ant-oat01-dummy"}}"#,
+            ),
+            (".codex", "auth.json", r#"{"OPENAI_API_KEY": "sk-codex"}"#),
+            (
+                ".kimi-code/credentials",
+                "kimi-code.json",
+                r#"{"access_token":"kimi-oauth"}"#,
+            ),
+        ] {
+            let path = tmp.path().join(dir);
+            std::fs::create_dir_all(&path).expect("mkdir");
+            std::fs::write(path.join(file), body).expect("write");
+        }
+        unsafe { std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token-1") };
+        unsafe { std::env::set_var("FORGE_PROVIDERS_PROXY_KEY", "dummy") };
+
+        // Sanity: outside proxy mode the stores are found.
+        assert!(resolve_credential(None, Some("kimi-code")).is_some());
+
+        unsafe { std::env::set_var(forge_config::proxy::PROXY_MODE_ENV, "1") };
+        for provider in ["anthropic", "openai", "kimi-code", "moonshot", "deepseek"] {
+            assert!(
+                resolve_credential(None, Some(provider)).is_none(),
+                "{provider} must resolve nothing inside forge proxy"
+            );
+        }
+        assert_eq!(codex_auth(), CodexAuth::Missing);
+        assert!(probe_auth().iter().all(|p| !p.detected && p.note.is_some()));
+        let key = resolve_credential(Some("FORGE_PROVIDERS_PROXY_KEY"), Some("anthropic"))
+            .expect("the entry's own key_env still resolves");
+        assert_eq!(
+            key.source,
+            CredentialSource::EnvVar("FORGE_PROVIDERS_PROXY_KEY".to_string())
+        );
+
+        unsafe { std::env::remove_var(forge_config::proxy::PROXY_MODE_ENV) };
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") };
+        unsafe { std::env::remove_var("FORGE_PROVIDERS_PROXY_KEY") };
+        match prev_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
     }

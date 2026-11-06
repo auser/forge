@@ -63,10 +63,10 @@ needle decision. See [Skills](#skills).)
 inference needs the native engine, and the engine is **on by default**: the
 build fetches and checksum-verifies it automatically for the platforms forge
 has verified, so the prebuilt release binaries for `aarch64-apple-darwin` and
-`aarch64-unknown-linux-gnu` — and a plain `cargo build` on those machines —
-come with a working brain. Intel macOS, x86_64 Linux and Windows get a
-statically-routing binary (the build warns once and continues engine-less),
-because no linkable engine exists for them yet.
+`aarch64-unknown-linux-gnu` — and a plain `cargo build` on those machines, or
+on x86_64 Linux with LLVM's libc++ 21+ installed — come with a working brain.
+Intel macOS and Windows get a statically-routing binary (the build warns once
+and continues engine-less), because no linkable engine exists for them yet.
 That is a supported configuration and fully usable, not a degraded one: you
 get deterministic static routing instead of the on-device model, and you give
 up the direct-dispatch fast path and the local semantic index
@@ -186,9 +186,11 @@ build instead of shipping, and CI runs each asset and asserts it really reports
 the engine before publishing. The `cargo install` fallback gets the brain too —
 the engine is fetched and checksum-verified by `needle-sys`'s build script on
 every build; if it cannot be fetched, the install retries engine-less, so a bad
-network never costs you the install. Intel macOS, x86_64 Linux and Windows get a
-statically-routing binary, because no linkable engine exists for them yet (see
-[Embedded Needle brain](#embedded-needle-brain) for exactly why each);
+network never costs you the install. On x86_64 Linux, `cargo install` links the
+brain when LLVM's libc++ 21+ is installed (the release asset for that target is
+still built brain-less, pending a CI image with that libc++). Intel macOS and
+Windows get a statically-routing binary, because no linkable engine exists for
+them yet (see [Embedded Needle brain](#embedded-needle-brain) for exactly why each);
 `forge doctor` says which one you have on its `needle engine` line.
 
 Brain-enabled assets need nothing extra installed to run — the C++ runtime is
@@ -408,7 +410,9 @@ hardware), `decider` (hosted routing from meraGPT's Decider 1) and `jev`
 `export TYPESAFE_API_KEY=...` is the one step that arms it), plus
 `local-first` (the default stack, made explicit), `hybrid-needle` (local
 first, hosted escalation), `budget-hosted`, `hybrid-laya` (the Laya-adapter
-example), and `hybrid-laya-native` (in-process Rust Laya), and an
+example), `hybrid-laya-native` (in-process Rust Laya), `opusplan` (the
+phase-tier policy: a strong model for the plan, a cheaper one for the
+build), and an
 [`env.example`](examples/env.example)
 template for provider keys. An existing config is never overwritten —
 `--preset` says so instead. Unit tests parse every preset (on disk and
@@ -585,6 +589,8 @@ session 01JCF3...  /help for commands
 /model      list models, or /model <name> to switch
 /auth       sign in: /auth <claude|codex|kimi>
 /approval   show the approval policy, or /approval <mode>
+/plan       toggle plan mode: /plan [on|off]
+/profile    list routing profiles, or /profile <name>|off
 /config     effective settings, or /config <key> for one
 /skills     discovered skills, name and description
 /graph      rank project files for a query, optionally /graph <query> -- <steering>
@@ -802,6 +808,14 @@ forge skill list|show|test
 forge router serve [--host --port]  Run the local Laya decision-router adapter
 forge model list|test
 forge config show|path|explain <key>
+forge proxy init [--url U] [--key-env N] [--models a,b]
+                                    Write the local proxy's [models] entries,
+                                    [proxy], local_only and router_escalate
+forge proxy [--url U] [--key-env N] [forge args…]
+                                    Run any forge command through the proxy with
+                                    subscription credentials hidden (`forge proxy`
+                                    alone is chat; `forge proxy -- init` runs
+                                    `forge init` itself)
 forge doctor [--live]               Environment/config health check (--live adds
                                     a real canary run: what answered, which router
                                     decided, whether Jev escalation fired, latency)
@@ -815,6 +829,7 @@ Global flags:
 --config <path>       additional config file, layered after the project config
 --project <path>      project directory (default: cwd, root discovered upward)
 --model <m>           override the configured model
+--profile <name>      activate a routing profile: which models may serve which phase
 --router <r>          override the router (needle|jev|laya|laya-native|http|static|cheapest)
 --execution <p>       override the execution provider (native)
 --local-only          refuse any provider or router endpoint that is not on
@@ -853,6 +868,7 @@ Key settings (all optional):
 | `model` | `qwen3-coder` | `FORGE_MODEL` | Active model |
 | `model_base_url` | `http://127.0.0.1:8080/v1` | `FORGE_MODEL_BASE_URL` | OpenAI-compatible endpoint (oMLX etc.). **Setting this overrides *every* model's endpoint**, including hosted `[models]` entries like `claude-sonnet` and `gpt-5` — setting it to the default value still counts as setting it. Per-model endpoints belong in `[models.<name>] base_url`. Combinations that cannot work are refused at startup, naming both settings: an `anthropic`-family model whose endpoint ends in `/v1` (the client appends `/v1/messages`, so it would 404), or an entry whose `provider` contradicts the endpoint (`provider = "anthropic"` pointed at `api.openai.com`) |
 | `model_key_env` | — | `FORGE_MODEL_KEY_ENV` | Name of the env var holding the API key |
+| `profile` | — | `FORGE_PROFILE` | Name of the active routing profile (`[profiles.<name>]`); without one, routing is unconstrained. A profile that is not defined is a configuration error, not a silent fallback — see [Routing profiles](#routing-profiles) |
 | `router` | `laya-native` | `FORGE_ROUTER` | Cost-aware native default; also `needle` \| `jev` \| `laya` \| `http` \| `static` \| `cheapest` |
 | `router_url` | — | `FORGE_ROUTER_URL` | System One-compatible router endpoint (laya default: `http://127.0.0.1:8788/decide`). Also used by `router = "jev"` as primary if `jev_url` is unset (backwards-compat only — **never** consulted by the Jev escalation tier; see `jev_url`) |
 | `router_key_env` | — | `FORGE_ROUTER_KEY_ENV` | Name of the env var holding the router key. Same primary-only fallback rule as `router_url` — the escalation tier never uses it (see `jev_key_env`) |
@@ -878,10 +894,12 @@ Key settings (all optional):
 | `laya.autofetch` | `true` | `FORGE_LAYA_AUTOFETCH` | Download the pinned ~847 MB native Laya checkpoint on first use; disabled automatically under `local_only` |
 | `needle.autofetch` | `true` | `FORGE_NEEDLE_AUTOFETCH` | `forge init` downloads + verifies weights (~35 MB for `full`) |
 | `needle.weights_sha256` | — | `FORGE_NEEDLE_WEIGHTS_SHA256` | Operator override for the expected weights checksum (64 hex chars); empty → use the compiled-in pin. Pairs with `weights_path`/a custom base URL to run your own weights without recompiling |
-| `embedding.provider` | `needle` | — | Semantic-index embedder: `needle` or `embeddinggemma2`; independent from `router` |
+| `embedding.provider` | `needle` | — | Semantic-index embedder: `needle`, `embeddinggemma2`, or `rten`; independent from `router` |
 | `embedding.base_url` | `http://127.0.0.1:8081/v1` | — | OpenAI-compatible embeddings endpoint used by `embeddinggemma2` |
-| `embedding.model` | `embeddinggemma-2` | — | Model name sent to the endpoint and included in index versioning; include a checkpoint/quantization suffix when changing either |
-| `embedding.dimensions` | `256` | — | EmbeddingGemma 2 MRL width: `128`, `256`, `512`, or `768` |
+| `embedding.model` | — | — | Model name for the configured provider, included in index versioning; include a checkpoint/quantization suffix when changing either. Empty → the provider's own default (`embeddinggemma-2` for `embeddinggemma2`, `bge-small-en-v1.5-int8` for `rten`) |
+| `embedding.dimensions` | `256` | — | EmbeddingGemma 2 MRL width: `128`, `256`, `512`, or `768`. Ignored by `rten`, whose width is fixed by the model (384) |
+| `embedding.weights_dir` | — | — | Directory holding the local model's files, used by `rten` only; empty → `~/.cache/forge/models/rten/<model-id>/` |
+| `embedding.autofetch` | `true` | — | Whether the pinned local model may be downloaded on first use, used by `rten` only; set false for offline deployments |
 
 Unknown keys are tolerated, with one deliberate exception: inside a
 `[models.<name>]` entry, `model_base_url`/`model_key_env` are rejected by
@@ -939,6 +957,80 @@ forge config show            # merged effective config
 forge config path            # config file locations and which exist
 forge config explain model   # winning value + source, e.g. model = "cli-model" (source: cli-flag)
 ```
+
+### Routing profiles
+
+A profile is a named policy that says which models may serve which phase of
+the work. It is Claude Code's `opusplan` alias — the strong model plans, the
+cheap one builds — expressed per *phase* rather than per vendor, so one
+profile works across Anthropic, OpenRouter, or a local model.
+
+```toml
+[profiles.opusplan]
+plan    = "claude-sonnet"              # one model  -> a decision
+execute = ["deepseek-chat", "gpt-5"]   # several    -> a menu
+review  = "claude-sonnet"
+general = "deepseek-chat"              # the default for phases the profile does not name
+```
+
+`forge init --preset opusplan` writes that shape, with the models forge
+declares. A tier names models, so a name that is not a declared model cannot
+be served — the tier degrades to the ordinary pool at run time, silently.
+`forge doctor` reports the active profile and marks every tier model that
+cannot be served, so a name that is not wired up shows up before a run
+quietly ignores it.
+
+Four keys, four phases: `plan`, `execute`, `review`, `general`. A phase takes
+either a single string or a list of strings — the two spellings mean the same
+thing, a tier. `[profiles.<name>]` entries merge by profile name across
+config layers (user config, then project config), exactly like
+`[models.<name>]`: a project layer that sets one tier does not erase the
+user's other tiers for the same profile.
+
+Selecting one takes three forms, lowest precedence first: `profile =
+"opusplan"` in the config file, `FORGE_PROFILE=opusplan` in the environment,
+`--profile opusplan` on the command line. Naming a profile that is not
+defined is a configuration error and the run refuses to start: a policy that
+silently did not apply is worse than one that failed to apply, because the
+user would believe their tier was in force while routing stayed
+unconstrained. `forge config explain profile` reports the selected profile
+and where it came from, like any other key.
+
+**How a tier resolves.** Four rules:
+
+1. **One model in a tier is a decision.** The router returns it directly: no
+   inference, no cost, no run-to-run variance.
+2. **Several models in a tier are a menu.** The configured decision router —
+   whatever `router =` names — chooses among them, so cost-aware selection
+   still applies *within* the tier. The tier says how good the model has to
+   be, not which one it is.
+3. **A phase the profile does not name falls back to `general`.** If
+   `general` is empty too, that phase is unconstrained and uses the ordinary
+   candidate pool.
+4. **The tier is capability-filtered.** A model in the tier that cannot do
+   what the task needs — no tools, no streaming — is dropped from it, the
+   same way it would be dropped from the ordinary pool.
+
+And two more, so a policy cannot turn a working run into a failed one:
+
+- **An unavailable tier degrades; it does not fail.** The tier is intersected
+  with the ordinary candidate pool, so a model that is unavailable,
+  undeclared, or incapable is dropped from it. If that leaves nothing, the
+  request falls through to the unconstrained pool and the decision says so:
+  an unavailable Opus should degrade to a working model, not to no model.
+- **The tier wins over the inner router.** If the router answers with a model
+  outside the tier, the answer is corrected to a model inside it and the
+  decision is marked as a fallback.
+
+**Where it applies.** `forge run --plan` runs a plan phase (read-only), then
+an execute phase, then an optional review phase, and a profile sends the plan
+to its `plan` tier and the build to its `execute` tier. The plan and the
+build share one conversation, so the cheap model still sees everything the
+expensive model produced. In the chat, an ordinary turn is the `general`
+phase and takes the `general` tier; `/plan` puts subsequent turns in the plan
+phase and keeps them read-only, and `/profile` selects a profile for the
+session — both are session-scoped, so no config file is written, and neither
+disturbs the running turn. See [Slash commands](#slash-commands).
 
 ### What `--local-only` restricts
 
@@ -1028,6 +1120,87 @@ Forge uses your existing credentials, in this order:
 `forge auth status` shows what was detected — provider, usable models, source,
 and kind (api-key/oauth) — never any values. `forge doctor` summarizes the
 same in one line.
+
+### Through a local proxy (`forge proxy`)
+
+When a local proxy holds the real credentials — for example a ccproxy serving
+Anthropic `POST /v1/messages` and OpenAI `POST /v1/chat/completions` /
+`POST /v1/responses` on `127.0.0.1:8001`, accepting any client key — run
+forge through it:
+
+```bash
+forge proxy init                     # once per machine
+forge proxy doctor
+forge proxy                          # chat
+forge proxy run "task"
+forge proxy --model claude-opus-5 run "task"
+```
+
+**`forge proxy init [--url URL] [--key-env NAME] [--models a,b,…]`** edits the
+user config (`$XDG_CONFIG_HOME/forge/config.toml`) in place — every other key,
+table and comment kept, and a second run changes nothing. It writes
+`local_only = true`, `router_escalate = "off"`, a `[proxy]` section (`url`,
+`key_env`), `model` (only if the file has none), and one `[models.<id>]` entry
+per model:
+
+- **Anthropic dialect** for `claude-*` ids: `provider = "anthropic"`,
+  `base_url = URL` (no `/v1` — forge appends `/v1/messages`).
+- **OpenAI dialect** for bare aliases (`sonnet`, `opus`, …): `base_url =
+  URL/v1`. The entry name is the wire model id, so one id gets one dialect.
+
+The list comes from `GET {URL}/v1/models` — the newest `claude-<family>-…` per
+family plus the bare aliases — or, if the proxy is unreachable, a built-in
+default (`claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5`; `opus`,
+`sonnet`, `haiku`). `--models` writes exactly the ids given. Existing entries
+of the same name keep their own description and capability keys; only
+`provider`, `base_url` and `key_env` are set.
+
+`local_only = true` and `router_escalate = "off"` are written into the *user*
+config, so they apply to every ordinary run as well as to proxied ones: after
+one `init`, a plain `forge run` cannot reach a hosted provider and the
+needle→jev escalation tier is off. That is a defensible way to run, but it is
+a global change, so `forge doctor` says so on its `proxy scope` line — and the
+line names where `local_only` came from. Delete the two lines from the user
+config to put ordinary runs back online.
+
+**Settings precedence:** flags (`--url`, `--key-env`) > environment
+(`FORGE_PROXY_URL`; the key from the `key_env` variable, then
+`FORGE_PROXY_API_KEY`, default `dummy`) > `[proxy]` > `http://127.0.0.1:8001`.
+The URL must be on this machine; for a proxy elsewhere, tunnel it
+(`ssh -N -L 8001:127.0.0.1:8001 host`) and point forge at the tunnel.
+
+**`forge proxy [forge args…]`** re-runs forge (`current_exe()`) with:
+
+- `HOME` → `~/.forge-home` (created `0700`), so no home-relative credential
+  store exists for anything in the process tree; `XDG_CONFIG_HOME` → the real
+  config dir (so the proxied forge reads the config `init` wrote);
+  `CARGO_HOME`/`RUSTUP_HOME` kept pointing at the real toolchains;
+- every `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`, `CODEX_*`, `MOONSHOT_*`, `KIMI_*`,
+  `DEEPSEEK_*`, `OPENROUTER_*`, `TYPESAFE_*` variable and forge's own endpoint
+  redirects (`FORGE_MODEL_BASE_URL`, `FORGE_ROUTER_URL`, `FORGE_JEV_*`, …)
+  removed;
+- `PATH` without the real home's directories or any directory holding a
+  `claude`, `codex` or `kimi` CLI;
+- the client key exported under `key_env`, and `FORGE_PROXY_MODE=1`.
+
+Inside that process forge also enforces it itself: credential resolution uses
+only a model entry's own `key_env` (no `~/.claude`, `~/.codex`, `~/.kimi-code`
+or Keychain read, whatever `HOME` is); `local_only = true` and
+`router_escalate = "off"` are pinned over every config layer and flag
+(`forge config explain local_only` reports `proxy`); every entry reading the
+proxy's `key_env` is pointed at the resolved URL; `.env` files cannot restore
+a cleared variable; `forge auth login` refuses. Global flags work before or
+after `proxy`; `forge proxy init` is the proxy's own subcommand, and
+`forge proxy -- init` runs `forge init` through the proxy.
+
+`forge doctor` reports a `proxy` line (URL and where it came from,
+reachability, the dialects the proxy answers — probed with a bodiless `GET`,
+which a POST-only route answers `405`, nothing forwarded upstream — and how
+many entries use it); inside `forge proxy` it adds `proxy isolation`, which
+fails if `HOME` is the real home, a cleared variable is set, or a subscription
+CLI is on `PATH`. Not a sandbox: like `local_only`, it constrains forge's own
+requests and credential lookups; a tool command the agent runs with an
+absolute path is still governed by the approval policy, not by this.
 
 The built-in subscription models are `claude-sonnet` (Anthropic Messages),
 `gpt-5.6-sol` (Codex Responses), and `k3` (Kimi Code). Forge reads token
@@ -1173,6 +1346,23 @@ relaxed. An `http`/`laya` router, by contrast, is judged on its endpoint —
 see [What `--local-only` restricts](#what---local-only-restricts). Jev
 and Kev-family services also work through the plain `http` backend if
 you'd rather speak the flat contract yourself — nothing is hard-coded.
+
+#### A profile wraps the whole stack
+
+A routing profile is not a filter on the primary router's proposal: it wraps
+the finished stack — threshold gate, escalation tier and fallback chain
+included — so the tier constrains the *final answer*, not just the first
+proposal. A fallback that would have answered outside the tier is corrected
+to the tier and the decision is marked as a fallback.
+
+That is the whole point of wrapping the stack rather than the primary tier.
+The fallback chain exists to keep a run working when a router is unreachable,
+unconfident, or uncredentialed, so a profile that only constrained the
+primary would be routed around exactly when things went wrong — the policy
+would hold exactly when it was not needed and lapse exactly when it was.
+
+See [Routing profiles](#routing-profiles) for the tiers themselves and how
+they resolve.
 
 ### Model registry with costs
 
@@ -1342,8 +1532,9 @@ forge graph context <query>    # ranked files/symbols for agent context
 
 `forge graph build --semantic` embeds every symbol and stores the vectors at
 `.forge/graph/embeddings.bin`. It uses the configured `[embedding]` provider;
-`needle` remains the zero-config default, while `embeddinggemma2` talks to a
-local OpenAI-compatible embeddings endpoint. Ordinary `forge graph build`
+`needle` remains the zero-config default, `embeddinggemma2` talks to a
+local OpenAI-compatible embeddings endpoint, and `rten` runs a pinned encoder
+in-process with no daemon and no native dependency. Ordinary `forge graph build`
 remains a fast, model-free structural operation. Embedding text is
 `"<kind> <name> in <path>"`;
 the index key is `"<path>::<name>"`, so two symbols with the same name in
@@ -1376,6 +1567,52 @@ Forge applies EmbeddingGemma 2's asymmetric code-retrieval prefixes, truncates
 the returned 768-value vectors to the configured MRL width, and L2-normalizes
 them before storage. Changing `model`, dimensions, or the built-in prompt
 format invalidates the old index cleanly.
+
+#### The `rten` provider (local, in-process)
+
+`rten` runs the encoder inside the forge process. There is no server to
+start, no Python, and — unlike the embedded Needle brain — no native
+toolchain and no per-platform static blob, so it works the same on every
+platform forge ships.
+
+```toml
+[embedding]
+provider = "rten"
+model = "bge-small-en-v1.5-int8"
+```
+
+`forge init` then downloads the pinned model (34 MB, int8) into
+`~/.cache/forge/models/rten/bge-small-en-v1.5-int8/`, verifying each file's
+SHA-256 before it is put in place. `forge doctor` reports whether the model is
+present and verified.
+
+Two pinned models are available:
+
+| `embedding.model` | Size | Dimensions | Notes |
+|---|---|---|---|
+| `bge-small-en-v1.5-int8` | 34 MB | 384 | Default. int8 — smaller *and* measured faster than float32 |
+| `bge-small-en-v1.5` | 133 MB | 384 | float32, for maximum fidelity |
+
+Both are `BAAI/bge-small-en-v1.5`, CLS-pooled and L2-normalised. The output
+width is fixed by the model, so `embedding.dimensions` does not apply to this
+provider.
+
+`embedding.model` is also the index-versioning key: the stored semantic index
+records the model id, so switching models discards and rebuilds the index
+rather than mixing vectors.
+
+`embedding.weights_dir` points at an operator-managed copy of the model
+instead of the forge cache, and `embedding.autofetch = false` turns the
+download off entirely for offline deployments — in which case the model must
+already be on disk, or semantic search stays off with a warning.
+
+Under `local_only`, the model may be *used* but never *fetched*: the
+download is the only network call this provider would ever make, and
+`local_only` hard-blocks all network. So with `local_only` on, the model has
+to be installed already.
+
+The runtime is CPU-only. It is a local *embedding* model, not a local
+generation model: it powers the semantic index, not code generation.
 
 `embeddings.bin` is a single `serde_json` blob today (an 8-byte `FRGEMB01`
 magic prefix + one JSON object), parsed in full on every load. That is fine
@@ -2226,6 +2463,7 @@ verified and whose link has been exercised:
 | --- | --- |
 | `aarch64-apple-darwin` | `macos-arm64` |
 | `aarch64-unknown-linux-gnu` | `linux-arm64` |
+| `x86_64-unknown-linux-gnu` | `linux-x86_64` (needs libc++ 21+, below) |
 
 The pinned checksums live in `PINNED_ENGINES` in
 `crates/needle-sys/build_support.rs`, together with the collected-but-unwired
@@ -2234,12 +2472,13 @@ checksums for the rest and the reason each is held back:
 - **Intel macOS: no engine exists.** There is no `macos-x86_64` folder in the
   repo at all. Builds for that target always resolve engine-less — they warn
   once at build time and forge routes statically.
-- **x86_64 Linux and x86_64 Windows: the archive cannot be linked.** Both leave
-  `std::__1::__hash_memory` undefined, and no distributed libc++ defines it
-  (checked across libc++ 18 and 20, dev and runtime, static and shared). That
-  symbol lives only inside Cactus's own libc++ build, which they ship
-  pre-linked inside their Python wheel's `.so` and do not publish separately.
-  The arm64 archives have no such problem.
+- **x86_64 archives need libc++ 21 or newer.** Both `linux-x86_64` and
+  `windows-x86_64` leave `std::__1::__hash_memory` undefined. libc++ moved that
+  function out of line in LLVM 21, so distro libc++ 18/20 cannot link the
+  engine but LLVM's own `libc++-21-dev` (apt.llvm.org) can. The build reads
+  this requirement from the archive and only uses a libc++ that defines it;
+  with none installed it continues engine-less with one warning naming the
+  packages, never a link error. The arm64 archives have no such requirement.
 - **Windows also** publishes `libneedle.a` (a COFF `ar` archive) rather than the
   `needle.lib` an MSVC `-lneedle` resolves, and needs a libc++ MSVC has not got.
 - **armv7/riscv64:** no forge target builds them, so the link is unexercised.
@@ -2258,6 +2497,17 @@ So on Linux, linking the engine needs libc++'s development files:
 ```bash
 sudo apt-get install libc++-dev libc++abi-dev     # Debian/Ubuntu
 sudo dnf install libcxx-devel libcxxabi-devel     # Fedora
+```
+
+On **x86_64 Linux** that libc++ must be 21 or newer (see above). On Ubuntu
+24.04, from LLVM's apt repository:
+
+```bash
+sudo install -d /etc/apt/keyrings
+curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
+  | sudo tee /etc/apt/sources.list.d/llvm-21.list
+sudo apt-get update && sudo apt-get install libc++-21-dev libc++abi-21-dev
 ```
 
 forge links them **statically**, so the binary you get has no libc++ runtime
@@ -2279,6 +2529,16 @@ Environment knobs:
 | `NEEDLE_ENGINE_BASE_URL` | fetch from a mirror instead of Hugging Face (same bytes: the checksum is not overridable) |
 | `NEEDLE_ENGINE_CACHE_DIR` | where verified engines are cached |
 | `NEEDLE_CXX_RUNTIME` | `static-libc++` (default), `libc++` (dynamic — for distro packages that must share the system runtime), `libstdc++` (escape hatch for a rebuilt engine), `none` (add no C++ runtime — for an engine that already carries its own) |
+
+Every build records which path it took — `forge doctor`'s `needle engine`
+line prints it: `pinned` (downloaded, checksum-verified), `local-verified`
+(`NEEDLE_LIB_DIR`/`vendor/` holding the pinned bytes), `local-unverified` (a
+local engine that is *not* a pinned artifact — linked as asked, labelled as
+such), or `none` with the reason. The same line reports the CPU: a linked
+engine runs only on a CPU that meets its measured floor (x86_64: SSE2;
+aarch64: NEON); the engine picks its own AVX2/AVX-512/VNNI or dotprod kernels,
+and a CPU without them gets the portable (much slower) kernels. Below the
+floor forge refuses the engine and routes with static rules, saying why.
 
 `needle.h` is committed as the contract of record — `needle-sys` hand-writes
 its six `extern "C"` declarations rather than generating them (no `bindgen`, so

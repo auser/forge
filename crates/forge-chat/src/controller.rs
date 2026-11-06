@@ -29,6 +29,7 @@ use crate::command::{
 };
 use crate::host::HostChange;
 use crate::io::{CompletionSnapshot, Line};
+use forge_core::RoutingPhase;
 
 /// How long a first `Ctrl-C` at an idle prompt stays armed (§6.3).
 const ARM_WINDOW: Duration = Duration::from_secs(2);
@@ -89,6 +90,12 @@ pub struct TurnRequest {
     /// Skill names for `RunOptions::activate_skills`. Empty for a plain
     /// prompt.
     pub activate_skills: Vec<String>,
+    /// The development phase this turn runs in.
+    ///
+    /// `General` for a plain prompt; `Plan` while plan mode is on. This is
+    /// the seam the routing profile uses to send the plan to a different
+    /// tier than the build — the same conversation, a different model.
+    pub routing_phase: RoutingPhase,
 }
 
 impl TurnRequest {
@@ -97,6 +104,7 @@ impl TurnRequest {
         Self {
             prompt: prompt.into(),
             activate_skills: Vec::new(),
+            routing_phase: RoutingPhase::General,
         }
     }
 }
@@ -127,6 +135,14 @@ pub enum Action {
     ShowApproval,
     /// `/config` (`None`) or `/config <key>` (`Some`).
     ShowConfig(Option<String>),
+    /// Turn plan mode on or off. A session-scoped toggle: the
+    /// conversation is not cleared, only the phase — and therefore the
+    /// routing tier — of subsequent turns changes.
+    SetPlanMode(bool),
+    /// Select a routing profile, or clear it with `None`.
+    SetProfile(Option<String>),
+    /// List the routing profiles this host offers.
+    ListProfiles,
     ListSkills,
     /// `/graph <query>`, optionally `/graph <query> -- <steering>`.
     Graph(String, Option<String>),
@@ -189,6 +205,11 @@ pub struct Controller {
     exit_requested: bool,
     /// Batch mode saw EOF: finish the in-flight turn, run the queue, leave.
     draining: bool,
+    /// Plan mode: subsequent turns run in the `Plan` phase, which a
+    /// routing profile sends to a different tier than the build. The
+    /// conversation is untouched — only the model behind it changes, which
+    /// is the property that makes switching mid-session safe.
+    plan_mode: bool,
 }
 
 impl Controller {
@@ -202,6 +223,7 @@ impl Controller {
             armed_at: None,
             exit_requested: false,
             draining: false,
+            plan_mode: false,
         }
     }
 
@@ -259,6 +281,7 @@ impl Controller {
             Parsed::Skill { name, prompt } => self.on_prompt(TurnRequest {
                 prompt,
                 activate_skills: vec![name],
+                routing_phase: RoutingPhase::General,
             }),
             Parsed::Unknown(name) => vec![Action::Write(Line::bad(format!(
                 "unknown command /{name} - /help lists them"
@@ -292,6 +315,27 @@ impl Controller {
                 self.rebuild(HostChange::Approval(mode))
             }
             Parsed::Config(key) => vec![Action::ShowConfig(key)],
+            Parsed::Plan(None) => {
+                let next = !self.plan_mode;
+                self.plan_mode = next;
+                vec![Action::SetPlanMode(next)]
+            }
+            Parsed::Plan(Some(on)) => {
+                self.plan_mode = on;
+                vec![Action::SetPlanMode(on)]
+            }
+            Parsed::Profile(None) => vec![Action::ListProfiles],
+            Parsed::Profile(Some(name)) => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return vec![Action::Write(Line::bad("usage: /profile <name>|off"))];
+                }
+                vec![Action::SetProfile(if name == "off" || name == "none" {
+                    None
+                } else {
+                    Some(name)
+                })]
+            }
             Parsed::Skills => vec![Action::ListSkills],
             Parsed::Graph(query, steering) => vec![Action::Graph(query, steering)],
             Parsed::Queue(command) => self.on_queue(command),
@@ -382,7 +426,11 @@ impl Controller {
         self.queue.len()
     }
 
-    fn on_prompt(&mut self, turn: TurnRequest) -> Vec<Action> {
+    fn on_prompt(&mut self, mut turn: TurnRequest) -> Vec<Action> {
+        // The phase is stamped at the moment the turn is created, not when
+        // it runs: a prompt queued while a turn was in flight keeps the
+        // phase that was in effect when it was typed.
+        turn.routing_phase = self.current_phase();
         if self.attached.is_some() {
             // §6.5: queued as the next turn, FIFO, never dropped.
             let preview = prompt_preview(&turn.prompt);
@@ -394,6 +442,20 @@ impl Controller {
         }
         self.attached = Some(Attached::Working);
         vec![Action::Prompt(turn)]
+    }
+
+    /// Whether plan mode is on.
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    /// The phase a turn started now would run in.
+    pub fn current_phase(&self) -> RoutingPhase {
+        if self.plan_mode {
+            RoutingPhase::Plan
+        } else {
+            RoutingPhase::General
+        }
     }
 
     fn on_queue(&mut self, command: QueueCommand) -> Vec<Action> {
@@ -643,6 +705,65 @@ mod tests {
 
     fn batch() -> Controller {
         Controller::new(CompletionSnapshot::default(), Interactivity::Batch)
+    }
+
+    /// Plan mode changes the phase of subsequent turns, not the
+    /// conversation: the prompt still runs, and it runs in the same
+    /// session.
+    #[test]
+    fn plan_mode_moves_the_next_turn_to_the_plan_phase() {
+        let mut c = idle();
+        assert_eq!(c.current_phase(), RoutingPhase::General);
+
+        let actions = c.on_line("/plan");
+        assert_eq!(actions, vec![Action::SetPlanMode(true)]);
+        assert_eq!(c.current_phase(), RoutingPhase::Plan);
+
+        let actions = c.on_line("design the approach");
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::Prompt(turn) => {
+                assert_eq!(turn.routing_phase, RoutingPhase::Plan);
+                assert_eq!(turn.prompt, "design the approach");
+            }
+            other => panic!("expected a prompt, got {other:?}"),
+        }
+    }
+
+    /// `/plan` toggles, and `/plan off` puts it back.
+    #[test]
+    fn plan_mode_toggles_and_can_be_set_outright() {
+        let mut c = idle();
+        assert_eq!(c.on_line("/plan"), vec![Action::SetPlanMode(true)]);
+        assert_eq!(c.on_line("/plan"), vec![Action::SetPlanMode(false)]);
+        assert_eq!(c.on_line("/plan on"), vec![Action::SetPlanMode(true)]);
+        assert_eq!(c.on_line("/plan off"), vec![Action::SetPlanMode(false)]);
+        assert_eq!(c.current_phase(), RoutingPhase::General);
+    }
+
+    /// A prompt typed while a turn was in flight keeps the phase that was
+    /// in effect when it was typed.
+    #[test]
+    fn a_queued_prompt_keeps_the_phase_it_was_typed_in() {
+        let mut c = idle();
+        c.on_line("/plan");
+        c.on_line("first");
+        // The first turn is attached, so the next prompt queues.
+        c.on_line("second");
+        let queued = c.take_queued().expect("a queued turn");
+        assert_eq!(queued.routing_phase, RoutingPhase::Plan);
+    }
+
+    /// `/profile` lists; `/profile <name>` selects; `/profile off` clears.
+    #[test]
+    fn the_profile_command_reaches_the_host() {
+        let mut c = idle();
+        assert_eq!(c.on_line("/profile"), vec![Action::ListProfiles]);
+        assert_eq!(
+            c.on_line("/profile opusplan"),
+            vec![Action::SetProfile(Some("opusplan".to_string()))]
+        );
+        assert_eq!(c.on_line("/profile off"), vec![Action::SetProfile(None)]);
     }
 
     #[test]
@@ -1166,6 +1287,7 @@ mod tests {
             Some(TurnRequest {
                 prompt: "Use the tdd skill.\n\nwrite the failing test".into(),
                 activate_skills: vec!["tdd".into()],
+                routing_phase: RoutingPhase::General,
             })
         );
     }
@@ -1280,6 +1402,7 @@ mod tests {
             vec![Action::Prompt(TurnRequest {
                 prompt: "Use the tdd skill.\n\nwrite the failing test".into(),
                 activate_skills: vec!["tdd".into()],
+                routing_phase: RoutingPhase::General,
             })]
         );
     }

@@ -66,11 +66,12 @@ jobs:
   # engine that stops linking, or an FFI unit test that starts failing for
   # real rather than merely compiling.
   #
-  # **arm64, not x86_64.** The only Linux engine forge can link is
-  # `linux-arm64`: the x86_64 archive leaves `std::__1::__hash_memory`
-  # undefined and no distributed libc++ defines it (see PINNED_ENGINES in
-  # crates/needle-sys/build_support.rs). Running this on `ubuntu-latest` would
-  # be a job that is *expected* to fail, which is just noise.
+  # **arm64, not x86_64 (yet).** The x86_64 archive is pinned too, but it
+  # references `std::__1::__hash_memory`, which only libc++ 21+ defines; the
+  # distro libc++ this job installs is older, so on `ubuntu-latest` needle-sys
+  # would (correctly) go engine-less and NEEDLE_REQUIRE_ENGINE would fail the
+  # job. An x86_64 twin needs LLVM's libc++-21-dev from apt.llvm.org (see
+  # PINNED_ENGINES in crates/needle-sys/build_support.rs).
   #
   # aarch64-unknown-linux-gnu is a pinned, link-verified target, so
   # NEEDLE_REQUIRE_ENGINE is safe to set: "could not get an engine" should fail

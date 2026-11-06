@@ -1,0 +1,12 @@
+[workspace]
+[package]
+name = "infinity-runtime-spike"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+infinity-agent-core = "0.2"
+infinity-provider-protocol = "0.2"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+async-trait = "0.1"
+futures-util = "0.3"

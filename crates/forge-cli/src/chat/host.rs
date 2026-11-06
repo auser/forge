@@ -67,6 +67,14 @@ pub struct CliHost {
     /// `/context` ranks lexically — the same degradation `forge graph
     /// context` has without an engine.
     embedder: Option<Arc<dyn Embedder>>,
+    /// The session's routing-profile override.
+    ///
+    /// `None` means "the config decides"; `Some(None)` means "no profile,
+    /// whatever the config says"; `Some(Some(name))` names one. Kept
+    /// outside [`ServiceOptions`] because it is *not* a config override
+    /// layer — it is a pointer swap on the live router, and a runtime
+    /// rebuild has to re-apply it rather than re-derive it from a file.
+    session_profile: Option<Option<String>>,
     /// `project_files`' cache: the loaded path list keyed by the graph
     /// file's mtime (`None` = the file was absent at load). `refresh_
     /// completions` calls this once per submitted line, so the steady
@@ -125,8 +133,30 @@ impl CliHost {
             options,
             needle,
             embedder,
+            session_profile: None,
             paths_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The routing policy this session should run under, if any.
+    ///
+    /// The session override wins over the config file; an explicit "off"
+    /// wins over both.
+    fn session_policy(&self) -> Option<forge_core::PhasePolicy> {
+        let config = self.service.config();
+        let name = match &self.session_profile {
+            Some(Some(name)) => name.clone(),
+            Some(None) => return None,
+            None => config.profile.clone()?,
+        };
+        let profile = config.profiles.get(&name)?.clone();
+        Some(forge_core::PhasePolicy::new(name, profile))
+    }
+
+    /// Push the session's policy onto the live router. Cheap: the router
+    /// reads the handle on every decision, so nothing is rebuilt.
+    fn apply_session_profile(&self) {
+        self.service.set_phase_policy(self.session_policy());
     }
 }
 
@@ -167,6 +197,72 @@ impl ChatHost for CliHost {
         let rendered = serde_json::to_string_pretty(&task)
             .map_err(|error| ForgeError::task(format!("serializing task: {error}")))?;
         Ok(rendered.lines().map(forge_chat::Line::meta).collect())
+    }
+
+    async fn set_profile(
+        &mut self,
+        profile: Option<String>,
+    ) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        // Validate before mutating anything: an unknown profile must leave
+        // the session exactly as it was.
+        if let Some(name) = &profile {
+            let config = self.service.config();
+            if !config.profiles.contains_key(name) {
+                return Err(ForgeError::config(format!(
+                    "profile {name:?} is not defined; add a [profiles.{name}] section"
+                )));
+            }
+        }
+        self.session_profile = Some(profile.clone());
+        self.apply_session_profile();
+        Ok(match profile {
+            None => vec![forge_chat::Line::meta(
+                "routing profile cleared - every phase uses the ordinary candidate pool",
+            )],
+            Some(name) => {
+                let policy = self.session_policy();
+                let summary = policy
+                    .map(|policy| {
+                        let profile = policy.profile;
+                        format!(
+                            "routing profile {} - plan: {} | execute: {} | review: {}",
+                            policy.name,
+                            tier_summary(&profile.plan),
+                            tier_summary(&profile.execute),
+                            tier_summary(&profile.review),
+                        )
+                    })
+                    .unwrap_or_else(|| format!("routing profile {name}"));
+                vec![forge_chat::Line::meta(summary)]
+            }
+        })
+    }
+
+    async fn list_profiles(&mut self) -> Result<Vec<forge_chat::Line>, ForgeError> {
+        let config = self.service.config();
+        if config.profiles.is_empty() {
+            return Ok(vec![forge_chat::Line::meta(
+                "no routing profiles are configured - add [profiles.<name>] to the config",
+            )]);
+        }
+        let active = self.session_policy().map(|policy| policy.name);
+        Ok(config
+            .profiles
+            .iter()
+            .map(|(name, profile)| {
+                let marker = if active.as_deref() == Some(name.as_str()) {
+                    "* "
+                } else {
+                    "  "
+                };
+                forge_chat::Line::meta(format!(
+                    "{marker}{name} - plan: {} | execute: {} | review: {}",
+                    tier_summary(&profile.plan),
+                    tier_summary(&profile.execute),
+                    tier_summary(&profile.review),
+                ))
+            })
+            .collect())
     }
 
     async fn context_status(
@@ -240,6 +336,7 @@ impl ChatHost for CliHost {
         let service = build_run_service_with(&self.ctx, options.clone()).await?;
         self.service = Arc::new(service);
         self.options = options;
+        self.apply_session_profile();
         Ok(())
     }
 
@@ -260,6 +357,7 @@ impl ChatHost for CliHost {
         let service = build_run_service_with(&self.ctx, options.clone()).await?;
         self.service = Arc::new(service);
         self.options = options;
+        self.apply_session_profile();
         Ok(())
     }
 
@@ -438,6 +536,16 @@ fn project_files_at(
     // for once per file version, not re-parsed on every submitted line.
     *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((mtime, paths.clone()));
     paths
+}
+
+/// How a profile's tier reads on one line. An empty tier is unconstrained,
+/// and says so rather than showing an empty gap.
+fn tier_summary(models: &[String]) -> String {
+    if models.is_empty() {
+        "any".to_string()
+    } else {
+        models.join(", ")
+    }
 }
 
 /// User-visible model choices, with every test-only mock removed (§9.3) —

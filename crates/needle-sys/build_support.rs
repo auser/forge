@@ -46,43 +46,49 @@ struct PinnedEngine {
 /// which are deliberately **not** wired up (see the report / spec §8):
 ///
 /// ```text
-/// linux-x86_64    2581e7d46acd4f66c5839bcfb06b0af11c157c8775636875beb0af5ca35ded54  1675104
 /// windows-x86_64  6fb0b9bccfa9f54d46e05a279273c15021570a53a8b3945613d80d299ca1f634  1808664
 /// windows-arm64   3a945065225cb383cab9b75333ebe0195d25c7e7c815f032d47857b354056d75  1650954
 /// linux-armv7     b1c3cf3ac526cb01314529da2094b8e5b38f41acd5b4a956fc05f22fb4b99346  1334534
 /// linux-riscv64   11e0eea3d8dff6826171a702f6e741c3cbedde4e42a1ca1959d3712092adbc53  1548596
 /// ```
 ///
-/// **The x86_64 archives cannot be linked against any distributed libc++** —
-/// measured, and the reason `linux-x86_64` is on that list despite being the
-/// most common Linux target. Both `linux-x86_64` and `windows-x86_64` leave
+/// **`linux-x86_64` is pinned, and needs libc++ 21 or newer to link.** The
+/// x86_64 archives (`linux-x86_64`, `windows-x86_64`) leave
 /// `std::__1::__hash_memory(void const*, unsigned long)`
-/// (`_ZNSt3__113__hash_memoryEPKvm`) undefined, and **no** Debian/Ubuntu
-/// libc++ package defines it — checked across libc++ 18 and 20, dev and
-/// runtime, static archive and shared object, all zero. The symbol exists only
-/// inside Cactus's own libc++ build, which they do not publish standalone:
-/// their manylinux x86_64 wheel ships `libneedle3.so` with that runtime
-/// *already linked in* (`objdump -p` shows only libm/libc/libpthread/libdl and
-/// no undefined `__hash_memory`). So the `.a` for x86_64 is effectively
-/// incomplete for external linking, while the arm64 `.a` links cleanly against
-/// a stock libc++. Nothing forge can do about that from here — reconsider if
-/// Cactus ships an x86_64 archive that links against a stock libc++, or if
-/// forge ever links their self-contained `.so` instead of the `.a`.
+/// (`_ZNSt3__113__hash_memoryEPKvm`) undefined. That symbol was moved out of
+/// line into the libc++ library in LLVM 21, so Ubuntu 24.04's own libc++ 18
+/// (and Debian's 20) do not define it — which is why this target used to be
+/// held back — but LLVM's `libc++-21-dev`/`libc++abi-21-dev` from
+/// apt.llvm.org do (`nm -C libc++.a` shows it as `T`). Verified 2026-10-12 on
+/// `x86_64-unknown-linux-gnu` (Ubuntu 24.04, libc++ 21.1.8, static): links
+/// with no new runtime dependencies (`ldd`: libm, libgcc_s, libc), and a real
+/// `needle_complete` against the pinned `needle3.cact` returns a valid tool
+/// call. Because the symbol requirement is a fact about the *artifact*,
+/// [`LIBCXX_NEWER_SYMBOLS`] lets [`probe_cxx`] pick only a libc++ that
+/// defines what the engine references, and a machine with only an older
+/// libc++ resolves engine-less with a warning naming the packages — never a
+/// link error. Measured instruction-set floor of this archive: everything
+/// outside the `*_avx2`/`*_avx512`/`*_vnni`/AMX kernels is plain x86-64
+/// (SSE2, no VEX), and the engine picks those kernels itself from `cpuid` at
+/// load (`g_avx2`, `g_avx512f`, `g_avx512_vnni`, `g_avx512_bf16`,
+/// `g_amx_bf16`); it was run to the same answer under `qemu-x86_64 -cpu
+/// qemu64` (no AVX at all). `forge-needle`'s `cpu` module mirrors that floor.
 ///
 /// Windows is held back for three independent reasons: the published file is
 /// `libneedle.a` (an `ar` archive of a COFF `needle.cpp.obj`), not the
 /// `needle.lib` an MSVC `-lneedle` resolves; it needs libc++, which an MSVC
 /// toolchain does not provide at all; and the x86_64 one has the
-/// `__hash_memory` problem above. armv7/riscv64 are held back because no forge
-/// CI or release target builds them, so the link has never been exercised.
+/// `__hash_memory` requirement above. armv7/riscv64 are held back because no
+/// forge CI or release target builds them, so the link has never been
+/// exercised.
 ///
 /// Note what is *not* published at all: there is no `macos-x86_64` folder in
 /// the repo (checked against the HF `siblings` listing), so
 /// `x86_64-apple-darwin` has no engine to fetch — builds for it always
 /// resolve engine-less and warn. See README's "Embedded Needle brain".
 ///
-/// What is left is arm64, on both platforms — and both are verified end to end
-/// (real `decide` against real weights, statically linked, no new runtime
+/// arm64 (both platforms) and x86_64 Linux are verified end to end (real
+/// `decide` against real weights, statically linked, no new runtime
 /// dependencies).
 const PINNED_ENGINES: &[PinnedEngine] = &[
     PinnedEngine {
@@ -96,6 +102,13 @@ const PINNED_ENGINES: &[PinnedEngine] = &[
         platform: "linux-arm64",
         sha256: "b36c214437b5230bae89291f684de571dceb0922834a09ceeb09a8e21464a481",
         bytes: 1_539_978,
+    },
+    // Needs libc++ >= 21 (`__hash_memory`); see the table's doc comment.
+    PinnedEngine {
+        target: "x86_64-unknown-linux-gnu",
+        platform: "linux-x86_64",
+        sha256: "2581e7d46acd4f66c5839bcfb06b0af11c157c8775636875beb0af5ca35ded54",
+        bytes: 1_675_104,
     },
 ];
 
@@ -515,6 +528,11 @@ struct CxxPlan {
     flags: Vec<String>,
     /// A `cargo:warning` to emit, when the chosen plan is worth explaining.
     warning: Option<String>,
+    /// Why this engine cannot be linked on this machine at all, when that is
+    /// knowable up front (the engine references libc++ symbols no libc++
+    /// found here defines). `build.rs` then continues engine-less with this
+    /// as its one warning — a clear message instead of a link error.
+    blocker: Option<String>,
 }
 
 /// What the machine actually has, so [`cxx_plan`] can stay pure and testable.
@@ -526,6 +544,10 @@ struct CxxAvailability {
     static_cxxabi: Option<PathBuf>,
     /// Whether a shared `libc++` was found at all.
     shared_cxx: bool,
+    /// libc++ symbols the engine references that no libc++ found on this
+    /// machine defines (see [`LIBCXX_NEWER_SYMBOLS`]). Non-empty means the
+    /// default plan cannot link, so [`cxx_plan`] reports a blocker.
+    unsatisfied: Vec<String>,
 }
 
 /// Decide the link plan. Pure: every impure input arrives as an argument, so
@@ -547,6 +569,7 @@ fn cxx_plan(target: &str, requested: Option<&str>, have: &CxxAvailability) -> Cx
         search_dirs: Vec::new(),
         flags: flags.iter().map(|s| (*s).to_string()).collect(),
         warning: None,
+        blocker: None,
     };
 
     match requested {
@@ -589,6 +612,26 @@ fn cxx_plan(target: &str, requested: Option<&str>, have: &CxxAvailability) -> Cx
     let elf_dynamic = ["dylib=c++", "dylib=c++abi", "dylib=m"];
     let strings = |flags: &[&str; 3]| flags.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
+    // The engine needs a newer libc++ than this machine has. Linking anyway
+    // would only trade this message for an "undefined reference" from the
+    // linker, so say what is missing and let the build go engine-less.
+    if !have.unsatisfied.is_empty() {
+        return CxxPlan {
+            search_dirs: Vec::new(),
+            flags: Vec::new(),
+            warning: None,
+            blocker: Some(format!(
+                "the libneedle engine for {target} references {} — defined only by libc++ 21 \
+                 or newer, and no libc++ on this machine has it — so this build has no \
+                 embedded brain; it continues engine-less and forge routes with static rules. \
+                 To link the brain, install libc++-21-dev and libc++abi-21-dev from \
+                 apt.llvm.org (or any LLVM >= 21 libc++), or set {CXX_RUNTIME_ENV} to take \
+                 over the C++ runtime yourself.",
+                have.unsatisfied.join(", ")
+            )),
+        };
+    }
+
     match (&have.static_cxx, &have.static_cxxabi) {
         (Some(cxx), Some(cxxabi)) => {
             let mut search_dirs = vec![cxx.clone()];
@@ -599,6 +642,7 @@ fn cxx_plan(target: &str, requested: Option<&str>, have: &CxxAvailability) -> Cx
                 search_dirs,
                 flags: strings(&elf_static),
                 warning: None,
+                blocker: None,
             }
         }
         _ if have.shared_cxx => CxxPlan {
@@ -611,6 +655,7 @@ fn cxx_plan(target: &str, requested: Option<&str>, have: &CxxAvailability) -> Cx
                  libcxxabi-devel (Fedora) for a self-contained build, or set \
                  {CXX_RUNTIME_ENV}=libc++ to ask for this on purpose and silence this."
             )),
+            blocker: None,
         },
         // Nothing found: still ask for static, so the failure is the linker's
         // specific "cannot find -lc++" rather than a confusing runtime crash,
@@ -624,6 +669,7 @@ fn cxx_plan(target: &str, requested: Option<&str>, have: &CxxAvailability) -> Cx
                  libc++abi-dev (Debian/Ubuntu) or libcxx-devel and libcxxabi-devel (Fedora); \
                  {CXX_RUNTIME_ENV} overrides the choice if your engine differs."
             )),
+            blocker: None,
         },
     }
 }
@@ -659,10 +705,22 @@ fn requested_cxx_runtime() -> Option<String> {
 ///    ones. Mixing Ubuntu's `libc++.a` with llvm-18's `libc++abi.a` is fine —
 ///    they are the same LLVM build — and this was verified to link and run.
 fn find_lib_dir(name: &str, target: &str) -> Option<PathBuf> {
-    if let Some(dir) = ask_compiler(name) {
+    find_lib_dir_where(name, target, &|_| true)
+}
+
+/// [`find_lib_dir`], keeping only a hit whose file passes `accept` — how a
+/// libc++ that lacks a symbol the engine needs is skipped in favour of one
+/// that has it (Ubuntu's libc++ 18 in gcc's path, LLVM 21's under
+/// `/usr/lib/llvm-21/lib`).
+fn find_lib_dir_where(name: &str, target: &str, accept: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    if let Some(dir) = ask_compiler(name)
+        && accept(&dir.join(name))
+    {
         return Some(dir);
     }
-    scan_lib_dirs(name, target)
+    lib_dir_candidates(target)
+        .into_iter()
+        .find(|dir| dir.join(name).is_file() && accept(&dir.join(name)))
 }
 
 /// Strategy 1: `-print-file-name`. Returns the *directory*, and only when the
@@ -700,6 +758,13 @@ fn ask_compiler(name: &str) -> Option<PathBuf> {
 /// `/usr/lib/llvm-*/lib` entries are sorted so the highest LLVM version wins,
 /// which matches what a `clang` on the same machine would pick.
 fn scan_lib_dirs(name: &str, target: &str) -> Option<PathBuf> {
+    lib_dir_candidates(target)
+        .into_iter()
+        .find(|dir| dir.join(name).is_file())
+}
+
+/// The directories [`scan_lib_dirs`] searches, in preference order.
+fn lib_dir_candidates(target: &str) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(triple) = gnu_multiarch_triple(target) {
         dirs.push(PathBuf::from(format!("/usr/lib/{triple}")));
@@ -733,8 +798,7 @@ fn scan_lib_dirs(name: &str, target: &str) -> Option<PathBuf> {
     });
     llvm.reverse();
     dirs.extend(llvm);
-
-    dirs.into_iter().find(|dir| dir.join(name).is_file())
+    dirs
 }
 
 /// `x86_64-unknown-linux-gnu` → `x86_64-linux-gnu`, the Debian/Ubuntu
@@ -759,12 +823,133 @@ fn gnu_multiarch_triple(target: &str) -> Option<String> {
 /// warn-and-ask-for-static branch, where `CXX_RUNTIME_ENV` and a manual
 /// `rustc-link-search` are the operator's tools. Apple and MSVC never need it.
 fn probe_cxx(target: &str, host: &str) -> CxxAvailability {
+    probe_cxx_for(target, host, &[])
+}
+
+/// [`probe_cxx`] for an engine that references `needs` (mangled libc++
+/// symbols, from [`engine_libcxx_needs`]): only a libc++ that defines all of
+/// them counts as found, and the ones nothing defines come back in
+/// `unsatisfied` so [`cxx_plan`] can refuse up front.
+fn probe_cxx_for(target: &str, host: &str, needs: &[&str]) -> CxxAvailability {
     if target != host || target.contains("apple") || target.contains("msvc") {
         return CxxAvailability::default();
     }
+    let defines_all = |path: &Path| {
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        needs.iter().all(|sym| library_defines(&bytes, sym))
+    };
+    let static_cxx = find_lib_dir_where("libc++.a", target, &defines_all);
+    // Prefer the libc++abi that sits next to the chosen libc++ (same LLVM).
+    let static_cxxabi = static_cxx
+        .as_ref()
+        .filter(|dir| dir.join("libc++abi.a").is_file())
+        .cloned()
+        .or_else(|| find_lib_dir("libc++abi.a", target));
+    let shared_cxx = find_lib_dir_where("libc++.so", target, &defines_all).is_some();
+    let unsatisfied = if needs.is_empty() || static_cxx.is_some() || shared_cxx {
+        Vec::new()
+    } else {
+        needs.iter().map(|s| (*s).to_string()).collect()
+    };
     CxxAvailability {
-        static_cxx: find_lib_dir("libc++.a", target),
-        static_cxxabi: find_lib_dir("libc++abi.a", target),
-        shared_cxx: find_lib_dir("libc++.so", target).is_some(),
+        static_cxx,
+        static_cxxabi,
+        shared_cxx,
+        unsatisfied,
+    }
+}
+
+/// libc++ symbols that published engines are known to reference but that
+/// older (distro) libc++ builds do not define, with the first libc++ that
+/// does. Only listed here when measured: `__hash_memory` is referenced by the
+/// `linux-x86_64` and `windows-x86_64` archives and defined from libc++ 21.
+const LIBCXX_NEWER_SYMBOLS: &[(&str, &str)] = &[("_ZNSt3__113__hash_memoryEPKvm", "libc++ 21")];
+
+/// Which of [`LIBCXX_NEWER_SYMBOLS`] this engine archive references. A plain
+/// byte search is exact enough here: the engine never *defines* a libc++
+/// symbol, so its name appearing in the archive means it is referenced.
+fn engine_libcxx_needs(engine_bytes: &[u8]) -> Vec<&'static str> {
+    LIBCXX_NEWER_SYMBOLS
+        .iter()
+        .filter(|(sym, _)| contains_bytes(engine_bytes, sym.as_bytes()))
+        .map(|(sym, _)| *sym)
+        .collect()
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Does this library define `symbol`? For an `ar` archive with a GNU/SysV
+/// symbol index (what `ar rcs`/`llvm-ar` write on Linux) the index is exact:
+/// it lists *defined* symbols only. Anything else — a shared object, or an
+/// archive without an index — falls back to a byte search, which is what a
+/// `.so`'s dynamic string table supports. A Debian `libc++.so` linker script
+/// mentions no symbols, so it never counts, which is the conservative answer.
+fn library_defines(bytes: &[u8], symbol: &str) -> bool {
+    match ar_symbol_index(bytes) {
+        Some(names) => names.contains(&symbol.as_bytes()),
+        None => contains_bytes(bytes, symbol.as_bytes()),
+    }
+}
+
+/// Parse the symbol index of a GNU/SysV `ar` archive (member `/`, 32-bit
+/// big-endian offsets, or `/SYM64/`, 64-bit). Returns `None` when `bytes` is
+/// not an archive or has no index.
+fn ar_symbol_index(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    const MAGIC: &[u8] = b"!<arch>\n";
+    const HEADER: usize = 60;
+    let body = bytes.strip_prefix(MAGIC)?;
+    let header = body.get(..HEADER)?;
+    let name = std::str::from_utf8(&header[..16]).ok()?.trim_end();
+    let width = match name {
+        "/" => 4,
+        "/SYM64/" => 8,
+        _ => return None,
+    };
+    let size: usize = std::str::from_utf8(&header[48..58]).ok()?.trim().parse().ok()?;
+    let index = body.get(HEADER..HEADER + size)?;
+    let count_bytes = index.get(..width)?;
+    let count = count_bytes.iter().fold(0usize, |n, b| (n << 8) | usize::from(*b));
+    let names = index.get(width + count.checked_mul(width)?..)?;
+    let mut out: Vec<&[u8]> = names.split(|b| *b == 0).take(count).collect();
+    out.retain(|n| !n.is_empty());
+    Some(out)
+}
+
+/// Where the linked engine came from and whether its bytes are the ones
+/// forge pinned — reported by `needle_sys::ENGINE_PROVENANCE` and
+/// `forge doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provenance {
+    /// Downloaded and checked against [`PINNED_ENGINES`].
+    Pinned,
+    /// Supplied locally (`NEEDLE_LIB_DIR` or `vendor/`) and byte-identical
+    /// to the pinned engine for this target.
+    LocalVerified,
+    /// Supplied locally and *not* the pinned bytes (a newer upstream build,
+    /// a self-built engine, or a target with no pin). Linked as asked — the
+    /// operator chose it — but labelled, never passed off as verified.
+    LocalUnverified,
+}
+
+impl Provenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::LocalVerified => "local-verified",
+            Self::LocalUnverified => "local-unverified",
+        }
+    }
+}
+
+/// Classify a locally supplied engine by its SHA-256 against the pin for
+/// `target`. Pure, so the rule is unit-tested.
+fn local_provenance(target: &str, actual_sha256: &str) -> Provenance {
+    match pinned_engine(target) {
+        Some(pin) if pin.sha256 == actual_sha256 => Provenance::LocalVerified,
+        _ => Provenance::LocalUnverified,
     }
 }

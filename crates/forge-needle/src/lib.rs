@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod cpu;
 pub mod engine;
 pub mod ffi_backend;
 pub mod hash_backend;
@@ -9,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub use backend::{BackendError, Decision, ENGINE_REMEDY, NeedleBackend, NeedleToolCall};
+pub use cpu::CpuSupport;
 pub use engine::{EngineEmbedder, NeedleEngine};
 pub use ffi_backend::FfiBackend;
 pub use hash_backend::HashBackend;
@@ -22,6 +24,13 @@ pub use weights::{WeightsSpec, WeightsStatus, ensure_weights, spec_for, verify, 
 /// When `false`, `FfiBackend` still compiles but sits on inert stubs, and
 /// [`engine_from_config`] picks [`backend::UnavailableBackend`] instead.
 pub const HAS_EMBEDDED_BACKEND: bool = needle_sys::ENGINE_LINKED;
+
+/// Where this build's engine came from (`pinned`, `local-verified`,
+/// `local-unverified`, or `none`) — `needle-sys`'s build-time classification.
+pub const ENGINE_PROVENANCE: &str = needle_sys::ENGINE_PROVENANCE;
+
+/// One line on which engine-resolution path this build took and why.
+pub const ENGINE_RESOLUTION: &str = needle_sys::ENGINE_RESOLUTION;
 
 /// Where the weights for `needle.variant` resolve to. A path-resolution
 /// failure (e.g. an unpinned variant with no cached override) degrades to
@@ -61,6 +70,16 @@ pub fn engine_from_config(
     needle: &forge_config::NeedleConfig,
 ) -> Result<NeedleEngine, forge_core::error::ForgeError> {
     if HAS_EMBEDDED_BACKEND {
+        // Linked is a build-time fact; runnable is a fact about *this* CPU.
+        // Below the engine's floor, refuse before any engine code runs and
+        // let the fallback router take over, saying why.
+        let cpu = cpu::host();
+        if !cpu.runnable() {
+            tracing::warn!("needle: {}; routing with static rules", cpu.describe());
+            return Ok(NeedleEngine::spawn(backend::UnsupportedCpuBackend {
+                reason: cpu.describe(),
+            }));
+        }
         let path = resolved_weights_path(needle);
         Ok(NeedleEngine::spawn(ffi_backend::FfiBackend::new(path)))
     } else {

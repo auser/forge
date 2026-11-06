@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -36,6 +37,15 @@ pub struct GlobalOpts {
     /// Override the configured model.
     #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
+
+    /// Activate a routing profile: which models may serve which phase.
+    ///
+    /// A profile is Forge's `opusplan` — a plan gets the high-fidelity
+    /// model, the build gets the cheap one — expressed per phase rather
+    /// than per vendor. Define it under `[profiles.<name>]` in the config
+    /// file. Without this flag, routing is unconstrained.
+    #[arg(long, global = true, value_name = "PROFILE")]
+    pub profile: Option<String>,
 
     /// Override the configured router (needle|jev|laya|laya-native|http|static|cheapest).
     // `mock` is deliberately absent from that list: it is a test-only
@@ -215,6 +225,11 @@ pub enum Command {
         command: ObserverCommand,
     },
 
+    /// Run any forge command through a local model proxy, with subscription
+    /// credentials hidden: `forge proxy` (chat), `forge proxy run "task"`,
+    /// `forge proxy doctor`, `forge proxy init`.
+    Proxy(ProxyArgs),
+
     /// Check environment and configuration health.
     Doctor {
         /// After the static checks, fire one tiny canary prompt through the
@@ -230,6 +245,58 @@ pub enum Command {
         /// Include the source commit and compilation target.
         #[arg(long)]
         build: bool,
+    },
+}
+
+/// `forge proxy [--url URL] [--key-env NAME] [FORGE_ARGS…]`.
+///
+/// Everything after the proxy's own flags is a normal forge command line,
+/// run in a hardened environment that only reaches the proxy; global flags
+/// (`--model`, `--json`, …) work before or after `proxy`. `forge proxy init`
+/// is the proxy's own subcommand; to run `forge init` itself through the
+/// proxy, write `forge proxy -- init`.
+#[derive(Args, Clone, Debug, Default)]
+pub struct ProxyArgs {
+    /// Proxy base URL, without /v1 (default: $FORGE_PROXY_URL, then
+    /// `[proxy] url`, then http://127.0.0.1:8001). Must be on this machine.
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+
+    /// Env var the proxy model entries read the client key from (default:
+    /// `[proxy] key_env`, then FORGE_PROXY_API_KEY). Its value comes from
+    /// that variable, else $FORGE_PROXY_API_KEY, else "dummy".
+    #[arg(long, value_name = "NAME")]
+    pub key_env: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Option<ProxyCommand>,
+
+    /// The forge command to run through the proxy (default: chat).
+    #[arg(
+        value_name = "FORGE_ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub forge_args: Vec<OsString>,
+}
+
+#[derive(Subcommand, Clone, Debug)]
+pub enum ProxyCommand {
+    /// Write the proxy's [models] entries, `[proxy]`, `local_only = true`
+    /// and `router_escalate = "off"` into the user config. Idempotent; keeps
+    /// everything else in the file.
+    Init {
+        /// Proxy base URL, without /v1.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Env var the entries read the client key from.
+        #[arg(long, value_name = "NAME")]
+        key_env: Option<String>,
+        /// Write exactly these models instead of discovering them from
+        /// `GET {url}/v1/models` (comma-separated; `claude-*` ids become
+        /// Anthropic-dialect entries, anything else OpenAI-dialect).
+        #[arg(long, value_name = "IDS", value_delimiter = ',')]
+        models: Vec<String>,
     },
 }
 

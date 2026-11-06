@@ -42,8 +42,9 @@ pub use model::{
 };
 pub use observer::{observer_model_from_config, observer_prices_from_config};
 pub use router::{
-    CheapestRouter, FallbackRouter, HttpRouter, LayaRouter, MockRouter, StaticRouter,
-    ThresholdRouter, effective_router_name, filter_candidates, jev_credential_present,
-    resolved_jev_key_env, resolved_jev_url, router_endpoint, router_from_config,
+    CheapestRouter, FallbackRouter, HttpRouter, LayaRouter, MockRouter, PhasePolicyRouter,
+    StaticRouter, ThresholdRouter, effective_router_name, filter_candidates,
+    jev_allowed_under_local_only, jev_credential_present, jev_endpoint, resolved_jev_key_env,
+    resolved_jev_url, router_endpoint, router_from_config, router_from_config_with_policy,
 };
 pub use scripted::{ScriptedMockModel, ScriptedReply};

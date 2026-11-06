@@ -12,6 +12,7 @@ pub mod mcp_cmd;
 pub mod model_cmd;
 pub mod observer_cmd;
 pub mod presets;
+pub mod proxy_cmd;
 pub mod router_cmd;
 pub mod run_cmd;
 pub mod serve_cmd;
@@ -40,6 +41,7 @@ impl Context {
         CliOverrides {
             config_path: self.global.config.clone(),
             model: self.global.model.clone(),
+            profile: self.global.profile.clone(),
             router: self.global.router.clone(),
             execution: self.global.execution.clone(),
             approval: self.global.approval.clone(),
@@ -123,6 +125,27 @@ pub async fn dispatch(cli: Cli) -> Result<(), ForgeError> {
             Ok(())
         }
         Some(Command::Doctor { live }) => doctor::run(&ctx, live).await,
+        Some(Command::Proxy(args)) => match args.command {
+            Some(crate::cli::ProxyCommand::Init {
+                url,
+                key_env,
+                models,
+            }) => {
+                proxy_cmd::init(
+                    &ctx,
+                    url.as_deref().or(args.url.as_deref()),
+                    key_env.as_deref().or(args.key_env.as_deref()),
+                    &models,
+                )
+                .await
+            }
+            None => proxy_cmd::run(
+                &ctx,
+                args.url.as_deref(),
+                args.key_env.as_deref(),
+                &args.forge_args,
+            ),
+        },
         Some(Command::Auth { command }) => match command {
             crate::cli::AuthCommand::Status => auth_cmd::status(&ctx),
             crate::cli::AuthCommand::Login { provider } => auth_cmd::login(&ctx, provider),
@@ -177,7 +200,11 @@ fn command_activity(command: &Option<Command>, json: bool) -> Option<Activity> {
         return None;
     }
     let label = match command {
-        None | Some(Command::Chat { .. } | Command::Version { .. }) => return None,
+        // `proxy` re-execs forge, and the proxied command reports its own
+        // activity; a label here would print twice.
+        None | Some(Command::Chat { .. } | Command::Version { .. } | Command::Proxy(_)) => {
+            return None;
+        }
         Some(Command::Init { .. }) => "initializing project",
         Some(Command::Doctor { .. }) => "checking environment",
         Some(Command::Auth { .. }) => "checking authentication",

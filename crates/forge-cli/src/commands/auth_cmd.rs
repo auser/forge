@@ -51,6 +51,12 @@ pub fn login(ctx: &Context, provider: AuthProvider) -> Result<(), ForgeError> {
             "`forge auth login` is interactive and cannot be combined with --json",
         ));
     }
+    if forge_config::proxy_mode() {
+        return Err(ForgeError::config(
+            "`forge proxy` hides subscription credentials, so it never signs in to one; \
+             models authenticate through the proxy",
+        ));
+    }
 
     let (binary, args, probe_name, install_hint): (&str, &[&str], &str, &str) = match provider {
         AuthProvider::Claude => (
@@ -118,6 +124,11 @@ pub fn login(ctx: &Context, provider: AuthProvider) -> Result<(), ForgeError> {
 /// rustyline starts, so the provider CLI owns the terminal during its
 /// browser/device flow.
 pub fn ensure_for_chat(ctx: &Context) -> Result<(), ForgeError> {
+    // Under `forge proxy` the proxy is the only way out, so there is no
+    // subscription to offer.
+    if forge_config::proxy_mode() {
+        return Ok(());
+    }
     let resolved = ctx.resolve_config()?;
     if resolved.config.explicit.contains("model")
         || forge_providers::automatic_model(&resolved.config).is_some()

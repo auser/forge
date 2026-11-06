@@ -9,6 +9,7 @@ members = [
     "crates/forge-core",
     "crates/forge-execution",
     "crates/forge-graph",
+    "crates/forge-inference",
     "crates/forge-mcp",
     "crates/forge-needle",
     "crates/forge-providers",
@@ -33,6 +34,7 @@ forge-core = { path = "crates/forge-core" }
 forge-config = { path = "crates/forge-config" }
 forge-execution = { path = "crates/forge-execution" }
 forge-graph = { path = "crates/forge-graph" }
+forge-inference = { path = "crates/forge-inference" }
 forge-mcp = { path = "crates/forge-mcp" }
 forge-needle = { path = "crates/forge-needle" }
 forge-providers = { path = "crates/forge-providers" }
@@ -91,6 +93,11 @@ tokio = { version = "1", features = [
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 toml = "0.9"
+# Format-preserving TOML edits for `forge proxy init`, which must update a
+# user's config.toml in place (keys, comments and layout kept) and be
+# idempotent. Shares toml 0.9's parser/writer/datetime crates, so it adds one
+# package to the tree.
+toml_edit = "0.23"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

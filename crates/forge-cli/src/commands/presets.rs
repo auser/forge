@@ -38,11 +38,16 @@ pub const PRESETS: &[(&str, &str)] = &[
         include_str!("../../../../examples/configs/kimi.toml"),
     ),
     ("kev", include_str!("../../../../examples/configs/kev.toml")),
+    ("lev", include_str!("../../../../examples/configs/lev.toml")),
     (
         "decider",
         include_str!("../../../../examples/configs/decider.toml"),
     ),
     ("jev", include_str!("../../../../examples/configs/jev.toml")),
+    (
+        "opusplan",
+        include_str!("../../../../examples/configs/opusplan.toml"),
+    ),
 ];
 
 /// The preset named `name`, or an error listing the valid ones.
@@ -90,5 +95,45 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("claude"), "{message}");
         assert!(message.contains("local-first"), "{message}");
+    }
+
+    /// The opusplan preset is the phase-tier policy: a strong model for
+    /// the plan, a cheaper one for the build. Its tiers must name models
+    /// forge actually declares — a tier naming a model that is not in the
+    /// catalogue degrades to the ordinary pool at run time, silently.
+    #[test]
+    fn the_opusplan_preset_names_declared_models() {
+        let contents = get("opusplan").expect("preset opusplan");
+        let config: forge_config::Config = toml::from_str(contents).expect("parses");
+        assert_eq!(config.profile.as_deref(), Some("opusplan"));
+        let profile = config.profiles.get("opusplan").expect("the profile");
+        assert!(
+            !profile.plan.is_empty(),
+            "the plan tier is the point of the preset"
+        );
+        for model in profile.models() {
+            assert!(
+                config.models.contains_key(model),
+                "the opusplan preset names {model:?}, which forge does not declare"
+            );
+        }
+    }
+
+    /// The lev preset is the local System One setup: a loopback endpoint,
+    /// no credential to configure, and the option-order check on.
+    #[test]
+    fn the_lev_preset_points_at_a_local_system_one_endpoint() {
+        let contents = get("lev").expect("preset lev");
+        let config: forge_config::Config = toml::from_str(contents).expect("parses");
+        assert_eq!(config.router, "jev");
+        let url = config.jev_url.expect("lev sets its own endpoint");
+        assert!(
+            url.starts_with("http://127.0.0.1"),
+            "the lev endpoint must be local: {url}"
+        );
+        assert!(
+            config.jev_order_check,
+            "the preset turns the option-order check on"
+        );
     }
 }

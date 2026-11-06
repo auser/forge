@@ -46,6 +46,10 @@ pub const FORGE_ENV_VARS: &[&str] = &[
     "FORGE_ROUTER_ESCALATE",
     "FORGE_JEV_URL",
     "FORGE_JEV_KEY_ENV",
+    // The option-order check costs an extra forward pass at the far end and
+    // is opt-in per project; scrubbed so a developer's shell can't turn it
+    // on for a supposedly-hermetic scenario run.
+    "FORGE_JEV_ORDER_CHECK",
     // Jev's default credential env var is a conventional provider-style
     // name, not a FORGE_* one — scrubbed here too so a developer's shell
     // can't make the default `router = "needle"`, `router_escalate =

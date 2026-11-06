@@ -79,6 +79,23 @@ pub trait ChatHost: Send + Sync {
             "task inspection is unavailable in this host",
         ))
     }
+    /// Select the active routing profile, or clear it with `None`.
+    ///
+    /// Unlike [`ChatHost::switch`], this does not rebuild the runtime: a
+    /// profile is a table of model names the router reads on every
+    /// decision, so changing one is a pointer swap. Rebuilding would drop
+    /// a live run's input channel for no reason.
+    async fn set_profile(&mut self, _profile: Option<String>) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "routing profiles are unavailable in this host",
+        ))
+    }
+    /// The routing profiles this host offers, for `/profile`.
+    async fn list_profiles(&mut self) -> Result<Vec<Line>, ForgeError> {
+        Err(ForgeError::config(
+            "routing profiles are unavailable in this host",
+        ))
+    }
     fn environment(&self) -> Environment;
     /// User-visible model candidates only: this is where mock entries are
     /// filtered out, in one place (§9.3).

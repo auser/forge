@@ -22,11 +22,37 @@ model.
 cargo install --locked --git https://github.com/auser/forge forge-cli
 ```
 
-The on-device engine links by default on macOS/Linux arm64 (fetched and
-checksum-verified at build time). Other platforms build engine-less and
-route with static rules — `forge doctor` says which you have. Prebuilt
+The on-device engine links by default on macOS/Linux arm64 and on x86_64
+Linux (fetched and checksum-verified at build time; x86_64 Linux also needs
+LLVM's libc++ 21+, see
+[Embedded Needle brain](docs/reference.md#embedded-needle-brain)). Other
+platforms build engine-less and route with static rules — `forge doctor` says
+which you have, which resolution path the build took, and what your CPU means
+for the engine. Prebuilt
 binaries and an install script are in
 [Installation](docs/reference.md#installation).
+
+### Through a local model proxy
+
+Running a Claude/OpenAI-compatible proxy on this machine (or tunnelled to it)?
+`forge proxy` sends every model request there, and keeps subscription
+credentials out of reach:
+
+```bash
+forge proxy init                       # once: write the proxy's [models], local_only, [proxy]
+forge proxy doctor                     # URL, reachability, dialects, isolation, needle
+forge proxy                            # chat
+forge proxy run "fix the failing test" # one-shot
+forge proxy --model sonnet run "…"     # any forge command and flags pass through
+```
+
+`init` discovers models from `GET {url}/v1/models` (Anthropic-dialect entries
+use the URL without `/v1`, OpenAI-dialect ones with it), is idempotent, and
+keeps the rest of your config. The URL comes from `--url`, then
+`$FORGE_PROXY_URL`, then `[proxy] url`, then `http://127.0.0.1:8001`; the
+client key from `$FORGE_PROXY_API_KEY` (default `dummy`). For a proxy on
+another host, tunnel it first: `ssh -N -L 8001:127.0.0.1:8001 host`. Details:
+[Through a local proxy](docs/reference.md#through-a-local-proxy-forge-proxy).
 
 ## Quickstart
 
@@ -165,6 +191,8 @@ and tradeoffs.
 
 - `forge run` — a bounded inspect/edit/check/review workflow over the
   multi-turn agent loop, with durable task evidence and a reviewable diff.
+- Routing profiles — a named policy per phase: plan with the strong model,
+  build with the cheap one (`[profiles.<name>]`).
 - `forge run --plan` — routes a read-only design pass, economical execution,
   and—when implementation changes something—a read-only independent review.
   The generated plan and review are durable task evidence.
@@ -199,8 +227,26 @@ approval = "prompt-dangerous" # ordinary edits run; destructive operations ask
 
 Presets live in [`examples/configs/`](examples/configs/) — or let init
 write one: `forge init --preset claude` (also `codex`, `kimi`, `kev`,
-`decider`, `jev`, `local-first`, `hybrid-needle`, `budget-hosted`,
+`decider`, `jev`, `opusplan`, `local-first`, `hybrid-needle`, `budget-hosted`,
 `hybrid-laya`, `hybrid-laya-native`).
+
+A **routing profile** says which models may serve which phase — the
+`opusplan` idea, per phase instead of per vendor. One model in a tier is a
+decision (no inference, no extra cost); several make a menu the router picks
+from:
+
+```toml
+profile = "opusplan"           # or FORGE_PROFILE=opusplan, or --profile opusplan
+
+[profiles.opusplan]
+plan    = "claude-sonnet"           # one model: a decision
+execute = ["deepseek-chat", "gpt-5"] # several: a menu
+```
+
+`forge init --preset opusplan` writes that shape with the models forge
+already declares. `forge doctor` reports the active profile and marks any
+tier model that cannot be served — a name that is not wired up would
+otherwise be ignored at run time, silently.
 
 ## Where to read more
 
