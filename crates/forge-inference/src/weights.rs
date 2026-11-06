@@ -106,20 +106,19 @@ fn http_client() -> Result<reqwest::Client, ForgeError> {
         .map_err(|e| ForgeError::config(format!("building HTTP client: {e}")))
 }
 
-/// Download `url` to `dest` via a `<dest>.part` temp file, then atomically
-/// rename into place — `dest` only ever holds fully-written bytes, which is
-/// what makes truncation on disk detectable by [`verify`] alone. Any
-/// leftover `.part` file from a failed attempt is cleaned up.
-async fn download(url: &str, dest: &Path) -> Result<(), ForgeError> {
-    let part = part_path(dest);
-    let result = download_to(url, dest, &part).await;
+/// Download `url` into `part`, cleaning the partial file up if the attempt
+/// fails. The caller verifies `part` and only then renames it into place,
+/// so the final path never holds bytes that have not hashed to the pin —
+/// and this function never writes to, or removes, the final path at all.
+async fn download(url: &str, part: &Path) -> Result<(), ForgeError> {
+    let result = download_to(url, part).await;
     if result.is_err() {
-        let _ = tokio::fs::remove_file(&part).await;
+        let _ = tokio::fs::remove_file(part).await;
     }
     result
 }
 
-async fn download_to(url: &str, dest: &Path, part: &Path) -> Result<(), ForgeError> {
+async fn download_to(url: &str, part: &Path) -> Result<(), ForgeError> {
     let client = http_client()?;
     let response = client
         .get(url)
@@ -136,15 +135,12 @@ async fn download_to(url: &str, dest: &Path, part: &Path) -> Result<(), ForgeErr
         .bytes()
         .await
         .map_err(|e| ForgeError::config(format!("reading response body from {url}: {e}")))?;
-    if let Some(parent) = dest.parent() {
+    if let Some(parent) = part.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(ForgeError::Io)?;
     }
     tokio::fs::write(part, &bytes)
-        .await
-        .map_err(ForgeError::Io)?;
-    tokio::fs::rename(part, dest)
         .await
         .map_err(ForgeError::Io)?;
     Ok(())
@@ -182,17 +178,17 @@ pub async fn ensure_weights(
         if dest.is_file() {
             match verify(&dest, &expected) {
                 Ok(true) => continue,
-                Ok(false) => {
-                    // Truncated or tampered bytes on disk: don't trust them.
-                    let _ = std::fs::remove_file(&dest);
-                }
+                // Truncated or tampered bytes on disk: don't trust them, and
+                // don't delete them either — a verified refetch replaces the
+                // file by atomic rename, and if no refetch happens the
+                // caller is told `Missing` rather than losing the file.
+                Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         path = %dest.display(),
                         "could not verify existing model file, refetching"
                     );
-                    let _ = std::fs::remove_file(&dest);
                 }
             }
         }
@@ -213,9 +209,7 @@ pub async fn ensure_weights(
                 fetched_any = true;
                 continue;
             }
-            Ok(false) => {
-                let _ = std::fs::remove_file(&dest);
-            }
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(error = %e, url = %url, "model fetch attempt 1 failed, retrying once");
             }
@@ -227,7 +221,6 @@ pub async fn ensure_weights(
                 continue;
             }
             Ok(false) => {
-                let _ = std::fs::remove_file(&dest);
                 return Ok(WeightsStatus::Missing {
                     path: dir.to_path_buf(),
                     reason: format!("checksum mismatch after 2 download attempts from {url}"),
@@ -249,13 +242,26 @@ pub async fn ensure_weights(
     })
 }
 
+/// Fetch `url` and install it at `dest` only if its bytes hash to
+/// `expected_sha256`. A mismatch leaves `dest` untouched and discards the
+/// download, so a file forge did not put there is never destroyed by a
+/// failed fetch — `embedding.weights_dir` may point at a directory the
+/// operator owns and keeps other files in.
 async fn fetch_and_verify(
     url: &str,
-    path: &Path,
+    dest: &Path,
     expected_sha256: &str,
 ) -> Result<bool, ForgeError> {
-    download(url, path).await?;
-    verify(path, expected_sha256)
+    let part = part_path(dest);
+    download(url, &part).await?;
+    if !verify(&part, expected_sha256)? {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Ok(false);
+    }
+    tokio::fs::rename(&part, dest)
+        .await
+        .map_err(ForgeError::Io)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -296,6 +302,52 @@ mod tests {
         // difference between "doesn't match" and "couldn't even check".
         let dir = tempfile::tempdir().expect("tmp");
         assert!(verify(dir.path(), &"0".repeat(64)).is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_fetch_never_destroys_a_file_forge_did_not_write() {
+        // `embedding.weights_dir` is ordinary layered config, so a cloned
+        // repo's project config can aim it at a directory the operator owns
+        // and keeps other files in — and one pinned artifact is named
+        // `tokenizer.json`, which collides with half the ML projects on
+        // disk. A checksum mismatch must therefore leave the existing file
+        // exactly as it was, not clean it up.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"wrong".to_vec()))
+            .mount(&server)
+            .await;
+        unsafe {
+            std::env::set_var(BASE_URL_ENV, server.uri());
+            std::env::set_var(TEST_SHA256_ENV, hex_sha256(b"what we actually pinned"));
+        }
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = dir.path().join("someone-elses-models");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        let precious = target.join(spec().tokenizer.filename);
+        std::fs::write(&precious, b"the operator's own tokenizer").expect("write");
+
+        let status = ensure_weights(spec(), &target, true).await.expect("ensure");
+        assert!(
+            matches!(status, WeightsStatus::Missing { .. }),
+            "a mismatch must degrade, not succeed: {status:?}"
+        );
+        assert_eq!(
+            std::fs::read(&precious).expect("the file is still there"),
+            b"the operator's own tokenizer",
+            "a failed fetch must not touch a file forge did not write"
+        );
+        assert!(
+            !part_path(&precious).exists(),
+            "the discarded download must not be left behind"
+        );
+
+        unsafe {
+            std::env::remove_var(BASE_URL_ENV);
+            std::env::remove_var(TEST_SHA256_ENV);
+        }
     }
 
     #[tokio::test]
