@@ -70,6 +70,21 @@ model wins, followed by an authenticated CLI subscription, then an API-key
 hosted provider. Models without working endpoints or credentials are never
 offered to the router.
 
+The graph's semantic index is embedded independently of the generation model.
+`embedding.provider` defaults to `needle`; the other valid values are
+`embeddinggemma2` and `rten`. `rten` runs on-device in pure Rust with no
+daemon and no native dependency, so it also works on hosts where the Needle
+engine cannot link, and it fetches SHA-256-pinned weights on first use.
+
+```toml
+[embedding]
+provider = "rten"          # or needle (the default), embeddinggemma2
+# autofetch = false        # supply the weights yourself, for offline use
+```
+
+The full embedding configuration is in
+[Configuration](docs/reference.md#configuration).
+
 No model yet? Sign in with a subscription you already have, then run `forge`
 again:
 
@@ -94,6 +109,32 @@ forge run "Explain this project"      # the agent loop (non-interactive)
 forge run --plan "Refactor auth"      # route planning separately from execution
 forge chat                            # the same loop, interactive
 ```
+
+To route each phase through a named model policy, initialize the ready-made
+profile and use it for a planned run:
+
+```bash
+forge init --preset opusplan
+forge --profile opusplan run --plan "Refactor auth"
+forge doctor                          # reports the active profile
+```
+
+A profile declares `plan`, `execute`, `review`, and `general` under
+`[profiles.<name>]`; each phase accepts one model name or a list:
+
+```toml
+[profiles.opusplan]
+plan = "claude-sonnet"
+execute = ["deepseek-chat", "qwen3-coder"]
+review = "claude-sonnet"
+general = "deepseek-chat"
+```
+
+You can activate it with `profile = "opusplan"` in config,
+`FORGE_PROFILE=opusplan` in the environment, or `--profile opusplan` on the
+command line, in that precedence order. The preset matches
+[`examples/configs/opusplan.toml`](examples/configs/opusplan.toml). Naming an
+undefined profile is a configuration error, and the run refuses to start.
 
 Forge also keeps durable project knowledge alongside the graph. Add a concise,
 reviewable decision linked to the files you changed, then inspect it before a
