@@ -1,181 +1,173 @@
-# Rearchitecting forge's runtime onto Infinity
+# Agent runtime: what to adopt from Infinity, Hydro and tellus
 
 **Date:** 2026-11-06
-**Status:** proposed — spike landed, sequencing not yet approved
+**Status:** proposed
 **Spike:** [`../spikes/infinity-runtime/`](../spikes/infinity-runtime/)
 
-Three projects were put forward for this rearchitecture:
+Three projects were put forward for a rearchitecture:
 [Infinity](https://infinity.hydro.run/), [Hydro](https://hydro.run/) and
-[tellus](https://tellus.rs). This spec takes each one as far as the evidence
-supports and no further. **One is adopted, two are not** — reasons below, and
-the cost of overriding either rejection is stated so the call stays reversible.
+[tellus](https://tellus.rs). The goal they are being measured against:
+forge should *contain* the easiest extensible AI framework — future-proof,
+fast, and as cheap as possible to run.
 
 ## The verdict
 
 | Project | Version | Verdict |
 |---|---|---|
-| `infinity-agent-core` | 0.2.0 (crates.io) | **Adopt** as the execution engine beneath `AgentService` |
-| `hydro_lang` | 0.17.0-alpha.6 | **Not as a dependency** — adopt one idea from it |
+| `infinity-agent-core` | 0.2.0 | **Idea, not dependency** — drop per-turn state; keep forge's runtime |
+| `hydro_lang` | 0.17.0-alpha.6 | **Idea, not dependency** — put stream guarantees in the type |
 | `tellus` | 0.5.3 | **Reject** — wholly subsumed |
 
-## Why Infinity, specifically
+**No new framework goes under `AgentService`.** Forge's own trait seams stay
+the framework. The one real gap — concurrent, model-callable fan-out — is
+built on primitives forge already owns.
 
-Forge and Infinity are solving the same problem, and Infinity is further along
-on the part forge has no answer for at all. Its own builder doc states the
-thesis:
+### Correction to the first draft of this spec
 
-> Analogous to an actor system: threads (root agents and their subagents) are
-> the actors, and the `InputSender` is how messages are delivered to them.
-> `AgentSystem` itself holds no running state — each `step()` loads the
-> thread's state from the stores, runs one slice, and drops it.
+The first version of this document recommended adopting Infinity as the
+execution engine, on the claim that *"forge has no subagent primitive at
+all."* That claim is wrong, and it was the load-bearing one. Checking the
+tree afterwards:
 
-That last sentence is the whole value. Forge's agent loop holds a run's state
-*in the loop*; a parked run (`waiting_for_approval`) is a live task waiting on
-a channel. Infinity's run state is **data in a store between turns**, so an
-agent costs ~103 KB while it waits and waking it is a store read. Everything
-forge wants and cannot currently express follows from that one property:
-parallel subagents, sleeping without polling, and thousands of concurrent
-agents in one process.
+- `AgentService::fork_session(session, at)` already copies an event-log
+  prefix into a self-contained session with a `session_forked` provenance
+  marker. That **is** `SpawnContext::InheritUpTo(n)` — forge just exposes it
+  as the user-facing `/fork` instead of as a tool a model can call. A fresh
+  session is `SpawnContext::Fresh`.
+- `forge-task` (1563 lines) is a durable task graph: `TaskPlan`, `TaskNode`,
+  `TaskState`, `TransitionRequest`, `CapabilityNeed`, `EffectClass`,
+  `EffectRequest`, `WorkspaceCheckpoint`, `Verification`, `JsonlTaskStore`,
+  and `DurableTaskState::{Queued, Running, Parked, Failed, Succeeded}` as the
+  "stable, transport-neutral lifecycle shown by every Forge front end".
+- `forge-runtime::workflow` (1571 lines) already orchestrates a
+  plan→build→verify→review development workflow over that graph.
+- Runs already stream per-run (`subscribe`/`attach`, cross-process) and
+  `forge-server` already spawns them concurrently.
 
-What forge gains that it genuinely does not have today:
+So forge is not missing an agent runtime. It has an event-sourced store with
+replay, durable parking, context-cutoff forking, and an orchestrator — and a
+*more* opinionated model than Infinity's, because it knows about workspace
+checkpoints, effect classes and verification. Infinity knows about none of
+those and would not replace them.
 
-- **Typed subagent spawning.** `SpawnContext::{InheritUpTo(n), Fresh}` — a
-  child either inherits history to a cutoff or is severed from it. Forge has
-  no subagent primitive at all.
-- **`DeferQueue`** — sleep/wake with no polling loop.
-- **Compaction across ancestors.** `load_history_with_ancestors` walks the
-  ancestor chain to the most recent compaction summary.
-- **A serverless step API** for free, should `forge serve` ever want it.
+## Why that flips the call
 
-### What the spike proved, and what it cost
+Measured against the five goals, adopting Infinity loses on four of them:
 
-The adoption is cheap because **forge keeps its own stack at every seam that
-matters**. Verified by the spike, not assumed:
+- **Easiest** — a 6-slice engine migration running two runtimes side by side,
+  versus a spawn tool over a function that already exists.
+- **Future-proof** — 0.2.0, 49% doc coverage, a single 220 KB
+  `event_processor.rs`. The insurance forge actually has is its own
+  `forge-core` seams; putting a 0.2.0 crate *underneath* them trades that away
+  and adds an adapter to maintain forever.
+- **Fast** — the spike's hard finding: Infinity's local driver spawns `!Send`
+  futures and needs a `LocalSet`, so its concurrency is cooperative within one
+  thread. Forge is already multi-threaded Tokio with no such constraint.
+  Adopting Infinity would make fan-out *slower*, not faster.
+- **Cheapest** — a wash at best. Forge's decision plane (embedded Needle free
+  → local models free → subscriptions → metered APIs last) already *is* the
+  cheapest-possible answer, and Infinity has no opinion about it. Any
+  migration must preserve it, so it cannot improve it.
 
-1. `infinity-provider-protocol` is deliberately SDK-free ("no HTTP stack, no
-   LLM SDKs"). Its `ModelProvider` trait is near-isomorphic to forge's own,
-   and `StaticModel::new` takes `Arc<dyn ModelProvider>`. So forge-providers
-   plugs in behind an adapter and **the entire decision plane survives
-   untouched** — Needle, Jev escalation, static rules, routing profiles, cost
-   books, credential detection, the local-first ladder. That plane is forge's
-   actual differentiator and Infinity has no opinion about it.
-2. `ConversationStore` and `StateStore` are pluggable traits — the crate ships
-   in-memory ones and notes "DSQL in Lambda, in-memory for CLI". **forge-session's
-   append-only JSONL store becomes a `ConversationStore`**, so redaction,
-   `forge resume` and the on-disk format all stay.
-3. Neither `rig-core` nor the AWS SDK is pulled in. Those live in sibling
-   provider crates forge never depends on.
-4. Infinity's `ErrorClass::{Transient, Throttled, ContextOverflow, Fatal}` is
-   forge's `ProviderFailureKind` by another name, and its `ToolDefinition` is
-   forge's. These are adapter-shaped differences, not redesigns.
+**Extensible** is the one it would not lose on — Infinity's seams really are
+pluggable, which the spike proved. But forge's seams are too, and they are
+already load-bearing for five front ends.
 
-**The one hard constraint the spike found:** Infinity's local driver spawns
-`!Send` futures. Without a `LocalSet` it panics on first thread launch
-(`spawn_local called from outside of a task::LocalSet`). So the Infinity system
-must own one dedicated thread behind a job channel.
+The spike was still worth running: it is what established the `!Send`
+constraint and the provider-seam isomorphism, and it is what makes this
+recommendation evidence rather than taste. It stays in-tree as the record of
+*why* the answer is no.
 
-That is not a new pattern here — it is the *third* instance of one
-ARCHITECTURE.md already names: `NeedleEngine` owns `libneedle` on a dedicated
-OS thread (mpsc jobs, oneshot replies), and `TerminalIo` owns `rustyline` the
-same way. The integration therefore has a precedent in-tree to copy rather
-than a design to invent. Only running the spike surfaced this; it type-checks
-fine.
+## What is actually missing
 
-## Why not Hydro (as a dependency)
+One thing: **concurrent, model-callable fan-out.** Every primitive it needs
+exists; nothing composes them, and no tool exposes them to a model. That is
+the whole gap, and it is small.
 
-Hydro is a genuinely beautiful system solving a problem **forge does not
-have**. Its value is location-oriented programming across machines: a single
-program spanning processes and clusters, with distribution in the types and
-eventual determinism enforced at compile time. Forge is one process on one
-developer's machine; `forge serve` is an adapter over the same in-process
-`AgentService`. There is no consensus protocol, no replication, no
-cross-region coordination to make correct.
+## Plan
 
-Against that, the costs are concrete: `0.17.0-alpha.6` is alpha, and the
-determinism discipline is not free — code whose result could vary with timing
-or duplication does not compile without algebraic proofs or explicit
-`nondet!` markers. That is a large tax levied on every stream in the codebase
-to buy guarantees about a topology forge does not have.
-
-**The idea worth taking, though, is cheap and real.** Hydro's core insight is
-that *ordering, duplication and retry semantics belong in the type, not in a
-comment*. Forge's event streams carry exactly those hazards today and express
-none of them — reattach replays a backlog, retries can duplicate, and
-cross-process `attach` interleaves store reads with a live broadcast. Forge
-already has a bug-shaped hole here: the committed test
-`subscribing_to_a_run_owned_by_another_process_creates_no_broadcaster` exists
-because a foreign run registered a broadcaster nothing published to. Stream
-metadata newtypes on forge's run events would have made that unrepresentable.
-
-Worth noting: **Infinity is itself a Hydro project**, co-led out of UC
-Berkeley's Sky Computing Lab. Adopting Infinity already banks the Hydro
-thinking at the layer where forge can use it. If Hydro-the-crate is wanted
-anyway, the honest place for it is a future multi-machine `forge serve`
-fan-out — a separate effort, after Infinity lands, and not before `hydro_lang`
-is out of alpha.
-
-## Why not tellus
-
-tellus offers typed actors, supervision trees, death watch, event sourcing and
-QUIC clustering. Checked one at a time against forge:
-
-- **Event sourcing with replay/snapshots** — this is `forge-session` plus
-  `forge-runtime::replay`, shipped and in use by `forge resume`.
-- **Mailboxes and typed actors** — this is what Infinity provides, in a crate
-  whose actors are *agents*, not generic state machines. Adopting both means
-  **two actor runtimes in one binary**, which is strictly worse than one.
-- **Supervision trees** — forge's failure model today is `catch_unwind` on the
-  engine thread plus typed errors, and it fits a single-process CLI. Nothing
-  in the backlog asks for restart-with-backoff of a supervised hierarchy.
-- **QUIC clustering with mutual TLS** — solves distributing actors across
-  nodes. Forge is local-first by design; this is the Hydro objection again.
-
-So every offer is either already built, better served by the crate being
-adopted, or aimed at a problem forge does not have. Added to that:
-`0.5.3`, 619 lifetime downloads, first published three months ago. Taking a
-pre-1.0 dependency is reasonable when it carries weight no existing code
-does — Infinity clears that bar, tellus does not.
-
-**If tellus goes in anyway**, the one defensible slice is supervision: restart
-policy and death-watch ordering around the Infinity thread. That is roughly
-50 lines over what exists, and should be written as 50 lines before it is
-taken as a dependency.
-
-## Sequencing
-
-Deliberately staged so forge is shippable and green at every step, and so the
-hand-rolled loop is deleted only once the replacement has proven parity. No
-front end changes until step 5 — all five (`forge run`, chat, `serve`, `mcp`,
-`acp`) sit over `AgentService` and keep sitting over it.
+Three slices, all additive, no new dependency, each shippable.
 
 | # | Slice | Done when |
 |---|---|---|
-| 1 | `forge-agents` crate: `ModelProvider` and `ConversationStore` adapters over forge-providers and forge-session | Spike's test passes against forge's real provider and real JSONL store |
-| 2 | `InfinityEngine`: the system on a dedicated thread behind a job channel, copying `NeedleEngine`'s shape | A run completes through it; panic containment covered |
-| 3 | Tool dispatch and approval: forge tools as Infinity tools, `RiskLevel` gating mapped onto `UserChoice`/`ChoiceId` | `waiting_for_approval` round-trips via `forge_run_input` as it does now |
-| 4 | Config switch, default off (`[runtime] engine = "legacy" \| "infinity"`), `forge doctor` reports which answers | `just verify` green under both engines |
-| 5 | Subagents — the capability that motivated the move | A run fans out and rejoins, recorded in the session log |
-| 6 | Delete the legacy loop | Parity proven; one engine in the tree |
+| 1 | A `spawn` tool over `fork_session` (inherit-to-cutoff) and a fresh session (severed), returning a child run id | A model fans out one child and the parent's log records the provenance |
+| 2 | Bounded concurrent scheduling of child runs — `JoinSet` plus a semaphore, per `async-joinset-structured` / `async-bounded-channel` | N children run in parallel across cores, backpressured, cancellation propagating from the parent |
+| 3 | A `join` primitive collecting child outcomes into the parent's event log | A fan-out/rejoin round-trips through `forge resume` |
 
-The engine switch in step 4 follows the pattern forge already uses for
-`needle` vs `rten` backends: two implementations behind one seam, config
-chooses, `doctor` explains the choice. It is also the rollback.
+Then, independently and cheaply:
 
-## Risks, stated plainly
+| # | Slice | Done when |
+|---|---|---|
+| 4 | **Infinity's idea:** stop holding run state in the loop across turns — load from the store, run a slice, drop it | A parked run holds no task; `attach` is a store read |
+| 5 | **Hydro's idea:** ordering/retry/duplication guarantees in the *type* of a run's event stream | The foreign-broadcaster class of bug is unrepresentable, not just tested |
 
-- **`infinity-agent-core` is 0.2.0** with 49% doc coverage, and
-  `event_processor.rs` is a single 220 KB file. The API will move under us.
-  Mitigated by steps 1 and 4: everything crosses an adapter forge owns, and
-  the legacy engine stays until step 6.
-- **`!Send` driver** constrains the system to one thread. Known, and the
-  in-tree pattern is proven twice over — but it does mean Infinity's
-  concurrency is cooperative within that thread, not spread across cores.
-  Worth measuring before step 5 is relied on for throughput.
-- **`rhai` is a transitive dependency** of `infinity-agent-core` — an embedded
-  scripting engine, which is new attack surface in a process that already
-  executes tools under approval gating. Needs a look at whether forge's path
-  can reach it at all before step 4.
-- **Approval parking is the integration's sharpest edge.** Forge parks a run
-  mid-tool-call awaiting `y`; Infinity models user input as `UserChoice`. If
-  the mapping is lossy, risk gating is what breaks — so step 3 lands before
-  the config switch, not after.
+Slice 4 is where Infinity's actual insight lands, and forge is most of the way
+there already: the JSONL store plus `replay` can reconstruct a conversation
+today. The loop simply does not let go between turns.
+
+Slice 5 pays a debt with a name. The committed test
+`subscribing_to_a_run_owned_by_another_process_creates_no_broadcaster` exists
+because a run live in *another process* is not terminal, so `subscribe`
+registered a broadcaster nothing ever published to and nothing pruned. Typed
+stream metadata is what makes that a compile error instead of a regression
+test.
+
+## Why not tellus
+
+Each of its offers, against forge:
+
+- **Event sourcing with replay/snapshots** — this is `forge-session` plus
+  `forge-runtime::replay`, shipped and used by `forge resume`.
+- **Typed actors and mailboxes** — forge's runs already have ordered input
+  delivery (`send_input`), per-run streams, and durable parking.
+- **Supervision trees** — forge's failure model is `catch_unwind` on the
+  engine thread plus typed errors, which fits a single-process CLI. Nothing
+  asks for restart-with-backoff of a supervised hierarchy.
+- **QUIC clustering with mutual TLS** — distributes actors across nodes.
+  Forge is local-first by design.
+
+Plus 0.5.3 and 619 lifetime downloads. A pre-1.0 dependency should carry
+weight no existing code does; this one carries none.
+
+## Why not Hydro as a dependency
+
+Hydro's value is correctness *across machines*: distribution in the types,
+eventual determinism enforced at compile time, for consensus and replication.
+Forge is one process on one machine; `forge serve` is an adapter over the same
+in-process `AgentService`. There is no protocol here to make correct, and
+`0.17.0-alpha.6` plus a `nondet!`/algebraic-proof obligation on every stream
+is a large tax for guarantees about a topology that does not exist.
+
+Worth noting Infinity is itself a Hydro project (UC Berkeley Sky Computing Lab
+with AWS), so slices 4 and 5 bank the Hydro thinking at the layer forge can
+use. If Hydro-the-crate is ever right, it is for a multi-machine `forge serve`
+fan-out — a separate effort, after it leaves alpha.
+
+## Where the money actually is
+
+"As cheap as possible" is a token question, not a framework question. No
+runtime swap moves it. The levers forge already has:
+
+- **The fast path** — Needle filling a tool call directly without waking a
+  generation model is the single largest saving available, and it is already
+  built. Widening what it covers is cheaper than any architectural change.
+- **Compaction** — Infinity's `load_history_with_ancestors` walks ancestors to
+  the latest compaction summary. Forge has `ContextArtifactsConfig` and an
+  observer/budget; ancestor-aware compaction becomes relevant exactly when
+  slice 1 lands and child contexts start nesting.
+- **The ladder itself** — free embedded decisions, free local generation, then
+  subscriptions, then metered keys. Keep it; it is the differentiator.
+
+## Risks
+
+- **Slices 1–3 add concurrency to a runtime whose approval gating assumes one
+  foreground run.** `RiskLevel` gating and `waiting_for_approval` are the
+  sharp edge: a parked child must not be able to consume the parent's approval
+  channel. This is the thing to design before slice 2, not after.
+- **`service.rs` is 3787 lines** and is where this lands. The honest risk is
+  that fan-out makes it worse. Slices 1–3 should extract a scheduling module
+  rather than grow the file.
+- **Not adopting Infinity means forge keeps building its own.** That is the
+  cost of this recommendation, stated plainly: if `infinity-agent-core` reaches
+  1.0 with a `Send` driver and forge has meanwhile hand-rolled fan-out,
+  revisit. The spike is kept in-tree so re-testing is cheap.

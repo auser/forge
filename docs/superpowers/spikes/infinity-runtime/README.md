@@ -1,5 +1,10 @@
 # Spike: Infinity as forge's execution engine
 
+> **Outcome: not adopted.** Findings 2 and 3 below are what decided it — see
+> [the spec](../../specs/2026-11-06-infinity-agent-runtime-rearchitecture.md).
+> Kept in-tree so the call is cheap to re-test if Infinity reaches 1.0 with a
+> `Send` driver.
+
 Throwaway, like `../rten-embed`. It answers one question and then stops
 being interesting: **can forge keep its own provider stack and still run on
 Infinity's agent runtime?**
